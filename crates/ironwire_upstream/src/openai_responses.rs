@@ -167,6 +167,21 @@ impl ResponsesBackend {
         match &self.auth {
             ResponsesAuth::Subscription { auth_path } => {
                 let creds = CodexCredentials::from_path(auth_path.clone())?;
+                if creds.is_expired(Utc::now()) {
+                    // Named plainly, because the fix is one command and a bare
+                    // 401 would send the user looking at IronWire instead.
+                    // IronWire does not refresh this itself — see
+                    // `CodexCredentials::is_expired` for why.
+                    return Err(CredentialError::NotFound {
+                        product: "Codex",
+                        locations: format!(
+                            "{} — the stored ChatGPT token has expired. \
+                             Run `codex` once to refresh it; IronWire will pick \
+                             up the new token on the next request.",
+                            creds.source
+                        ),
+                    });
+                }
                 Ok((creds.bearer(), creds.account_id()))
             }
             ResponsesAuth::ApiKey(key) => Ok((

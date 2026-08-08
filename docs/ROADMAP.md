@@ -103,9 +103,14 @@ see the carried items above.
   reflects what this account is actually entitled to. An unreadable or empty
   response leaves the compiled-in list in force — the position we were in
   before asking
-- ⬜ Codex token refresh. `ironclaw_llm::codex_auth::refresh_access_token` is
-  `pub(crate)`; IronWire currently relies on Codex refreshing its own token and
-  re-reads `auth.json` on every request to pick it up
+- ✅ Expired-token handling — and a **deliberate decision not to refresh**.
+  `ironclaw_llm::codex_auth::refresh_access_token` writes back to
+  `~/.codex/auth.json`, and that file is Codex's, not ours: a second writer
+  racing Codex's own refresh can log a user out of the tool they actually paid
+  for, and the failure would look like Codex's bug rather than IronWire's. So
+  IronWire re-reads the file every request, picks up whatever Codex wrote, and
+  when the token really is stale says so in one sentence with one command to
+  run — rather than presenting it and handing the user a 401 to interpret
 - ⬜ Verify against a real ChatGPT subscription. Every assertion in
   `tests/codex_on_subscription.rs` runs against a mock; the header set the live
   backend actually requires is unverified

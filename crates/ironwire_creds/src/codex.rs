@@ -89,6 +89,41 @@ impl CodexCredentials {
         account_id_from_jwt(self.token.expose_secret())
     }
 
+    /// When this credential expires, if it says.
+    ///
+    /// Read from the token's own `exp` claim. `None` for an API key, which does
+    /// not expire, and for a token we cannot parse.
+    #[must_use]
+    pub fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        if self.mode != CodexMode::ChatGpt {
+            return None;
+        }
+        expiry_from_jwt(self.token.expose_secret())
+    }
+
+    /// Whether the stored token has already expired.
+    ///
+    /// **IronWire does not refresh it.** `ironclaw_llm` can — its
+    /// `refresh_access_token` posts to OpenAI's token endpoint and writes the
+    /// result back to `auth.json` — and IronWire deliberately does not, for a
+    /// reason worth stating: `~/.codex/auth.json` is Codex's file, not ours. A
+    /// second writer racing Codex's own refresh can leave a user logged out of
+    /// the tool they actually paid for, and the failure would look like Codex's
+    /// bug rather than ours.
+    ///
+    /// So IronWire re-reads the file on every request, picks up whatever Codex
+    /// wrote, and when the token really is stale says so in one clear sentence.
+    /// A user running `codex` once is a smaller cost than a proxy corrupting
+    /// their login.
+    #[must_use]
+    pub fn is_expired(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        // A minute of slack: a token expiring while the request is in flight is
+        // effectively expired, and reporting it early beats a 401 the user has
+        // to interpret.
+        self.expires_at()
+            .is_some_and(|at| at <= now + chrono::Duration::seconds(60))
+    }
+
     /// Bearer bound to the host matching this credential's mode.
     #[must_use]
     pub fn bearer(&self) -> Bearer {
@@ -163,17 +198,33 @@ pub fn auth_path() -> PathBuf {
 /// verify it. A token we cannot parse yields `None` and the header is simply
 /// omitted, which is the same position we would be in without this function.
 fn account_id_from_jwt(token: &str) -> Option<String> {
+    jwt_claims(token)?
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Read the `exp` claim, so an expired login is reported as such rather than as
+/// a bare 401.
+fn expiry_from_jwt(token: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let exp = jwt_claims(token)?.get("exp")?.as_i64()?;
+    chrono::DateTime::from_timestamp(exp, 0)
+}
+
+/// Decode a JWT payload.
+///
+/// The signature is neither checked nor needed: we are reading claims out of a
+/// token we already hold and are about to present to its issuer, which will
+/// verify it. A token we cannot parse yields `None`, which every caller treats
+/// as "we do not know" rather than as a failure.
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
     use base64::Engine as _;
 
     let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    claims
-        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    serde_json::from_slice(&decoded).ok()
 }
 
 #[cfg(test)]
@@ -282,5 +333,89 @@ mod tests {
         let creds = CodexCredentials::from_path(Some(path)).expect("reads");
         assert!(!format!("{creds:?}").contains("SECRETVALUE"));
         assert!(!format!("{:?}", creds.bearer()).contains("SECRETVALUE"));
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_auth(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(contents.as_bytes()).expect("write");
+        (dir, path)
+    }
+
+    fn token_expiring_at(exp: i64) -> String {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct"},
+            "exp": exp,
+        });
+        format!(
+            "{}.{}.{}",
+            engine.encode(br#"{"alg":"RS256"}"#),
+            engine.encode(payload.to_string()),
+            engine.encode(b"inert"),
+        )
+    }
+
+    fn creds_expiring_at(exp: i64) -> (tempfile::TempDir, CodexCredentials) {
+        let (dir, path) = write_auth(&format!(
+            r#"{{"auth_mode":"chatgpt","tokens":{{"access_token":"{}","refresh_token":"rt"}}}}"#,
+            token_expiring_at(exp)
+        ));
+        let creds = CodexCredentials::from_path(Some(path)).expect("reads");
+        (dir, creds)
+    }
+
+    #[test]
+    fn a_live_token_is_not_expired() {
+        let now = chrono::Utc::now();
+        let (_dir, creds) = creds_expiring_at(now.timestamp() + 3600);
+        assert!(!creds.is_expired(now));
+        assert!(creds.expires_at().is_some());
+    }
+
+    #[test]
+    fn a_stale_token_is_reported_rather_than_presented() {
+        // Presenting it produces a 401 the user has to interpret. Saying
+        // "expired, run `codex`" is one sentence and one command.
+        let now = chrono::Utc::now();
+        let (_dir, creds) = creds_expiring_at(now.timestamp() - 60);
+        assert!(creds.is_expired(now));
+    }
+
+    #[test]
+    fn a_token_expiring_within_the_minute_counts_as_expired() {
+        // It would expire mid-request otherwise, and a 401 halfway through is
+        // worse than a clear refusal up front.
+        let now = chrono::Utc::now();
+        let (_dir, creds) = creds_expiring_at(now.timestamp() + 10);
+        assert!(creds.is_expired(now));
+    }
+
+    #[test]
+    fn a_token_with_no_expiry_claim_is_never_assumed_stale() {
+        // We do not know, and guessing "expired" would lock a working user out
+        // of their own subscription.
+        let (_dir, path) = write_auth(
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"not-a-jwt","refresh_token":"rt"}}"#,
+        );
+        let creds = CodexCredentials::from_path(Some(path)).expect("reads");
+        assert_eq!(creds.expires_at(), None);
+        assert!(!creds.is_expired(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn an_api_key_never_expires() {
+        let (_dir, path) = write_auth(r#"{"auth_mode":"apiKey","OPENAI_API_KEY":"sk-proj-x"}"#);
+        let creds = CodexCredentials::from_path(Some(path)).expect("reads");
+        assert_eq!(creds.expires_at(), None);
+        assert!(!creds.is_expired(chrono::Utc::now()));
     }
 }
