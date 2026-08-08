@@ -271,3 +271,84 @@ async fn the_event_endpoint_needs_the_control_token() {
         .expect("served");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn pinning_to_a_backend_that_does_not_exist_is_refused() {
+    // It used to succeed. Every subsequent request then silently ignored the
+    // pin and routed normally, while `ironwire status` reported "Pinned to
+    // <whatever>" — so the user believed all their traffic was on one backend
+    // and it was not. Worse than the `X-IronWire-Route` version of this bug,
+    // because a pin persists rather than affecting one request.
+    let (nearai, _hits) = spawn_chat_upstream().await;
+    let response = app(state_for(&nearai))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_ironwire/pin")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"backend":"not-a-real-backend"}"#))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not-a-real-backend")),
+        "the error must name what was asked for: {value}"
+    );
+    // Rejected here rather than per-request precisely so the answer can list
+    // what exists; without that the user has to go and find out separately.
+    let available = value["available"].as_array().expect("a list of backends");
+    assert!(
+        available.iter().any(|id| id == "nearai"),
+        "the error must name what is available: {value}"
+    );
+}
+
+#[tokio::test]
+async fn pinning_to_a_real_backend_still_works() {
+    // The regression that would make the validation useless.
+    let (nearai, _hits) = spawn_chat_upstream().await;
+    let response = app(state_for(&nearai))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_ironwire/pin")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"backend":"nearai"}"#))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn clearing_the_pin_needs_no_backend_to_exist() {
+    // `{"backend": null}` is how the pin is cleared, and it must not be
+    // validated against the registry — a user clearing a stale pin should not
+    // have to satisfy a check about a backend they are removing.
+    let (nearai, _hits) = spawn_chat_upstream().await;
+    let response = app(state_for(&nearai))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_ironwire/pin")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"backend":null}"#))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::OK);
+}

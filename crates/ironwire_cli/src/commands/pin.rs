@@ -21,7 +21,8 @@ pub(crate) async fn run(
                 Some(m) => println!("Pinned to {id} ({m})."),
                 None => println!("Pinned to {id}."),
             }
-            println!("Clear with `ironwire pin`.");
+            println!("Clear with `ironwire pin`. The pin lives in the running");
+            println!("daemon, so restarting it also clears the pin.");
         }
         None => {
             client.pin(None, None).await?;

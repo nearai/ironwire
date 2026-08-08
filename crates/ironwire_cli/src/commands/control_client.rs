@@ -91,7 +91,26 @@ impl ControlClient {
             .await
             .map_err(|e| not_running_inner(&e))?;
         if !response.status().is_success() {
-            bail!("control API returned {}", response.status());
+            // The daemon knows which backends exist and says so in the body.
+            // Passing that through beats "control API returned 400", which
+            // tells the user nothing they can act on.
+            let status = response.status();
+            if let Ok(body) = response.json::<serde_json::Value>().await
+                && let Some(error) = body["error"].as_str()
+            {
+                let available = body["available"]
+                    .as_array()
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|list| !list.is_empty())
+                    .unwrap_or_else(|| "none".to_string());
+                bail!("{error}.\n\nConnected backends: {available}");
+            }
+            bail!("control API returned {status}");
         }
         Ok(())
     }

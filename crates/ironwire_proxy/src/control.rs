@@ -418,6 +418,33 @@ async fn pin(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
+    // Validate before storing. An unknown backend used to be accepted, and then
+    // every request silently ignored the pin and routed normally — while
+    // `ironwire status` reported "Pinned to <whatever>". The user believes all
+    // their traffic is on one backend and it is not, which is the same failure
+    // `X-IronWire-Route` was fixed for, made worse by persisting.
+    //
+    // Rejected here rather than per-request, because here is where the backend
+    // list is visible and the answer can name what actually exists.
+    if let Some(requested) = &request.backend {
+        let known: Vec<String> = state
+            .backends
+            .all()
+            .iter()
+            .map(|backend| backend.id().to_string())
+            .collect();
+        if !known.iter().any(|id| id == requested) {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": format!("`{requested}` is not a connected backend"),
+                    "available": known,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let mut policy = match state.policy.lock() {
         Ok(p) => p,
         Err(poisoned) => poisoned.into_inner(),
