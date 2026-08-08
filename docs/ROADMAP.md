@@ -143,12 +143,33 @@ correctly waits rather than switching. Not yet run against live NEAR AI.
 
 ## M4 — Distribution and updates
 
-- [ ] CI release matrix: macos-arm64/x64, linux-x64/arm64 (gnu + musl), windows-x64
-- [ ] `cargo-dist`: shell installer, Homebrew tap, npm package, MSI
-- [ ] `.deb` + hosted apt repo
-- [ ] pip wheel with platform tags
+- [x] CI release matrix: macos-arm64/x64, linux-x64/arm64 (gnu + musl),
+      windows-x64 — `.github/workflows/release.yml`, tag-driven, with a
+      version/tag consistency check that fails *before* the matrix runs
+- [x] Shell installer (`scripts/install.sh`) — POSIX sh, checked under dash,
+      because it is the fallback for platforms the package managers miss and
+      that includes machines without bash
+- [x] Homebrew formula generator (`packaging/build_brew.py`) with a
+      `brew services` definition and generated completions
+- [x] npm: shim + os/cpu-gated per-platform packages, **no postinstall script**
+- [x] pip: one wheel per platform tag, no sdist (an sdist would promise a
+      from-source build that does not exist)
+- [x] `.deb` via nfpm, carrying a systemd **user** unit
+- [x] `manifest.json` generator; structurally cannot express a URL or host
+- [x] `ironwire service install|uninstall|status` — launchd / systemd-user /
+      schtasks. Always a user agent, and there is deliberately no flag to ask
+      for a system service
+- [x] `ironwire completions <shell>`
+- [x] Every packaging script is exercised on **every CI push** against fake
+      release artifacts (`scripts/test-install.sh`, `scripts/test-packaging.sh`)
+      — they otherwise only run inside a tag build, which is the worst place to
+      find a typo
 - [ ] **Signed releases** — minisign/cosign, verified against a key in the
       binary. A checksum served from the same host as the binary proves nothing.
+      *Needs a real signing key; see "Blocked on infrastructure" below.*
+- [ ] Hosted apt repo at `apt.ironwire.dev`. *Needs hosting.*
+- [ ] Windows MSI. The `.zip` and `winget` cover the same ground; revisit if
+      anyone asks.
 
 ### Updates: notify-only ✅ built
 
@@ -315,3 +336,28 @@ nominated value; the client's transcript contains no placeholder; and
   different credential — high-fidelity fallback)
 - Hooks plugin adding `git diff` / test results / acceptance to traces
 - Windows-native credential store support
+
+---
+
+## Blocked on infrastructure or a live account
+
+Not "not done yet" — these cannot be finished from a development machine, and
+listing them here keeps them from looking finished when they are not.
+
+| Item | Needs | Milestone |
+|---|---|---|
+| Verify the ChatGPT lane end to end | a live ChatGPT/Codex subscription. Every assertion in `tests/codex_on_subscription.rs` runs against a mock; the header set the real backend requires is unverified | M2 |
+| Verify the Claude lane end to end, `scripts/acceptance.sh` against a real account | a live Claude subscription | M1 |
+| Measure Claude Code's real stall timeout | a live session; `keepalive_secs` is currently a guess | M1 |
+| An 8-hour session including a real rate-limit descent | time, and a subscription to exhaust | M1 |
+| Signed releases | a real signing key, held somewhere that is not a repo | M4 |
+| Publish `manifest.json` | a pinned URL to serve it from | M4 |
+| Hosted apt repo | hosting, plus a signing key for the `Release` file | M4 |
+| Real quirks signing key | same. The compiled-in key is a placeholder that verifies nothing, so the channel is inert — which is the correct failure mode, but it *is* inert | M4 |
+| npm / PyPI / tap publication | `NPM_TOKEN`, PyPI trusted publishing, `TAP_TOKEN` | M4 |
+| macOS menu bar app | Xcode, and a Mac to build on | M5 |
+| Tier-3 PII classifier | a local model, and a labelled corpus to state its precision and recall against | M7 |
+
+The code paths for these exist and are tested against mocks and fixtures. What
+is missing is the last mile that only a real credential, a real key, or real
+hosting can provide.

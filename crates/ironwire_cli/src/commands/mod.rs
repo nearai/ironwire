@@ -10,6 +10,7 @@ pub(crate) mod doctor;
 pub(crate) mod log;
 pub(crate) mod pin;
 pub(crate) mod serve;
+pub(crate) mod service;
 pub(crate) mod status;
 pub(crate) mod update;
 

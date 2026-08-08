@@ -71,6 +71,15 @@ enum Command {
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
 
+    /// Run the daemon in the background as a user agent.
+    ///
+    /// Always a *user* agent, never a system service: IronWire holds your
+    /// credentials and must not run with more privilege than you have.
+    Service {
+        /// `install`, `uninstall`, or `status`.
+        action: String,
+    },
+
     /// Emit a shell completion script.
     ///
     /// Packaged installs wire this up for you; `eval "$(ironwire completions
@@ -117,6 +126,7 @@ async fn main() -> Result<()> {
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env => commands::connect::print_env(cli.port),
+        Command::Service { action } => commands::service::run(&action, cli.port),
         Command::Completions { shell } => {
             clap_complete::generate(
                 shell,
