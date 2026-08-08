@@ -6,6 +6,7 @@ members = [
     "crates/ironwire_ledger",
     "crates/ironwire_quirks",
     "crates/ironwire_update",
+    "crates/ironwire_privacy",
     "crates/ironwire_translate",
     "crates/ironwire_upstream",
     "crates/ironwire_proxy",
@@ -27,6 +28,7 @@ ironwire_creds = { path = "crates/ironwire_creds", version = "0.1.0" }
 ironwire_ledger = { path = "crates/ironwire_ledger", version = "0.1.0" }
 ironwire_quirks = { path = "crates/ironwire_quirks", version = "0.1.0" }
 ironwire_update = { path = "crates/ironwire_update", version = "0.1.0" }
+ironwire_privacy = { path = "crates/ironwire_privacy", version = "0.1.0" }
 ironwire_translate = { path = "crates/ironwire_translate", version = "0.1.0" }
 ironwire_upstream = { path = "crates/ironwire_upstream", version = "0.1.0" }
 ironwire_proxy = { path = "crates/ironwire_proxy", version = "0.1.0" }
@@ -37,6 +39,7 @@ ironwire_proxy = { path = "crates/ironwire_proxy", version = "0.1.0" }
 # not silently follow someone else's main branch.
 ironclaw_llm = { git = "https://github.com/nearai/ironclaw", branch = "main" }
 ironclaw_common = { git = "https://github.com/nearai/ironclaw", branch = "main" }
+ironclaw_safety = { git = "https://github.com/nearai/ironclaw", branch = "main" }
 
 anyhow = "1"
 async-trait = "0.1"
