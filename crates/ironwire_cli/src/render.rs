@@ -229,7 +229,19 @@ fn backend_block(backend: &BackendView) -> String {
         out.push_str(&format!("  {line}\n"));
     }
     if !backend.models.is_empty() {
-        out.push_str(&format!("  models: {}\n", backend.models.join(", ")));
+        // Best-first, so the head of the list is the part worth reading. A
+        // general endpoint can offer fifty models, and printing all of them
+        // turns the one screen a user checks under pressure into a wall of
+        // text — the count still says how many there are.
+        const SHOWN: usize = 6;
+        let shown = backend.models.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+        let rest = backend.models.len().saturating_sub(shown.len());
+        let more = if rest > 0 {
+            format!(" (+{rest} more)")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  models: {}{more}\n", shown.join(", ")));
     }
     out
 }
@@ -298,10 +310,31 @@ fn balance_block(balance: &BalanceView) -> String {
         return String::new();
     }
     let mut out = format!("Balance: {}\n", parts.join(" · "));
-    if let Some(spend) = balance.spend_today_usd
-        && spend > 0.0
-    {
-        out.push_str(&format!("  metered spend, last 24h: ${spend:.2}\n"));
+
+    // Two different currencies, so two lines rather than one number. A
+    // subscription is spent in percent of a window you have already bought; an
+    // API key is spent in dollars you have not. Collapsing them into one figure
+    // is how "$0.16 of metered spend" came to describe a day that ran entirely
+    // on subscriptions and was billed nothing.
+    let used: Vec<String> = balance
+        .subscription_used
+        .iter()
+        .filter(|s| s.exchanges > 0 || s.used_pct.is_some())
+        .map(|s| match s.used_pct {
+            Some(pct) => format!("{} {pct:.0}% used", s.name),
+            None => format!("{} not yet reported", s.name),
+        })
+        .collect();
+    if !used.is_empty() {
+        out.push_str(&format!("  subscriptions: {}\n", used.join(" · ")));
+    }
+    match balance.spend_today_usd {
+        // Zero is a result, not an absence: it is the sentence "nothing was
+        // billed today", which is the whole point of routing to a subscription.
+        // `+ 0.0` because summing no dollars at all gives `-0.0` in IEEE 754,
+        // and "$-0.00" reads like a refund.
+        Some(spend) => out.push_str(&format!("  metered spend, last 24h: ${:.2}\n", spend + 0.0)),
+        None => out.push_str("  metered spend, last 24h: not recorded (ledger off)\n"),
     }
     out
 }
@@ -442,6 +475,7 @@ mod log_tests {
             output_tokens: 900,
             cost_usd: 1.25,
             by_backend: vec![("claude-sub".into(), 7), ("anthropic-key".into(), 3)],
+            cost_by_backend: vec![("claude-sub".into(), 0.0), ("anthropic-key".into(), 1.25)],
         });
         assert!(rendered.contains("10 exchanges"));
         assert!(rendered.contains("3 with no usage reported"));
@@ -605,6 +639,7 @@ mod tests {
             unavailable: 0,
             next_available_at: None,
             spend_today_usd: Some(1.234),
+            subscription_used: Vec::new(),
         });
         assert!(rendered.contains("3 pool(s) available (2 already paid for)"));
         assert!(rendered.contains("1 not yet reporting"));

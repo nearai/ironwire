@@ -20,7 +20,7 @@ use crate::headers::forward_response_header;
 use crate::observe::{Observation, retry_after};
 
 /// NEAR AI's OpenAI-compatible inference endpoint.
-pub const NEARAI_DEFAULT_BASE_URL: &str = "https://api.near.ai/v1";
+pub const NEARAI_DEFAULT_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 
 /// Capability profile for a modern OSS model served over Chat Completions.
 ///
@@ -51,7 +51,14 @@ pub struct ChatCompletionsBackend {
     base_url: String,
     client: reqwest::Client,
     capabilities: Capabilities,
+    /// Configured catalogue, used until a probe learns better.
     models: Vec<(String, ModelTier)>,
+    /// What the endpoint itself reported.
+    ///
+    /// An OpenAI-compatible endpoint is somebody else's product with somebody
+    /// else's release schedule; a list configured here is a guess that goes
+    /// stale silently. Once we have asked, we use the answer.
+    discovered: Arc<Mutex<Option<Vec<(String, ModelTier)>>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
 }
 
@@ -111,6 +118,7 @@ impl ChatCompletionsBackend {
                 .build()?,
             capabilities: chat_capabilities(128_000),
             models,
+            discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
     }
@@ -162,7 +170,18 @@ impl Backend for ChatCompletionsBackend {
     }
 
     fn models(&self) -> Vec<(String, ModelTier)> {
-        self.models.clone()
+        match self.discovered.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+        .unwrap_or_else(|| self.models.clone())
+    }
+
+    fn catalogue_from_provider(&self) -> bool {
+        match self.discovered.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
     }
 
     async fn status(&self) -> BackendStatus {
@@ -174,7 +193,7 @@ impl Backend for ChatCompletionsBackend {
             authenticated,
             detail: (!authenticated).then(|| "no API key configured".to_string()),
             quota: self.quota(),
-            models: self.models.clone(),
+            models: self.models(),
         }
     }
 
@@ -311,6 +330,22 @@ impl Backend for ChatCompletionsBackend {
             })?;
         let status = response.status();
         if status.is_success() {
+            // The probe already has the answer in its hand; parsing it is what
+            // turns a configured guess into what the endpoint actually serves.
+            if let Ok(body) = response.bytes().await
+                && let Some(models) = crate::openai_responses::parse_model_list(&body)
+                && !models.is_empty()
+            {
+                tracing::info!(
+                    backend = %self.id,
+                    count = models.len(),
+                    "learned the model catalogue from the provider"
+                );
+                match self.discovered.lock() {
+                    Ok(mut guard) => *guard = Some(models),
+                    Err(poisoned) => *poisoned.into_inner() = Some(models),
+                }
+            }
             return Ok(());
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {

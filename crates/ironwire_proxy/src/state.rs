@@ -86,6 +86,7 @@ impl BackendRegistry {
                         || consent.is_granted(backend.id().as_str()),
                     requires_client_identity: backend.requires_client_identity(),
                     models: backend.models(),
+                    catalogue_from_provider: backend.catalogue_from_provider(),
                 }
             })
             .collect()

@@ -196,6 +196,16 @@ pub trait Backend: Send + Sync {
     /// then remember (`crate::codex_version`).
     fn models(&self) -> Vec<(String, ModelTier)>;
 
+    /// Whether [`Self::models`] is what the provider said, rather than a list
+    /// compiled into this binary.
+    ///
+    /// Routing needs the difference: see
+    /// [`ironwire_core::policy::Candidate::catalogue_from_provider`]. Default
+    /// `false`, because a backend that has never asked has only a guess.
+    fn catalogue_from_provider(&self) -> bool {
+        false
+    }
+
     /// Whether this backend requires the inbound request to carry the
     /// originating product's own client identity (`docs/TRUST.md` §3).
     fn requires_client_identity(&self) -> bool {
@@ -219,6 +229,23 @@ pub trait Backend: Send + Sync {
 
     /// Latest observed quota.
     fn quota(&self) -> QuotaSnapshot;
+
+    /// The provider's own models document, verbatim, if this backend has one.
+    ///
+    /// `/v1/models` is not one schema. The public OpenAI endpoint answers with
+    /// `{"object":"list","data":[…]}`, while the endpoint Codex actually asks —
+    /// `chatgpt.com/backend-api/codex/models` — answers with `{"models":[…]}`,
+    /// where each entry carries the client configuration Codex runs on:
+    /// context window, truncation policy, reasoning levels, even the
+    /// instructions template. Synthesizing a list in the other product's shape
+    /// throws all of that away and leaves Codex on its compiled-in defaults.
+    ///
+    /// So this is the same rule as the native lane, applied to a second
+    /// endpoint: forward the provider's bytes rather than a summary of them.
+    /// `None` for backends that have no such document to forward.
+    async fn models_document(&self) -> Option<Vec<u8>> {
+        None
+    }
 
     /// Verify this backend actually works, right now, over the network.
     ///

@@ -67,7 +67,14 @@ pub struct AnthropicBackend {
     base_url: String,
     client: reqwest::Client,
     capabilities: Capabilities,
+    /// Compiled-in catalogue, used until a probe learns better.
     models: Vec<(String, ModelTier)>,
+    /// What `GET /v1/models` actually reported for this account.
+    ///
+    /// The probe already fetches this list to check the credential; not reading
+    /// it left `ironwire status` naming models from whenever the binary was
+    /// built, months after the account gained newer ones.
+    discovered: Arc<Mutex<Option<Vec<(String, ModelTier)>>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
     /// Protocol constants. These are the values most likely to change under us,
     /// so they come from the signed quirks channel rather than a release
@@ -98,6 +105,7 @@ impl AnthropicBackend {
             client: build_client(timeout_secs)?,
             capabilities: anthropic_capabilities(),
             models: anthropic_models(),
+            discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
             quirks: AnthropicQuirks::default(),
         })
@@ -122,6 +130,7 @@ impl AnthropicBackend {
             client: build_client(timeout_secs)?,
             capabilities: anthropic_capabilities(),
             models: anthropic_models(),
+            discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
             quirks: AnthropicQuirks::default(),
         })
@@ -187,7 +196,18 @@ impl Backend for AnthropicBackend {
     }
 
     fn models(&self) -> Vec<(String, ModelTier)> {
-        self.models.clone()
+        match self.discovered.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+        .unwrap_or_else(|| self.models.clone())
+    }
+
+    fn catalogue_from_provider(&self) -> bool {
+        match self.discovered.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
     }
 
     fn requires_client_identity(&self) -> bool {
@@ -208,7 +228,7 @@ impl Backend for AnthropicBackend {
             authenticated,
             detail,
             quota: self.quota(),
-            models: self.models.clone(),
+            models: self.models(),
         }
     }
 
@@ -316,6 +336,23 @@ impl Backend for AnthropicBackend {
         })?;
         let status = response.status();
         if status.is_success() {
+            // The list is already in our hands from the auth check; reading it
+            // is what keeps `status` from naming a catalogue frozen at build
+            // time. Ordered as the provider ordered it — newest first.
+            if let Ok(body) = response.bytes().await
+                && let Some(models) = crate::openai_responses::parse_model_list(&body)
+                && !models.is_empty()
+            {
+                tracing::info!(
+                    backend = %self.id,
+                    count = models.len(),
+                    "learned the model catalogue from the provider"
+                );
+                match self.discovered.lock() {
+                    Ok(mut guard) => *guard = Some(models),
+                    Err(poisoned) => *poisoned.into_inner() = Some(models),
+                }
+            }
             return Ok(());
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {

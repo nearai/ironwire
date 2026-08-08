@@ -61,9 +61,51 @@ async fn chat_completions(
     .await
 }
 
-/// Synthesized from the backends that are actually eligible, in the shape
-/// OpenAI clients expect.
-async fn models(State(state): State<AppState>) -> Response {
+/// `/v1/models`, in whichever of its two shapes the caller is actually asking
+/// for.
+///
+/// Codex does not ask the public OpenAI endpoint. It asks
+/// `chatgpt.com/backend-api/codex/models`, which answers with `{"models":[…]}`
+/// — a client-configuration document carrying each model's context window,
+/// truncation policy, reasoning levels and instructions template. So this is
+/// not "OpenAI disagreeing with OpenAI": it is a different product surface, and
+/// a list synthesized in the public shape is both unparseable to Codex and
+/// missing everything it came for.
+///
+/// For Codex we therefore forward the provider's own document, by the same rule
+/// as the native lane. For every other OpenAI-compatible client we synthesize
+/// the public shape from the backends that are actually eligible.
+async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let markers = state.identity_markers();
+    if ironwire_core::peek::originator_names_codex(
+        headers.get("originator").and_then(|v| v.to_str().ok()),
+        &markers.codex_originator_prefix,
+    ) && let Some(document) = codex_models_document(&state).await
+    {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            document,
+        )
+            .into_response();
+    }
+    openai_shaped_models(state).await
+}
+
+/// The models document from a consented ChatGPT subscription, if there is one.
+async fn codex_models_document(state: &AppState) -> Option<Vec<u8>> {
+    let consent = state.consent_snapshot();
+    for backend in state.backends.all() {
+        if backend.kind().requires_consent() && !consent.is_granted(backend.id().as_str()) {
+            continue;
+        }
+        if let Some(document) = backend.models_document().await {
+            return Some(document);
+        }
+    }
+    None
+}
+
+async fn openai_shaped_models(state: AppState) -> Response {
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
     let mut data = Vec::new();

@@ -165,9 +165,35 @@ pub struct BalanceView {
     pub unavailable: usize,
     /// When the first unavailable pool is expected back.
     pub next_available_at: Option<DateTime<Utc>>,
-    /// Metered spend recorded in the last 24 hours. `None` when the ledger is
-    /// off — which means unmeasured, not zero.
+    /// Spend on *metered* backends in the last 24 hours. `None` when the
+    /// ledger is off — which means unmeasured, not zero.
+    ///
+    /// Subscription and credit traffic is deliberately not in here. The ledger
+    /// prices every exchange, including the ones served by a subscription, and
+    /// summing all of it produced a "spend" figure for a day on which nothing
+    /// was billed — the opposite of what this proxy exists to tell you.
     pub spend_today_usd: Option<f64>,
+    /// What each subscription has used of its own window, as the provider
+    /// reported it. The unit that matters for capacity already paid for: a
+    /// percentage, not a price.
+    ///
+    /// Defaulted on the way in so a newer CLI against an older daemon renders
+    /// what it can instead of refusing the whole status screen — the daemon
+    /// outlives the shell that talks to it, so the two versions *will* differ.
+    #[serde(default)]
+    pub subscription_used: Vec<SubscriptionUse>,
+}
+
+/// One subscription's consumption of its own window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubscriptionUse {
+    /// Display name, e.g. `Claude subscription`.
+    pub name: String,
+    /// Percent of the window consumed, as the provider reported it. `None`
+    /// means the provider has not said — never a guess.
+    pub used_pct: Option<f32>,
+    /// Exchanges served in the last 24 hours, from the local ledger.
+    pub exchanges: i64,
 }
 
 /// Body of `POST /_ironwire/pin`.
@@ -357,10 +383,46 @@ fn balance(
 ) -> BalanceView {
     use ironwire_upstream::breaker::CircuitState;
 
+    let summary = ledger.and_then(|l| l.summary(now - chrono::Duration::hours(24)).ok());
+    // Which backend is metered is knowable only here, where the registry is —
+    // the ledger stores an id, not a kind. Everything else is priced but not
+    // billed, and must not be added up as though it were.
+    let metered: std::collections::HashSet<&str> = statuses
+        .iter()
+        .filter(|s| s.kind.is_metered())
+        .map(|s| s.id.as_str())
+        .collect();
     let mut view = BalanceView {
-        spend_today_usd: ledger
-            .and_then(|l| l.summary(now - chrono::Duration::hours(24)).ok())
-            .map(|s| s.cost_usd),
+        spend_today_usd: summary.as_ref().map(|s| {
+            s.cost_by_backend
+                .iter()
+                .filter(|(backend, _)| metered.contains(backend.as_str()))
+                .map(|(_, cost)| cost)
+                .sum()
+        }),
+        subscription_used: statuses
+            .iter()
+            .filter(|s| {
+                s.kind.requires_consent()
+                    && s.authenticated
+                    && consent.is_granted(s.id.as_str())
+            })
+            .map(|s| SubscriptionUse {
+                name: s.name.clone(),
+                used_pct: match s.quota.primary {
+                    Headroom::Observed { used_pct, .. } => Some(used_pct),
+                    _ => None,
+                },
+                exchanges: summary
+                    .as_ref()
+                    .and_then(|sum| {
+                        sum.by_backend
+                            .iter()
+                            .find(|(backend, _)| backend == s.id.as_str())
+                    })
+                    .map_or(0, |(_, count)| *count),
+            })
+            .collect(),
         ..BalanceView::default()
     };
     let mut resets: Vec<DateTime<Utc>> = Vec::new();

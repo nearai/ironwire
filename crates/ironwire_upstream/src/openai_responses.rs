@@ -88,6 +88,13 @@ pub struct ResponsesBackend {
     /// version, so the compiled-in list is a guess about someone else's
     /// entitlements. Once we have asked, we use the answer.
     discovered: Arc<Mutex<Option<Catalogue>>>,
+    /// The provider's own models document, exactly as it answered.
+    ///
+    /// Kept beside the parsed catalogue rather than derived from it, because
+    /// what Codex needs from this endpoint is everything we do *not* parse:
+    /// per-model context windows, truncation policy, reasoning levels, the
+    /// instructions template. See [`Backend::models_document`].
+    document: Arc<Mutex<Option<Vec<u8>>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
 }
 
@@ -125,6 +132,7 @@ impl ResponsesBackend {
             capabilities: responses_capabilities(),
             models: responses_models(),
             discovered: Arc::new(Mutex::new(None)),
+            document: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
     }
@@ -149,6 +157,7 @@ impl ResponsesBackend {
             capabilities: responses_capabilities(),
             models: responses_models(),
             discovered: Arc::new(Mutex::new(None)),
+            document: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
     }
@@ -191,6 +200,54 @@ impl ResponsesBackend {
                 },
                 None,
             )),
+        }
+    }
+
+    /// The `/models` URL for this backend.
+    ///
+    /// The client version matters for the subscription and nowhere else: the
+    /// backend gates newer models behind it, so asking with a stale one
+    /// silently returns a shorter list and IronWire would offer fewer models
+    /// than Codex does for the same account (`crate::codex_version`).
+    async fn models_url(&self) -> String {
+        if matches!(self.auth, ResponsesAuth::Subscription { .. }) {
+            let version = crate::codex_version::client_version().await;
+            format!("{}/models?client_version={version}", self.base_url)
+        } else {
+            format!("{}/models", self.base_url)
+        }
+    }
+
+    /// Keep both what the provider said and what we understood of it.
+    ///
+    /// The parsed catalogue is what routing needs; the raw bytes are what a
+    /// client asking `/models` needs, and no summary of ours can stand in for
+    /// them (see [`Backend::models_document`]).
+    fn remember_catalogue(&self, body: &[u8]) {
+        if let Some(models) = parse_model_list(body)
+            && !models.is_empty()
+        {
+            tracing::info!(
+                backend = %self.id,
+                count = models.len(),
+                "learned the model catalogue from the provider"
+            );
+            match self.discovered.lock() {
+                Ok(mut guard) => *guard = Some(models),
+                Err(poisoned) => *poisoned.into_inner() = Some(models),
+            }
+            match self.document.lock() {
+                Ok(mut guard) => *guard = Some(body.to_vec()),
+                Err(poisoned) => *poisoned.into_inner() = Some(body.to_vec()),
+            }
+        }
+    }
+
+    /// The last document this backend was given, if any.
+    fn cached_document(&self) -> Option<Vec<u8>> {
+        match self.document.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -237,6 +294,13 @@ impl Backend for ResponsesBackend {
 
     fn models(&self) -> Vec<(String, ModelTier)> {
         self.effective_models()
+    }
+
+    fn catalogue_from_provider(&self) -> bool {
+        match self.discovered.lock() {
+            Ok(guard) => guard.is_some(),
+            Err(poisoned) => poisoned.into_inner().is_some(),
+        }
     }
 
     fn requires_client_identity(&self) -> bool {
@@ -407,6 +471,31 @@ impl Backend for ResponsesBackend {
         }
     }
 
+    async fn models_document(&self) -> Option<Vec<u8>> {
+        if let Some(cached) = self.cached_document() {
+            return Some(cached);
+        }
+        // Not fetched yet — a client can ask for this before any probe has run,
+        // and answering "here is my own idea of your models" would be worse
+        // than the round trip.
+        let (bearer, _) = self.credential().ok()?;
+        self.check_host(&bearer).ok()?;
+        let response = self
+            .client
+            .get(self.models_url().await)
+            .bearer_auth(bearer.token.expose_secret())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.bytes().await.ok()?;
+        self.remember_catalogue(&body);
+        self.cached_document()
+    }
+
     async fn probe(&self) -> Result<(), UpstreamError> {
         let (bearer, _) = self.credential().map_err(|e| UpstreamError::NeedsAuth {
             backend: self.id.clone(),
@@ -421,12 +510,7 @@ impl Backend for ResponsesBackend {
         // newer models behind it, so asking with a stale one silently returns a
         // shorter list and IronWire would offer fewer models than Codex does
         // for the same account (`crate::codex_version`).
-        let url = if matches!(self.auth, ResponsesAuth::Subscription { .. }) {
-            let version = crate::codex_version::client_version().await;
-            format!("{}/models?client_version={version}", self.base_url)
-        } else {
-            format!("{}/models", self.base_url)
-        };
+        let url = self.models_url().await;
 
         let response = self
             .client
@@ -441,21 +525,8 @@ impl Backend for ResponsesBackend {
             })?;
         let status = response.status();
         if status.is_success() {
-            // Remember what this account is actually entitled to, rather than
-            // continuing to offer a list compiled in months ago.
-            if let Ok(body) = response.bytes().await
-                && let Some(models) = parse_model_list(&body)
-                && !models.is_empty()
-            {
-                tracing::info!(
-                    backend = %self.id,
-                    count = models.len(),
-                    "learned the model catalogue from the provider"
-                );
-                match self.discovered.lock() {
-                    Ok(mut guard) => *guard = Some(models),
-                    Err(poisoned) => *poisoned.into_inner() = Some(models),
-                }
+            if let Ok(body) = response.bytes().await {
+                self.remember_catalogue(&body);
             }
             return Ok(());
         }
@@ -535,10 +606,34 @@ pub fn parse_model_list(body: &[u8]) -> Option<Catalogue> {
                     .or_else(|| item.get("model"))
                     .and_then(serde_json::Value::as_str)
                     .or_else(|| item.as_str())?;
-                Some((id.to_string(), ModelTier::from_model_hint(id)))
+                serves_text_chat(item).then(|| (id.to_string(), ModelTier::from_model_hint(id)))
             })
             .collect(),
     )
+}
+
+/// Whether an entry describes something that can answer a chat turn.
+///
+/// A general endpoint's catalogue is not only chat models: NEAR AI's lists
+/// image generators, a speech model and an embedding model alongside them.
+/// Offering those as routing targets means a coding session can be handed to a
+/// model that cannot read its prompt or cannot answer in words.
+///
+/// The test is the entry's *declared* modalities, not its name — a name pattern
+/// is a guess about someone else's naming scheme, and this is stated in the
+/// data. An entry that declares nothing is kept: no modality field is an
+/// absence of evidence, and every catalogue that predates this (including
+/// OpenAI's and Codex's) has none.
+fn serves_text_chat(item: &serde_json::Value) -> bool {
+    let declares = |field: &str, wanted: &str| -> Option<bool> {
+        let list = item
+            .get(field)
+            .or_else(|| item.get("architecture").and_then(|a| a.get(field)))?
+            .as_array()?;
+        Some(list.iter().any(|m| m.as_str() == Some(wanted)))
+    };
+    declares("input_modalities", "text").unwrap_or(true)
+        && declares("output_modalities", "text").unwrap_or(true)
 }
 
 fn normalize(base: Option<String>, default: &str) -> String {

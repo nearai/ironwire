@@ -101,6 +101,16 @@ pub struct Candidate {
     pub requires_client_identity: bool,
     /// Models this backend offers, best-first, with the tier each satisfies.
     pub models: Vec<(String, ModelTier)>,
+    /// Whether [`Self::models`] came from the provider rather than from a list
+    /// compiled into this binary.
+    ///
+    /// The difference decides what an unknown model means. Against a list the
+    /// provider gave us, "not in the catalogue" means the backend genuinely
+    /// cannot serve it, and descending to something it can is correct. Against
+    /// a compiled-in guess it means only that this build is older than the
+    /// model — and substituting our newest known name for the client's is how
+    /// `claude-opus-5` became `claude-opus-4-6` and failed.
+    pub catalogue_from_provider: bool,
 }
 
 /// The router's answer.
@@ -433,17 +443,18 @@ impl Policy {
         cross_family.sort_by_key(sort_key);
 
         if let Some(best) = same_wire.first() {
-            // A model string we do not recognise is not a model that does not
-            // exist. Our catalogue is a compiled-in snapshot and the providers
-            // ship faster than we do, so "never heard of `claude-opus-5`" means
-            // our list is old — not that the client asked for something wrong.
-            // On the native lane, with capacity to spare, forward the client's
-            // own string and let the provider be the authority. Substituting
-            // the newest model *we* know about is a silent downgrade to a name
-            // that may not even be current, which is the failure this replaces.
-            let unrecognised = peek.requested_model.as_deref().is_some_and(|requested| {
-                !best.models.iter().any(|(known, _)| known == requested)
-            });
+            // A model missing from a catalogue we only *guessed* is not a model
+            // that does not exist — it is a build older than the model. The
+            // providers ship faster than we do, so on the native lane, with
+            // capacity to spare, forward the client's own string and let the
+            // provider be the authority. Substituting the newest name we happen
+            // to know is how `claude-opus-5` became `claude-opus-4-6` and
+            // failed. Once the provider has told us its catalogue, that list is
+            // authoritative and a missing model means what it says.
+            let unrecognised = !best.catalogue_from_provider
+                && peek.requested_model.as_deref().is_some_and(|requested| {
+                    !best.models.iter().any(|(known, _)| known == requested)
+                });
             if unrecognised && !best.quota.is_pressured(now) {
                 return Ok(RouteDecision {
                     backend: best.id.clone(),
@@ -607,6 +618,7 @@ mod tests {
                 ("claude-opus-4-6".to_string(), ModelTier::Frontier),
                 ("claude-sonnet-4-6".to_string(), ModelTier::Balanced),
             ],
+            catalogue_from_provider: true,
         }
     }
 
@@ -1029,6 +1041,9 @@ mod compaction_tests {
                 .iter()
                 .map(|(m, tier)| ((*m).to_string(), *tier))
                 .collect(),
+            // These fixtures state what a backend really offers, so they stand
+            // for a catalogue the provider gave us, not one we guessed.
+            catalogue_from_provider: true,
         }
     }
 

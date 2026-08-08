@@ -128,6 +128,14 @@ pub struct Summary {
     pub cost_usd: f64,
     /// Per-backend exchange counts, descending.
     pub by_backend: Vec<(String, i64)>,
+    /// Per-backend priced cost, in the same order.
+    ///
+    /// Kept per backend rather than only as a total because the total answers
+    /// the wrong question: work done on a subscription is priced here too — as
+    /// what it *would* have cost on the metered API — and reporting that as
+    /// spend tells a user they were billed for capacity they had already paid
+    /// for. Only the caller knows which backend is which.
+    pub cost_by_backend: Vec<(String, f64)>,
 }
 
 /// The ledger.
@@ -312,17 +320,33 @@ impl Ledger {
                     output_tokens: row.get(4)?,
                     cost_usd: row.get(5)?,
                     by_backend: Vec::new(),
+                    cost_by_backend: Vec::new(),
                 })
             },
         )?;
 
         let mut statement = conn.prepare(
-            "SELECT backend, COUNT(*) FROM exchanges WHERE started_at >= ?1
+            "SELECT backend, COUNT(*), COALESCE(SUM(cost_usd), 0.0)
+             FROM exchanges WHERE started_at >= ?1
              GROUP BY backend ORDER BY COUNT(*) DESC",
         )?;
-        summary.by_backend = statement
-            .query_map([&cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        let rows = statement
+            .query_map([&cutoff], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        summary.by_backend = rows
+            .iter()
+            .map(|(backend, count, _)| (backend.clone(), *count))
+            .collect();
+        summary.cost_by_backend = rows
+            .into_iter()
+            .map(|(backend, _, cost)| (backend, cost))
+            .collect();
         Ok(summary)
     }
 
