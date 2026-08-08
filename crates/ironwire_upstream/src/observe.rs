@@ -157,16 +157,19 @@ pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitRea
     let five_hour = window("5h");
     let seven_day = window("7d");
 
-    let binding = match get("anthropic-ratelimit-unified-representative-claim") {
-        Some("five_hour") => five_hour.clone().or_else(|| seven_day.clone()),
-        Some("seven_day") => seven_day.clone().or_else(|| five_hour.clone()),
-        _ => None,
-    };
-    if let Some(reading) = binding.or_else(|| match (five_hour, seven_day) {
+    // Without a claim, the fuller window: it is the one that stops the user
+    // first, and reporting the emptier one is reassurance we cannot support.
+    let fuller = match (five_hour.clone(), seven_day.clone()) {
         (Some(a), Some(b)) if b.used_pct > a.used_pct => Some(b),
         (Some(a), _) => Some(a),
         (None, b) => b,
-    }) {
+    };
+    let binding = match get("anthropic-ratelimit-unified-representative-claim") {
+        Some("five_hour") => five_hour.or(seven_day),
+        Some("seven_day") => seven_day.or(five_hour),
+        _ => None,
+    };
+    if let Some(reading) = binding.or(fuller) {
         return Some(reading);
     }
 

@@ -58,7 +58,7 @@ pub struct ChatCompletionsBackend {
     /// An OpenAI-compatible endpoint is somebody else's product with somebody
     /// else's release schedule; a list configured here is a guess that goes
     /// stale silently. Once we have asked, we use the answer.
-    discovered: Arc<Mutex<Option<Vec<(String, ModelTier)>>>>,
+    discovered: Arc<Mutex<Option<crate::Catalogue>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
 }
 
@@ -306,6 +306,13 @@ impl Backend for ChatCompletionsBackend {
                             .unwrap_or(86_400),
                     ),
             };
+        }
+    }
+
+    fn restore_quota(&self, snapshot: QuotaSnapshot) {
+        match self.quota.lock() {
+            Ok(mut guard) => *guard = snapshot,
+            Err(poisoned) => *poisoned.into_inner() = snapshot,
         }
     }
 

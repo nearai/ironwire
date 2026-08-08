@@ -22,6 +22,9 @@ pub mod openai_responses;
 pub mod sse;
 
 pub use backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};
+
+/// A model catalogue: each slug and the quality tier it satisfies, best first.
+pub type Catalogue = Vec<(String, ironwire_core::protocol::ModelTier)>;
 pub use observe::{Observation, RateLimitReading, UsageReading};
 
 /// Join an OpenAI-family base URL to the path the client asked for.

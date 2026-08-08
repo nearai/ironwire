@@ -59,8 +59,7 @@ pub fn responses_capabilities() -> Capabilities {
     }
 }
 
-/// A model catalogue: slug and the quality tier it satisfies.
-pub type Catalogue = Vec<(String, ModelTier)>;
+pub use crate::Catalogue;
 
 /// Models offered over the Responses API, best first.
 #[must_use]
@@ -461,6 +460,13 @@ impl Backend for ResponsesBackend {
                             .unwrap_or(86_400),
                     ),
             };
+        }
+    }
+
+    fn restore_quota(&self, snapshot: QuotaSnapshot) {
+        match self.quota.lock() {
+            Ok(mut guard) => *guard = snapshot,
+            Err(poisoned) => *poisoned.into_inner() = snapshot,
         }
     }
 

@@ -74,7 +74,7 @@ pub struct AnthropicBackend {
     /// The probe already fetches this list to check the credential; not reading
     /// it left `ironwire status` naming models from whenever the binary was
     /// built, months after the account gained newer ones.
-    discovered: Arc<Mutex<Option<Vec<(String, ModelTier)>>>>,
+    discovered: Arc<Mutex<Option<crate::Catalogue>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
     /// Protocol constants. These are the values most likely to change under us,
     /// so they come from the signed quirks channel rather than a release
@@ -291,6 +291,13 @@ impl Backend for AnthropicBackend {
             quota.primary = Headroom::Exhausted {
                 until: now + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)),
             };
+        }
+    }
+
+    fn restore_quota(&self, snapshot: QuotaSnapshot) {
+        match self.quota.lock() {
+            Ok(mut guard) => *guard = snapshot,
+            Err(poisoned) => *poisoned.into_inner() = snapshot,
         }
     }
 

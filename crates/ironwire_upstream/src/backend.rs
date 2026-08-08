@@ -230,6 +230,13 @@ pub trait Backend: Send + Sync {
     /// Latest observed quota.
     fn quota(&self) -> QuotaSnapshot;
 
+    /// Seed observed quota from a previous run (`ironwire_core::quota_store`).
+    ///
+    /// Default: ignore, so a backend that tracks no quota needs no change. The
+    /// caller has already applied the staleness rules — what arrives here is
+    /// what is still true, with its original observation times intact.
+    fn restore_quota(&self, _snapshot: QuotaSnapshot) {}
+
     /// The provider's own models document, verbatim, if this backend has one.
     ///
     /// `/v1/models` is not one schema. The public OpenAI endpoint answers with

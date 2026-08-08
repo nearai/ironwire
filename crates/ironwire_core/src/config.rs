@@ -76,6 +76,13 @@ impl PathsConfig {
         self.home.join("quirks.json")
     }
 
+    /// Observed quota from the previous run, mode 0600
+    /// (`crate::quota_store`).
+    #[must_use]
+    pub fn quota_file(&self) -> PathBuf {
+        self.home.join("quota.json")
+    }
+
     /// Cached result of the last update check.
     #[must_use]
     pub fn update_cache_file(&self) -> PathBuf {

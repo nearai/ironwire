@@ -20,6 +20,7 @@ pub mod peek;
 pub mod policy;
 pub mod protocol;
 pub mod quota;
+pub mod quota_store;
 
 pub use capability::{Capabilities, Ineligible, ReasoningNeed, RequestRequirements};
 pub use config::{Config, PathsConfig, ResilienceConfig, ServerConfig, UpdateConfig};

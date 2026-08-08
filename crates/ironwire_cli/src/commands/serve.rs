@@ -29,6 +29,10 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let token = control_token(&paths)?;
 
     let registry = build_registry(&config)?;
+    // What the providers told us before the last shutdown, minus whatever has
+    // since expired or gone stale. A backend inside a stated `retry-after`
+    // stays out of the rotation instead of being walked into again.
+    restore_quota(&registry, &paths);
     if registry.is_empty() {
         eprintln!(
             "No backends are available.\n\
@@ -75,15 +79,120 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     // nobody ran doctor against routed on compiled-in guesses for its whole
     // life — and picked models accordingly.
     spawn_catalogue_discovery(state.clone());
+    // Keep what the providers have told us across the next restart.
+    let quota_writer = QuotaWriter::new(paths.quota_file());
+    quota_writer.spawn(state.clone());
 
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
     println!("  Codex:       ironwire connect codex");
     println!();
 
-    ironwire_proxy::server::serve_on(listener, state, shutdown_signal())
+    let result = ironwire_proxy::server::serve_on(listener, state.clone(), shutdown_signal())
         .await
-        .context("serving")
+        .context("serving");
+    // A clean stop should lose nothing: `systemctl --user restart` and a
+    // Ctrl-C both land here, and the timer may be up to its full period behind.
+    quota_writer.write_now(&state);
+    result
+}
+
+/// Writes observed quota to disk, on a timer and once at shutdown.
+///
+/// One writer, holding the last rendered document, so the periodic write and
+/// the shutdown write cannot race into a last-writer-wins where the loser is
+/// the *newer* snapshot. Both go through [`Self::write_now`].
+#[derive(Clone)]
+struct QuotaWriter {
+    path: std::path::PathBuf,
+    last: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl QuotaWriter {
+    /// How often to check whether anything changed.
+    ///
+    /// A write per request would be absurd — SSE-observed usage updates several
+    /// times within a single stream — and the value being protected is only
+    /// useful at restart, so half a minute of lag costs nothing.
+    const PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            last: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn spawn(&self, state: ironwire_proxy::state::AppState) {
+        let writer = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Self::PERIOD);
+            ticker.tick().await; // fires immediately; nothing has changed yet
+            loop {
+                ticker.tick().await;
+                writer.write_now(&state);
+            }
+        });
+    }
+
+    /// Render and write, unless nothing has changed since the last write.
+    ///
+    /// Reads `Backend::quota()` directly rather than `statuses()`: the latter
+    /// does a fresh credential check per backend, which on a thirty-second
+    /// timer would re-read the Keychain a few thousand times a day to learn
+    /// something it already has in a mutex.
+    fn write_now(&self, state: &ironwire_proxy::state::AppState) {
+        let quotas: Vec<(String, ironwire_core::quota::QuotaSnapshot)> = state
+            .backends
+            .all()
+            .iter()
+            .map(|backend| (backend.id().to_string(), backend.quota()))
+            .collect();
+        let rendered = ironwire_core::quota_store::render(&quotas, chrono::Utc::now());
+
+        let mut last = match self.last.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // `written_at` changes every time, so compare the part that carries
+        // meaning rather than the whole document.
+        if last.as_deref().map(strip_written_at) == Some(strip_written_at(&rendered)) {
+            return;
+        }
+        // A bookkeeping failure must never affect routing — same rule as the
+        // ledger. Warn once per change, not once per tick.
+        if let Err(error) = ironwire_core::quota_store::write(&self.path, &rendered) {
+            tracing::warn!(path = %self.path.display(), %error, "could not persist observed quota");
+            return;
+        }
+        *last = Some(rendered);
+    }
+}
+
+/// The document minus its timestamp line, for change detection.
+fn strip_written_at(document: &str) -> String {
+    document
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("\"written_at\""))
+        .collect()
+}
+
+/// Seed each backend with what it had observed before the last shutdown.
+///
+/// A backend id in the file that is not in this registry is ignored rather than
+/// resurrected: the user may have disconnected it, and quota for a backend we
+/// will not route to is not a fact about anything.
+fn restore_quota(registry: &BackendRegistry, paths: &PathsConfig) {
+    let stored = ironwire_core::quota_store::load(&paths.quota_file(), chrono::Utc::now());
+    if stored.is_empty() {
+        return;
+    }
+    for backend in registry.all() {
+        if let Some(quota) = ironwire_core::quota_store::for_backend(&stored, backend.id().as_str())
+        {
+            backend.restore_quota(quota);
+        }
+    }
 }
 
 /// Learn every backend's catalogue in the background, once, at startup.
