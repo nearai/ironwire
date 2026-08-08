@@ -270,6 +270,23 @@ tolerance for a missing block at each position is not documented. Until then,
 mid-loop switching is a **known limitation, not a design position**. It is
 tracked in `ROADMAP.md` under M3.
 
+### Content this build does not model
+
+The translator handles `text`, `thinking`, `image`, `tool_use` and
+`tool_result`. Anything else — a `document`, a `search_result`, whatever
+Anthropic ships next — is **named in `Dropped::unknown_blocks` and makes the
+cross-family route ineligible.**
+
+Refusing rather than dropping, because the two are indistinguishable from here.
+A `document` block a user asked a question about looks exactly like one that was
+decorative, and translating it away produces an answer about content the model
+never received — silent degradation, which §6 exists to refuse. The native lane
+carries it perfectly, so the cost is waiting for same-family capacity.
+
+An earlier version let these fall through a catch-all arm and vanish without
+appearing in the dropped report at all, which made this document's own promise
+false for exactly the case where it mattered most.
+
 ## 7. Conformance testing
 
 Fidelity claims are worthless without a harness that proves them.

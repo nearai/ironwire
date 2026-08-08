@@ -401,6 +401,20 @@ fn translate_request(
 
     let (translated, dropped) =
         ironwire_translate::anthropic_to_chat_completions(&parsed, model, peek.stream);
+    // A block type this build does not model makes the whole cross-family
+    // route ineligible. We cannot tell whether it was load-bearing — a
+    // `document` the user asked a question about looks exactly like one that
+    // was decorative — and answering about content the model never received is
+    // the silent degradation `docs/PROTOCOL.md` §6 refuses. The native lane
+    // carries it perfectly, so the cost is waiting for same-family capacity.
+    if !dropped.unknown_blocks.is_empty() {
+        return Err(format!(
+            "the request contains content this build cannot translate \
+             ({}); routing it to a different API family would silently drop it",
+            dropped.unknown_blocks.join(", ")
+        ));
+    }
+
     if !dropped.is_empty() {
         tracing::info!(
             backend = %decision.backend,

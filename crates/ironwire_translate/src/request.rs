@@ -21,6 +21,20 @@ pub struct Dropped {
     /// Image blocks, when the target is text-only. The gate refuses this route
     /// when images are present, so a non-zero count here is a bug.
     pub images: usize,
+    /// Content-block types this build does not recognise, by name.
+    ///
+    /// Previously these fell through a `_ => {}` and vanished — silently, and
+    /// without appearing in this struct at all, which made the module's own
+    /// promise ("dropped deliberately and namedly") untrue for exactly the case
+    /// that matters most. Anthropic ships new block types regularly; a
+    /// `document` a user asked a question about would have been discarded, and
+    /// the model would have answered as though it were never sent.
+    ///
+    /// A non-empty list makes the *route* ineligible rather than degrading the
+    /// request: we cannot tell whether an unrecognised block was load-bearing,
+    /// and the native lane handles it perfectly. Waiting a turn for same-family
+    /// capacity beats an answer about a document the model never saw.
+    pub unknown_blocks: Vec<String>,
 }
 
 impl Dropped {
@@ -168,7 +182,14 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>, dropped: &mut Dropped) {
                     "content": flatten_tool_result(block.get("content")),
                 }));
             }
-            _ => {}
+            // A block we do not model. Named rather than swallowed — see
+            // `Dropped::unknown_blocks`.
+            other => {
+                let name = other.unwrap_or("<no type field>");
+                if !dropped.unknown_blocks.iter().any(|seen| seen == name) {
+                    dropped.unknown_blocks.push(name.to_string());
+                }
+            }
         }
     }
 

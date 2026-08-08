@@ -583,3 +583,80 @@ async fn the_subscription_is_used_again_once_its_window_resets() {
         "NEAR AI was used while same-family capacity was available"
     );
 }
+
+#[tokio::test]
+async fn an_unrecognised_content_block_refuses_the_cross_family_route() {
+    // `docs/PROTOCOL.md` §6: what would genuinely break the request is refused
+    // rather than silently degraded. An unmodelled block — a `document` a user
+    // asked a question about, or whatever Anthropic ships next — used to fall
+    // through the translator's catch-all and vanish, so the model answered
+    // about content it never received.
+    //
+    // Refusing means the conversation waits for same-family capacity. That is
+    // the correct trade: an error the user can see beats an answer built on
+    // something they sent and the model never got.
+    let (base, received) = spawn_nearai(vec![text_turn("should never be reached")]).await;
+    let state = state_with_exhausted_claude(&base);
+
+    let mut body = claude_code_request(json!([
+        {"role": "user", "content": [
+            {"type": "text", "text": "what does this say?"},
+            {"type": "document", "source": {"type": "base64", "data": "JVBERi0="}},
+        ]}
+    ]));
+    body["stream"] = json!(true);
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+
+    assert_ne!(
+        response.status(),
+        StatusCode::OK,
+        "the request was served by translating away content the user sent"
+    );
+    assert!(
+        received.lock().expect("lock").is_empty(),
+        "a request with an unmodelled block reached the foreign provider"
+    );
+}
+
+#[tokio::test]
+async fn a_request_with_only_modelled_blocks_still_crosses_families() {
+    // The other side of the refusal: it must not have disabled the fallback
+    // lane for ordinary traffic, which is the whole feature.
+    let (base, received) = spawn_nearai(vec![text_turn("done")]).await;
+    let state = state_with_exhausted_claude(&base);
+
+    let mut body = claude_code_request(json!([
+        {"role": "user", "content": [{"type": "text", "text": "fix the test"}]}
+    ]));
+    body["stream"] = json!(true);
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+    assert!(
+        !received.lock().expect("lock").is_empty(),
+        "ordinary traffic no longer reaches the fallback lane"
+    );
+}
