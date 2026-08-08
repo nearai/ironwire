@@ -340,7 +340,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .privacy
             .as_ref()
             .map(|filter| filter.summary().to_string()),
-        quirks_serial: state.quirks.serial(),
+        quirks_serial: state.quirks().serial(),
         update: state.update_status(),
     })
     .into_response()

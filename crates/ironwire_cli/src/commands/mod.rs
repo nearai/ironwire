@@ -11,6 +11,7 @@ pub(crate) mod init;
 pub(crate) mod log;
 pub(crate) mod pin;
 pub(crate) mod privacy;
+pub(crate) mod quirks;
 pub(crate) mod serve;
 pub(crate) mod service;
 pub(crate) mod status;

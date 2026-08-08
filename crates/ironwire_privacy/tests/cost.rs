@@ -25,7 +25,12 @@ fn large_history(turns: usize) -> serde_json::Value {
     })
 }
 
+/// Release-only. A debug build runs this ~25x slower (38 ms vs 1.5 ms on the
+/// same history), so a budget asserted there measures the optimiser, not the
+/// code — and would either fail on every `cargo test` or be loose enough to
+/// mean nothing. CI runs it with `--release`.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "perf budget is only meaningful in release")]
 fn substituting_a_large_history_is_fast_enough_to_be_invisible() {
     let detector = Detector::new(&Tiers {
         secrets: true,

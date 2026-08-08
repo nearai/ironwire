@@ -58,6 +58,9 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
 
     // Notify-only: check rarely, tell the user, never act. See docs/UPDATES.md.
     super::update::spawn_check(state.clone(), &paths, config_updates_enabled);
+    // Provider quirks refresh while running, so a changed `anthropic-beta`
+    // flag is a minutes-long fix rather than a restart (docs/UPDATES.md §2).
+    super::quirks::spawn_refresh(state.clone(), &paths, config_updates_enabled);
 
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");

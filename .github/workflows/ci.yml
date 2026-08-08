@@ -25,6 +25,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-features
+      # The privacy filter's cost budget is only meaningful optimised; in debug
+      # it is ~25x slower and the assertion would measure the optimiser. An
+      # ignored test nobody runs is a deleted test, so it runs here.
+      - run: cargo test --release -p ironwire_privacy --test cost -- --include-ignored
 
   # The packaging scripts only otherwise run inside a tag build, which is the
   # worst place to find a typo: the tag is already pushed and a fix needs

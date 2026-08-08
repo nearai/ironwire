@@ -218,7 +218,12 @@ Signed data, refreshed independently of the binary, so a changed
 - [x] Wired into the Anthropic protocol constants and the client-identity markers
 - [ ] Real signing key + a published document (the compiled-in key is a
       placeholder that verifies nothing, so the channel is inert until then)
-- [ ] Periodic refresh in the daemon (today it loads at startup)
+- [x] Periodic refresh in the daemon: a document that needed a restart to take
+      effect would have the same latency as a release, which is the problem the
+      channel exists to solve. Six-hourly, first check delayed a minute so it
+      never competes with the first request, and governed by the same
+      `updates.check` switch — someone who turned one network call off meant
+      both. A failed fetch leaves the previous document in force
 
 ---
 
