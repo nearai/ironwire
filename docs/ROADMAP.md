@@ -238,8 +238,14 @@ which are routing problems.
       gives a syntax error and no clue why
 - [x] `ironwire service install|uninstall|status`, `ironwire completions`
 - [x] `ironwire watch` for live routing, `ironwire privacy check` for the filter
-- [ ] A single `ironwire init` that walks a new user through connect → consent
-      → serve, instead of them reading `--help` to find the order
+- [x] `ironwire init` — says what capacity this machine already has and what to
+      run, in order. It is not a wizard: it changes nothing without `--write`,
+      and it never grants a subscription consent, because a command that did
+      would make the consent prompt decorative
+- [x] `ironwire init --write` drops a commented `config.toml`. A test asserts
+      the generated file parses **and equals the built-in defaults** — a
+      template that drifts turns "a file documenting what IronWire does" into
+      "a file that quietly changes what IronWire does"
 
 ---
 

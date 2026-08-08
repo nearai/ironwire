@@ -21,6 +21,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Set up IronWire: see what capacity this machine has, and what to run.
+    Init {
+        /// Also write a commented `config.toml`, if there is not one already.
+        #[arg(long)]
+        write: bool,
+    },
+
     /// Run the loopback daemon in the foreground.
     Serve,
 
@@ -140,6 +147,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Init { write } => commands::init::run(cli.port, write),
         Command::Serve => commands::serve::run(cli.port).await,
         Command::Status { json } => commands::status::run(cli.port, json).await,
         Command::Connect {
