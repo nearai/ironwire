@@ -114,6 +114,16 @@ pub struct CaptureConfig {
     /// Also record request and response bodies. Off by default: these contain
     /// the user's source code.
     pub bodies: bool,
+    /// How many days of exchanges to keep.
+    ///
+    /// A ledger with no retention grows for the life of the install, silently,
+    /// on a machine where nobody is watching a SQLite file in a dotdir. Ninety
+    /// days is long enough for "what did my agent do last quarter" and short
+    /// enough that the file stays a few tens of megabytes.
+    ///
+    /// `0` disables pruning — an explicit choice someone can make, not the
+    /// default, and not the accident it currently is.
+    pub retain_days: u32,
 }
 
 impl Default for CaptureConfig {
@@ -121,6 +131,7 @@ impl Default for CaptureConfig {
         Self {
             enabled: true,
             bodies: false,
+            retain_days: 90,
         }
     }
 }
@@ -370,6 +381,7 @@ mod tests {
             capture: CaptureConfig {
                 enabled: true,
                 bodies: true,
+                retain_days: 30,
             },
             updates: UpdateConfig { check: false },
             resilience: ResilienceConfig::default(),

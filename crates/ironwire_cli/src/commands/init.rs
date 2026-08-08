@@ -211,6 +211,9 @@ upstream_timeout_secs = 900
 enabled = true
 # Request and response bodies. Off by default — these contain your source.
 bodies = false
+# Days of history to keep. Pruned daily by the daemon; 0 keeps everything,
+# which is a real choice but not a good default for a file nobody watches.
+retain_days = 90
 
 [resilience]
 # Emit an SSE ping after this many seconds of upstream silence, so a client

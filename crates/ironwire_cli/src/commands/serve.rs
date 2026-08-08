@@ -36,6 +36,11 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
         );
     }
 
+    // One daemon per home. Port collision already covers the same-port case;
+    // this covers two daemons on different ports sharing a consent ledger,
+    // where the symptom is a consent silently disappearing.
+    let _lock = super::lock::acquire(&paths.lock_file(), port).await?;
+
     // Bind before announcing: printing "listening on 8463" and then failing to
     // bind sends people looking in entirely the wrong place.
     let listener = match ironwire_proxy::server::bind(port).await {
@@ -51,6 +56,10 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     if quirks.serial() > 0 {
         println!("  provider quirks: serial {}", quirks.serial());
     }
+    // Housekeeping the user should never have to remember: capture is on by
+    // default, so without this the ledger grows for the life of the install.
+    super::prune::spawn(ledger.clone(), config.capture.retain_days);
+
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
         .with_ledger(ledger)
@@ -258,7 +267,37 @@ fn base_url_for(config: &Config, id: &str, env_key: &str) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+/// Shut down on Ctrl-C **or** SIGTERM.
+///
+/// SIGTERM is what every service manager sends — `systemctl --user stop`,
+/// launchd, and a plain `kill`. Handling only Ctrl-C meant a normal service
+/// stop killed in-flight streams instead of draining them, and left the daemon
+/// lock behind because `Drop` never ran. Both are exactly the kind of thing
+/// that looks fine on a developer's machine and is wrong everywhere the
+/// packaging puts it.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutting down");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                // Losing SIGTERM handling is not worth refusing to serve; fall
+                // back to Ctrl-C only and say so.
+                tracing::warn!(%error, "could not listen for SIGTERM; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("shutting down");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("interrupted; shutting down"),
+            _ = terminate.recv() => tracing::info!("terminated; shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    }
 }
