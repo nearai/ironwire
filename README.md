@@ -33,33 +33,65 @@ only decides where each conversation's inference goes.
 
 ## Status
 
-**M1 complete at the wire level; M2 in progress.** Claude Code → IronWire →
-Claude subscription works end to end, with an Anthropic API key as fallback,
-byte-identical streaming passthrough, observed quota, consent-gated subscription
-access, a local trace ledger, and cancellation that provably stops the upstream.
+**Built and tested at the wire level. Not yet run against a live
+subscription.** That distinction is the whole of this section, so it is stated
+before anything else.
 
-Not yet done: a real multi-hour Claude Code session against a live account.
-Until that runs, "no observable behavioural difference" is an inference from
-wire-level tests rather than an observation — `scripts/acceptance.sh` is the
-check, and [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks it.
+Working, with tests that pin each claim: both native lanes (Claude Code →
+Anthropic, Codex → ChatGPT/OpenAI), the translated lane to NEAR AI, byte-identical
+passthrough, observed quota, consent-gated subscription access, per-backend
+circuit breaking, stream resilience, compaction-aware routing, a local trace
+ledger with real costs, and an optional privacy filter.
+
+**Every one of those is verified against a mock.** A live Claude or ChatGPT
+subscription would exercise header sets and rate-limit shapes that no fixture
+can prove. `docs/ROADMAP.md` has a table of exactly which items need a real
+account, a signing key, or hosting — none of them are "not done yet", and
+listing them keeps them from reading as finished.
+
+## Install
+
+```bash
+curl -fsSL https://ironwire.dev/install.sh | sh   # any Unix
+brew install nearai/tap/ironwire                  # macOS, Linux
+npx ironwire@latest                               # no install
+pip install ironwire                              # the Aider crowd
+```
+
+Or from source: `cargo install --git https://github.com/nearai/ironwire`.
+
+> The hosted channels above need a published release. Until one exists, build
+> from source — `docs/ROADMAP.md` lists what each channel is waiting on.
 
 ## Quick start
 
 ```bash
-cargo build --release
+ironwire init       # what capacity this machine has, and what to run next
+```
 
+`init` reads the room — a Claude Code login, a Codex login, API keys in your
+environment — and prints the steps in order. Roughly:
+
+```bash
 ironwire connect claude --subscription   # explains the tradeoffs, then asks
-ironwire serve                           # in another terminal
+ironwire serve                           # leave this running
 
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8463/anthropic
+# in another terminal
+eval "$(ironwire env)"                   # points Claude Code here
+ironwire doctor                          # confirms it actually is
 claude
 ```
+
+`doctor` checks the *clients*, not just the backends. Every backend can be
+healthy while your agent still goes straight to the provider because nothing
+points it here — the commonest way this looks broken when it is not.
 
 Then:
 
 ```bash
 ironwire status     # capacity, as the providers reported it
 ironwire log        # what your agents sent, and what it cost
+ironwire watch      # live routing; silent unless something changes
 ironwire doctor     # probe every backend for real
 ```
 
@@ -108,6 +140,27 @@ backend does not have, images it cannot see, a context that does not fit) is
 still refused outright rather than silently degraded. See
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §6.
 
+## The optional privacy filter
+
+Off by default. When you turn it on, IronWire substitutes sensitive values on
+the way out and restores them on the way back, so a provider never sees them
+and you never see a placeholder.
+
+```bash
+ironwire privacy check src/config.rs   # what it would catch, before you rely on it
+```
+
+Two things it deliberately does not do. It does not claim to make anything
+*safe* — it has a false-negative rate nobody can measure on your data, so
+`privacy check` reports what it found and never says "clean"
+([`docs/TRUST.md`](docs/TRUST.md) I7). And it does not substitute values inside
+code blocks, tool results, or documentation ranges like `example.com` and
+RFC 1918 addresses: in a coding session those are load-bearing *code*, and
+replacing them makes the model write something that does not work.
+
+[`docs/PRIVACY.md`](docs/PRIVACY.md) is the design and the critique of it,
+including where the mechanism stops.
+
 ## What IronWire promises about your credentials
 
 IronWire sits where all of your source code and all of your API credentials
@@ -138,7 +191,7 @@ pass. That position comes with hard commitments, not defaults
 | [`docs/CRITIQUE.md`](docs/CRITIQUE.md) | The design review that produced it |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Wire fidelity: what is mutated, what is refused |
 | [`docs/TRUST.md`](docs/TRUST.md) | Credentials, consent, traces |
-| [`docs/PRIVACY.md`](docs/PRIVACY.md) | The optional privacy filter — designed, not built |
+| [`docs/PRIVACY.md`](docs/PRIVACY.md) | The optional privacy filter, and where it stops |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestones |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | brew / npx / apt / pip |
 | [`docs/UPDATES.md`](docs/UPDATES.md) | notify-only updates, and the signed quirks channel |
@@ -152,6 +205,7 @@ crates/
   ironwire_ledger     the local trace ledger
   ironwire_quirks     the signed provider-quirks channel
   ironwire_update     notify-only update checking
+  ironwire_privacy    reversible substitution (the optional filter)
   ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   backends: native passthrough and observation
   ironwire_proxy      axum façades, pipeline, control API
@@ -165,7 +219,7 @@ cargo test              # unit + conformance
 cargo clippy --all-targets
 ```
 
-Three suites carry the fidelity claim:
+These suites carry the claims the design rests on:
 
 | Suite | Proves |
 |---|---|
@@ -173,9 +227,25 @@ Three suites carry the fidelity claim:
 | `tests/multi_turn.rs` | a three-turn tool loop — signed thinking, replayed tool ids, cache breakpoints — survives, and stays on one backend |
 | `tests/cancellation.rs` | an abandoned request stops the upstream, and still records what it consumed |
 | `tests/claude_code_on_nearai.rs` | a Claude Code session keeps working on NEAR AI when Anthropic capacity is exhausted — and waits for a turn boundary rather than switching mid tool loop |
+| `tests/codex_on_subscription.rs` | Codex reaches ChatGPT byte-identical, and a non-Codex client is never merely refused but never dialled |
 | `tests/stalled_stream.rs` | the "stalled mid-stream" failures: a thinking upstream is kept alive, a thinking-gap failure is restarted invisibly, a post-content failure is reported rather than replayed, a 529 is retried |
+| `tests/circuit.rs` | a dead backend stops being dialled — but the last one standing is still tried, because a breaker should waste less time, not turn a degraded proxy into a dead one |
+| `tests/privacy_filter.rs` | with the filter on, the provider never sees the value and the client never sees a placeholder |
+| `tests/privacy_compaction.rs` | the same, across a compaction boundary on all three wires — where a mistake becomes permanent history |
 
-`scripts/acceptance.sh` is the manual check the mocks cannot replace: a real
+Two scripts run the parts a unit test cannot see:
+
+```bash
+scripts/journey.sh          # the commands a person runs, in order, against a mock
+scripts/test-install.sh     # install.sh, including its failure paths
+scripts/test-packaging.sh   # the release scripts, before a tag depends on them
+```
+
+`scripts/journey.sh` is where every integration bug in this project has been
+found — including a privacy-filter path that bypassed reversal on reconnect,
+which every unit test was happy about.
+
+`scripts/acceptance.sh` is the one check the mocks cannot replace: a real
 Claude Code task, through IronWire, against real providers. It costs
 subscription quota — run it before a release, not in CI.
 
