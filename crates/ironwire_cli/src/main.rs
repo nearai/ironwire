@@ -1,5 +1,6 @@
 //! The `ironwire` command-line interface.
 
+mod codex_config;
 mod commands;
 mod render;
 

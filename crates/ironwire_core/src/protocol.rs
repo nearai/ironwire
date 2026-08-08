@@ -86,6 +86,15 @@ impl BackendKind {
         matches!(self, Self::Subscription)
     }
 
+    /// Whether using this backend costs money per token.
+    ///
+    /// A subscription and local capacity are already paid for; credits are
+    /// bought up front, so spending them is not a surprise on a bill.
+    #[must_use]
+    pub fn is_metered(self) -> bool {
+        matches!(self, Self::ApiKey)
+    }
+
     /// Routing preference under equal fidelity: lower sorts first.
     #[must_use]
     pub fn marginal_cost_rank(self) -> u8 {

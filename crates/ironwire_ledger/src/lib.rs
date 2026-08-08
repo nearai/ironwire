@@ -19,6 +19,22 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Price an exchange from its observed token counts.
+///
+/// Delegates to `ironclaw_common::llm_costs` — the price table every NEAR AI
+/// surface already shares. A second copy would drift the moment a provider
+/// changes a rate, and a confidently wrong cost is worse than none.
+///
+/// Returns `None` when nothing was observed, so an unpriced exchange never
+/// looks free.
+#[must_use]
+pub fn price(model: &str, usage: Option<(u32, u32, u32, u32)>) -> Option<f64> {
+    let (input, output, cache_read, cache_write) = usage?;
+    let cost =
+        ironclaw_common::llm_costs::price_usage(model, input, output, cache_read, cache_write);
+    cost.total_cost.to_string().parse().ok()
+}
+
 /// Failure reading or writing the ledger.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -63,6 +79,13 @@ pub struct Exchange {
     pub cache_write_tokens: Option<i64>,
     /// Output tokens.
     pub output_tokens: Option<i64>,
+    /// USD this exchange cost, priced from the observed token counts.
+    ///
+    /// `None` when the provider reported no usage — the same rule as everywhere
+    /// else: a fabricated zero would understate what the user actually spent.
+    /// Subscription capacity still carries a price, because "what this would
+    /// have cost on the meter" is the number that makes a subscription legible.
+    pub cost_usd: Option<f64>,
     /// HTTP status returned to the client.
     pub status: i64,
     /// Error, when the exchange failed.
@@ -95,6 +118,8 @@ pub struct Summary {
     pub cache_read_tokens: i64,
     /// Summed output tokens.
     pub output_tokens: i64,
+    /// Summed USD across the window, priced from observed usage.
+    pub cost_usd: f64,
     /// Per-backend exchange counts, descending.
     pub by_backend: Vec<(String, i64)>,
 }
@@ -133,6 +158,7 @@ CREATE TABLE IF NOT EXISTS exchanges (
     cache_read_tokens  INTEGER,
     cache_write_tokens INTEGER,
     output_tokens      INTEGER,
+    cost_usd           REAL,
     status             INTEGER NOT NULL,
     error              TEXT
 );
@@ -183,8 +209,8 @@ impl Ledger {
                 started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
                 requested_model, served_model, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                status, error
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                cost_usd, status, error
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -201,6 +227,7 @@ impl Ledger {
                 exchange.cache_read_tokens,
                 exchange.cache_write_tokens,
                 exchange.output_tokens,
+                exchange.cost_usd,
                 exchange.status,
                 exchange.error,
             ],
@@ -219,7 +246,7 @@ impl Ledger {
             "SELECT started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
                     requested_model, served_model, rung, attempts,
                     input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                    status, error
+                    cost_usd, status, error
              FROM exchanges ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit], |row| {
@@ -239,8 +266,9 @@ impl Ledger {
                 cache_read_tokens: row.get(12)?,
                 cache_write_tokens: row.get(13)?,
                 output_tokens: row.get(14)?,
-                status: row.get(15)?,
-                error: row.get(16)?,
+                cost_usd: row.get(15)?,
+                status: row.get(16)?,
+                error: row.get(17)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -262,7 +290,8 @@ impl Ledger {
                              AND cache_read_tokens IS NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0),
-                    COALESCE(SUM(output_tokens), 0)
+                    COALESCE(SUM(output_tokens), 0),
+                    COALESCE(SUM(cost_usd), 0.0)
              FROM exchanges WHERE started_at >= ?1",
             [&cutoff],
             |row| {
@@ -272,6 +301,7 @@ impl Ledger {
                     input_tokens: row.get(2)?,
                     cache_read_tokens: row.get(3)?,
                     output_tokens: row.get(4)?,
+                    cost_usd: row.get(5)?,
                     by_backend: Vec::new(),
                 })
             },
@@ -340,6 +370,7 @@ mod tests {
             cache_read_tokens: Some(98_000),
             cache_write_tokens: Some(2_048),
             output_tokens: Some(137),
+            cost_usd: Some(0.42),
             status: 200,
             error: None,
         }
@@ -376,6 +407,7 @@ mod tests {
         unknown.cache_read_tokens = None;
         unknown.cache_write_tokens = None;
         unknown.output_tokens = None;
+        unknown.cost_usd = None;
         assert!(!unknown.has_usage());
         ledger.record(&unknown).expect("records");
         ledger.record(&exchange("claude-sub", 1)).expect("records");
@@ -397,6 +429,7 @@ mod tests {
             .expect("records");
 
         let summary = ledger.summary(at(-1)).expect("summarises");
+        assert!((summary.cost_usd - 4.0 * 0.42).abs() < 1e-9);
         assert_eq!(
             summary.by_backend,
             vec![
@@ -443,6 +476,22 @@ mod tests {
         let read = ledger.recent(1).expect("reads");
         assert_eq!(read[0].error.as_deref(), Some("rate limited"));
         assert_eq!(read[0].attempts, 2);
+    }
+
+    #[test]
+    fn cost_comes_from_the_shared_price_table_and_is_none_without_usage() {
+        // A subscription turn still gets a price: "what this would have cost on
+        // the meter" is what makes the subscription's value legible.
+        let priced =
+            price("claude-opus-4-6", Some((12, 137, 98_000, 2_048))).expect("a known model prices");
+        assert!(priced > 0.0, "a paid model must not price at zero");
+        // Cache reads are discounted, so the same tokens billed fresh cost more.
+        let fresh = price("claude-opus-4-6", Some((98_012, 137, 0, 2_048))).expect("prices");
+        assert!(
+            fresh > priced,
+            "cache reads should be cheaper: {fresh} vs {priced}"
+        );
+        assert_eq!(price("claude-opus-4-6", None), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use ironwire_ledger::Ledger;
 use ironwire_quirks::QuirksStore;
 use ironwire_update::UpdateStatus;
 use ironwire_upstream::backend::{Backend, BackendStatus};
+use ironwire_upstream::breaker::BreakerBoard;
 
 /// The set of backends this daemon can route to.
 #[derive(Clone, Default)]
@@ -112,6 +113,9 @@ pub struct AppState {
     /// What the last update check concluded. Notify-only — IronWire never
     /// applies an update itself.
     pub update: Arc<Mutex<UpdateStatus>>,
+    /// Per-backend circuit state, so a failure is remembered past the end of
+    /// the request that hit it (`ironwire_upstream::breaker`).
+    pub breakers: Arc<BreakerBoard>,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -134,6 +138,7 @@ impl AppState {
             ledger: None,
             quirks: Arc::new(QuirksStore::new(ironwire_quirks::QUIRKS_PUBLIC_KEY)),
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
+            breakers: Arc::new(BreakerBoard::default()),
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),

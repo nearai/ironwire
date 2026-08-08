@@ -120,6 +120,28 @@ impl UpstreamError {
         }
     }
 
+    /// Whether this failure says the *backend* is unhealthy.
+    ///
+    /// Distinct from [`Self::is_retryable`], which asks whether some other
+    /// backend should be tried. The two differ where they must:
+    ///
+    /// - A missing or rejected credential is worth failing over, but it is a
+    ///   configuration problem, not an outage. Counting it would open a circuit
+    ///   and replace "re-run `claude login`" with "temporarily unavailable".
+    /// - A rate limit means the backend is working exactly as designed, and its
+    ///   own quota accounting already steers us away (`docs/CRITIQUE.md` §4).
+    ///   Counting it too would take a backend out twice for one event.
+    #[must_use]
+    pub fn indicates_unhealthy_backend(&self) -> bool {
+        match self {
+            Self::Transport { .. } => true,
+            Self::Upstream { status, .. } => status.is_server_error(),
+            Self::RateLimited { .. }
+            | Self::NeedsAuth { .. }
+            | Self::CredentialHostMismatch { .. } => false,
+        }
+    }
+
     /// Provider-supplied retry delay, where there is one.
     #[must_use]
     pub fn retry_after_secs(&self) -> Option<u64> {

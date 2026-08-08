@@ -13,8 +13,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use chrono::{DateTime, Utc};
 use ironwire_core::protocol::BackendId;
 use ironwire_core::quota::Headroom;
+use ironwire_creds::ConsentLedger;
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_update::UpdateStatus;
 use serde::{Deserialize, Serialize};
@@ -38,8 +40,32 @@ pub struct BackendView {
     pub detail: Option<String>,
     /// Observed capacity — or `unknown`. Never a guess (`docs/CRITIQUE.md` §4).
     pub headroom: HeadroomView,
+    /// Circuit state, so a backend that is being skipped says so rather than
+    /// looking idle.
+    pub health: HealthView,
     /// Models offered.
     pub models: Vec<String>,
+}
+
+/// A backend's circuit state, flattened for display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthView {
+    /// `closed` / `open` / `half_open`.
+    pub circuit: String,
+    /// Consecutive failures counted against this backend's health.
+    pub consecutive_failures: u32,
+    /// Seconds until an open circuit will next allow a probe.
+    pub retry_in_secs: Option<i64>,
+}
+
+impl Default for HealthView {
+    fn default() -> Self {
+        Self {
+            circuit: "closed".to_string(),
+            consecutive_failures: 0,
+            retry_in_secs: None,
+        }
+    }
 }
 
 /// Observed capacity, flattened for display.
@@ -99,12 +125,46 @@ pub struct StatusView {
     pub pin: Option<String>,
     /// Every configured backend.
     pub backends: Vec<BackendView>,
+    /// Every pool, seen as one balance.
+    pub balance: BalanceView,
     /// Serial of the signed quirks document in force; `0` means the values this
     /// binary shipped with (`docs/UPDATES.md`).
     pub quirks_serial: u64,
     /// What the last update check concluded. IronWire never applies an update
     /// itself — this is notification, not action.
     pub update: UpdateStatus,
+}
+
+/// Every pool, seen as one balance.
+///
+/// Deliberately a *count* of pools rather than a single merged number. The
+/// pools are not commensurable: a Claude Max five-hour window, a ChatGPT weekly
+/// window, and a dollar balance have no shared unit, and averaging their
+/// percentages would produce a figure that looks authoritative and means
+/// nothing. What a user actually needs to know is how many places they can still
+/// go, whether any of them is free, and when the closed ones come back —
+/// all of which are answerable without inventing a unit.
+///
+/// Every field here is derived from an *observation* or from a recorded cost.
+/// Nothing is estimated (`docs/CRITIQUE.md` §4).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BalanceView {
+    /// Pools that could serve a request right now.
+    pub available: usize,
+    /// Available pools whose marginal cost is zero — a subscription or credits
+    /// already paid for. The number that decides whether a user should worry.
+    pub free_available: usize,
+    /// Pools that are authenticated and consented but have not yet reported
+    /// their capacity. Named rather than folded into `available`, because "we
+    /// do not know" is not "there is room".
+    pub unknown: usize,
+    /// Pools that are exhausted, or whose circuit is open.
+    pub unavailable: usize,
+    /// When the first unavailable pool is expected back.
+    pub next_available_at: Option<DateTime<Utc>>,
+    /// Metered spend recorded in the last 24 hours. `None` when the ledger is
+    /// off — which means unmeasured, not zero.
+    pub spend_today_usd: Option<f64>,
 }
 
 /// Body of `POST /_ironwire/pin`.
@@ -178,7 +238,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
 
-    let backends = statuses
+    let health = state.breakers.statuses();
+    let backends: Vec<BackendView> = statuses
         .iter()
         .map(|s| BackendView {
             id: s.id.to_string(),
@@ -188,9 +249,19 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             consented: !s.kind.requires_consent() || consent.is_granted(s.id.as_str()),
             detail: s.detail.clone(),
             headroom: HeadroomView::from(&s.quota.primary, now),
+            health: health.iter().find(|h| h.backend == s.id).map_or_else(
+                HealthView::default,
+                |h| HealthView {
+                    circuit: format!("{:?}", h.state).to_lowercase(),
+                    consecutive_failures: h.consecutive_failures,
+                    retry_in_secs: h.retry_at.map(|at| (at - now).num_seconds().max(0)),
+                },
+            ),
             models: s.models.iter().map(|(m, _)| m.clone()).collect(),
         })
         .collect();
+
+    let balance = balance(&statuses, &consent, &health, state.ledger.as_ref(), now);
 
     let (tracked, pin) = {
         let policy = match state.policy.lock() {
@@ -212,10 +283,75 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         tracked_conversations: tracked,
         pin,
         backends,
+        balance,
         quirks_serial: state.quirks.serial(),
         update: state.update_status(),
     })
     .into_response()
+}
+
+/// Collapse every pool into one balance — see [`BalanceView`] for why this
+/// counts pools instead of summing them.
+fn balance(
+    statuses: &[ironwire_upstream::backend::BackendStatus],
+    consent: &ConsentLedger,
+    health: &[ironwire_upstream::breaker::BreakerStatus],
+    ledger: Option<&ironwire_ledger::Ledger>,
+    now: DateTime<Utc>,
+) -> BalanceView {
+    use ironwire_upstream::breaker::CircuitState;
+
+    let mut view = BalanceView {
+        spend_today_usd: ledger
+            .and_then(|l| l.summary(now - chrono::Duration::hours(24)).ok())
+            .map(|s| s.cost_usd),
+        ..BalanceView::default()
+    };
+    let mut resets: Vec<DateTime<Utc>> = Vec::new();
+
+    for status in statuses {
+        // A backend the user has not logged into, or not consented to, is not a
+        // pool that is *down* — it is one they have not opted into. Counting it
+        // as unavailable would make a working setup look half-broken.
+        if !status.authenticated
+            || (status.kind.requires_consent() && !consent.is_granted(status.id.as_str()))
+        {
+            continue;
+        }
+
+        let circuit_open = health
+            .iter()
+            .find(|h| h.backend == status.id)
+            .is_some_and(|h| h.state == CircuitState::Open);
+        if circuit_open {
+            view.unavailable += 1;
+            if let Some(at) = health
+                .iter()
+                .find(|h| h.backend == status.id)
+                .and_then(|h| h.retry_at)
+            {
+                resets.push(at);
+            }
+            continue;
+        }
+
+        match status.quota.primary {
+            Headroom::Exhausted { until } => {
+                view.unavailable += 1;
+                resets.push(until);
+            }
+            Headroom::Unknown => view.unknown += 1,
+            Headroom::Observed { .. } => {
+                view.available += 1;
+                if !status.kind.is_metered() {
+                    view.free_available += 1;
+                }
+            }
+        }
+    }
+
+    view.next_available_at = resets.into_iter().min();
+    view
 }
 
 async fn pin(

@@ -76,6 +76,28 @@ pub async fn dispatch(
     let consent = state.consent_snapshot();
     let candidates = state.backends.candidates(&statuses, &consent);
 
+    // Skip backends whose circuit is open, so a known-dead one is not
+    // rediscovered — at the cost of a round trip — on every single turn.
+    //
+    // Unless that would leave nothing. A breaker exists to spend less time on a
+    // backend that is failing, not to turn a degraded proxy into a dead one:
+    // when every circuit is open, the honest move is to try anyway and report
+    // the real upstream error rather than a 503 of our own invention.
+    let now = Utc::now();
+    let healthy: Vec<_> = candidates
+        .iter()
+        .filter(|c| state.breakers.allows(&c.id, now))
+        .cloned()
+        .collect();
+    let candidates = if healthy.is_empty() {
+        if !candidates.is_empty() {
+            tracing::warn!("every backend's circuit is open; trying anyway");
+        }
+        candidates
+    } else {
+        healthy
+    };
+
     let mut rejected: Vec<(String, String)> = Vec::new();
     let mut attempts = 0usize;
     let mut last_error: Option<UpstreamError> = None;
@@ -148,6 +170,11 @@ pub async fn dispatch(
                 } else {
                     response
                 };
+                // Headers are in hand, so the backend answered. Whether the
+                // *stream* then stalls is a different failure, handled on the
+                // open stream by `resilience` — a breaker cannot help there,
+                // because by then the client is already committed.
+                state.breakers.record_success(&decision.backend);
                 return Ok((
                     response,
                     Routed {
@@ -165,6 +192,9 @@ pub async fn dispatch(
                     "backend failed before first byte"
                 );
                 rejected.push((decision.backend.to_string(), error.to_string()));
+                state
+                    .breakers
+                    .record_failure(&decision.backend, &error, Utc::now());
 
                 // A rate limit teaches us something; fold it in so the next
                 // decision does not pick the same backend again.
@@ -537,6 +567,23 @@ impl LedgerContext {
     /// delivered anyway.
     pub fn write(self, ledger: &Ledger, observation: &Observation) {
         let usage = observation.usage;
+        // Priced against whichever model actually served it, so a fallback to a
+        // cheaper model shows up as a cheaper turn.
+        let cost_usd = ironwire_ledger::price(
+            observation
+                .served_model
+                .as_deref()
+                .or(self.requested_model.as_deref())
+                .unwrap_or("unknown"),
+            usage.and_then(|u| {
+                Some((
+                    u32::try_from(u.input_tokens).ok()?,
+                    u32::try_from(u.output_tokens).ok()?,
+                    u32::try_from(u.cache_read_tokens).ok()?,
+                    u32::try_from(u.cache_creation_tokens).ok()?,
+                ))
+            }),
+        );
         let exchange = Exchange {
             started_at: self.started_at,
             ttfb_ms: None,
@@ -555,6 +602,7 @@ impl LedgerContext {
             cache_read_tokens: usage.and_then(|u| i64::try_from(u.cache_read_tokens).ok()),
             cache_write_tokens: usage.and_then(|u| i64::try_from(u.cache_creation_tokens).ok()),
             output_tokens: usage.and_then(|u| i64::try_from(u.output_tokens).ok()),
+            cost_usd,
             status: i64::from(self.status),
             error: None,
         };

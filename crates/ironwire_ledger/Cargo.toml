@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 ironwire_core.workspace = true
+ironclaw_common.workspace = true
 
 chrono.workspace = true
 rusqlite = { version = "0.37", features = ["bundled"] }

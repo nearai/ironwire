@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 authors = ["NEAR AI <support@near.ai>"]
 homepage = "https://github.com/nearai/ironwire"
@@ -31,8 +31,16 @@ ironwire_translate = { path = "crates/ironwire_translate", version = "0.1.0" }
 ironwire_upstream = { path = "crates/ironwire_upstream", version = "0.1.0" }
 ironwire_proxy = { path = "crates/ironwire_proxy", version = "0.1.0" }
 
+# Reused from nearai/ironclaw rather than reimplemented: credential discovery
+# and refresh for the CLI-managed logins, provider error classification, and the
+# price table. Pinned to a revision so a proxy holding people's credentials does
+# not silently follow someone else's main branch.
+ironclaw_llm = { git = "https://github.com/nearai/ironclaw", branch = "main" }
+ironclaw_common = { git = "https://github.com/nearai/ironclaw", branch = "main" }
+
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

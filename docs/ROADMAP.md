@@ -75,16 +75,39 @@ see the carried items above.
 
 **Codex → IronWire → ChatGPT subscription / OpenAI API key.**
 
-- OpenAI façade: `/v1/responses` (streaming), `/v1/chat/completions`
-- Codex credential discovery via `ironclaw_llm::auth`
-  (`CredentialSource::CodexCli`), client-version detection for model gating
-- `ironwire connect codex` — writes the `[model_providers.ironwire]` block
-- NEAR AI backend over Chat Completions
-- Per-backend circuit breaker + cooldown
-- Aggregate view: `ironwire status` shows all pools as one balance
+- ✅ OpenAI façade: `/openai/v1/responses`, `/openai/v1/chat/completions`,
+  `/openai/v1/models` (`ironwire_proxy::facade::openai`)
+- ✅ `ResponsesBackend` — ChatGPT subscription and metered OpenAI key on one
+  wire, so falling between them costs money and nothing else
+- ✅ Codex credential discovery **delegated** to `ironclaw_llm::auth`
+  (`CredentialSource::CodexCli`), plus the `chatgpt-account-id` header derived
+  from the credential itself — Codex omits it on a custom-provider path and the
+  subscription rejects requests without it
+- ✅ `ironwire connect codex` / `ironwire disconnect codex` — edits
+  `~/.codex/config.toml` as *text*, so comments and hand-edits survive, backs
+  up the previous contents, and restores the previous `model_provider` on
+  disconnect (`ironwire_cli::codex_config`)
+- ✅ NEAR AI backend over Chat Completions (landed with M3)
+- ✅ Per-backend circuit breaker (`ironwire_upstream::breaker`), wired into
+  routing so a dead backend is not rediscovered every turn — with the
+  deliberate exception that the last backend standing is still tried
+- ✅ Aggregate view: `ironwire status` shows all pools as one balance —
+  counted, not summed, because the windows share no unit
+- ⬜ Codex `client_version` detection (`codex --version` →
+  `/models?client_version=`). The backend gates newer models behind it, so a
+  stale value silently hides models the account is entitled to. ironclaw's
+  implementation is in a private module; needs porting or an upstream export
+- ⬜ Codex token refresh. `ironclaw_llm::codex_auth::refresh_access_token` is
+  `pub(crate)`; IronWire currently relies on Codex refreshing its own token and
+  re-reads `auth.json` on every request to pick it up
+- ⬜ Verify against a real ChatGPT subscription. Every assertion in
+  `tests/codex_on_subscription.rs` runs against a mock; the header set the live
+  backend actually requires is unverified
 
 **Exit criterion:** Codex and Claude Code both run through one daemon
 simultaneously, each on its own native lane, with independent quota tracking.
+*Not yet met* — the lane is built and tested against a mock, but has not been
+run against a live ChatGPT subscription.
 
 ---
 

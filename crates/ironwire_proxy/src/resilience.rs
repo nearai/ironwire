@@ -42,6 +42,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt};
 use ironwire_upstream::backend::UpstreamError;
+use ironwire_upstream::sse::Dialect;
 
 /// How aggressively to keep a quiet stream alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,19 +80,47 @@ impl Default for ResilienceConfig {
     }
 }
 
-/// An Anthropic SSE `ping`. Content-free by definition, which is what makes
-/// injecting one honest.
-fn ping() -> Bytes {
-    Bytes::from_static(b"event: ping\ndata: {\"type\": \"ping\"}\n\n")
+/// A content-free heartbeat in the dialect the client is speaking.
+///
+/// Anthropic has a `ping` event; the OpenAI dialects do not, so we use an SSE
+/// **comment**, which every conforming parser ignores. Inventing an event type
+/// the client has never seen would be a worse kind of help.
+fn keepalive(dialect: Dialect) -> Bytes {
+    match dialect {
+        Dialect::Anthropic => Bytes::from_static(b"event: ping\ndata: {\"type\": \"ping\"}\n\n"),
+        Dialect::OpenAiResponses | Dialect::OpenAiChat => {
+            Bytes::from_static(b": ironwire-keepalive\n\n")
+        }
+    }
 }
 
-/// A terminal `error` event in the shape Claude Code already handles.
-fn error_event(message: &str) -> Bytes {
-    let payload = serde_json::json!({
-        "type": "error",
-        "error": {"type": "api_error", "message": message},
-    });
-    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+/// A terminal failure in the shape the client already handles.
+fn error_event(dialect: Dialect, message: &str) -> Bytes {
+    match dialect {
+        Dialect::Anthropic => {
+            let payload = serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": message},
+            });
+            Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+        }
+        Dialect::OpenAiResponses => {
+            let payload = serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": "api_error", "message": message},
+                },
+            });
+            Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"))
+        }
+        Dialect::OpenAiChat => {
+            let payload = serde_json::json!({
+                "error": {"type": "api_error", "message": message},
+            });
+            Bytes::from(format!("data: {payload}\n\n"))
+        }
+    }
 }
 
 /// What a pre-commitment frame should do.
@@ -108,22 +137,50 @@ enum Disposition {
     ForwardAsKeepalive,
 }
 
-fn disposition(frame: &str) -> Disposition {
+fn disposition(dialect: Dialect, frame: &str) -> Disposition {
+    // An SSE comment is a keepalive by definition, in every dialect.
+    if frame
+        .lines()
+        .all(|line| line.trim().is_empty() || line.starts_with(':'))
+    {
+        return Disposition::ForwardAsKeepalive;
+    }
     let event = frame
         .lines()
         .find_map(|line| line.strip_prefix("event:"))
         .map(str::trim);
-    match event {
-        Some("message_start") => Disposition::HoldAsEnvelope,
-        Some("ping") => Disposition::ForwardAsKeepalive,
-        Some(_) => Disposition::Commits,
-        // A `data:`-only frame: read the payload, and treat anything we do not
-        // recognise as content — assuming otherwise risks replaying text.
-        None => {
-            if frame.contains("message_start") {
+    match dialect {
+        Dialect::Anthropic => match event {
+            Some("message_start") => Disposition::HoldAsEnvelope,
+            Some("ping") => Disposition::ForwardAsKeepalive,
+            Some(_) => Disposition::Commits,
+            // A `data:`-only frame: read the payload, and treat anything we do
+            // not recognise as content — assuming otherwise risks replaying it.
+            None => {
+                if frame.contains("message_start") {
+                    Disposition::HoldAsEnvelope
+                } else if frame.contains("\"ping\"") {
+                    Disposition::ForwardAsKeepalive
+                } else {
+                    Disposition::Commits
+                }
+            }
+        },
+        // The Responses envelope: the response object exists but has produced
+        // no output items yet — exactly the thinking window.
+        Dialect::OpenAiResponses => {
+            let name = event.map_or_else(|| frame.to_string(), str::to_string);
+            if name.contains("response.created") || name.contains("response.in_progress") {
                 Disposition::HoldAsEnvelope
-            } else if frame.contains("\"ping\"") {
-                Disposition::ForwardAsKeepalive
+            } else {
+                Disposition::Commits
+            }
+        }
+        // Chat Completions has no event names: its envelope is the first chunk,
+        // which announces a role and carries nothing else.
+        Dialect::OpenAiChat => {
+            if !frame.contains("[DONE]") && is_chat_role_only(frame) {
+                Disposition::HoldAsEnvelope
             } else {
                 Disposition::Commits
             }
@@ -131,9 +188,40 @@ fn disposition(frame: &str) -> Disposition {
     }
 }
 
+/// A Chat Completions chunk whose delta announces the role and nothing else.
+fn is_chat_role_only(frame: &str) -> bool {
+    let Some(payload) = frame.lines().find_map(|line| line.strip_prefix("data:")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+        return false;
+    };
+    let Some(delta) = value
+        .pointer("/choices/0/delta")
+        .and_then(|d| d.as_object())
+    else {
+        return false;
+    };
+    delta.contains_key("role")
+        && !delta.contains_key("tool_calls")
+        && delta
+            .get("content")
+            .is_none_or(|c| c.as_str().is_none_or(str::is_empty))
+}
+
 /// Whether a frame ends the message cleanly.
-fn is_terminal(frame: &str) -> bool {
-    frame.contains("message_stop") || frame.contains("\"type\":\"error\"")
+fn is_terminal(dialect: Dialect, frame: &str) -> bool {
+    match dialect {
+        Dialect::Anthropic => {
+            frame.contains("message_stop") || frame.contains("\"type\":\"error\"")
+        }
+        Dialect::OpenAiResponses => {
+            frame.contains("response.completed")
+                || frame.contains("response.failed")
+                || frame.contains("response.incomplete")
+        }
+        Dialect::OpenAiChat => frame.contains("[DONE]"),
+    }
 }
 
 /// Split complete SSE frames out of `buffer`, leaving any partial tail behind.
@@ -175,6 +263,7 @@ pub fn guard(
     initial: BoxStream<'static, Result<Bytes, UpstreamError>>,
     reconnect: Reconnect,
     config: ResilienceConfig,
+    dialect: Dialect,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     async_stream::stream! {
         let mut upstream = initial;
@@ -198,14 +287,14 @@ pub fn guard(
                             committed,
                             "upstream went silent; ending the stream rather than pinging into the void"
                         );
-                        yield Ok(error_event(&format!(
+                        yield Ok(error_event(dialect, &format!(
                             "upstream produced nothing for {}s; IronWire ended the stream. \
                              Retry — the request may simply have been dropped.",
                             silence.as_secs()
                         )));
                         return;
                     }
-                    yield Ok(ping());
+                    yield Ok(keepalive(dialect));
                 }
 
                 Ok(Some(Ok(chunk))) => {
@@ -216,7 +305,7 @@ pub fn guard(
                         // told apart from a truncation.
                         buffer.extend_from_slice(&chunk);
                         for frame in take_frames(&mut buffer) {
-                            if is_terminal(&frame) {
+                            if is_terminal(dialect, &frame) {
                                 saw_terminal = true;
                             }
                             yield Ok(Bytes::from(frame));
@@ -226,7 +315,7 @@ pub fn guard(
 
                     buffer.extend_from_slice(&chunk);
                     for frame in take_frames(&mut buffer) {
-                        match disposition(&frame) {
+                        match disposition(dialect, &frame) {
                             // Straight through: a held heartbeat is not a
                             // heartbeat, and holding them would also let the
                             // buffer grow without bound.
@@ -237,7 +326,7 @@ pub fn guard(
                                 if let Some(envelope) = envelope.take() {
                                     yield Ok(Bytes::from(envelope));
                                 }
-                                if is_terminal(&frame) {
+                                if is_terminal(dialect, &frame) {
                                     saw_terminal = true;
                                 }
                                 yield Ok(Bytes::from(frame));
@@ -250,7 +339,7 @@ pub fn guard(
                 Ok(Some(Err(error))) => {
                     if committed {
                         tracing::warn!(%error, "upstream failed after committing content");
-                        yield Ok(error_event(&format!(
+                        yield Ok(error_event(dialect, &format!(
                             "the upstream failed partway through this response ({error}). \
                              IronWire does not retry once text has reached you, because \
                              replaying would duplicate it."
@@ -265,7 +354,7 @@ pub fn guard(
                             silence = Duration::ZERO;
                         }
                         None => {
-                            yield Ok(error_event(&format!(
+                            yield Ok(error_event(dialect, &format!(
                                 "no capacity could serve this request ({error})."
                             )));
                             return;
@@ -281,6 +370,7 @@ pub fn guard(
                         // Truncated. Saying so beats letting the client guess.
                         tracing::warn!("upstream closed mid-message without a terminal event");
                         yield Ok(error_event(
+                            dialect,
                             "the upstream closed this response before finishing it. \
                              The text above is incomplete.",
                         ));
@@ -300,6 +390,7 @@ pub fn guard(
                         }
                         None => {
                             yield Ok(error_event(
+                                dialect,
                                 "the upstream closed without producing a response, and no \
                                  other capacity could serve it.",
                             ));
@@ -391,7 +482,13 @@ mod tests {
             .filter_map(|c| c.as_ref().ok())
             .map(|c| String::from_utf8_lossy(c).to_string())
             .collect();
-        let out = collect(guard(stream::iter(source).boxed(), no_reconnect(), cfg())).await;
+        let out = collect(guard(
+            stream::iter(source).boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert_eq!(out, expected, "a working stream must not be altered");
     }
 
@@ -408,7 +505,13 @@ mod tests {
             Ok(message_stop()),
         ]));
 
-        let out = collect(guard(slow.boxed(), no_reconnect(), cfg())).await;
+        let out = collect(guard(
+            slow.boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(out.contains("event: ping"), "no keepalive emitted: {out}");
         assert!(out.contains("done"));
         assert!(out.contains("message_stop"));
@@ -422,7 +525,13 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(Bytes::new())
         });
-        let out = collect(guard(hung.boxed(), no_reconnect(), cfg())).await;
+        let out = collect(guard(
+            hung.boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(out.contains("event: error"), "{out}");
         assert!(out.contains("produced nothing"), "{out}");
     }
@@ -451,7 +560,13 @@ mod tests {
             }) as futures_util::future::BoxFuture<'static, _>
         };
 
-        let out = collect(guard(first.boxed(), Box::new(second), cfg())).await;
+        let out = collect(guard(
+            first.boxed(),
+            Box::new(second),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(out.contains("recovered"));
         assert!(
             !out.contains("event: error"),
@@ -478,7 +593,7 @@ mod tests {
                 panic!("must not reconnect after content was forwarded");
             })
         });
-        let out = collect(guard(source.boxed(), reconnect, cfg())).await;
+        let out = collect(guard(source.boxed(), reconnect, cfg(), Dialect::Anthropic)).await;
         assert_eq!(out.matches("partial answer").count(), 1);
         assert!(out.contains("event: error"));
         assert!(
@@ -492,7 +607,13 @@ mod tests {
         // This is literally the "may be incomplete" case: the client should be
         // told, not left to infer it.
         let source = stream::iter(vec![Ok(message_start()), Ok(text_delta("half"))]);
-        let out = collect(guard(source.boxed(), no_reconnect(), cfg())).await;
+        let out = collect(guard(
+            source.boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(out.contains("event: error"), "{out}");
         assert!(out.contains("incomplete"), "{out}");
     }
@@ -504,7 +625,13 @@ mod tests {
             Ok(text_delta("x")),
             Ok(message_stop()),
         ]);
-        let out = collect(guard(source.boxed(), no_reconnect(), cfg())).await;
+        let out = collect(guard(
+            source.boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(!out.contains("event: error"), "{out}");
     }
 
@@ -525,7 +652,13 @@ mod tests {
             backend: ironwire_core::protocol::BackendId::from("x"),
             detail: "dead".into(),
         })]);
-        let out = collect(guard(source.boxed(), Box::new(dead), cfg())).await;
+        let out = collect(guard(
+            source.boxed(),
+            Box::new(dead),
+            cfg(),
+            Dialect::Anthropic,
+        ))
+        .await;
         assert!(out.contains("event: error"), "{out}");
         assert!(out.contains("no capacity"), "{out}");
     }
@@ -549,7 +682,11 @@ mod tests {
             (r#"data: {"type":"message_start"}"#, HoldAsEnvelope),
         ];
         for (frame, expected) in cases {
-            assert_eq!(disposition(frame), expected, "{frame:?}");
+            assert_eq!(
+                disposition(Dialect::Anthropic, frame),
+                expected,
+                "{frame:?}"
+            );
         }
     }
 
@@ -562,7 +699,12 @@ mod tests {
             Ok(frame("ping", r#"{"type":"ping"}"#)),
             Ok(frame("ping", r#"{"type":"ping"}"#)),
         ]);
-        let mut guarded = Box::pin(guard(source.boxed(), no_reconnect(), cfg()));
+        let mut guarded = Box::pin(guard(
+            source.boxed(),
+            no_reconnect(),
+            cfg(),
+            Dialect::Anthropic,
+        ));
         let first = guarded.next().await.expect("a chunk").expect("ok");
         assert!(
             String::from_utf8_lossy(&first).contains("event: ping"),

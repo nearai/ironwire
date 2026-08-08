@@ -35,6 +35,7 @@ pub enum ServeError {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .nest("/anthropic", facade::anthropic::router())
+        .nest("/openai", facade::openai::router())
         .nest("/_ironwire", crate::control::router())
         .with_state(state)
 }

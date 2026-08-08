@@ -7,12 +7,14 @@ use ironwire_core::config::{Config, PathsConfig};
 use ironwire_core::protocol::ModelTier;
 use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
+use ironwire_creds::codex::{CodexCredentials, CodexMode};
 use ironwire_ledger::Ledger;
 use ironwire_proxy::server::ServeError;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_quirks::QuirksStore;
 use ironwire_upstream::anthropic::AnthropicBackend;
 use ironwire_upstream::openai_chat::ChatCompletionsBackend;
+use ironwire_upstream::openai_responses::ResponsesBackend;
 use secrecy::SecretString;
 
 use super::{control_token, paths};
@@ -59,6 +61,7 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
 
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
+    println!("  Codex:       ironwire connect codex");
     println!();
 
     ironwire_proxy::server::serve_on(listener, state, shutdown_signal())
@@ -130,8 +133,11 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
 
     if ClaudeCodeCredentials::discover().is_ok() {
         registry.push(Arc::new(
-            AnthropicBackend::subscription(base_url_for(config, "claude-sub"), timeout)
-                .context("building the Claude subscription backend")?,
+            AnthropicBackend::subscription(
+                base_url_for(config, "claude-sub", "IRONWIRE_ANTHROPIC_BASE_URL"),
+                timeout,
+            )
+            .context("building the Claude subscription backend")?,
         ));
     }
 
@@ -141,10 +147,36 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         registry.push(Arc::new(
             AnthropicBackend::api_key(
                 SecretString::from(key),
-                base_url_for(config, "anthropic-key"),
+                base_url_for(config, "anthropic-key", "IRONWIRE_ANTHROPIC_BASE_URL"),
                 timeout,
             )
             .context("building the Anthropic API backend")?,
+        ));
+    }
+
+    // The ChatGPT subscription. Same wire as the metered OpenAI key below, so
+    // the two are rungs of one ladder and falling between them costs nothing
+    // but money (`docs/DESIGN.md` §3).
+    if CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt) {
+        registry.push(Arc::new(
+            ResponsesBackend::codex_subscription(
+                base_url_for(config, "codex-sub", "IRONWIRE_CODEX_BASE_URL"),
+                timeout,
+            )
+            .context("building the ChatGPT subscription backend")?,
+        ));
+    }
+
+    // A key from the environment, or the one Codex itself stored — a user who
+    // ran `codex login --api-key` has exactly one place they expect it to live.
+    if let Some(key) = openai_api_key() {
+        registry.push(Arc::new(
+            ResponsesBackend::openai_api_key(
+                key,
+                base_url_for(config, "openai-key", "IRONWIRE_OPENAI_BASE_URL"),
+                timeout,
+            )
+            .context("building the OpenAI API backend")?,
         ));
     }
 
@@ -156,8 +188,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         registry.push(Arc::new(
             ChatCompletionsBackend::nearai(
                 SecretString::from(key),
-                base_url_for(config, "nearai")
-                    .or_else(|| std::env::var("IRONWIRE_NEARAI_BASE_URL").ok()),
+                base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
                 nearai_models(config),
                 timeout,
             )
@@ -166,6 +197,17 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     }
 
     Ok(registry)
+}
+
+/// The metered OpenAI key, from the environment or from Codex's own store.
+fn openai_api_key() -> Option<SecretString> {
+    if let Ok(key) = std::env::var("OPENAI_API_KEY")
+        && !key.is_empty()
+    {
+        return Some(SecretString::from(key));
+    }
+    let creds = CodexCredentials::discover().ok()?;
+    (creds.mode == CodexMode::ApiKey).then(|| creds.bearer().token)
 }
 
 /// Models to offer from NEAR AI.
@@ -198,13 +240,18 @@ fn nearai_models(config: &Config) -> Vec<(String, ModelTier)> {
 /// `config.toml` is the user-facing form; the environment variable exists so
 /// the conformance harness can point a real backend at a recording mock
 /// without writing config (`docs/PROTOCOL.md` §7.2).
-fn base_url_for(config: &Config, id: &str) -> Option<String> {
+///
+/// The environment variable is named per family rather than shared. A single
+/// override would send *every* backend to whichever mock the harness happened to
+/// start — including one holding a credential for a different provider, which
+/// `check_host` would then have to refuse (`docs/TRUST.md` I2).
+fn base_url_for(config: &Config, id: &str, env_key: &str) -> Option<String> {
     config
         .backends
         .iter()
         .find(|b| b.id == id)
         .and_then(|b| b.base_url.clone())
-        .or_else(|| std::env::var("IRONWIRE_ANTHROPIC_BASE_URL").ok())
+        .or_else(|| std::env::var(env_key).ok())
         .filter(|url| !url.is_empty())
 }
 

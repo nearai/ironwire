@@ -130,10 +130,10 @@ impl RequestPeek {
                 for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
                         Some("image") => requirements.images = true,
-                        Some("thinking" | "redacted_thinking") => {
-                            if block.get("signature").is_some() || block.get("data").is_some() {
-                                requirements.reasoning = ReasoningNeed::LoadBearing;
-                            }
+                        Some("thinking" | "redacted_thinking")
+                            if block.get("signature").is_some() || block.get("data").is_some() =>
+                        {
+                            requirements.reasoning = ReasoningNeed::LoadBearing;
                         }
                         _ => {}
                     }

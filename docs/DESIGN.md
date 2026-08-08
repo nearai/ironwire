@@ -266,16 +266,17 @@ Reuse is deliberate and layered, because binary size is a distribution
 constraint (`brew`/`npx`/`apt`/`pip` all want one small self-contained
 executable) and `ironclaw_llm` pulls `rig-core`.
 
-| What | From | How |
+| What | From | Status |
 |---|---|---|
-| Codex credential file format, refresh, ChatGPT base URL | `ironclaw_llm::auth` (`CredentialSource::CodexCli`) | git dep, feature `ironclaw-auth` |
-| Claude Code credential reading | `ironclaw_llm::anthropic_oauth` (currently private) | **ported into `ironwire_creds`**; upstream PR to add `CredentialSource::ClaudeCode` |
+| Codex credential discovery, `auth.json` format, ChatGPT-vs-key base URL split | `ironclaw_llm::auth::load_persisted_credentials` (`CredentialSource::CodexCli`) | **delegated** — `ironwire_creds::codex` is a thin wrapper. Two exceptions, both noted in that module: the `CODEX_HOME` override (ironclaw hardcodes `~/.codex`) and the `chatgpt_account_id` claim (ironclaw's extractor is private) |
+| Price table | `ironclaw_common::llm_costs::price_usage` | **delegated** — `ironwire_ledger::price`. Closed a real gap: `spend_today_usd` was structurally always `None` before |
+| Circuit-breaker vocabulary (`CircuitState`, `CircuitBreakerConfig`) | `ironclaw_llm::circuit_breaker` | **delegated** — types reused so both products report backend health in the same words. The transitions are ours (`ironwire_upstream::breaker`) because ironclaw's live on `LlmProvider`; see below |
+| Claude Code credential reading | `ironclaw_llm::anthropic_oauth` (private module) | **ported** into `ironwire_creds::claude` — cannot be delegated until upstream exposes it. Upstream PR: add `CredentialSource::ClaudeCode` |
 | Anthropic OAuth header/beta constants, refresh-on-401 shape | `ironclaw_llm::anthropic_oauth` | pattern reused, ~200 LOC |
-| Error classification, `retry-after` parsing, rate-limit detection | `ironclaw_llm::error` | pattern reused |
-| Retry / circuit breaker / failover / cooldown semantics | `ironclaw_llm::{retry, circuit_breaker, failover}` | pattern reused, adapted to before-first-byte-only |
-| Price table | `ironclaw_common::llm_costs` | git dep (light: no rig) |
-| Complexity scoring (tier hint only) | `ironclaw_llm::smart_routing` | feature `complexity`, off by default |
-| OpenAI Chat/Responses wire types, SSE framing, error mapping | `ironclaw_openai_compat` (`chat.rs`, `responses.rs`, `content_parts.rs`, `streaming.rs`, `error.rs`) | extracted into `ironwire_wire_openai`; the workflow half is ironclaw-specific and not reused |
+| Codex `client_version` detection (`codex --version` → `/models?client_version=`) | `ironclaw_llm::codex_chatgpt` (private module) | **not yet done** — gates newer models, so a stale value silently hides models the account is entitled to. Tracked in `ROADMAP.md` |
+| Error classification, `retry-after` parsing | `ironclaw_llm::error` | pattern reused in `UpstreamError` |
+| Complexity scoring (tier hint only) | `ironclaw_llm::smart_routing` | not built; feature `complexity`, off by default |
+| OpenAI Chat/Responses wire types, SSE framing, error mapping | `ironclaw_openai_compat` | not reused — see the note on the native lane below |
 | **Whole trace contribution pipeline** — consent policy, deterministic redaction, on-disk queue with holds, manual-review gating, classification, credit/claims, device-key onboarding | `ironclaw_trace_commons` | git dep, feature `contribute`, off by default |
 
 `ironclaw_trace_commons::capture::capture_conversation_trace(scope, messages,
@@ -285,10 +286,18 @@ exchange. That crate is the entire NEAR-AI-credits half of the product and we
 should not reinvent any of it.
 
 **What we deliberately do not reuse:** `ironclaw_llm`'s `LlmProvider` trait and
-`CompletionRequest`/`ToolCompletionRequest` types. They are a
-chat-completions-shaped abstraction — exactly the lossy common denominator the
-native lane exists to avoid. They are appropriate for an agent that owns its
-own prompts; they are not appropriate for a pipe.
+`CompletionRequest`/`ToolCompletionRequest` types, and any wire-type crate that
+implies them. They are a chat-completions-shaped abstraction — exactly the lossy
+common denominator the native lane exists to avoid. A typed request struct
+cannot express "unchanged", and "unchanged" is the entire fidelity claim
+(`tests/passthrough.rs`, `tests/codex_on_subscription.rs`). They are appropriate
+for an agent that owns its own prompts; they are not appropriate for a pipe.
+
+That boundary is narrower than it first looks, and an earlier draft of this
+document over-applied it. It rules out the *datapath*: the bytes on the wire,
+the request and response types, the streaming decode. It says nothing about
+credential discovery, price tables, or health vocabulary — all of which are
+now delegated rather than reimplemented, per the table above.
 
 ---
 

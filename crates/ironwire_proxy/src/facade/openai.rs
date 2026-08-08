@@ -1,9 +1,11 @@
-//! The Anthropic façade — what `ANTHROPIC_BASE_URL` points at.
+//! The OpenAI façade — what a Codex custom provider points at.
 //!
-//! Mounted at `/anthropic`; Claude Code appends `/v1/...` itself.
-//! `docs/PROTOCOL.md` §1 lists what has to exist here and why —
-//! `count_tokens` in particular is not optional, because Claude Code drives its
-//! context budget and compaction trigger off it.
+//! Mounted at `/openai`; Codex appends `/v1/responses` itself, and third-party
+//! clients append `/v1/chat/completions`.
+//!
+//! Two native lanes live here, not one. Responses and Chat Completions are the
+//! same *family* but different wires, so each gets a backend that speaks it
+//! natively and neither is translated into the other.
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -21,37 +23,46 @@ use crate::pipeline::{self, dialect_for};
 use crate::resilience;
 use crate::state::AppState;
 
-const PROTOCOL: Protocol = Protocol::AnthropicMessages;
-
-/// Routes for the Anthropic façade.
+/// Routes for the OpenAI façade.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v1/messages", post(messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/responses", post(responses))
+        .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
 }
 
-async fn messages(
+async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    forward(state, headers, body, "/v1/messages").await
+    forward(
+        state,
+        headers,
+        body,
+        "/v1/responses",
+        Protocol::OpenAiResponses,
+    )
+    .await
 }
 
-/// Claude Code calls this before every turn to decide whether to compact.
-/// It goes through the same routing so the count comes from the model that
-/// will actually serve the turn.
-async fn count_tokens(
+async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    forward(state, headers, body, "/v1/messages/count_tokens").await
+    forward(
+        state,
+        headers,
+        body,
+        "/v1/chat/completions",
+        Protocol::OpenAiChat,
+    )
+    .await
 }
 
-/// Synthesized from the backends that are actually eligible, so a picker never
-/// offers a model IronWire cannot currently serve.
+/// Synthesized from the backends that are actually eligible, in the shape
+/// OpenAI clients expect.
 async fn models(State(state): State<AppState>) -> Response {
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
@@ -68,13 +79,13 @@ async fn models(State(state): State<AppState>) -> Response {
                 continue;
             }
             data.push(serde_json::json!({
-                "type": "model",
                 "id": model,
-                "display_name": model,
+                "object": "model",
+                "owned_by": "ironwire",
             }));
         }
     }
-    axum::Json(serde_json::json!({ "data": data, "has_more": false })).into_response()
+    axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 
 async fn forward(
@@ -82,14 +93,15 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
     path: &str,
+    protocol: Protocol,
 ) -> Result<Response, FacadeError> {
     let started_at = chrono::Utc::now();
-    // Parse once, for the peek only. The bytes we forward are the bytes we
+    // Parsed once, for the peek only. The bytes we forward are the bytes we
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
-    let peek = RequestPeek::inspect_with(PROTOCOL, &parsed, body.len(), &state.identity_markers());
-    let key = conversation_key(&parsed);
+    let peek = RequestPeek::inspect_with(protocol, &parsed, body.len(), &state.identity_markers());
+    let key = conversation_key(protocol, &parsed);
     let conversation = key.0;
 
     let forwarded: Vec<(String, String)> = headers
@@ -105,7 +117,7 @@ async fn forward(
 
     let (response, routed) = pipeline::dispatch(
         &state,
-        PROTOCOL,
+        protocol,
         path,
         &peek,
         key.clone(),
@@ -133,13 +145,11 @@ async fn forward(
         .cloned()
         .expect("dispatch returned a registered backend");
 
-    // The observation closure runs when the stream ends *or is dropped*, so
-    // both quota accounting and the ledger entry survive a cancelled request.
     let ledger = state.ledger.clone();
     let entry = pipeline::LedgerContext {
         started_at,
         started: std::time::Instant::now(),
-        facade: "anthropic",
+        facade: "openai",
         path: path.to_string(),
         conversation: conversation.to_string(),
         backend: routed.decision.backend.to_string(),
@@ -148,21 +158,18 @@ async fn forward(
         attempts: routed.attempts,
         status: response.status.as_u16(),
     };
-    let observed = pipeline::observe_boxed(response.body, dialect_for(PROTOCOL), move |obs| {
+    let observed = pipeline::observe_boxed(response.body, dialect_for(protocol), move |obs| {
         pipeline::record(&backend, &obs);
         if let Some(ledger) = ledger.as_ref() {
             entry.write(ledger, &obs);
         }
     });
 
-    // Keep a quiet stream alive, end a dead one honestly, and restart one that
-    // failed before producing content — the three shapes of "Response stalled
-    // mid-stream" (`docs/PROTOCOL.md` §5, `resilience`).
     let body: Body = if peek.stream {
         let reconnect_state = state.clone();
         let reconnect_path = path.to_string();
         let reconnect_peek = peek.clone();
-        let resilience = resilience::ResilienceConfig::from(&state.config.resilience);
+        let settings = resilience::ResilienceConfig::from(&state.config.resilience);
         let reconnect: resilience::Reconnect = Box::new(move || {
             let state = reconnect_state.clone();
             let path = reconnect_path.clone();
@@ -171,12 +178,12 @@ async fn forward(
             let body = body.clone();
             let headers = forwarded.clone();
             Box::pin(async move {
-                match pipeline::dispatch(&state, PROTOCOL, &path, &peek, key, body, headers).await {
+                match pipeline::dispatch(&state, protocol, &path, &peek, key, body, headers).await {
                     Ok((response, routed)) => {
                         tracing::info!(backend = %routed.decision.backend, "stream restarted");
                         Some(pipeline::observe_boxed(
                             response.body,
-                            dialect_for(PROTOCOL),
+                            dialect_for(protocol),
                             |_| {},
                         ))
                     }
@@ -190,8 +197,8 @@ async fn forward(
         Body::from_stream(resilience::guard(
             observed,
             reconnect,
-            resilience,
-            dialect_for(PROTOCOL),
+            settings,
+            dialect_for(protocol),
         ))
     } else {
         Body::from_stream(observed)
@@ -204,8 +211,6 @@ async fn forward(
             builder = builder.header(name, value);
         }
     }
-    // Tell every intermediary — and any buffering layer of our own — to leave
-    // an event stream alone. A buffered SSE stream is a hung coding agent.
     if peek.stream {
         builder = builder
             .header("cache-control", "no-cache")
@@ -218,29 +223,44 @@ async fn forward(
         .map_err(|e| FacadeError::invalid_request(format!("could not build response: {e}")))
 }
 
-/// Derive the conversation key from the parts that stay fixed as a
-/// conversation grows (`docs/DESIGN.md` §3).
-fn conversation_key(body: &serde_json::Value) -> ConversationKey {
-    let system = match body.get("system") {
-        Some(serde_json::Value::String(s)) => s.as_str(),
-        Some(serde_json::Value::Array(blocks)) => blocks
-            .first()
-            .and_then(|b| b.get("text"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default(),
-        _ => "",
-    };
+/// Derive the conversation key from the parts that stay fixed as a conversation
+/// grows (`docs/DESIGN.md` §3).
+///
+/// Codex carries its persona in `instructions`; Chat Completions carries it in
+/// the first `system` message. Both are stable across a session, which is what
+/// affinity needs.
+fn conversation_key(protocol: Protocol, body: &serde_json::Value) -> ConversationKey {
+    let preamble = body
+        .get("instructions")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            body.get("messages")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|messages| messages.first())
+                .filter(|first| {
+                    first.get("role").and_then(serde_json::Value::as_str) == Some("system")
+                })
+                .and_then(|first| first.get("content"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or_default();
+
     let tools: Vec<&str> = body
         .get("tools")
         .and_then(serde_json::Value::as_array)
         .map(|tools| {
             tools
                 .iter()
-                .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
+                .filter_map(|t| {
+                    t.get("name")
+                        .or_else(|| t.pointer("/function/name"))
+                        .and_then(serde_json::Value::as_str)
+                })
                 .collect()
         })
         .unwrap_or_default();
-    ConversationKey::derive(PROTOCOL, system, &tools)
+
+    ConversationKey::derive(protocol, preamble, &tools)
 }
 
 #[cfg(test)]
@@ -249,29 +269,67 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn the_key_is_stable_as_turns_accumulate() {
+    fn a_codex_session_keeps_one_key_as_it_grows() {
         let turn_1 = json!({
-            "system": "You are Claude Code",
-            "tools": [{"name": "Read"}, {"name": "Bash"}],
-            "messages": [{"role": "user", "content": "hi"}],
+            "instructions": "You are Codex, a coding agent.",
+            "tools": [{"type": "function", "name": "shell"}],
+            "input": [{"role": "user", "content": "hi"}],
         });
         let turn_40 = json!({
-            "system": "You are Claude Code",
-            "tools": [{"name": "Read"}, {"name": "Bash"}],
-            "messages": (0..80).map(|i| json!({"role": "user", "content": format!("m{i}")})).collect::<Vec<_>>(),
+            "instructions": "You are Codex, a coding agent.",
+            "tools": [{"type": "function", "name": "shell"}],
+            "input": (0..80).map(|i| json!({"role": "user", "content": format!("m{i}")})).collect::<Vec<_>>(),
         });
-        assert_eq!(conversation_key(&turn_1), conversation_key(&turn_40));
+        assert_eq!(
+            conversation_key(Protocol::OpenAiResponses, &turn_1),
+            conversation_key(Protocol::OpenAiResponses, &turn_40)
+        );
     }
 
     #[test]
-    fn a_different_session_gets_a_different_key() {
-        let a = json!({"system": "You are Claude Code", "tools": [{"name": "Read"}]});
-        let b = json!({"system": "You are Aider", "tools": [{"name": "Read"}]});
-        assert_ne!(conversation_key(&a), conversation_key(&b));
+    fn chat_completions_keys_off_its_system_message() {
+        let a = json!({"messages": [{"role": "system", "content": "You are Aider."}]});
+        let b = json!({"messages": [{"role": "system", "content": "You are something else."}]});
+        assert_ne!(
+            conversation_key(Protocol::OpenAiChat, &a),
+            conversation_key(Protocol::OpenAiChat, &b)
+        );
     }
 
     #[test]
-    fn a_body_with_no_system_or_tools_still_keys() {
-        let _ = conversation_key(&json!({"messages": []}));
+    fn the_two_openai_wires_share_one_key() {
+        // Affinity is keyed on the *family*, not the wire (`ConversationKey::
+        // derive`), and that is the behaviour we want here: what affinity
+        // protects is the provider-side prompt cache, which is shared across
+        // both wires. A client that sends the same preamble and tools to both is
+        // one conversation, and splitting it would throw the cache away.
+        let body = json!({"instructions": "same", "tools": []});
+        assert_eq!(
+            conversation_key(Protocol::OpenAiResponses, &body),
+            conversation_key(Protocol::OpenAiChat, &body)
+        );
+        // The Anthropic family is a different pool and must not collide.
+        assert_ne!(
+            conversation_key(Protocol::OpenAiResponses, &body),
+            ConversationKey::derive(Protocol::AnthropicMessages, "same", &[])
+        );
+    }
+
+    #[test]
+    fn tool_names_are_read_from_both_shapes() {
+        // Responses puts `name` at the top level; Chat Completions nests it
+        // under `function`. Missing one would split a conversation in half.
+        let responses =
+            json!({"instructions": "x", "tools": [{"type": "function", "name": "shell"}]});
+        let chat = json!({"instructions": "x", "tools": [{"type": "function", "function": {"name": "shell"}}]});
+        assert_eq!(
+            conversation_key(Protocol::OpenAiResponses, &responses),
+            conversation_key(Protocol::OpenAiResponses, &chat)
+        );
+    }
+
+    #[test]
+    fn a_body_with_nothing_recognisable_still_keys() {
+        let _ = conversation_key(Protocol::OpenAiResponses, &json!({}));
     }
 }

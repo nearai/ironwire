@@ -6,7 +6,9 @@
 //! screen.
 
 use ironwire_ledger::{Exchange, Summary};
-use ironwire_proxy::control::{BackendView, HeadroomView, LogView, StatusView};
+use ironwire_proxy::control::{
+    BackendView, BalanceView, HeadroomView, HealthView, LogView, StatusView,
+};
 use ironwire_update::UpdateStatus;
 
 /// Render `ironwire log`.
@@ -138,6 +140,12 @@ pub(crate) fn status(status: &StatusView) -> String {
         out.push('\n');
     }
 
+    let balance = balance_block(&status.balance);
+    if !balance.is_empty() {
+        out.push_str(&balance);
+        out.push('\n');
+    }
+
     if let Some(pin) = &status.pin {
         out.push_str(&format!("Pinned to {pin} (clear with `ironwire pin`)\n"));
     }
@@ -202,8 +210,85 @@ fn backend_block(backend: &BackendView) -> String {
         backend.kind.replace('_', " ")
     ));
     out.push_str(&format!("  capacity: {}\n", headroom(&backend.headroom)));
+    // Only when it is not the boring answer. A "circuit: closed" line on every
+    // healthy backend is noise that trains people to stop reading the block.
+    if let Some(line) = health_line(&backend.health) {
+        out.push_str(&format!("  {line}\n"));
+    }
     if !backend.models.is_empty() {
         out.push_str(&format!("  models: {}\n", backend.models.join(", ")));
+    }
+    out
+}
+
+/// Say a backend is being skipped, and why — a silently-skipped backend looks
+/// like one that is simply not being chosen.
+fn health_line(health: &HealthView) -> Option<String> {
+    match health.circuit.as_str() {
+        "open" => Some(match health.retry_in_secs {
+            Some(secs) if secs > 0 => format!(
+                "skipping after {} consecutive failures · next try in {}",
+                health.consecutive_failures,
+                duration(secs)
+            ),
+            _ => format!(
+                "skipping after {} consecutive failures",
+                health.consecutive_failures
+            ),
+        }),
+        "halfopen" | "half_open" => Some("recovering — trying it again now".to_string()),
+        _ if health.consecutive_failures > 0 => Some(format!(
+            "{} recent failure(s), still in use",
+            health.consecutive_failures
+        )),
+        _ => None,
+    }
+}
+
+/// Every pool as one balance — see `BalanceView` for why this counts pools
+/// rather than merging them into a single number.
+fn balance_block(balance: &BalanceView) -> String {
+    let mut parts = Vec::new();
+    if balance.available > 0 {
+        parts.push(match balance.free_available {
+            0 => format!("{} pool(s) available", balance.available),
+            free if free == balance.available => {
+                format!("{} pool(s) available, all already paid for", free)
+            }
+            free => format!(
+                "{} pool(s) available ({free} already paid for)",
+                balance.available
+            ),
+        });
+    }
+    if balance.unknown > 0 {
+        // Not folded into "available": the provider has told us nothing, and
+        // reporting that as headroom is exactly the fabrication this screen
+        // exists to avoid.
+        parts.push(format!("{} not yet reporting", balance.unknown));
+    }
+    if balance.unavailable > 0 {
+        parts.push(match balance.next_available_at {
+            Some(at) => {
+                let secs = (at - chrono::Utc::now()).num_seconds().max(0);
+                format!(
+                    "{} unavailable · first back in {}",
+                    balance.unavailable,
+                    duration(secs)
+                )
+            }
+            None => format!("{} unavailable", balance.unavailable),
+        });
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("Balance: {}\n", parts.join(" · "));
+    if let Some(spend) = balance.spend_today_usd
+        && spend > 0.0
+    {
+        out.push_str(&format!("  metered spend, last 24h: ${spend:.2}\n"));
     }
     out
 }
@@ -288,6 +373,7 @@ mod log_tests {
             cache_read_tokens: Some(98_000),
             cache_write_tokens: Some(2_048),
             output_tokens: Some(137),
+            cost_usd: Some(0.42),
             status: 200,
             error: None,
         }
@@ -340,6 +426,7 @@ mod log_tests {
             input_tokens: 1_200,
             cache_read_tokens: 2_400_000,
             output_tokens: 900,
+            cost_usd: 1.25,
             by_backend: vec![("claude-sub".into(), 7), ("anthropic-key".into(), 3)],
         });
         assert!(rendered.contains("10 exchanges"));
@@ -392,6 +479,7 @@ mod tests {
             consented: true,
             detail: None,
             headroom,
+            health: HealthView::default(),
             models: vec!["claude-opus-4-6".into()],
         }
     }
@@ -461,9 +549,78 @@ mod tests {
             tracked_conversations: 0,
             pin: None,
             backends: vec![],
+            balance: BalanceView::default(),
             quirks_serial: 0,
             update: UpdateStatus::Unknown,
         });
         assert!(rendered.contains("ironwire connect claude"));
+    }
+
+    #[test]
+    fn a_healthy_backend_says_nothing_about_its_circuit() {
+        // A "circuit: closed" line on every healthy backend is noise that
+        // trains people to stop reading the block.
+        let rendered = backend_block(&view(HeadroomView::Unknown));
+        assert!(!rendered.contains("circuit"));
+        assert!(!rendered.contains("skipping"));
+    }
+
+    #[test]
+    fn a_backend_being_skipped_says_so_and_says_when_it_comes_back() {
+        // Otherwise a skipped backend is indistinguishable from one that is
+        // simply not being chosen, and the user has no idea why their requests
+        // are landing somewhere more expensive.
+        let mut backend = view(HeadroomView::Unknown);
+        backend.health = HealthView {
+            circuit: "open".into(),
+            consecutive_failures: 5,
+            retry_in_secs: Some(90),
+        };
+        let rendered = backend_block(&backend);
+        assert!(rendered.contains("skipping after 5 consecutive failures"));
+        assert!(rendered.contains("1m"), "got: {rendered}");
+    }
+
+    #[test]
+    fn the_balance_counts_pools_and_says_which_are_free() {
+        let rendered = balance_block(&BalanceView {
+            available: 3,
+            free_available: 2,
+            unknown: 1,
+            unavailable: 0,
+            next_available_at: None,
+            spend_today_usd: Some(1.234),
+        });
+        assert!(rendered.contains("3 pool(s) available (2 already paid for)"));
+        assert!(rendered.contains("1 not yet reporting"));
+        assert!(rendered.contains("$1.23"));
+    }
+
+    #[test]
+    fn a_pool_that_has_not_reported_is_never_counted_as_available() {
+        // The whole reason `unknown` is a separate field. Folding it into
+        // `available` would be the same fabrication the headroom column exists
+        // to avoid.
+        let rendered = balance_block(&BalanceView {
+            available: 0,
+            free_available: 0,
+            unknown: 2,
+            ..BalanceView::default()
+        });
+        assert!(rendered.contains("2 not yet reporting"));
+        assert!(!rendered.contains("available"), "got: {rendered}");
+    }
+
+    #[test]
+    fn an_unmeasured_spend_shows_no_figure_at_all() {
+        // `None` means the ledger is off — which is not the same as zero, and
+        // printing "$0.00" would tell the user something we do not know.
+        let rendered = balance_block(&BalanceView {
+            available: 1,
+            free_available: 1,
+            spend_today_usd: None,
+            ..BalanceView::default()
+        });
+        assert!(!rendered.contains('$'), "got: {rendered}");
     }
 }

@@ -18,6 +18,8 @@ use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::CodexCredentials;
 use ironwire_creds::consent::ConsentLedger;
 
+use crate::codex_config;
+
 use super::paths;
 
 /// Run `ironwire connect <target>`.
@@ -55,13 +57,19 @@ pub(crate) fn disconnect(target: &str, subscription: bool) -> Result<()> {
         println!("Restart the daemon for this to take effect: `ironwire serve`");
         return Ok(());
     }
-    println!("Remove the IronWire settings you added for {target}:");
     match target {
-        "claude" => println!("  unset ANTHROPIC_BASE_URL"),
-        "codex" => println!("  remove [model_providers.ironwire] from ~/.codex/config.toml"),
+        // Claude Code is pointed here by an environment variable, which is the
+        // user's shell to own — we can only say what to remove.
+        "claude" => {
+            println!("Remove the IronWire setting you added for Claude Code:");
+            println!("  unset ANTHROPIC_BASE_URL");
+            println!("  (and remove it from your shell profile)");
+            Ok(())
+        }
+        // Codex is pointed here by a file we wrote, so we can undo it.
+        "codex" => disconnect_codex(),
         other => bail!("unknown target `{other}`"),
     }
-    Ok(())
 }
 
 /// Print the environment a client needs.
@@ -137,27 +145,138 @@ fn connect_claude(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn connect_codex(_subscription: bool, _dry_run: bool, port: u16) -> Result<()> {
+fn connect_codex(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
     println!("Codex → IronWire");
     println!();
-    println!("The OpenAI façade lands in M2 (see docs/ROADMAP.md). When it does,");
-    println!("this command will add the following to ~/.codex/config.toml:");
-    println!();
-    println!("    model_provider = \"ironwire\"");
-    println!();
-    println!("    [model_providers.ironwire]");
-    println!("    name = \"IronWire\"");
-    println!("    base_url = \"http://127.0.0.1:{port}/openai/v1\"");
-    println!("    wire_api = \"responses\"");
-    println!();
+
+    let path = codex_config_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let edit = codex_config::connect(&existing, port).with_context(|| {
+        format!(
+            "{} is not valid TOML — IronWire will not append to a file it cannot read",
+            path.display()
+        )
+    })?;
+
+    // TRUST.md: name the file before touching it, every time.
+    if edit.is_noop() {
+        println!("{} already points at IronWire.", path.display());
+    } else {
+        println!("This will change {}:", path.display());
+        for change in &edit.changes {
+            println!("  · {change}");
+        }
+        println!();
+        if dry_run {
+            println!("[dry run] nothing was written.");
+        } else {
+            write_codex_config(&path, &existing, &edit.contents)?;
+            println!("Written. Restart Codex to pick it up.");
+        }
+        println!();
+    }
+
     match CodexCredentials::discover() {
         Ok(creds) => println!(
             "Found a Codex login ({:?}) at {}.",
             creds.mode, creds.source
         ),
-        Err(e) => println!("No Codex login found: {e}"),
+        Err(e) => {
+            println!("No Codex login found: {e}");
+            println!("IronWire can still route Codex through OPENAI_API_KEY.");
+            return Ok(());
+        }
     }
+
+    if !subscription {
+        println!();
+        println!(
+            "To let IronWire use that ChatGPT subscription, run:\n\
+             \n    ironwire connect codex --subscription\n"
+        );
+        return Ok(());
+    }
+
+    if dry_run {
+        println!();
+        println!("[dry run] would record consent for the `codex-sub` backend.");
+        return Ok(());
+    }
+
+    let paths = paths()?;
+    let consent_path = paths.consent_file();
+    let mut ledger = ConsentLedger::load(&consent_path);
+    if ledger.is_granted("codex-sub") {
+        println!();
+        println!("The ChatGPT subscription backend is already enabled.");
+        return Ok(());
+    }
+
+    if !ask_subscription_consent("Codex", "chatgpt.com", "OpenAI", "an OpenAI API key")? {
+        println!("Left disabled. IronWire will use API keys only.");
+        return Ok(());
+    }
+
+    ledger.grant("codex-sub", Utc::now());
+    ledger
+        .save(&consent_path)
+        .context("writing the consent ledger")?;
+    println!();
+    println!("Enabled. Recorded in {}.", consent_path.display());
+    println!("Start the daemon with `ironwire serve`.");
     Ok(())
+}
+
+fn disconnect_codex() -> Result<()> {
+    let path = codex_config_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.is_empty() {
+        println!("{} does not exist — nothing to undo.", path.display());
+        return Ok(());
+    }
+    let edit = codex_config::disconnect(&existing)
+        .with_context(|| format!("{} is not valid TOML", path.display()))?;
+    if edit.is_noop() {
+        println!("{} does not point at IronWire.", path.display());
+        return Ok(());
+    }
+    println!("This will change {}:", path.display());
+    for change in &edit.changes {
+        println!("  · {change}");
+    }
+    write_codex_config(&path, &existing, &edit.contents)?;
+    println!();
+    println!("Written. Restart Codex to pick it up.");
+    Ok(())
+}
+
+/// Write the config, keeping a copy of what was there.
+///
+/// The backup is not ceremony: this is a file the user edits by hand, and the
+/// cost of being wrong about their config is an afternoon of theirs.
+fn write_codex_config(path: &std::path::Path, existing: &str, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if !existing.is_empty() {
+        let backup = path.with_extension("toml.ironwire-backup");
+        std::fs::write(&backup, existing)
+            .with_context(|| format!("writing {}", backup.display()))?;
+        println!("  (previous contents saved to {})", backup.display());
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Where Codex keeps its config. `CODEX_HOME` wins, as it does for Codex.
+fn codex_config_path() -> Result<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("CODEX_HOME")
+        && !home.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(home).join("config.toml"));
+    }
+    let home = dirs::home_dir().context("could not locate your home directory")?;
+    Ok(home.join(".codex").join("config.toml"))
 }
 
 /// The consent prompt. `docs/TRUST.md` §2 fixes its content; changing what it
