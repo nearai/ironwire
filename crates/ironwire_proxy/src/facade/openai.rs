@@ -170,6 +170,9 @@ async fn forward(
         requested_model: peek.requested_model.clone(),
         rung: format!("{:?}", routed.decision.rung).to_lowercase(),
         attempts: routed.attempts,
+        substitutions: applied
+            .as_ref()
+            .map(|a| i64::try_from(a.substitutions).unwrap_or(i64::MAX)),
         status: response.status.as_u16(),
     };
     let observed = pipeline::observe_boxed(response.body, dialect_for(protocol), move |obs| {

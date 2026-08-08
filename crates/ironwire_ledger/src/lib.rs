@@ -86,6 +86,12 @@ pub struct Exchange {
     /// Subscription capacity still carries a price, because "what this would
     /// have cost on the meter" is the number that makes a subscription legible.
     pub cost_usd: Option<f64>,
+    /// How many distinct values the privacy filter substituted, when it was on.
+    ///
+    /// `None` means the filter was off — which is *not* the same as zero, and
+    /// the two must not be conflated in a log a user reads to decide whether
+    /// the filter is doing anything (`docs/PRIVACY.md` §7).
+    pub substitutions: Option<i64>,
     /// HTTP status returned to the client.
     pub status: i64,
     /// Error, when the exchange failed.
@@ -159,6 +165,7 @@ CREATE TABLE IF NOT EXISTS exchanges (
     cache_write_tokens INTEGER,
     output_tokens      INTEGER,
     cost_usd           REAL,
+    substitutions      INTEGER,
     status             INTEGER NOT NULL,
     error              TEXT
 );
@@ -209,8 +216,8 @@ impl Ledger {
                 started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
                 requested_model, served_model, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                cost_usd, status, error
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                cost_usd, substitutions, status, error
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -228,6 +235,7 @@ impl Ledger {
                 exchange.cache_write_tokens,
                 exchange.output_tokens,
                 exchange.cost_usd,
+                exchange.substitutions,
                 exchange.status,
                 exchange.error,
             ],
@@ -246,7 +254,7 @@ impl Ledger {
             "SELECT started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
                     requested_model, served_model, rung, attempts,
                     input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                    cost_usd, status, error
+                    cost_usd, substitutions, status, error
              FROM exchanges ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit], |row| {
@@ -267,8 +275,9 @@ impl Ledger {
                 cache_write_tokens: row.get(13)?,
                 output_tokens: row.get(14)?,
                 cost_usd: row.get(15)?,
-                status: row.get(16)?,
-                error: row.get(17)?,
+                substitutions: row.get(16)?,
+                status: row.get(17)?,
+                error: row.get(18)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -371,6 +380,7 @@ mod tests {
             cache_write_tokens: Some(2_048),
             output_tokens: Some(137),
             cost_usd: Some(0.42),
+            substitutions: None,
             status: 200,
             error: None,
         }

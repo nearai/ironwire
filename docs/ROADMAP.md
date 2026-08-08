@@ -292,8 +292,9 @@ hard failure lives and a detector is worthless without it.
 - [x] Per-conversation salts, bounded and memory-only, stable across turns so
       the provider's prompt cache is not destroyed every request
 - [x] Filter state on its own permanent line in `ironwire status`
-- [ ] Per-exchange substitution counts in `ironwire log` (the ledger column)
-- [ ] `ironwire privacy check <file>`
+- [x] Per-exchange substitution counts in the ledger and `ironwire log`. `None`
+      (filter off) is never conflated with `0` (on, found nothing) — the second
+      is the signal a user needs to see
 
 ### Tier 1 — secrets (deterministic)
 
@@ -304,8 +305,10 @@ hard failure lives and a detector is worthless without it.
 
 - [x] User-nominated exact strings via `redaction_values_for_secret`, which
       already expands URL-encoded variants
-- [ ] `ironwire privacy check <file>` — show what would and would not be caught,
-      so the false-negative rate is something a user can see
+- [x] `ironwire privacy check <file>` / `privacy status` — show what would and
+      would not be caught, so the false-negative rate is something a user can
+      see. Prints "no matches", never "clean", and previews rather than
+      reprinting matched values into a terminal that may be screen-shared
 
 ### Compaction — one case per harness
 
@@ -343,7 +346,11 @@ Much of what a PII detector flags in a coding session is load-bearing *code*.
 - [x] Never substitute reserved ranges (`example.com`, RFC 5737, RFC 1918,
       RFC 3849, `555-01`) — including the `172.16/12` boundary, which a prefix
       test alone gets wrong
-- [ ] Corpus test: real-looking fixtures pass tiers 1–2 with zero substitutions
+- [x] Corpus test: real-looking fixtures pass tiers 1–2 with zero
+      substitutions, paired with a fixture set of genuine secrets so the corpus
+      test cannot be satisfied by matching nothing. It found a real false
+      positive — `high_entropy_hex` matching lockfile checksums and git SHAs,
+      which now require a nearby credential word
 - [ ] Decide opaque tokens vs. format-preserving surrogates **with data** —
       opaque tokens preserve the value but destroy the structure the model needs
       to reason about (PRIVACY §6)

@@ -71,6 +71,18 @@ enum Command {
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
 
+    /// Inspect the optional privacy filter.
+    ///
+    /// `check <file>` shows what the configured filter would and would not
+    /// catch, so its false-negative rate is something you can see rather than
+    /// take on trust.
+    Privacy {
+        /// `check` or `status`.
+        action: String,
+        /// File to scan, for `check`.
+        path: Option<std::path::PathBuf>,
+    },
+
     /// Watch routing decisions as they happen.
     ///
     /// IronWire cannot write into your agent's transcript — the only channel
@@ -138,6 +150,7 @@ async fn main() -> Result<()> {
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env => commands::connect::print_env(cli.port),
+        Command::Privacy { action, path } => commands::privacy::run(&action, path),
         Command::Watch { only_changes } => commands::watch::run(cli.port, only_changes).await,
         Command::Service { action } => commands::service::run(&action, cli.port),
         Command::Completions { shell } => {

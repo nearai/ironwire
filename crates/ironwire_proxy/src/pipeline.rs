@@ -651,6 +651,11 @@ pub struct LedgerContext {
     pub rung: String,
     /// Backends tried before this one succeeded.
     pub attempts: usize,
+    /// Distinct values the privacy filter substituted, or `None` when the
+    /// filter was off. Not conflated with zero: a user reading the log to
+    /// decide whether the filter is working needs to tell "off" from "on and
+    /// found nothing" (`docs/PRIVACY.md` §7).
+    pub substitutions: Option<i64>,
     /// Status returned to the client.
     pub status: u16,
 }
@@ -699,6 +704,7 @@ impl LedgerContext {
             cache_write_tokens: usage.and_then(|u| i64::try_from(u.cache_creation_tokens).ok()),
             output_tokens: usage.and_then(|u| i64::try_from(u.output_tokens).ok()),
             cost_usd,
+            substitutions: self.substitutions,
             status: i64::from(self.status),
             error: None,
         };

@@ -111,6 +111,11 @@ impl Detector {
 
         if let Some(detector) = &self.secrets {
             for hit in detector.scan(text).matches {
+                if needs_credential_context(&hit.pattern_name)
+                    && !has_credential_context(text, hit.location.start)
+                {
+                    continue;
+                }
                 findings.push(Finding {
                     range: hit.location,
                     class: Class::Secret,
@@ -136,6 +141,64 @@ impl Detector {
 
         resolve_overlaps(findings, text)
     }
+}
+
+/// Patterns whose shape alone is not evidence of a secret.
+///
+/// `high_entropy_hex` is the whole reason this exists. In a general corpus a
+/// 64-character hex string is often a credential; in a *repository* it is
+/// overwhelmingly a git SHA, a lockfile checksum, or a content hash. IronWire
+/// only ever sees repositories.
+///
+/// Substituting one is not a small annoyance: the model rewrites a
+/// `Cargo.lock` or a `package-lock.json` around a placeholder, the build
+/// breaks, and nothing in the failure points at IronWire. So these patterns
+/// need a second signal — a nearby word saying the value is a credential —
+/// before they count.
+///
+/// The cost is stated plainly: a bare hex secret with no surrounding context is
+/// missed. That is the trade this feature makes everywhere (`docs/PRIVACY.md`
+/// §1), and here it is the right side of it.
+fn needs_credential_context(pattern: &str) -> bool {
+    matches!(pattern, "high_entropy_hex" | "high_entropy_base64")
+}
+
+/// Words near a match that suggest it really is a credential.
+const CREDENTIAL_WORDS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "api-key",
+    "credential",
+    "auth",
+    "bearer",
+    "private_key",
+    "privatekey",
+    "access_key",
+    "accesskey",
+    "client_secret",
+    "signing",
+    "session",
+];
+
+/// Whether the text just before a match calls it a credential.
+///
+/// A short window on purpose: `token = "..."` and `Authorization: Bearer ...`
+/// both fit, while a `token` mentioned three lines earlier is not evidence
+/// about *this* value.
+fn has_credential_context(text: &str, at: usize) -> bool {
+    const WINDOW: usize = 48;
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take(WINDOW)
+        .last()
+        .map_or(0, |(i, _)| i);
+    let before = text[start..at].to_ascii_lowercase();
+    CREDENTIAL_WORDS.iter().any(|word| before.contains(word))
 }
 
 /// Whether a match should be left alone despite matching.

@@ -1327,6 +1327,7 @@ dependencies = [
  "ironwire_core",
  "ironwire_creds",
  "ironwire_ledger",
+ "ironwire_privacy",
  "ironwire_proxy",
  "ironwire_quirks",
  "ironwire_update",

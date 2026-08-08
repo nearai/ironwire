@@ -59,9 +59,15 @@ fn exchange_row(exchange: &Exchange) -> String {
     } else {
         format!("  [{}]", exchange.status)
     };
+    // Shown only when the filter was on. Zero substitutions on a turn the user
+    // believed was being filtered is exactly the signal they need, so it is
+    // printed rather than suppressed as uninteresting (`docs/PRIVACY.md` §7).
+    let filtered = exchange
+        .substitutions
+        .map_or_else(String::new, |n| format!("  🔒{n}"));
 
     format!(
-        "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}{status}\n",
+        "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}{status}{filtered}\n",
         exchange.started_at.format("%Y-%m-%d %H:%M:%S"),
         truncate(&exchange.backend, 15),
         truncate(model, 18),
@@ -381,6 +387,7 @@ mod log_tests {
             cache_write_tokens: Some(2_048),
             output_tokens: Some(137),
             cost_usd: Some(0.42),
+            substitutions: None,
             status: 200,
             error: None,
         }

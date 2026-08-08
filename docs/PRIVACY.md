@@ -248,6 +248,15 @@ ranges (`example.com`, `example.org`, RFC 5737 and RFC 1918 addresses, `555`
 numbers); and require tier 3 to justify a match against surrounding context
 rather than shape alone.
 
+**The corpus test found one of these before a user did.** `high_entropy_hex`
+matched every lockfile checksum and git SHA. Substituting one is not a small
+annoyance: the model rewrites `Cargo.lock` around a placeholder, the build
+breaks, and nothing in the failure points at IronWire. That pattern — and
+`high_entropy_base64` — now require a *credential word* within 48 characters
+before the match (`token`, `secret`, `Bearer`, …). The cost is stated rather
+than hidden: a bare hex secret with no surrounding context is missed. In a
+repository, that is the right side of the trade.
+
 ---
 
 ## 7. What the UI is allowed to claim
