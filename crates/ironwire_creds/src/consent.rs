@@ -51,12 +51,13 @@ impl ConsentLedger {
     ///
     /// Propagates I/O and serialization failures; a consent we failed to record
     /// must not be treated as granted.
+    /// Written atomically. [`Self::load`] fails closed on a corrupt file —
+    /// correct, and it means a truncated write would silently withdraw *every*
+    /// consent the user ever gave, not just fail to record the new one. Nothing
+    /// about that symptom points at a crash (`ironwire_core::atomic`).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text)
+        ironwire_core::atomic::write(path, &text)
     }
 
     /// Whether `backend_id` has current consent.
@@ -142,5 +143,69 @@ mod tests {
         let json = r#"{"claude-sub": {"prompt_version": 0, "granted_at": "2026-01-01T00:00:00Z"}}"#;
         let ledger: ConsentLedger = serde_json::from_str(json).expect("parses");
         assert!(!ledger.is_granted("claude-sub"));
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    use chrono::Utc;
+
+    #[test]
+    fn a_corrupt_ledger_grants_nothing() {
+        // Fail-closed is the only acceptable direction here: a consent ledger
+        // that fails *open* would use someone's subscription because a file got
+        // truncated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("consent.json");
+        std::fs::write(&path, "{\"entries\": {\"claude-sub\"").expect("write");
+
+        let ledger = ConsentLedger::load(&path);
+        assert!(!ledger.is_granted("claude-sub"));
+    }
+
+    #[test]
+    fn a_missing_ledger_grants_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = ConsentLedger::load(&dir.path().join("absent.json"));
+        assert!(!ledger.is_granted("claude-sub"));
+    }
+
+    #[test]
+    fn saving_leaves_no_partial_file_and_no_temp_file() {
+        // The pairing that makes atomicity matter: `load` fails closed, so a
+        // truncated write does not fail — it silently withdraws every consent
+        // the user ever gave, and nothing about that points at a crash.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("consent.json");
+
+        let mut ledger = ConsentLedger::default();
+        ledger.grant("claude-sub", Utc::now());
+        ledger.grant("codex-sub", Utc::now());
+        ledger.save(&path).expect("saves");
+
+        let reloaded = ConsentLedger::load(&path);
+        assert!(reloaded.is_granted("claude-sub"));
+        assert!(reloaded.is_granted("codex-sub"));
+
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["consent.json".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_is_not_writable_by_other_local_users() {
+        // Another local user granting a consent on this user's behalf would be
+        // a straightforward way around `docs/TRUST.md` §2.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("consent.json");
+        ConsentLedger::default().save(&path).expect("saves");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "group or other can access it: {mode:o}");
     }
 }

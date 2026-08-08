@@ -45,7 +45,10 @@ pub(crate) fn control_token(paths: &PathsConfig) -> Result<String> {
         }
     }
     let token = mint_token();
-    std::fs::write(&path, &token).with_context(|| format!("writing {}", path.display()))?;
+    // Atomic and owner-only. A truncated token locks the user out of their own
+    // daemon until they find and delete the file.
+    ironwire_core::atomic::write(&path, &token)
+        .with_context(|| format!("writing {}", path.display()))?;
     restrict_permissions(&path, 0o600)?;
     Ok(token)
 }

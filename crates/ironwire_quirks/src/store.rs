@@ -161,10 +161,10 @@ impl QuirksStore {
     /// Propagates I/O failures. A cache we could not write is not fatal — the
     /// document is in force for this process either way.
     pub fn persist(signed: &SignedQuirks, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(signed)?)
+        // Atomic: a half-written document is rejected at verification and the
+        // built-ins take over, which is safe but means a crash mid-write
+        // silently discards a provider fix the user had already received.
+        ironwire_core::atomic::write(path, &serde_json::to_string_pretty(signed)?)
     }
 
     /// The quirks currently in force.

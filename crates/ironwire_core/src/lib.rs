@@ -12,6 +12,7 @@
 //! shaped to make the second lane's refusals cheap and total.
 #![warn(missing_docs)]
 
+pub mod atomic;
 pub mod capability;
 pub mod config;
 pub mod error;
