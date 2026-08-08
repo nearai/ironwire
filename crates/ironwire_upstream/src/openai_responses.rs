@@ -388,7 +388,14 @@ impl Backend for ResponsesBackend {
         }
         if let Some(secs) = observation.retry_after_secs {
             quota.primary = Headroom::Exhausted {
-                until: now + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)),
+                // Clamped at the parse site too (`observe::retry_after`); this
+                // is belt and braces, because `chrono` panics rather than
+                // saturating and the input is upstream-controlled.
+                until: now
+                    + chrono::Duration::seconds(
+                        i64::try_from(secs.min(crate::observe::MAX_RETRY_AFTER_SECS))
+                            .unwrap_or(86_400),
+                    ),
             };
         }
     }
@@ -482,9 +489,21 @@ pub fn chatgpt_rate_limit(headers: &[(String, String)], window: &str) -> Option<
     };
     let used = get(&format!("x-codex-{window}-used-percent"))?
         .parse::<f32>()
-        .ok()?;
+        .ok()
+        // See `observe::anthropic_rate_limit`: a NaN survives `clamp` and then
+        // compares false against every threshold, so the backend would look
+        // healthy forever.
+        .filter(|pct: &f32| pct.is_finite())?;
+    // Clamped for the same reason as `retry-after`: this feeds a `Duration`,
+    // and `chrono` panics rather than saturating when one is out of range.
     let resets_at = get(&format!("x-codex-{window}-reset-after-seconds"))
         .and_then(|v| v.parse::<i64>().ok())
+        .map(|secs| {
+            secs.clamp(
+                0,
+                i64::try_from(crate::observe::MAX_RETRY_AFTER_SECS).unwrap_or(86_400),
+            )
+        })
         .map(|secs| Utc::now() + chrono::Duration::seconds(secs));
     Some(RateLimitReading {
         used_pct: used.clamp(0.0, 100.0),

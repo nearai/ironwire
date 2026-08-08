@@ -123,8 +123,13 @@ pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitRea
     // Prefer an explicit percentage where the provider gives one; otherwise
     // derive it from remaining/limit. If neither is present we return None —
     // that becomes `Headroom::Unknown`, not a guess.
-    if let Some(pct) =
-        get("anthropic-ratelimit-unified-used-percent").and_then(|v| v.parse::<f32>().ok())
+    // `parse::<f32>` accepts "NaN" and "inf". A NaN survives `clamp` — it
+    // propagates — and then `used_pct >= 90.0` is false forever, so a backend
+    // reporting NaN would look permanently healthy while `status` printed
+    // "NaN% used". Rejecting it yields `Unknown`, which is the honest answer.
+    if let Some(pct) = get("anthropic-ratelimit-unified-used-percent")
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|pct| pct.is_finite())
     {
         return Some(RateLimitReading {
             used_pct: pct.clamp(0.0, 100.0),
@@ -141,6 +146,9 @@ pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitRea
     if limit <= 0.0 {
         return None;
     }
+    if !limit.is_finite() || !remaining.is_finite() {
+        return None;
+    }
     let used_pct = (((limit - remaining) / limit) * 100.0).clamp(0.0, 100.0);
     #[expect(
         clippy::cast_possible_truncation,
@@ -152,7 +160,21 @@ pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitRea
     })
 }
 
+/// Longest `retry-after` IronWire will act on.
+///
+/// A provider asking us to wait longer than a day is telling us nothing useful:
+/// the user will have restarted, the conversation is gone, and the value is
+/// almost certainly a bug at the other end rather than an instruction. Clamping
+/// keeps a plausible-looking header from becoming an arithmetic overflow.
+pub const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
 /// Read a `retry-after` header. Seconds form and HTTP-date form.
+///
+/// **Clamped**, because the value is upstream-controlled and feeds
+/// `now + Duration::seconds(..)`. `chrono` panics rather than saturating on an
+/// out-of-range duration, so an unclamped header was a remotely-triggerable
+/// crash — and a crash here takes down every conversation on the machine, not
+/// just the request that received the header.
 #[must_use]
 pub fn retry_after(headers: &[(String, String)], now: DateTime<Utc>) -> Option<u64> {
     let value = headers
@@ -160,12 +182,14 @@ pub fn retry_after(headers: &[(String, String)], now: DateTime<Utc>) -> Option<u
         .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
         .map(|(_, v)| v.as_str())?;
     if let Ok(secs) = value.trim().parse::<u64>() {
-        return Some(secs);
+        return Some(secs.min(MAX_RETRY_AFTER_SECS));
     }
     let when = DateTime::parse_from_rfc2822(value.trim())
         .ok()
         .map(|d| d.with_timezone(&Utc))?;
-    u64::try_from((when - now).num_seconds()).ok()
+    u64::try_from((when - now).num_seconds())
+        .ok()
+        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
 }
 
 /// Read a usage object in Anthropic's shape.

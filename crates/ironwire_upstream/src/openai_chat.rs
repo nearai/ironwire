@@ -278,7 +278,14 @@ impl Backend for ChatCompletionsBackend {
         }
         if let Some(secs) = observation.retry_after_secs {
             quota.primary = Headroom::Exhausted {
-                until: now + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)),
+                // Clamped at the parse site too (`observe::retry_after`); this
+                // is belt and braces, because `chrono` panics rather than
+                // saturating and the input is upstream-controlled.
+                until: now
+                    + chrono::Duration::seconds(
+                        i64::try_from(secs.min(crate::observe::MAX_RETRY_AFTER_SECS))
+                            .unwrap_or(86_400),
+                    ),
             };
         }
     }
