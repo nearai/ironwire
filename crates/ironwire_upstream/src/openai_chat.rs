@@ -161,8 +161,8 @@ impl Backend for ChatCompletionsBackend {
         &self.capabilities
     }
 
-    fn models(&self) -> &[(String, ModelTier)] {
-        &self.models
+    fn models(&self) -> Vec<(String, ModelTier)> {
+        self.models.clone()
     }
 
     async fn status(&self) -> BackendStatus {

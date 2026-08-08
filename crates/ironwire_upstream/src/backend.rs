@@ -189,7 +189,12 @@ pub trait Backend: Send + Sync {
     fn capabilities(&self) -> &Capabilities;
 
     /// Models offered, best first.
-    fn models(&self) -> &[(String, ModelTier)];
+    ///
+    /// Owned rather than borrowed, because for some backends this is not a
+    /// fixed list: the ChatGPT backend gates models behind the client version
+    /// it is told about, so the real catalogue is something we *ask* for and
+    /// then remember (`crate::codex_version`).
+    fn models(&self) -> Vec<(String, ModelTier)>;
 
     /// Whether this backend requires the inbound request to carry the
     /// originating product's own client identity (`docs/TRUST.md` §3).

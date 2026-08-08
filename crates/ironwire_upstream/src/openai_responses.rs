@@ -59,9 +59,12 @@ pub fn responses_capabilities() -> Capabilities {
     }
 }
 
+/// A model catalogue: slug and the quality tier it satisfies.
+pub type Catalogue = Vec<(String, ModelTier)>;
+
 /// Models offered over the Responses API, best first.
 #[must_use]
-pub fn responses_models() -> Vec<(String, ModelTier)> {
+pub fn responses_models() -> Catalogue {
     vec![
         ("gpt-5.6".to_string(), ModelTier::Frontier),
         ("gpt-5.6-mini".to_string(), ModelTier::Fast),
@@ -77,7 +80,14 @@ pub struct ResponsesBackend {
     base_url: String,
     client: reqwest::Client,
     capabilities: Capabilities,
+    /// Compiled-in catalogue, used until a probe learns better.
     models: Vec<(String, ModelTier)>,
+    /// What `/models?client_version=` actually reported for this account.
+    ///
+    /// The Codex backend gates newer models behind the reported client
+    /// version, so the compiled-in list is a guess about someone else's
+    /// entitlements. Once we have asked, we use the answer.
+    discovered: Arc<Mutex<Option<Catalogue>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
 }
 
@@ -114,6 +124,7 @@ impl ResponsesBackend {
             client: build_client(timeout_secs)?,
             capabilities: responses_capabilities(),
             models: responses_models(),
+            discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
     }
@@ -137,8 +148,18 @@ impl ResponsesBackend {
             client: build_client(timeout_secs)?,
             capabilities: responses_capabilities(),
             models: responses_models(),
+            discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
+    }
+
+    /// Models this backend will actually offer.
+    fn effective_models(&self) -> Catalogue {
+        match self.discovered.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+        .unwrap_or_else(|| self.models.clone())
     }
 
     /// The credential and, for the subscription, the account it belongs to.
@@ -199,8 +220,8 @@ impl Backend for ResponsesBackend {
         &self.capabilities
     }
 
-    fn models(&self) -> &[(String, ModelTier)] {
-        &self.models
+    fn models(&self) -> Vec<(String, ModelTier)> {
+        self.effective_models()
     }
 
     fn requires_client_identity(&self) -> bool {
@@ -221,7 +242,7 @@ impl Backend for ResponsesBackend {
             authenticated,
             detail,
             quota: self.quota(),
-            models: self.models.clone(),
+            models: self.effective_models(),
         }
     }
 
@@ -373,9 +394,21 @@ impl Backend for ResponsesBackend {
         // Auth-only, for the same reason as the Anthropic probe: a real request
         // against the subscription would have to carry Codex's identity, and
         // synthesising that is what `docs/TRUST.md` §3 forbids.
+        //
+        // The client version matters here and nowhere else: the backend gates
+        // newer models behind it, so asking with a stale one silently returns a
+        // shorter list and IronWire would offer fewer models than Codex does
+        // for the same account (`crate::codex_version`).
+        let url = if matches!(self.auth, ResponsesAuth::Subscription { .. }) {
+            let version = crate::codex_version::client_version().await;
+            format!("{}/models?client_version={version}", self.base_url)
+        } else {
+            format!("{}/models", self.base_url)
+        };
+
         let response = self
             .client
-            .get(format!("{}/models", self.base_url))
+            .get(url)
             .bearer_auth(bearer.token.expose_secret())
             .timeout(std::time::Duration::from_secs(15))
             .send()
@@ -386,6 +419,22 @@ impl Backend for ResponsesBackend {
             })?;
         let status = response.status();
         if status.is_success() {
+            // Remember what this account is actually entitled to, rather than
+            // continuing to offer a list compiled in months ago.
+            if let Ok(body) = response.bytes().await
+                && let Some(models) = parse_model_list(&body)
+                && !models.is_empty()
+            {
+                tracing::info!(
+                    backend = %self.id,
+                    count = models.len(),
+                    "learned the model catalogue from the provider"
+                );
+                match self.discovered.lock() {
+                    Ok(mut guard) => *guard = Some(models),
+                    Err(poisoned) => *poisoned.into_inner() = Some(models),
+                }
+            }
             return Ok(());
         }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -426,6 +475,36 @@ pub fn chatgpt_rate_limit(headers: &[(String, String)], window: &str) -> Option<
         used_pct: used.clamp(0.0, 100.0),
         resets_at,
     })
+}
+
+/// Read a `/models` response into a catalogue.
+///
+/// Tolerant on purpose: this endpoint is undocumented and its shape is not ours
+/// to rely on. A body we cannot read leaves the compiled-in list in force,
+/// which is the same position we were in before asking.
+#[must_use]
+pub fn parse_model_list(body: &[u8]) -> Option<Catalogue> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let items = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())?;
+
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("slug"))
+                    .or_else(|| item.get("model"))
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| item.as_str())?;
+                Some((id.to_string(), ModelTier::from_model_hint(id)))
+            })
+            .collect(),
+    )
 }
 
 fn normalize(base: Option<String>, default: &str) -> String {
@@ -535,5 +614,58 @@ mod tests {
             ..Observation::default()
         });
         assert!(backend.quota().is_pressured(Utc::now()));
+    }
+}
+
+#[cfg(test)]
+mod catalogue_tests {
+    use super::*;
+
+    #[test]
+    fn the_openai_list_shape_parses() {
+        let body = br#"{"object":"list","data":[{"id":"gpt-5.6"},{"id":"gpt-5.6-mini"}]}"#;
+        let models = parse_model_list(body).expect("parses");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].0, "gpt-5.6");
+    }
+
+    #[test]
+    fn a_bare_array_of_strings_parses_too() {
+        // The Codex backend is undocumented and its shape is not ours to rely
+        // on. Reading more shapes costs nothing and avoids a silent downgrade.
+        let models = parse_model_list(br#"["gpt-5.6","gpt-5.6-mini"]"#).expect("parses");
+        assert_eq!(models.len(), 2);
+    }
+
+    #[test]
+    fn a_body_we_cannot_read_leaves_the_compiled_in_list_in_force() {
+        // Which is exactly where we were before asking — no worse.
+        assert!(parse_model_list(b"not json").is_none());
+        assert!(parse_model_list(b"{}").is_none());
+    }
+
+    #[test]
+    fn a_discovered_catalogue_replaces_the_compiled_in_one() {
+        let backend = ResponsesBackend::codex_subscription(Some(CHATGPT_BASE_URL.into()), 60)
+            .expect("client builds");
+        let before = backend.models();
+        assert!(!before.is_empty(), "there is always a fallback");
+
+        *backend.discovered.lock().expect("lock") =
+            Some(vec![("gpt-6-preview".to_string(), ModelTier::Frontier)]);
+        let after = backend.models();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, "gpt-6-preview");
+    }
+
+    #[test]
+    fn an_empty_discovery_is_ignored_rather_than_leaving_no_models() {
+        // A backend offering nothing is a backend that can never be routed to.
+        // Better to keep a stale list than to have none.
+        let body = br#"{"data":[]}"#;
+        let models = parse_model_list(body).expect("parses");
+        assert!(models.is_empty(), "the parse itself is faithful");
+        // ...and `probe` refuses to install an empty list; see the `!models
+        // .is_empty()` guard there.
     }
 }

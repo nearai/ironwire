@@ -14,6 +14,7 @@
 pub mod anthropic;
 pub mod backend;
 pub mod breaker;
+pub mod codex_version;
 pub mod headers;
 pub mod observe;
 pub mod openai_chat;

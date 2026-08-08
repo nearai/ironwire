@@ -84,7 +84,7 @@ impl BackendRegistry {
                     consented: !backend.kind().requires_consent()
                         || consent.is_granted(backend.id().as_str()),
                     requires_client_identity: backend.requires_client_identity(),
-                    models: backend.models().to_vec(),
+                    models: backend.models(),
                 }
             })
             .collect()

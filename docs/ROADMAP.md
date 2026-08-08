@@ -93,10 +93,16 @@ see the carried items above.
   deliberate exception that the last backend standing is still tried
 - ✅ Aggregate view: `ironwire status` shows all pools as one balance —
   counted, not summed, because the windows share no unit
-- ⬜ Codex `client_version` detection (`codex --version` →
-  `/models?client_version=`). The backend gates newer models behind it, so a
-  stale value silently hides models the account is entitled to. ironclaw's
-  implementation is in a private module; needs porting or an upstream export
+- ✅ Codex `client_version` detection (`ironwire_upstream::codex_version`) —
+  ported, since ironclaw's lives in a private module. `codex --version` under a
+  2s bound, cached per process, with `IRONWIRE_CODEX_CLIENT_VERSION` for a
+  daemon whose `PATH` is not the user's shell `PATH`. Absent Codex is a normal
+  state, not an error
+- ✅ The catalogue is now *asked for* rather than compiled in: `probe` reads
+  `/models?client_version=` and remembers the answer, so `Backend::models()`
+  reflects what this account is actually entitled to. An unreadable or empty
+  response leaves the compiled-in list in force — the position we were in
+  before asking
 - ⬜ Codex token refresh. `ironclaw_llm::codex_auth::refresh_access_token` is
   `pub(crate)`; IronWire currently relies on Codex refreshing its own token and
   re-reads `auth.json` on every request to pick it up

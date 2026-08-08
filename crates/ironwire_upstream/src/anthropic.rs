@@ -186,8 +186,8 @@ impl Backend for AnthropicBackend {
         &self.capabilities
     }
 
-    fn models(&self) -> &[(String, ModelTier)] {
-        &self.models
+    fn models(&self) -> Vec<(String, ModelTier)> {
+        self.models.clone()
     }
 
     fn requires_client_identity(&self) -> bool {
