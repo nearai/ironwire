@@ -33,6 +33,22 @@ Zero translation. Proves the pipe.
       automatable half)
 - [x] `ironwire connect` / `disconnect` / `status` / `doctor` / `log` / `env` / `pin`
 
+### Stream resilience ✅ built
+
+The three shapes of "API Error: Response stalled mid-stream" (`PROTOCOL.md` §5):
+
+- [x] `ping` keepalives during upstream silence, with a give-up cap so we never
+      ping at a hung upstream
+- [x] Terminal `error` events instead of a dropped connection, so a truncated
+      response is stated rather than inferred
+- [x] Retry window widened to the first **content** byte — a failure during the
+      thinking gap is restarted invisibly
+- [x] Same-backend retry with backoff on 529/5xx/reset before descending the
+      ladder, so a blip does not move a conversation onto a metered key
+- [ ] Confirm the keepalive interval is comfortably under Claude Code's own
+      stall timeout (15s is a conservative guess; the real value is not
+      documented and should be measured)
+
 Carried into M2 (needs a live account, not a mock):
 
 - [ ] `scripts/acceptance.sh` — run a real Claude Code task through IronWire and

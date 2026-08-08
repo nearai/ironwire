@@ -18,6 +18,7 @@ use ironwire_upstream::headers::{forward_request_header, forward_response_header
 
 use crate::facade::error::FacadeError;
 use crate::pipeline::{self, dialect_for};
+use crate::resilience;
 use crate::state::AppState;
 
 const PROTOCOL: Protocol = Protocol::AnthropicMessages;
@@ -102,13 +103,20 @@ async fn forward(
         })
         .collect();
 
-    let (response, routed) =
-        pipeline::dispatch(&state, PROTOCOL, path, &peek, key, body, forwarded)
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "no route for request");
-                FacadeError::from_pipeline(&e)
-            })?;
+    let (response, routed) = pipeline::dispatch(
+        &state,
+        PROTOCOL,
+        path,
+        &peek,
+        key.clone(),
+        body.clone(),
+        forwarded.clone(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "no route for request");
+        FacadeError::from_pipeline(&e)
+    })?;
 
     tracing::info!(
         backend = %routed.decision.backend,
@@ -147,6 +155,43 @@ async fn forward(
         }
     });
 
+    // Keep a quiet stream alive, end a dead one honestly, and restart one that
+    // failed before producing content — the three shapes of "Response stalled
+    // mid-stream" (`docs/PROTOCOL.md` §5, `resilience`).
+    let body: Body = if peek.stream {
+        let reconnect_state = state.clone();
+        let reconnect_path = path.to_string();
+        let reconnect_peek = peek.clone();
+        let resilience = resilience::ResilienceConfig::from(&state.config.resilience);
+        let reconnect: resilience::Reconnect = Box::new(move || {
+            let state = reconnect_state.clone();
+            let path = reconnect_path.clone();
+            let peek = reconnect_peek.clone();
+            let key = key.clone();
+            let body = body.clone();
+            let headers = forwarded.clone();
+            Box::pin(async move {
+                match pipeline::dispatch(&state, PROTOCOL, &path, &peek, key, body, headers).await {
+                    Ok((response, routed)) => {
+                        tracing::info!(backend = %routed.decision.backend, "stream restarted");
+                        Some(pipeline::observe_boxed(
+                            response.body,
+                            dialect_for(PROTOCOL),
+                            |_| {},
+                        ))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "no capacity left to restart the stream");
+                        None
+                    }
+                }
+            })
+        });
+        Body::from_stream(resilience::guard(observed, reconnect, resilience))
+    } else {
+        Body::from_stream(observed)
+    };
+
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(response.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
     for (name, value) in &response.headers {
@@ -164,7 +209,7 @@ async fn forward(
     builder = builder.header("x-ironwire-backend", routed.decision.backend.to_string());
 
     builder
-        .body(Body::from_stream(observed))
+        .body(body)
         .map_err(|e| FacadeError::invalid_request(format!("could not build response: {e}")))
 }
 

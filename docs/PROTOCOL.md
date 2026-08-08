@@ -102,27 +102,76 @@ exactly the spend the user needs to see.
 
 ---
 
-## 5. Retry and failover boundaries
+## 5. Retry, failover, and keeping a stream alive
 
-**The only safe retry point is before the first byte of the response body has
-reached the client.**
+### The point of no return is the first *content* byte
+
+An earlier revision of this section said retry ends at the first byte of the
+response body. That was too strict, and it gave away the most recoverable
+failure there is.
+
+`message_start` and `ping` carry no content — they are an envelope and a
+heartbeat. A stream that has emitted only those has told the client nothing it
+would later have to un-tell. Anthropic's shape is `message_start`, then often a
+long silence while the model thinks, then content; failures land in that gap
+constantly, and under the old rule every one of them was unrecoverable for no
+reason.
+
+So the boundary moved:
 
 ```
 request received
    │
-   ├─ [retryable window] connect / send / await response head / first body byte
-   │      429, 5xx, connect error, auth error → retry or descend the ladder
+   ├─ [retryable] connect · send · response head · message_start · ping
+   │      429 / 5xx / connect error / reset / silence
+   │      → retry the same backend, or descend the ladder
+   │      `message_start` is HELD, so a restart is invisible
    │
-   ├─ FIRST BYTE FORWARDED ──────────── point of no return
+   ├─ FIRST CONTENT EVENT ──────────── point of no return
    │
-   └─ [committed] any upstream failure is surfaced as a protocol-correct
-          terminal event on the open stream. No transparent retry: replaying
-          would duplicate content the client has already committed to its
-          transcript.
+   └─ [committed] any failure becomes a terminal `error` event on the open
+          stream. Never retried: replaying would duplicate text the client has
+          already written into its transcript.
 ```
 
-For the Anthropic façade the committed-failure shape is an SSE `error` event
-followed by stream close. For Responses, `response.failed`.
+`ironwire_proxy::resilience` implements this; `tests/stalled_stream.rs` pins it.
+
+### Keeping a quiet stream alive
+
+The other half of "Response stalled mid-stream" is not a failure at all — the
+upstream is thinking, and the client's patience runs out first. IronWire emits
+`ping` events after `resilience.keepalive_secs` of upstream silence. A ping is
+part of the Anthropic event stream, carries nothing, and states something true:
+still connected, still waiting.
+
+Two rules keep that honest rather than a way of hiding a hang:
+
+- **Upstream pings are forwarded immediately**, never held. A delayed heartbeat
+  is not a heartbeat, and holding them would grow the pre-commit buffer without
+  bound.
+- **We give up too.** After `resilience.stall_timeout_secs` of continuous
+  silence the stream ends with a stated `error` rather than pinging into the
+  void. A user waiting forever is a worse outcome than a user told to retry.
+
+### Ending a dead stream honestly
+
+When an upstream dies mid-response the old behaviour was to drop the connection,
+leaving the client to infer a stall — which is literally the message the user
+sees. Now the stream ends with a terminal `error` event in the shape Claude Code
+already handles, saying whether the response was truncated and whether retrying
+is worth it.
+
+### Same-backend retry before descending
+
+A 529 or a reset is usually momentary. Descending the fidelity ladder over one
+would move a warm conversation off its subscription and onto a metered key the
+user pays for. So a transient failure retries the **same** backend up to
+`MAX_SAME_BACKEND_RETRIES` times with exponential backoff first, and only then
+descends.
+
+A 429 that carries a real `retry-after` is the exception: the provider told us
+how long, and sleeping through it while other capacity sits idle would stall the
+agent for no reason. Those descend immediately.
 
 ---
 

@@ -7,6 +7,7 @@
 pub mod control;
 pub mod facade;
 pub mod pipeline;
+pub mod resilience;
 pub mod server;
 pub mod state;
 

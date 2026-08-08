@@ -83,8 +83,9 @@ pub async fn dispatch(
     // Bounded: each iteration marks the failed backend unavailable, so the
     // candidate set strictly shrinks. The cap is belt and braces against a
     // backend that reports itself healthy after failing.
-    let max_attempts = candidates.len().max(1);
+    let max_attempts = candidates.len().max(1) + MAX_SAME_BACKEND_RETRIES;
     let mut excluded: Vec<ironwire_core::protocol::BackendId> = Vec::new();
+    let mut same_backend_attempts = 0usize;
 
     while attempts < max_attempts {
         let available: Vec<_> = candidates
@@ -177,6 +178,28 @@ pub async fn dispatch(
                 if !error.is_retryable() {
                     return Err(PipelineError::Upstream(error));
                 }
+
+                // A 529/overload or a dropped connection is usually momentary.
+                // Descending the ladder on one would move a warm conversation
+                // off its subscription — and onto a metered key the user pays
+                // for — over a blip. Try the same backend again first.
+                if should_retry_same_backend(&error)
+                    && same_backend_attempts < MAX_SAME_BACKEND_RETRIES
+                {
+                    same_backend_attempts += 1;
+                    let backoff = backoff_for(same_backend_attempts);
+                    tracing::info!(
+                        backend = %decision.backend,
+                        attempt = same_backend_attempts,
+                        ?backoff,
+                        "transient upstream failure; retrying the same backend before descending"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    last_error = Some(error);
+                    continue;
+                }
+
+                same_backend_attempts = 0;
                 // Drop this conversation's affinity: it is pinned to a backend
                 // that just failed, and keeping it would re-select it.
                 if let Ok(mut policy) = state.policy.lock() {
@@ -192,6 +215,36 @@ pub async fn dispatch(
         Some(last) => Err(PipelineError::AllFailed { last, rejected }),
         None => Err(PipelineError::NoRoute(NoRoute::AllExhausted)),
     }
+}
+
+/// How many times to retry the *same* backend on a transient failure before
+/// descending the fidelity ladder. Small on purpose: the point is to ride out a
+/// blip, not to wait out a real outage.
+pub const MAX_SAME_BACKEND_RETRIES: usize = 2;
+
+/// Whether this failure is worth another go at the same backend.
+///
+/// A 429 the provider attached a real wait to is *not* — it told us how long,
+/// and sleeping through it would stall the agent when other capacity exists.
+/// Everything else transient is: an overload or a reset usually clears.
+#[must_use]
+pub fn should_retry_same_backend(error: &UpstreamError) -> bool {
+    match error {
+        UpstreamError::RateLimited {
+            retry_after_secs, ..
+        } => retry_after_secs.is_none_or(|secs| secs <= 2),
+        UpstreamError::Transport { .. } => true,
+        UpstreamError::Upstream { status, .. } => status.is_server_error(),
+        // A missing credential will not fix itself, and a host mismatch is our
+        // own bug — retrying either just delays the real answer.
+        UpstreamError::NeedsAuth { .. } | UpstreamError::CredentialHostMismatch { .. } => false,
+    }
+}
+
+/// Exponential backoff for same-backend retries.
+#[must_use]
+pub fn backoff_for(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(250 * (1 << attempt.min(6)) as u64)
 }
 
 /// Build a Chat Completions request out of an Anthropic Messages body.

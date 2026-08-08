@@ -21,7 +21,7 @@ pub mod protocol;
 pub mod quota;
 
 pub use capability::{Capabilities, Ineligible, ReasoningNeed, RequestRequirements};
-pub use config::{Config, PathsConfig, ServerConfig, UpdateConfig};
+pub use config::{Config, PathsConfig, ResilienceConfig, ServerConfig, UpdateConfig};
 pub use error::{Error, Result};
 pub use peek::{IdentityMarkers, RequestPeek};
 pub use policy::{ConversationKey, RouteDecision, Rung};

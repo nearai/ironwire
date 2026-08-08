@@ -19,6 +19,7 @@ ironwire_update.workspace = true
 ironwire_translate.workspace = true
 ironwire_upstream.workspace = true
 
+async-stream = "0.3"
 axum.workspace = true
 bytes.workspace = true
 chrono.workspace = true

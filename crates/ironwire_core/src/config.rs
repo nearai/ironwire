@@ -141,6 +141,33 @@ impl Default for UpdateConfig {
     }
 }
 
+/// How hard to work at keeping a streamed response alive.
+///
+/// These exist because a coding agent's own patience is shorter than a model's
+/// thinking time, and the gap is where "Response stalled mid-stream" lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResilienceConfig {
+    /// Emit an SSE `ping` after this many seconds of upstream silence.
+    pub keepalive_secs: u64,
+    /// Give up on a silent upstream after this many seconds and end the stream
+    /// with a stated error rather than pinging forever.
+    pub stall_timeout_secs: u64,
+    /// How many times to transparently restart a stream that died before
+    /// producing any content.
+    pub max_reconnects: usize,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            keepalive_secs: 15,
+            stall_timeout_secs: 180,
+            max_reconnects: 2,
+        }
+    }
+}
+
 /// A user-configured backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,6 +208,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// Update-check settings.
     pub updates: UpdateConfig,
+    /// Stream-resilience settings.
+    pub resilience: ResilienceConfig,
     /// Configured backends, in preference order for ties.
     pub backends: Vec<BackendConfig>,
 }
@@ -242,6 +271,7 @@ mod tests {
                 bodies: true,
             },
             updates: UpdateConfig { check: false },
+            resilience: ResilienceConfig::default(),
             backends: vec![BackendConfig {
                 id: "claude-sub".into(),
                 kind: "claude-subscription".into(),

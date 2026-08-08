@@ -12,6 +12,12 @@ available model and degrades gracefully when limits hit.
 
 > **Your coding agent never dies at the rate limit.**
 
+It also stops dying at *"API Error: Response stalled mid-stream."* IronWire
+keeps a thinking upstream alive with heartbeats, restarts a stream that failed
+before producing any text, rides out a 529 instead of moving you to a metered
+key — and when a response really does die, ends it with a stated error rather
+than a dropped connection you have to guess about.
+
 ```
 Claude Code ──┐
 Codex ────────┤
@@ -166,6 +172,7 @@ Three suites carry the fidelity claim:
 | `tests/multi_turn.rs` | a three-turn tool loop — signed thinking, replayed tool ids, cache breakpoints — survives, and stays on one backend |
 | `tests/cancellation.rs` | an abandoned request stops the upstream, and still records what it consumed |
 | `tests/claude_code_on_nearai.rs` | a Claude Code session keeps working on NEAR AI when Anthropic capacity is exhausted — and waits for a turn boundary rather than switching mid tool loop |
+| `tests/stalled_stream.rs` | the "stalled mid-stream" failures: a thinking upstream is kept alive, a thinking-gap failure is restarted invisibly, a post-content failure is reported rather than replayed, a 529 is retried |
 
 `scripts/acceptance.sh` is the manual check the mocks cannot replace: a real
 Claude Code task, through IronWire, against real providers. It costs
