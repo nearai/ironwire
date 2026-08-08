@@ -156,6 +156,15 @@ pub struct ResilienceConfig {
     /// How many times to transparently restart a stream that died before
     /// producing any content.
     pub max_reconnects: usize,
+    /// Stall timeout for a turn that looks like compaction
+    /// (`docs/PROTOCOL.md` §8).
+    ///
+    /// A compaction turn sends the whole conversation and asks for a long
+    /// summary, so it thinks for far longer than an ordinary turn before
+    /// producing a token. Applying the normal timeout to it would abandon the
+    /// one turn whose output becomes permanent — and it would do so most often
+    /// in exactly the longest sessions, where compaction matters most.
+    pub compaction_stall_timeout_secs: u64,
 }
 
 impl Default for ResilienceConfig {
@@ -164,6 +173,23 @@ impl Default for ResilienceConfig {
             keepalive_secs: 15,
             stall_timeout_secs: 180,
             max_reconnects: 2,
+            compaction_stall_timeout_secs: 600,
+        }
+    }
+}
+
+impl ResilienceConfig {
+    /// The stall timeout to apply to this turn.
+    #[must_use]
+    pub fn stall_timeout_for(&self, likely_compaction: bool) -> u64 {
+        if likely_compaction {
+            // Never *shorter* than the ordinary timeout, whatever a user
+            // configures: a config that made compaction more fragile than a
+            // normal turn would be the opposite of the point.
+            self.compaction_stall_timeout_secs
+                .max(self.stall_timeout_secs)
+        } else {
+            self.stall_timeout_secs
         }
     }
 }
@@ -302,5 +328,36 @@ mod tests {
             paths.control_token_file(),
             Path::new("/tmp/iw-test/control.token")
         );
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::ResilienceConfig;
+
+    #[test]
+    fn a_compaction_turn_gets_the_longer_patience() {
+        let config = ResilienceConfig::default();
+        assert!(config.stall_timeout_for(true) > config.stall_timeout_for(false));
+    }
+
+    #[test]
+    fn an_ordinary_turn_is_unaffected() {
+        let config = ResilienceConfig::default();
+        assert_eq!(config.stall_timeout_for(false), config.stall_timeout_secs);
+    }
+
+    #[test]
+    fn a_misconfigured_compaction_timeout_never_makes_compaction_more_fragile() {
+        // Someone lowering `compaction_stall_timeout_secs` below the ordinary
+        // one would get the exact opposite of what the setting is for, and the
+        // symptom — abandoned compaction turns in long sessions — is very hard
+        // to trace back to a config value.
+        let config = ResilienceConfig {
+            stall_timeout_secs: 180,
+            compaction_stall_timeout_secs: 10,
+            ..ResilienceConfig::default()
+        };
+        assert_eq!(config.stall_timeout_for(true), 180);
     }
 }

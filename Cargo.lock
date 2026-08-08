@@ -1412,6 +1412,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "hex",
+ "ironwire_core",
  "rand 0.8.7",
  "serde",
  "serde_json",

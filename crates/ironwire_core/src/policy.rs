@@ -252,7 +252,20 @@ impl Policy {
 
         // Sticky: if this conversation already has a home and that home is
         // still fine, stay. Moving costs a cache; staying costs nothing.
-        if let Some(affinity) = self.affinities.get(&key).cloned()
+        //
+        // One exception. A conversation that descended a rung earlier is
+        // sitting on degraded capacity, and a compaction turn is the worst
+        // possible turn to spend it on: the summary becomes the conversation.
+        // So a compaction turn re-selects rather than inheriting a degraded
+        // affinity, and pays the cache cost to do it.
+        let inherit_affinity = !peek.likely_compaction
+            || self
+                .affinities
+                .get(&key)
+                .is_none_or(|a| a.rung == Rung::Preferred);
+
+        if inherit_affinity
+            && let Some(affinity) = self.affinities.get(&key).cloned()
             && let Some(candidate) = candidates.iter().find(|c| c.id == affinity.backend)
             && usable(candidate, peek, inbound, now).is_ok()
         {
@@ -335,15 +348,24 @@ impl Policy {
             }
         }
 
+        // On an ordinary turn: free capacity first, then quality. On a
+        // compaction turn the two swap, because the output of a compaction turn
+        // *becomes the conversation* — it is written into the client's
+        // permanent history and resent every turn afterwards
+        // (`docs/PROTOCOL.md` §8). Saving money there buys one cheaper request
+        // and pays for it for the rest of the session.
         let sort_key = |c: &&Candidate| {
-            (
-                // Prefer un-pressured capacity...
-                u8::from(c.quota.is_pressured(now)),
-                // ...then free over metered...
-                c.kind.marginal_cost_rank(),
-                // ...then a backend that can actually serve the tier.
-                u8::from(pick_model(c, tier).is_none()),
-            )
+            let pressured = u8::from(c.quota.is_pressured(now));
+            let cost = c.kind.marginal_cost_rank();
+            if peek.likely_compaction {
+                // `pick_model` falls back to a lesser tier rather than refusing,
+                // so "has no model at all" is the wrong question here — what
+                // matters is whether this backend can serve the tier the client
+                // actually asked for, without descending.
+                (pressured, u8::from(!serves_tier(c, tier)), cost)
+            } else {
+                (pressured, cost, u8::from(pick_model(c, tier).is_none()))
+            }
         };
         same_family.sort_by_key(sort_key);
         cross_family.sort_by_key(sort_key);
@@ -436,6 +458,16 @@ fn pick_model(candidate: &Candidate, tier: ModelTier) -> Option<String> {
         .map(|(m, _)| m.clone())
 }
 
+/// Whether this backend can serve the requested tier without descending.
+///
+/// Distinct from [`pick_model`], which deliberately falls back to a lesser model
+/// rather than refusing. Both behaviours are wanted, at different moments:
+/// falling back keeps an ordinary turn working, and refusing to fall back is
+/// what a compaction turn needs (`docs/PROTOCOL.md` §8).
+fn serves_tier(candidate: &Candidate, tier: ModelTier) -> bool {
+    candidate.models.iter().any(|(_, t)| *t >= tier)
+}
+
 fn kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Subscription => "subscription",
@@ -497,6 +529,7 @@ mod tests {
             requirements: RequestRequirements::default(),
             carries_client_identity: true,
             message_count: 3,
+            likely_compaction: false,
         }
     }
 
@@ -861,5 +894,244 @@ mod tests {
             )
             .expect_err("unconsented backend must not be routed to");
         assert_eq!(err, NoRoute::AllExhausted);
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    //! `docs/PROTOCOL.md` §8 — a compaction turn's output *becomes* the
+    //! conversation, so fidelity outranks cost on exactly that turn.
+
+    use super::*;
+    use crate::quota::Headroom;
+
+    fn t(offset: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + offset, 0).expect("valid timestamp")
+    }
+
+    fn caps(protocol: Protocol) -> Capabilities {
+        Capabilities {
+            protocol,
+            tools: true,
+            parallel_tool_calls: true,
+            images: true,
+            reasoning: true,
+            prompt_cache: true,
+            structured_output: true,
+            context_tokens: 200_000,
+        }
+    }
+
+    /// A backend offering exactly the models it is given.
+    fn backend(
+        id: &str,
+        kind: BackendKind,
+        protocol: Protocol,
+        models: &[(&str, ModelTier)],
+    ) -> Candidate {
+        Candidate {
+            id: BackendId::from(id),
+            kind,
+            caps: caps(protocol),
+            quota: QuotaSnapshot::default(),
+            healthy: true,
+            consented: true,
+            requires_client_identity: false,
+            models: models
+                .iter()
+                .map(|(m, tier)| ((*m).to_string(), *tier))
+                .collect(),
+        }
+    }
+
+    fn peek(compaction: bool) -> RequestPeek {
+        RequestPeek {
+            requested_model: Some("claude-opus-4-6".to_string()),
+            stream: true,
+            requirements: RequestRequirements::default(),
+            carries_client_identity: true,
+            message_count: 40,
+            likely_compaction: compaction,
+        }
+    }
+
+    fn key() -> ConversationKey {
+        ConversationKey::derive(
+            Protocol::AnthropicMessages,
+            "You are Claude Code",
+            &["Read"],
+        )
+    }
+
+    /// A free subscription that can only serve a lesser model, and a metered
+    /// key that can serve the one the client asked for. The interesting case:
+    /// the two orderings disagree.
+    fn split_candidates() -> Vec<Candidate> {
+        vec![
+            backend(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+                &[("claude-sonnet-4-6", ModelTier::Balanced)],
+            ),
+            backend(
+                "anthropic-key",
+                BackendKind::ApiKey,
+                Protocol::AnthropicMessages,
+                &[("claude-opus-4-6", ModelTier::Frontier)],
+            ),
+        ]
+    }
+
+    #[test]
+    fn an_ordinary_turn_prefers_free_capacity_over_the_exact_model() {
+        // Unchanged behaviour, asserted so the compaction change cannot quietly
+        // alter what every other turn does.
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(false),
+                &split_candidates(),
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.backend.as_str(), "claude-sub");
+    }
+
+    #[test]
+    fn a_compaction_turn_pays_for_the_model_the_client_asked_for() {
+        // The summary is written into the client's permanent history and
+        // resent every turn afterwards. A cheaper summary is not a saving.
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(true),
+                &split_candidates(),
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.backend.as_str(), "anthropic-key");
+        assert_eq!(decision.rung, Rung::Preferred);
+    }
+
+    #[test]
+    fn a_compaction_turn_still_avoids_pressured_capacity_first() {
+        // Fidelity outranks cost, not availability. Sending a compaction turn
+        // at an exhausted backend fails the turn, which is strictly worse than
+        // a cheaper summary.
+        let mut candidates = split_candidates();
+        candidates[1].quota.primary = Headroom::Exhausted { until: t(3600) };
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(true),
+                &candidates,
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.backend.as_str(), "claude-sub");
+    }
+
+    #[test]
+    fn a_compaction_turn_leaves_a_degraded_affinity_behind() {
+        // A conversation that descended earlier is sitting on degraded
+        // capacity. Inheriting that for the one turn whose output is permanent
+        // is the mistake this rule exists to prevent.
+        let mut policy = Policy::new();
+
+        // Establish an affinity on the cheaper backend via an ordinary turn.
+        let first = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(false),
+                &split_candidates(),
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(first.backend.as_str(), "claude-sub");
+        assert_eq!(first.rung, Rung::SmallerModel, "the affinity is degraded");
+
+        let compaction = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(true),
+                &split_candidates(),
+                t(60),
+            )
+            .expect("routes");
+        assert_eq!(
+            compaction.backend.as_str(),
+            "anthropic-key",
+            "a compaction turn must not inherit a degraded affinity"
+        );
+    }
+
+    #[test]
+    fn a_compaction_turn_keeps_an_undegraded_affinity() {
+        // The rule is about *degraded* affinity. A conversation already on a
+        // full-fidelity backend should stay there — moving would throw away a
+        // warm prompt cache for nothing.
+        let candidates = vec![backend(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+            &[("claude-opus-4-6", ModelTier::Frontier)],
+        )];
+        let mut policy = Policy::new();
+        let first = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(false),
+                &candidates,
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(first.rung, Rung::Preferred);
+
+        let compaction = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(true),
+                &candidates,
+                t(60),
+            )
+            .expect("routes");
+        assert_eq!(compaction.backend.as_str(), "claude-sub");
+        assert_eq!(compaction.reason, "sticky affinity");
+    }
+
+    #[test]
+    fn a_compaction_turn_is_still_served_when_only_a_foreign_family_is_left() {
+        // Fidelity is a preference, not a veto. Refusing the turn would leave
+        // the user unable to compact at all, which means the session cannot
+        // continue — strictly worse than a summary from another family.
+        let candidates = vec![backend(
+            "nearai",
+            BackendKind::Credits,
+            Protocol::OpenAiChat,
+            &[("deepseek-v3", ModelTier::Frontier)],
+        )];
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek(true),
+                &candidates,
+                t(0),
+            )
+            .expect("a compaction turn must still be served");
+        assert_eq!(decision.rung, Rung::CrossFamily);
+        assert!(decision.translated);
     }
 }

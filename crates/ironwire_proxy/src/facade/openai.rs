@@ -169,7 +169,10 @@ async fn forward(
         let reconnect_state = state.clone();
         let reconnect_path = path.to_string();
         let reconnect_peek = peek.clone();
-        let settings = resilience::ResilienceConfig::from(&state.config.resilience);
+        let settings = resilience::ResilienceConfig::for_turn(
+            &state.config.resilience,
+            peek.likely_compaction,
+        );
         let reconnect: resilience::Reconnect = Box::new(move || {
             let state = reconnect_state.clone();
             let path = reconnect_path.clone();

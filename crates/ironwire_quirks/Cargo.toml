@@ -11,6 +11,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+ironwire_core.workspace = true
 chrono.workspace = true
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "pkcs8"] }
 hex = "0.4"

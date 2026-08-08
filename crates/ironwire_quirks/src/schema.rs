@@ -85,6 +85,22 @@ pub struct ClientIdentityQuirks {
     pub claude_code_system_prefix: String,
     /// Substring identifying Codex in a Responses `instructions` field.
     pub codex_instructions_marker: String,
+    /// Phrases suggesting a request is a compaction turn
+    /// (`docs/PROTOCOL.md` §8).
+    ///
+    /// Refreshable precisely because these are the least knowable strings in
+    /// the product: every harness words its compaction prompt differently, none
+    /// document it, and all of them change it. Advisory only — a wrong value
+    /// costs a slightly worse routing decision, never a wrong answer.
+    #[serde(default = "default_compaction_markers")]
+    pub compaction_markers: Vec<String>,
+}
+
+fn default_compaction_markers() -> Vec<String> {
+    ironwire_core::peek::COMPACTION_MARKERS
+        .iter()
+        .map(|m| (*m).to_string())
+        .collect()
 }
 
 impl Default for ClientIdentityQuirks {
@@ -92,6 +108,7 @@ impl Default for ClientIdentityQuirks {
         Self {
             claude_code_system_prefix: "You are Claude Code".to_string(),
             codex_instructions_marker: "Codex".to_string(),
+            compaction_markers: default_compaction_markers(),
         }
     }
 }

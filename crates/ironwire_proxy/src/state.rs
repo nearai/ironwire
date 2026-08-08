@@ -176,6 +176,7 @@ impl AppState {
         IdentityMarkers {
             claude_code_system_prefix: quirks.client_identity.claude_code_system_prefix.clone(),
             codex_instructions_marker: quirks.client_identity.codex_instructions_marker.clone(),
+            compaction_markers: quirks.client_identity.compaction_markers.clone(),
         }
     }
 

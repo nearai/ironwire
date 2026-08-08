@@ -27,6 +27,24 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 /// kind of thing that changes without notice.
 pub const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code";
 
+/// Phrases that suggest a request is asking the model to summarize the
+/// conversation so it can be compacted (`docs/PROTOCOL.md` §8).
+///
+/// **These are a conservative starting guess, not a verified fingerprint.**
+/// Each harness words its compaction prompt differently and none of them
+/// document it, so the real set has to be established by observation and then
+/// shipped through the quirks channel — which is precisely what that channel is
+/// for. Nothing here is load-bearing: a miss costs a slightly worse routing
+/// decision on one turn, never a wrong answer (see [`RequestPeek::
+/// likely_compaction`]).
+pub const COMPACTION_MARKERS: &[&str] = &[
+    "summary of the conversation",
+    "summarize the conversation",
+    "conversation so far",
+    "detailed summary of the conversation",
+    "condense the conversation",
+];
+
 /// Markers used to recognise a client's own identity, so the caller can supply
 /// refreshed ones without this crate depending on the quirks channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +53,8 @@ pub struct IdentityMarkers {
     pub claude_code_system_prefix: String,
     /// Substring identifying Codex in a Responses `instructions` field.
     pub codex_instructions_marker: String,
+    /// Phrases suggesting a compaction turn. Advisory only.
+    pub compaction_markers: Vec<String>,
 }
 
 impl Default for IdentityMarkers {
@@ -42,9 +62,21 @@ impl Default for IdentityMarkers {
         Self {
             claude_code_system_prefix: CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
             codex_instructions_marker: "Codex".to_string(),
+            compaction_markers: COMPACTION_MARKERS
+                .iter()
+                .map(|m| (*m).to_string())
+                .collect(),
         }
     }
 }
+
+/// How many messages a conversation needs before a summarization-shaped request
+/// is worth treating as a compaction.
+///
+/// A short conversation containing the words "summarize the conversation" is
+/// almost certainly a user asking a question, not a harness compacting. The
+/// threshold costs us nothing: compaction only happens in long sessions.
+const COMPACTION_MIN_MESSAGES: usize = 8;
 
 /// What policy learned from one look at the body.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +92,16 @@ pub struct RequestPeek {
     pub carries_client_identity: bool,
     /// Number of messages, for conversation-key derivation and logging.
     pub message_count: usize,
+    /// Whether this looks like a request to summarize the conversation so the
+    /// client can compact it (`docs/PROTOCOL.md` §8).
+    ///
+    /// **Advisory, and deliberately so.** Nothing about correctness may depend
+    /// on it: the detection is a heuristic over undocumented client prompts,
+    /// and a fingerprint of a client's wording is exactly the sort of thing
+    /// that breaks silently on a client update. All it does is tell policy to
+    /// value fidelity over cost for one turn — a false positive spends a little
+    /// more money, a false negative gets today's behaviour.
+    pub likely_compaction: bool,
 }
 
 impl RequestPeek {
@@ -181,6 +223,11 @@ impl RequestPeek {
             carries_client_identity: anthropic_system_prefix(system)
                 .is_some_and(|s| s.starts_with(&markers.claude_code_system_prefix)),
             message_count: messages.map_or(0, Vec::len),
+            likely_compaction: looks_like_compaction(
+                messages.map_or(0, Vec::len),
+                &anthropic_trailing_text(messages),
+                markers,
+            ),
             requirements,
         }
     }
@@ -266,9 +313,78 @@ impl RequestPeek {
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.contains(&markers.codex_instructions_marker)),
             message_count: items.map_or(0, Vec::len),
+            likely_compaction: looks_like_compaction(
+                items.map_or(0, Vec::len),
+                &openai_trailing_text(items),
+                markers,
+            ),
             requirements,
         }
     }
+}
+
+/// Whether this request reads as "summarize what we have said so far".
+///
+/// Keyed on the *trailing* message, because that is where a harness puts its
+/// compaction instruction — and keyed on a length threshold, because a short
+/// conversation containing those words is a user asking a question.
+fn looks_like_compaction(message_count: usize, trailing: &str, markers: &IdentityMarkers) -> bool {
+    if message_count < COMPACTION_MIN_MESSAGES || trailing.is_empty() {
+        return false;
+    }
+    let haystack = trailing.to_ascii_lowercase();
+    markers
+        .compaction_markers
+        .iter()
+        .any(|marker| haystack.contains(&marker.to_ascii_lowercase()))
+}
+
+/// Text of the last message, however the client chose to shape it.
+fn anthropic_trailing_text(messages: Option<&Vec<Value>>) -> String {
+    let Some(last) = messages.and_then(|m| m.last()) else {
+        return String::new();
+    };
+    collect_text(last.get("content"))
+}
+
+/// The Responses and Chat Completions equivalents.
+fn openai_trailing_text(items: Option<&Vec<Value>>) -> String {
+    let Some(last) = items.and_then(|i| i.last()) else {
+        return String::new();
+    };
+    collect_text(last.get("content"))
+}
+
+/// Flatten whatever shape a content field takes into searchable text.
+///
+/// Bounded: a compaction instruction is a short sentence, and scanning a
+/// megabyte of replayed history for it would cost more than the decision is
+/// worth.
+fn collect_text(content: Option<&Value>) -> String {
+    const MAX: usize = 4096;
+    let mut out = String::new();
+    fn walk(value: &Value, out: &mut String, max: usize) {
+        if out.len() >= max {
+            return;
+        }
+        match value {
+            Value::String(s) => {
+                out.push_str(&s[..s.len().min(max - out.len())]);
+                out.push(' ');
+            }
+            Value::Array(items) => items.iter().for_each(|v| walk(v, out, max)),
+            Value::Object(map) => {
+                if let Some(text) = map.get("text").or_else(|| map.get("content")) {
+                    walk(text, out, max);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(content) = content {
+        walk(content, &mut out, MAX);
+    }
+    out
 }
 
 /// Whether the conversation is mid tool loop: the last message replays tool
@@ -573,6 +689,104 @@ mod tests {
         assert!(!p.carries_client_identity);
         assert!(!p.requirements.tools);
         assert_eq!(p.message_count, 0);
+    }
+
+    #[test]
+    fn a_long_session_asking_for_a_summary_reads_as_compaction() {
+        let mut messages: Vec<serde_json::Value> = (0..12)
+            .map(|i| json!({"role": "user", "content": format!("m{i}")}))
+            .collect();
+        messages.push(json!({
+            "role": "user",
+            "content": "Provide a detailed summary of the conversation so far."
+        }));
+        let p = peek_anthropic(json!({"model": "m", "messages": messages}));
+        assert!(p.likely_compaction);
+    }
+
+    #[test]
+    fn a_short_conversation_mentioning_a_summary_does_not() {
+        // Someone asking "summarize the conversation" three turns in is a user
+        // asking a question, not a harness compacting. A false positive only
+        // costs money, but it should still not be free to trigger.
+        let p = peek_anthropic(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "summarize the conversation so far"},
+            ],
+        }));
+        assert!(!p.likely_compaction);
+    }
+
+    #[test]
+    fn an_ordinary_long_turn_does_not() {
+        let messages: Vec<serde_json::Value> = (0..20)
+            .map(|i| json!({"role": "user", "content": format!("fix the bug in file {i}")}))
+            .collect();
+        let p = peek_anthropic(json!({"model": "m", "messages": messages}));
+        assert!(!p.likely_compaction);
+    }
+
+    #[test]
+    fn the_marker_is_read_from_block_content_too() {
+        // Claude Code sends content as blocks, not a bare string.
+        let mut messages: Vec<serde_json::Value> = (0..12)
+            .map(|i| json!({"role": "user", "content": format!("m{i}")}))
+            .collect();
+        messages.push(json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "Summarize the conversation for me."}],
+        }));
+        let p = peek_anthropic(json!({"model": "m", "messages": messages}));
+        assert!(p.likely_compaction);
+    }
+
+    #[test]
+    fn detection_is_keyed_on_the_last_message_not_the_history() {
+        // The instruction lives in the trailing message. A conversation that
+        // merely *discussed* summarizing, twenty turns ago, is not compacting.
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": "Should I ask you for a summary of the conversation later?"
+        })];
+        messages.extend((0..15).map(|i| json!({"role": "user", "content": format!("m{i}")})));
+        let p = peek_anthropic(json!({"model": "m", "messages": messages}));
+        assert!(!p.likely_compaction);
+    }
+
+    #[test]
+    fn openai_dialects_detect_it_too() {
+        let mut input: Vec<serde_json::Value> = (0..12)
+            .map(|i| json!({"type": "message", "role": "user", "content": format!("m{i}")}))
+            .collect();
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Condense the conversation into a summary."}],
+        }));
+        let body = json!({"model": "gpt-5.6", "input": input});
+        let raw = body.to_string();
+        assert!(
+            RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len()).likely_compaction
+        );
+    }
+
+    #[test]
+    fn an_empty_marker_set_disables_detection_entirely() {
+        // The quirks channel can turn this off by shipping no markers, which is
+        // the escape hatch if the heuristic turns out to misfire in the field.
+        let mut messages: Vec<serde_json::Value> = (0..12)
+            .map(|i| json!({"role": "user", "content": format!("m{i}")}))
+            .collect();
+        messages.push(json!({"role": "user", "content": "summarize the conversation"}));
+        let body = json!({"model": "m", "messages": messages});
+        let raw = body.to_string();
+        let markers = IdentityMarkers {
+            compaction_markers: Vec::new(),
+            ..IdentityMarkers::default()
+        };
+        let p = RequestPeek::inspect_with(Protocol::AnthropicMessages, &body, raw.len(), &markers);
+        assert!(!p.likely_compaction);
     }
 
     #[test]
