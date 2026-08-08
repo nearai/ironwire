@@ -14,6 +14,7 @@ use ironwire_upstream::backend::{Backend, BackendStatus};
 use ironwire_upstream::breaker::BreakerBoard;
 
 use crate::events::EventBus;
+use crate::privacy::PrivacyFilter;
 
 /// The set of backends this daemon can route to.
 #[derive(Clone, Default)]
@@ -121,6 +122,9 @@ pub struct AppState {
     /// Route and health events, for `ironwire watch` and the menu bar app.
     /// Lossy and non-blocking by construction (`crate::events`).
     pub events: EventBus,
+    /// The optional privacy filter. `None` unless the user turned it on and
+    /// configured something for it to match (`docs/PRIVACY.md`).
+    pub privacy: Option<Arc<PrivacyFilter>>,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -145,6 +149,7 @@ impl AppState {
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             breakers: Arc::new(BreakerBoard::default()),
             events: EventBus::new(),
+            privacy: PrivacyFilter::from_config(&config.privacy).map(Arc::new),
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),

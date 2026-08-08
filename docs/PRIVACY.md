@@ -1,7 +1,8 @@
 # Privacy filter
 
-**Status: designed, not built.** This document is the plan and the critique of
-the plan. `ROADMAP.md` M7 tracks the work.
+**Status: tiers 1 and 2 built; tier 3 not started.** This document is the plan,
+the critique of the plan, and now the record of what was actually built.
+`ROADMAP.md` M7 tracks the rest.
 
 An optional, off-by-default filter that removes sensitive values from requests
 on the way out and restores them on the way back, so a coding agent can run
@@ -177,6 +178,20 @@ from a rule that needs no recognition:
 how to handle, log what could not be reversed with the plaintext elided, and
 leave the client's transcript untouched. A failed turn the user can retry is
 vastly better than a corrupted transcript they will not notice for a week.
+
+**What that rule can and cannot catch, stated rather than implied.** A
+*truncated* token is recognisable: its prefix matches one we minted and then the
+stream diverges or ends, so it fails the exchange. A token whose *middle* was
+rewritten — `⟦named. abc⟧` — is not distinguishable from one the model invented
+out of nothing, and guessing would mean fuzzy-matching arbitrary model output
+against our tokens, where a false positive fails a working session.
+
+So a rewritten token is passed through untouched and **counted**. It is never
+mapped to a wrong value; the user's real data does not appear. What they get is
+a visible oddity in one response and a non-zero `passed_through` count in
+`ironwire log` — which is the signal that something went sideways. That is the
+honest boundary of this mechanism, and it is why §7 forbids the interface from
+claiming more.
 
 Recognition, when it works, buys us three things on top: raise the strictness
 for that request, prefer format-preserving surrogates (§6) which survive

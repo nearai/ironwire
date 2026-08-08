@@ -127,6 +127,9 @@ pub struct StatusView {
     pub backends: Vec<BackendView>,
     /// Every pool, seen as one balance.
     pub balance: BalanceView,
+    /// What the privacy filter is *doing*, never what the user is safe from
+    /// (`docs/TRUST.md` I7). `None` when it is off.
+    pub privacy: Option<String>,
     /// Serial of the signed quirks document in force; `0` means the values this
     /// binary shipped with (`docs/UPDATES.md`).
     pub quirks_serial: u64,
@@ -333,6 +336,10 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         pin,
         backends,
         balance,
+        privacy: state
+            .privacy
+            .as_ref()
+            .map(|filter| filter.summary().to_string()),
         quirks_serial: state.quirks.serial(),
         update: state.update_status(),
     })

@@ -99,7 +99,7 @@ impl Reverser {
         // A trailing fragment that *starts* like one of our placeholders is the
         // dangerous case: it will be written into the transcript and can never
         // be reversed afterwards.
-        if let Some(count) = self.dangling(map) {
+        if let Some(count) = self.dangling(map).or_else(|| self.mangled(map)) {
             return Err(ReverseError::Unreversed { count });
         }
         let rest = std::mem::take(&mut self.pending);
@@ -118,6 +118,39 @@ impl Reverser {
             .filter(|token| token.starts_with(fragment))
             .count();
         (matches > 0).then_some(matches)
+    }
+
+    /// Whether the pending text begins with a *mangled* placeholder: one of our
+    /// tokens that was truncated or altered part-way through.
+    ///
+    /// Distinct from [`Self::dangling`], which catches a token cut off at the
+    /// end of the stream. This catches one that was cut off *and then followed
+    /// by more text* — which is what a model paraphrasing a summary produces,
+    /// and what an over-long unterminated candidate would otherwise be flushed
+    /// as ordinary text.
+    ///
+    /// Requires the digest to have started matching before calling it mangled:
+    /// a bare `⟦` followed by coincidental text is not evidence of anything,
+    /// and treating it as a failure would break streams that merely contain the
+    /// delimiter.
+    fn mangled(&self, map: &Map) -> Option<usize> {
+        let start = self.pending.find(OPEN)?;
+        let fragment = &self.pending[start..];
+        let count = map
+            .placeholders()
+            .filter(|token| {
+                let common = common_prefix_len(fragment, token);
+                // The whole token is present: it will be reversed normally.
+                if common == token.len() {
+                    return false;
+                }
+                // Enough of the digest matched that this is our token, altered.
+                token[..common]
+                    .split_once('.')
+                    .is_some_and(|(_, digest)| digest.len() >= MANGLE_EVIDENCE)
+            })
+            .count();
+        (count > 0).then_some(count)
     }
 
     /// Emit everything we can classify; hold the rest.
@@ -171,7 +204,17 @@ impl Reverser {
                     // longer than any placeholder can be, in which case the
                     // opening delimiter was ordinary text and holding more
                     // would grow the buffer without bound.
+                    //
+                    // Unless it is one of *our* tokens, altered. Flushing that
+                    // as ordinary text is exactly the silent corruption this
+                    // module exists to prevent, so it is held for `finish` to
+                    // report. The buffer stays bounded because `mangled` only
+                    // fires on a fragment that matches a token we minted, and
+                    // those are bounded in number and length.
                     if self.pending.len() > bound {
+                        if self.mangled(map).is_some() {
+                            return out;
+                        }
                         let safe = floor_char_boundary(&self.pending, bound);
                         out.push_str(&self.pending[..safe]);
                         self.pending.drain(..safe);
@@ -182,6 +225,22 @@ impl Reverser {
             }
         }
     }
+}
+
+/// How many digest characters must match before a fragment is treated as one
+/// of our tokens rather than as coincidental text.
+const MANGLE_EVIDENCE: usize = 4;
+
+/// Length of the longest common prefix, on a character boundary.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    let mut len = 0;
+    for (x, y) in a.chars().zip(b.chars()) {
+        if x != y {
+            break;
+        }
+        len += x.len_utf8();
+    }
+    len
 }
 
 /// Largest index `<= at` that lies on a UTF-8 character boundary.

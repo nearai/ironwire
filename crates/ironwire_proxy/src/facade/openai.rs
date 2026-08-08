@@ -104,6 +104,20 @@ async fn forward(
     let key = conversation_key(protocol, &parsed);
     let conversation = key.0;
 
+    // The privacy filter is the one documented exception to byte-identical
+    // forwarding (`docs/PROTOCOL.md` §2), and it is opt-in. With it off,
+    // `body` below is still exactly the bytes the client sent.
+    let applied = state
+        .privacy
+        .as_ref()
+        .map(|filter| filter.apply(&key, &parsed));
+    let body = match &applied {
+        Some(applied) => {
+            bytes::Bytes::from(serde_json::to_vec(&applied.body).unwrap_or_else(|_| body.to_vec()))
+        }
+        None => body,
+    };
+
     let forwarded: Vec<(String, String)> = headers
         .iter()
         .filter(|(name, _)| forward_request_header(name.as_str()))
@@ -165,7 +179,25 @@ async fn forward(
         }
     });
 
+    // Put the real values back before anything reaches the client. This runs
+    // inside the resilience guard's input, so a reconnect gets its own
+    // reverser and cannot inherit half a placeholder.
+    let observed: std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = Result<bytes::Bytes, ironwire_upstream::backend::UpstreamError>,
+                > + Send,
+        >,
+    > = match applied.as_ref().map(|a| std::sync::Arc::clone(&a.map)) {
+        Some(map) => Box::pin(crate::privacy::reverse_stream(observed, map)),
+        None => Box::pin(observed),
+    };
+
     let body: Body = if peek.stream {
+        // A restarted stream carries the same placeholders, so it needs the
+        // same map. Without this the reverser is bypassed on exactly the path
+        // that runs when something already went wrong.
+        let reconnect_map = applied.as_ref().map(|a| std::sync::Arc::clone(&a.map));
         let reconnect_state = state.clone();
         let reconnect_path = path.to_string();
         let reconnect_peek = peek.clone();
@@ -180,15 +212,21 @@ async fn forward(
             let key = key.clone();
             let body = body.clone();
             let headers = forwarded.clone();
+            let map = reconnect_map.clone();
             Box::pin(async move {
                 match pipeline::dispatch(&state, protocol, &path, &peek, key, body, headers).await {
                     Ok((response, routed)) => {
                         tracing::info!(backend = %routed.decision.backend, "stream restarted");
-                        Some(pipeline::observe_boxed(
-                            response.body,
-                            dialect_for(protocol),
-                            |_| {},
-                        ))
+                        let restarted =
+                            pipeline::observe_boxed(response.body, dialect_for(protocol), |_| {});
+                        Some(match map {
+                            Some(map) => Box::pin(crate::privacy::reverse_stream(restarted, map))
+                                as futures_util::stream::BoxStream<
+                                    'static,
+                                    Result<bytes::Bytes, ironwire_upstream::backend::UpstreamError>,
+                                >,
+                            None => restarted,
+                        })
                     }
                     Err(error) => {
                         tracing::warn!(%error, "no capacity left to restart the stream");

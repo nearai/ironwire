@@ -276,28 +276,34 @@ hard failure lives and a detector is worthless without it.
 
 ### Foundation — reversal
 
-- [ ] `ironwire_privacy` crate: deterministic
+- [x] `ironwire_privacy` crate: deterministic
       `HMAC(conversation_salt, plaintext) → placeholder`, map derived per
-      request and never persisted (PRIVACY §4)
-- [ ] Substitution over parsed request bodies, per façade, without disturbing
-      anything it did not match
-- [ ] Streaming reversal across SSE chunk boundaries, bounded buffer, tested at
-      **every** byte offset — the likeliest place for a silent bug
-- [ ] **Fail loudly on partial reversal.** A half-reversed response is never
-      forwarded; the exchange fails with a provider-shaped error and the
-      client's transcript is left untouched
-- [ ] Filter state visible in `ironwire status` and per-exchange substitution
-      counts in `ironwire log` (PRIVACY §7)
+      request and never persisted (PRIVACY §4). No `save`, no `load`, no
+      `Serialize`
+- [x] Substitution over parsed request bodies, both façades, preserving field
+      order and leaving non-string leaves alone
+- [x] Streaming reversal across SSE chunk boundaries, bounded buffer, tested at
+      **every** byte offset plus one-chunk-per-character, with UTF-8
+      reassembly for codepoints split across chunks
+- [x] **Fail loudly on partial reversal.** Caught a real bug: the reconnect
+      path inside `resilience::guard` bypassed the reverser, so a restarted
+      stream forwarded raw placeholders. Both façades now reverse the restart
+      too
+- [x] Per-conversation salts, bounded and memory-only, stable across turns so
+      the provider's prompt cache is not destroyed every request
+- [x] Filter state on its own permanent line in `ironwire status`
+- [ ] Per-exchange substitution counts in `ironwire log` (the ledger column)
+- [ ] `ironwire privacy check <file>`
 
 ### Tier 1 — secrets (deterministic)
 
-- [ ] Reuse `ironclaw_safety::LeakDetector` and its pattern set directly
-- [ ] Map its one-way `LeakAction::Redact` onto our reversible substitution
+- [x] Reuse `ironclaw_safety::LeakDetector` and its pattern set directly
+- [x] Map its one-way `LeakAction::Redact` onto our reversible substitution
 
 ### Tier 2 — named values (deterministic)
 
-- [ ] User-nominated exact strings via `ironclaw_safety::redact_exact_values` +
-      `redaction_values_for_secret` (which already expands URL-encoded variants)
+- [x] User-nominated exact strings via `redaction_values_for_secret`, which
+      already expands URL-encoded variants
 - [ ] `ironwire privacy check <file>` — show what would and would not be caught,
       so the false-negative rate is something a user can see
 
@@ -332,9 +338,11 @@ history. An unreversed placeholder there is self-perpetuating corruption
 
 Much of what a PII detector flags in a coding session is load-bearing *code*.
 
-- [ ] Never substitute inside fenced code blocks or `tool_result` content by
-      default
-- [ ] Never substitute reserved ranges (`example.com`, RFC 5737, RFC 1918, `555`)
+- [x] Never substitute inside fenced code blocks or `tool_result` content by
+      default; both are switchable
+- [x] Never substitute reserved ranges (`example.com`, RFC 5737, RFC 1918,
+      RFC 3849, `555-01`) — including the `172.16/12` boundary, which a prefix
+      test alone gets wrong
 - [ ] Corpus test: real-looking fixtures pass tiers 1–2 with zero substitutions
 - [ ] Decide opaque tokens vs. format-preserving surrogates **with data** —
       opaque tokens preserve the value but destroy the structure the model needs

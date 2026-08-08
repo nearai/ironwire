@@ -194,6 +194,79 @@ impl ResilienceConfig {
     }
 }
 
+/// The optional privacy filter.
+///
+/// **Off by default, and that is a trust commitment rather than a default**
+/// (`docs/TRUST.md` I7). Everything else in IronWire rests on forwarding bytes
+/// it did not change; this filter changes them by design, so it is never on
+/// unless the user turned it on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrivacyConfig {
+    /// Master switch.
+    pub enabled: bool,
+    /// Tier 1: substitute values with a machine-checkable secret shape.
+    pub secrets: bool,
+    /// Tier 2: exact strings to substitute, nominated by the user.
+    ///
+    /// These are the user's own sensitive values and they live in
+    /// `$IRONWIRE_HOME/config.toml` (mode 0700). That is a real trade-off:
+    /// listing them is what makes tier 2 work, and it also writes them down.
+    /// Stated here rather than left for someone to discover.
+    pub named_values: Vec<String>,
+    /// Scan inside fenced code blocks. Off by default — a value in one is
+    /// nearly always the code being edited, and substituting it makes the model
+    /// rewrite a file into something that does not work.
+    pub scan_code_blocks: bool,
+    /// Scan replayed tool results. Off by default — they are output from the
+    /// user's own machine that the model needs verbatim to reason about.
+    pub scan_tool_results: bool,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            secrets: true,
+            named_values: Vec::new(),
+            scan_code_blocks: false,
+            scan_tool_results: false,
+        }
+    }
+}
+
+impl PrivacyConfig {
+    /// Whether the filter would actually do anything.
+    ///
+    /// Enabled-but-configured-with-nothing is a real state and it should read
+    /// as off, not as protection.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.enabled && (self.secrets || !self.named_values.is_empty())
+    }
+
+    /// One line describing what is running — never what the user is safe from
+    /// (`docs/TRUST.md` I7).
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if !self.enabled {
+            return "off".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.secrets {
+            parts.push("secrets".to_string());
+        }
+        if !self.named_values.is_empty() {
+            parts.push(format!("{} named value(s)", self.named_values.len()));
+        }
+        if parts.is_empty() {
+            "on, but nothing configured to match".to_string()
+        } else {
+            parts.join(" + ")
+        }
+    }
+}
+
 /// A user-configured backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,6 +309,8 @@ pub struct Config {
     pub updates: UpdateConfig,
     /// Stream-resilience settings.
     pub resilience: ResilienceConfig,
+    /// Optional privacy filter. Off by default (`docs/PRIVACY.md`).
+    pub privacy: PrivacyConfig,
     /// Configured backends, in preference order for ties.
     pub backends: Vec<BackendConfig>,
 }
@@ -298,6 +373,7 @@ mod tests {
             },
             updates: UpdateConfig { check: false },
             resilience: ResilienceConfig::default(),
+            privacy: PrivacyConfig::default(),
             backends: vec![BackendConfig {
                 id: "claude-sub".into(),
                 kind: "claude-subscription".into(),

@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 ironwire_core.workspace = true
+ironwire_privacy.workspace = true
 ironwire_creds.workspace = true
 ironwire_ledger.workspace = true
 ironwire_quirks.workspace = true

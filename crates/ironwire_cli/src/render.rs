@@ -153,6 +153,13 @@ pub(crate) fn status(status: &StatusView) -> String {
         "{} conversation(s) with a sticky route\n",
         status.tracked_conversations
     ));
+    // Permanent, not a startup message that scrolls away: with the filter on,
+    // IronWire is mutating requests, and that must never become invisible
+    // (`docs/PRIVACY.md` §3). It states what is running, never what the user is
+    // protected from.
+    if let Some(privacy) = &status.privacy {
+        out.push_str(&format!("privacy filter: {privacy}\n"));
+    }
     if status.quirks_serial > 0 {
         out.push_str(&format!(
             "provider quirks: serial {}\n",
@@ -550,6 +557,7 @@ mod tests {
             pin: None,
             backends: vec![],
             balance: BalanceView::default(),
+            privacy: None,
             quirks_serial: 0,
             update: UpdateStatus::Unknown,
         });
