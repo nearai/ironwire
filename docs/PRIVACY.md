@@ -199,12 +199,23 @@ paraphrase better, and warn the user *before* a summary is committed.
 
 ### Cache invalidation
 
-Detection over the whole history every turn is O(history), which is unaffordable
-at tier 3 on a 200k-token conversation. Detection results are cached per content
-block, keyed by hash — history is append-mostly, so all but the newest blocks
-hit. **Compaction invalidates the cache wholesale**: the history is replaced,
-not appended to. One expensive turn, then cheap again. Sized and measured, not
-assumed.
+Detection over the whole history every turn is O(history), and this document
+originally assumed that would need a per-block cache keyed by content hash.
+
+**Measured instead** (`ironwire_privacy/tests/cost.rs`): tiers 1 and 2 cost
+**~1.5 ms per turn on a 333 KB history** — the size at which a harness compacts.
+Against a model's time-to-first-token of hundreds of milliseconds that is
+invisible, so there is no cache, and the correctness hazard a cache would
+introduce across a compaction boundary does not exist. The Aho-Corasick
+prefilter in `ironclaw_safety::LeakDetector` is doing the work.
+
+The test carries the budget as an assertion, so if a future tier pushes the cost
+past ~50 ms it fails and says which paragraph of this document to come back to.
+
+**Tier 3 will need the cache**, because a local model is orders of magnitude
+slower than a regex sweep, and there the invalidation rule stated above applies:
+compaction replaces the history rather than appending to it, so the cache is
+invalidated wholesale — one expensive turn, then cheap again.
 
 ---
 

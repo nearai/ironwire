@@ -361,7 +361,11 @@ history. An unreversed placeholder there is self-perpetuating corruption
 - [ ] Optional compaction fingerprints in the **quirks channel**, as an
       optimization only — a client-shape fingerprint is exactly the thing that
       breaks silently on a client update
-- [ ] Detection cache invalidation across a compaction boundary, measured
+- [x] Detection cost **measured rather than assumed**: tiers 1 and 2 cost ~1.5 ms
+      per turn on a 333 KB history, so the per-block cache this document
+      originally planned is not built — and the correctness hazard it would have
+      introduced across a compaction boundary does not exist. The budget is an
+      assertion in `ironwire_privacy/tests/cost.rs`; tier 3 will need the cache
 
 ### Tier 3 — inferred PII (local model, non-deterministic)
 
