@@ -248,18 +248,22 @@ A compaction turn's output *becomes the conversation*: it is written into the
 client's permanent history and resent every turn afterwards. Degrading it to
 save money buys one cheaper request and pays for it for the rest of the session.
 
-- [ ] Fidelity dominates marginal cost on a compaction turn — do not descend a
-      rung, and prefer the same backend even under mild pressure
-- [ ] Note that our own turn-boundary gate currently *permits* a cross-family
-      switch here: `mid_tool_loop` is false during compaction by construction,
-      so `capability::eligible` allows a switch at the one moment it is most
-      expensive. The gate is not wrong — it answers whether a switch is
-      *correct*, not whether it is *wise* — but the policy layer should decline
-- [ ] Compaction turns are the largest and slowest of a session, so they are
-      where `resilience` earns its keep. Confirm the keepalive and stall
-      timeouts are sized for a summary of a full context, not a normal turn
-- [ ] Recognition is optional and lives in the quirks channel; nothing may
-      depend on it being right
+- [x] Fidelity dominates marginal cost on a compaction turn: the candidate sort
+      swaps its two middle keys, so a metered backend that serves the requested
+      tier outranks free capacity that would descend
+- [x] A compaction turn does not inherit a *degraded* affinity. An undegraded
+      one is kept — moving would throw away a warm cache for nothing
+- [x] Availability still outranks fidelity, and cross-family is still served if
+      it is all that is left: refusing would leave the user unable to compact
+      at all, which ends the session
+- [x] `compaction_stall_timeout_secs` (600s), floored at the ordinary timeout so
+      a misconfiguration cannot make compaction *more* fragile than a normal turn
+- [x] Recognition lives in the quirks channel and is advisory: a miss costs a
+      slightly worse routing decision on one turn, never a wrong answer. An
+      empty marker list disables it
+- [ ] **The marker set is a conservative guess, not a verified fingerprint.** No
+      harness documents its compaction prompt; the real strings need observing
+      per harness and shipping through the quirks channel
 
 ---
 
@@ -316,13 +320,17 @@ Every harness compacts, and a compaction summary becomes *permanent* client-side
 history. An unreversed placeholder there is self-perpetuating corruption
 (PRIVACY §5). Correctness must not depend on recognizing a compaction request.
 
-- [ ] Claude Code (`/v1/messages`, trigger driven off `count_tokens`)
-- [ ] Codex (`/v1/responses`)
-- [ ] Aider (`/v1/chat/completions`)
-- [ ] Cline / Roo ("Condense context")
-- [ ] Mangled-placeholder case for each: fail loudly, never a partial write
-- [ ] Stale placeholder from a previous salt is passed through, never
-      mis-reversed
+- [x] Claude Code (`/v1/messages`), Codex (`/v1/responses`), Aider
+      (`/v1/chat/completions`) — `tests/privacy_compaction.rs`. Cline/Roo speak
+      whichever façade they are pointed at, so the two wires above cover them;
+      a third fixture would test the same code twice
+- [x] Mangled-placeholder case for each: the damaged summary never reaches the
+      client, so it can never become permanent history
+- [x] Stale placeholder from a previous salt is passed through, never
+      mis-reversed — asserted across a simulated daemon restart
+- [x] Compaction does not change the conversation key, so the salt and the
+      route survive it. If it did, every compaction would silently re-roll both
+      at the worst possible moment
 - [ ] Optional compaction fingerprints in the **quirks channel**, as an
       optimization only — a client-shape fingerprint is exactly the thing that
       breaks silently on a client update
