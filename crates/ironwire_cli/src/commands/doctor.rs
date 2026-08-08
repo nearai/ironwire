@@ -1,9 +1,9 @@
 //! `ironwire doctor` — verify every connection end to end.
 //!
-//! The point of this command is that it makes a *real* request. A config that
-//! parses and a credential that exists prove nothing; the failure modes that
-//! matter (an expired token, a beta flag the provider stopped accepting, a
-//! model the account is not entitled to) only show up on the wire.
+//! This command makes **real network calls**. A config that parses and a
+//! credential file that exists prove nothing; the failures that actually bite
+//! — an expired token, a beta flag the provider stopped honouring, an account
+//! not entitled to a model — only appear on the wire.
 
 use anyhow::Result;
 
@@ -11,7 +11,8 @@ use super::control_client::ControlClient;
 
 /// Check the daemon and each backend.
 pub(crate) async fn run(port: Option<u16>) -> Result<()> {
-    let status = ControlClient::new(port)?.status().await?;
+    let client = ControlClient::new(port)?;
+    let status = client.status().await?;
     println!("daemon        ok — 127.0.0.1:{}", status.port);
 
     if status.backends.is_empty() {
@@ -22,22 +23,47 @@ pub(crate) async fn run(port: Option<u16>) -> Result<()> {
         return Ok(());
     }
 
+    // Static checks first: a backend awaiting consent must not be probed, since
+    // probing it would use the very credential the user has not authorised.
+    let mut probeable = false;
     for backend in &status.backends {
-        let verdict = if !backend.authenticated {
-            format!(
-                "no credential — {}",
-                backend.detail.as_deref().unwrap_or("unknown")
-            )
+        if !backend.authenticated {
+            let why = backend.detail.as_deref().unwrap_or("no credential found");
+            println!("{:<14}not connected — {why}", backend.id);
         } else if !backend.consented {
-            "awaiting consent".to_string()
+            println!(
+                "{:<14}awaiting consent — `ironwire connect claude --subscription`",
+                backend.id
+            );
         } else {
-            "ok".to_string()
-        };
-        println!("{:<14}{verdict}", backend.id);
+            probeable = true;
+        }
+    }
+
+    if !probeable {
+        println!();
+        println!("Nothing to probe: no backend is both authenticated and enabled.");
+        return Ok(());
     }
 
     println!();
-    println!("Live probe (a real 1-token request per backend) lands with the");
-    println!("conformance harness in M1 — see docs/PROTOCOL.md §7.4.");
+    println!("Probing backends…");
+    let mut failures = 0;
+    for probe in client.probe().await? {
+        if probe.ok {
+            println!("{:<14}ok — {} ms", probe.id, probe.latency_ms);
+        } else {
+            failures += 1;
+            let detail = probe.error.as_deref().unwrap_or("unknown failure");
+            println!("{:<14}FAILED — {detail}", probe.id);
+        }
+    }
+
+    println!();
+    if failures == 0 {
+        println!("All connected backends answered.");
+    } else {
+        println!("{failures} backend(s) failed. `ironwire status` has the details.");
+    }
     Ok(())
 }

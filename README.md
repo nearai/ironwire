@@ -27,10 +27,15 @@ only decides where each conversation's inference goes.
 
 ## Status
 
-**M1, in progress.** The Anthropic façade works end to end: Claude Code →
-IronWire → Claude subscription, with an Anthropic API key as fallback, real
-streaming passthrough, observed quota, and consent-gated subscription access.
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what is and is not done.
+**M1 complete at the wire level; M2 in progress.** Claude Code → IronWire →
+Claude subscription works end to end, with an Anthropic API key as fallback,
+byte-identical streaming passthrough, observed quota, consent-gated subscription
+access, a local trace ledger, and cancellation that provably stops the upstream.
+
+Not yet done: a real multi-hour Claude Code session against a live account.
+Until that runs, "no observable behavioural difference" is an inference from
+wire-level tests rather than an observation — `scripts/acceptance.sh` is the
+check, and [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks it.
 
 ## Quick start
 
@@ -47,7 +52,9 @@ claude
 Then:
 
 ```bash
-ironwire status
+ironwire status     # capacity, as the providers reported it
+ironwire log        # what your agents sent, and what it cost
+ironwire doctor     # probe every backend for real
 ```
 
 ```
@@ -121,8 +128,9 @@ pass. That position comes with hard commitments, not defaults
 
 ```
 crates/
-  ironwire_core       protocols, capabilities, routing policy, quota ledger
+  ironwire_core       protocols, capabilities, routing policy, quota
   ironwire_creds      credential discovery + consent
+  ironwire_ledger     the local trace ledger
   ironwire_upstream   backends: native passthrough and observation
   ironwire_proxy      axum façades, pipeline, control API
   ironwire_cli        the `ironwire` binary
@@ -135,10 +143,17 @@ cargo test              # unit + conformance
 cargo clippy --all-targets
 ```
 
-The conformance suite in `crates/ironwire_proxy/tests/passthrough.rs` is the
-load-bearing one: it asserts the request bytes reaching the provider and the
-response bytes reaching the client are byte-identical to the originals, modulo
-the mutations `docs/PROTOCOL.md` §2 enumerates.
+Three suites carry the fidelity claim:
+
+| Suite | Proves |
+|---|---|
+| `tests/passthrough.rs` | request and response bytes are identical to the originals, modulo the mutations `docs/PROTOCOL.md` §2 enumerates |
+| `tests/multi_turn.rs` | a three-turn tool loop — signed thinking, replayed tool ids, cache breakpoints — survives, and stays on one backend |
+| `tests/cancellation.rs` | an abandoned request stops the upstream, and still records what it consumed |
+
+`scripts/acceptance.sh` is the manual check the mocks cannot replace: a real
+Claude Code task, through IronWire, against real providers. It costs
+subscription quota — run it before a release, not in CI.
 
 ## License
 

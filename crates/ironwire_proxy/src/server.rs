@@ -39,6 +39,45 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Bind loopback.
+///
+/// Separate from [`serve_on`] so a caller can announce the listener only after
+/// it exists — printing "listening on 8463" and *then* failing to bind is a
+/// small lie that sends people looking in the wrong place.
+///
+/// # Errors
+///
+/// [`ServeError::PortInUse`] when something already holds the port, or
+/// [`ServeError::Io`] for any other bind failure.
+pub async fn bind(port: u16) -> Result<tokio::net::TcpListener, ServeError> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    tokio::net::TcpListener::bind(addr).await.map_err(|source| {
+        if source.kind() == std::io::ErrorKind::AddrInUse {
+            ServeError::PortInUse { port }
+        } else {
+            ServeError::Io { port, source }
+        }
+    })
+}
+
+/// Serve on an already-bound listener until `shutdown` resolves.
+///
+/// # Errors
+///
+/// [`ServeError::Io`] when the server fails.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), ServeError> {
+    let port = listener.local_addr().map_or(0, |addr| addr.port());
+    tracing::info!(port, "IronWire listening");
+    axum::serve(listener, app(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|source| ServeError::Io { port, source })
+}
+
 /// Bind loopback and serve until `shutdown` resolves.
 ///
 /// # Errors
@@ -49,23 +88,7 @@ pub async fn serve(
     port: u16,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::AddrInUse {
-                ServeError::PortInUse { port }
-            } else {
-                ServeError::Io { port, source }
-            }
-        })?;
-
-    tracing::info!(%addr, "IronWire listening");
-
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|source| ServeError::Io { port, source })
+    serve_on(bind(port).await?, state, shutdown).await
 }
 
 #[cfg(test)]
@@ -86,6 +109,27 @@ mod tests {
             ConsentLedger::default(),
             "test-token".to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn the_listener_is_always_loopback() {
+        // TRUST.md I1. There is no host parameter anywhere in this module, and
+        // this test is what keeps it that way: a credential custodian that can
+        // be exposed to a network is a different, worse product.
+        let listener = bind(0).await.expect("binds an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(
+            addr.ip().is_loopback(),
+            "IronWire bound {addr}, which is not loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_is_reported_as_such_rather_than_as_a_generic_io_error() {
+        let held = bind(0).await.expect("binds");
+        let port = held.local_addr().expect("local addr").port();
+        let err = bind(port).await.expect_err("port is held");
+        assert!(matches!(err, ServeError::PortInUse { .. }), "got {err:?}");
     }
 
     #[tokio::test]

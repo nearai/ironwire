@@ -93,8 +93,12 @@ request's `AbortHandle` in a guard tied to the response body's `Drop`. Abandoned
 requests otherwise keep generating — burning exactly the scarce quota IronWire
 exists to protect.
 
-Test: connect, read 3 SSE frames, drop the connection, assert the upstream mock
-observed a cancelled request within 500ms.
+Proved by `crates/ironwire_proxy/tests/cancellation.rs`: an upstream that streams
+forever, a client that reads two frames and walks away, and an assertion that the
+upstream's next writes fail. The same test pins the other half — the observation
+tee flushes on `Drop`, so an abandoned request still records the tokens the
+provider had already reported. Cancellation that loses the accounting would hide
+exactly the spend the user needs to see.
 
 ---
 
@@ -166,8 +170,19 @@ Fidelity claims are worthless without a harness that proves them.
    response.
 3. **Stream-shape test.** Assert SSE event order, event names and frame
    boundaries are preserved exactly.
-4. **Live smoke.** `ironwire doctor` runs a real 1-token request against every
-   connected backend and reports per-backend latency and observed quota.
+4. **Live smoke.** `ironwire doctor` hits every connected backend for real and
+   reports per-backend latency.
+
+   The probe must not claim another product's identity (`TRUST.md` §3), which
+   rules out the obvious design. A synthetic 1-token *message* against the
+   Claude subscription would have to carry Claude Code's system preamble to be
+   accepted — i.e. IronWire pretending to be Claude Code, which is the one thing
+   the architecture refuses. So subscription backends are probed with an
+   auth-only call (`GET /v1/models`), which validates the credential and costs
+   nothing. Metered backends may use a real 1-token request.
+
+   `doctor` also skips any backend that is authenticated but not consented:
+   probing it would use the very credential the user has not authorised.
 5. **Agent-level acceptance.** A scripted Claude Code task (edit a file, run a
    test, fix the failure) must complete through IronWire with the same
    turn count as direct. This is the only test that catches subtle behavioral

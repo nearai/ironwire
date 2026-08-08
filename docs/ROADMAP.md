@@ -8,13 +8,11 @@ dies (CRITIQUE §8).
 
 ---
 
-## M1 — One native lane, end to end  ← current
+## M1 — One native lane, end to end  ✅ complete
 
 **Claude Code → IronWire → Claude subscription, falling back to Anthropic API key.**
 
 Zero translation. Proves the pipe.
-
-Done and covered by tests:
 
 - [x] Workspace, docs, trust posture
 - [x] Credential discovery: Claude Code (Keychain + file); host-binding guard
@@ -25,33 +23,39 @@ Done and covered by tests:
 - [x] Before-first-byte failover, sticky affinity, descent hysteresis
 - [x] Client-identity eligibility rule (TRUST §3)
 - [x] Consent gate with recorded acceptance, versioned prompt (TRUST §2)
-- [x] Passthrough conformance harness (PROTOCOL §7.2–7.3)
-- [x] `ironwire connect claude` / `disconnect` / `status` / `doctor` / `env` / `pin`
+- [x] Cancellation propagation, **proved** by `tests/cancellation.rs`
+- [x] Credential re-read and single retry on a subscription 401
+- [x] Local trace ledger (SQLite) + `ironwire log`
+- [x] Live probe in `ironwire doctor` (PROTOCOL §7.4)
+- [x] Port-collision UX that distinguishes "IronWire already running" from
+      "something else holds this port"
+- [x] Conformance: passthrough (§7.2–7.3) and a three-turn tool loop (§7.5,
+      automatable half)
+- [x] `ironwire connect` / `disconnect` / `status` / `doctor` / `log` / `env` / `pin`
 
-Remaining before M1 closes:
+Carried into M2 (needs a live account, not a mock):
 
-- [ ] **Cancellation propagation on client disconnect.** The mechanism is in
-      place (the tee flushes on `Drop`, and dropping a `reqwest` body stream
-      aborts the request) but it is **not yet proved by a test** — PROTOCOL §4
-      specifies the one to write. Until that test exists, treat this as
-      unverified: an abandoned request that keeps generating burns the exact
-      quota IronWire exists to protect.
-- [ ] Token refresh on a 401 from the subscription backend (currently the
-      credential is re-read from the store each request, which picks up Claude
-      Code's own background refresh but does not drive one)
-- [ ] Local trace ledger (SQLite) + `ironwire log`
-- [ ] Live probe in `ironwire doctor` (PROTOCOL §7.4)
-- [ ] Single-daemon lockfile and `ironwire serve` port-collision UX
-- [ ] Agent-level acceptance test (PROTOCOL §7.5)
+- [ ] `scripts/acceptance.sh` — run a real Claude Code task through IronWire and
+      compare its turn count against a direct run. Written; **not yet executed
+      against a live account.** Until someone runs it, "no observable
+      behavioural difference" is an inference from wire-level tests, not an
+      observation.
+- [ ] An 8-hour session survived, including a real rate-limit descent
 
-**Exit criterion:** an 8-hour Claude Code session runs through IronWire with no
-observable behavioral difference, survives a rate-limit event by descending to
-rung 1 then 2, and `ironwire status` shows quota numbers that match what the
-Anthropic console reports.
+**Exit criterion (wire level, met):** every mutation is enumerated and pinned by
+a byte-identity test; a three-turn tool loop with signed thinking blocks and
+replayed tool ids survives intact; an abandoned request provably stops
+generating upstream; observed quota comes from provider headers or reads
+`unknown`.
+
+**Exit criterion (field level, open):** an 8-hour Claude Code session with no
+observable behavioural difference, surviving a real rate-limit descent, with
+`ironwire status` matching the Anthropic console. That needs a live account —
+see the carried items above.
 
 ---
 
-## M2 — Second native lane
+## M2 — Second native lane  ← current
 
 **Codex → IronWire → ChatGPT subscription / OpenAI API key.**
 

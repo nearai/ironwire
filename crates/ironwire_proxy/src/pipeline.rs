@@ -19,6 +19,7 @@ use futures_util::{Stream, StreamExt};
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::{ConversationKey, NoRoute, RouteDecision};
 use ironwire_core::protocol::Protocol;
+use ironwire_ledger::{Exchange, Ledger};
 use ironwire_upstream::backend::{Backend, UpstreamError, UpstreamRequest, UpstreamResponse};
 use ironwire_upstream::observe::Observation;
 use ironwire_upstream::sse::{Dialect, SseObserver};
@@ -279,6 +280,70 @@ where
 pub fn record(backend: &Arc<dyn Backend>, observation: &Observation) {
     if !observation.is_empty() {
         backend.record(observation);
+    }
+}
+
+/// Everything the ledger needs that the observation itself does not carry.
+///
+/// Assembled before the response streams and consumed when it ends — including
+/// when the client disconnects early, so an abandoned request is still on the
+/// record with whatever the provider had already reported.
+#[derive(Debug, Clone)]
+pub struct LedgerContext {
+    /// When the request arrived.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Monotonic start, for durations.
+    pub started: std::time::Instant,
+    /// Façade that received it.
+    pub facade: &'static str,
+    /// Path beneath the façade.
+    pub path: String,
+    /// Opaque conversation key.
+    pub conversation: String,
+    /// Backend that served it.
+    pub backend: String,
+    /// Model the client asked for.
+    pub requested_model: Option<String>,
+    /// Fidelity rung, lowercased.
+    pub rung: String,
+    /// Backends tried before this one succeeded.
+    pub attempts: usize,
+    /// Status returned to the client.
+    pub status: u16,
+}
+
+impl LedgerContext {
+    /// Write one exchange.
+    ///
+    /// Never propagates: a ledger problem must not fail a user's inference
+    /// request, and by the time this runs the response has already been
+    /// delivered anyway.
+    pub fn write(self, ledger: &Ledger, observation: &Observation) {
+        let usage = observation.usage;
+        let exchange = Exchange {
+            started_at: self.started_at,
+            ttfb_ms: None,
+            total_ms: i64::try_from(self.started.elapsed().as_millis()).ok(),
+            facade: self.facade.to_string(),
+            path: self.path,
+            conversation: self.conversation,
+            backend: self.backend,
+            requested_model: self.requested_model,
+            served_model: observation.served_model.clone(),
+            rung: self.rung,
+            attempts: i64::try_from(self.attempts).unwrap_or(i64::MAX),
+            // `None`, not `0`, when the provider reported nothing: a fabricated
+            // zero would silently understate the user's spend.
+            input_tokens: usage.and_then(|u| i64::try_from(u.input_tokens).ok()),
+            cache_read_tokens: usage.and_then(|u| i64::try_from(u.cache_read_tokens).ok()),
+            cache_write_tokens: usage.and_then(|u| i64::try_from(u.cache_creation_tokens).ok()),
+            output_tokens: usage.and_then(|u| i64::try_from(u.output_tokens).ok()),
+            status: i64::from(self.status),
+            error: None,
+        };
+        if let Err(error) = ledger.record(&exchange) {
+            tracing::debug!(%error, "could not write the trace ledger entry");
+        }
     }
 }
 

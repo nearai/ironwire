@@ -6,6 +6,7 @@ use ironwire_core::config::Config;
 use ironwire_core::policy::{Candidate, Policy};
 use ironwire_core::protocol::BackendId;
 use ironwire_creds::ConsentLedger;
+use ironwire_ledger::Ledger;
 use ironwire_upstream::backend::{Backend, BackendStatus};
 
 /// The set of backends this daemon can route to.
@@ -98,6 +99,10 @@ pub struct AppState {
     /// Control-API bearer token. The control plane exposes the ledger and can
     /// change routing, so loopback alone is not enough on a shared machine.
     pub control_token: Arc<String>,
+    /// Local trace ledger. `None` when `capture.enabled = false`, or when the
+    /// ledger could not be opened — a ledger problem must never stop the proxy
+    /// from doing its actual job.
+    pub ledger: Option<Ledger>,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -117,10 +122,18 @@ impl AppState {
             backends,
             policy: Arc::new(Mutex::new(Policy::new())),
             consent: Arc::new(Mutex::new(consent)),
+            ledger: None,
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),
         }
+    }
+
+    /// Attach a trace ledger.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Option<Ledger>) -> Self {
+        self.ledger = ledger;
+        self
     }
 
     /// Record the port actually bound.

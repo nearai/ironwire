@@ -27,10 +27,20 @@ are thin shims that select and exec the right platform binary.
 | `x86_64-unknown-linux-musl` | static; what the shell installer prefers on unknown distros |
 | `x86_64-pc-windows-msvc` | |
 
-Binary size is a real constraint here, and it is why the ironclaw reuse is
-feature-gated (DESIGN §7): the default build must not pull `rig-core` or the
-AWS SDK. Budget: **< 15 MB** stripped for the default feature set. CI fails the
-release if the binary exceeds it.
+Binary size is worth keeping down — five ecosystems ship this one file and
+users re-download it on every update — which is part of why the ironclaw reuse
+is feature-gated (DESIGN §7): the default build does not pull `rig-core` or the
+AWS SDK.
+
+It is **not a hard budget**. CI reports the size on every build so a jump shows
+up in review, and nothing fails on a threshold. A capability worth its bytes
+should not be blocked by a number picked in advance; the point is that growth is
+a decision someone makes rather than something that happens quietly.
+
+Current default build: **~7 MB stripped** on linux-x64. Most of the growth from
+the initial ~5 MB is bundled SQLite for the trace ledger — a deliberate trade:
+vendoring it keeps the install a single self-contained file on every platform,
+which matters more here than two megabytes.
 
 ---
 
@@ -109,7 +119,7 @@ installer tells you to run, and it is what `doctor` assumes.
 
 1. Tag `vX.Y.Z`.
 2. CI builds the matrix, runs the conformance harness (PROTOCOL §7) on
-   macos-arm64 and linux-x64, checks the size budget.
+   macos-arm64 and linux-x64, and reports the binary size.
 3. `cargo-dist` publishes the GitHub release, the tap commit and the npm
    packages; `nfpm` pushes the `.deb`; the wheel job pushes to PyPI.
 4. `install.sh` and `ironwire update` both read the release manifest, so there

@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 ironwire_core.workspace = true
 ironwire_creds.workspace = true
+ironwire_ledger.workspace = true
 ironwire_upstream.workspace = true
 
 axum.workspace = true
@@ -32,6 +33,7 @@ tower.workspace = true
 http-body-util = "0.1"
 secrecy.workspace = true
 futures-util.workspace = true
+ironwire_ledger.workspace = true
 
 [lints]
 workspace = true

@@ -5,7 +5,7 @@
 //! *actually* doing (`docs/DESIGN.md` §6).
 
 use anyhow::{Context, Result, bail};
-use ironwire_proxy::control::StatusView;
+use ironwire_proxy::control::{LogView, ProbeView, StatusView};
 
 use super::{control_token, paths};
 
@@ -45,6 +45,39 @@ impl ControlClient {
             bail!("control API returned {}", response.status());
         }
         response.json().await.context("parsing the status response")
+    }
+
+    /// Fetch recent exchanges from the local ledger.
+    pub(crate) async fn log(&self, limit: usize) -> Result<LogView> {
+        let response = self
+            .client
+            .get(format!("{}/log?limit={limit}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| not_running(&e))?;
+        if !response.status().is_success() {
+            bail!("control API returned {}", response.status());
+        }
+        response.json().await.context("parsing the log response")
+    }
+
+    /// Hit every backend for real.
+    pub(crate) async fn probe(&self) -> Result<Vec<ProbeView>> {
+        let response = self
+            .client
+            .post(format!("{}/probe", self.base))
+            .bearer_auth(&self.token)
+            // A probe talks to real providers, so it needs longer than the
+            // default control-plane timeout.
+            .timeout(std::time::Duration::from_secs(45))
+            .send()
+            .await
+            .map_err(|e| not_running(&e))?;
+        if !response.status().is_success() {
+            bail!("control API returned {}", response.status());
+        }
+        response.json().await.context("parsing the probe response")
     }
 
     /// Force all traffic onto a backend, or clear the force.

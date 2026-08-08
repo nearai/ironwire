@@ -94,8 +94,12 @@ feature was never ours to sell.
 
 ### Defaults
 
-- **Local capture: on.** Metadata only (timing, model, tokens, cost, route,
-  finish reason). Bodies require `capture.bodies = true`.
+- **Local capture: on.** Metadata only — timing, model, route, rung, attempts,
+  status, and the token counts the *provider* reported. Bodies require
+  `capture.bodies = true`. Visible via `ironwire log`.
+- **No fabricated numbers in the ledger either.** An exchange whose usage the
+  provider never reported is stored as unknown and rendered as `—`, not as
+  zero: a fabricated zero would silently understate what the user spent.
 - **Upload: off.** Not "off until onboarding asks"; off until the user runs an
   explicit command, per scope.
 

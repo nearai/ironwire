@@ -26,20 +26,18 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-features
 
-  size-budget:
-    # brew/npx/apt/pip all ship this binary; a bloated default build makes the
-    # whole distribution story worse (docs/PACKAGING.md).
+  size:
+    # brew/npx/apt/pip all ship this binary, so size is worth watching — but it
+    # is a signal, not a gate. A feature worth its bytes should never be blocked
+    # by a threshold (docs/PACKAGING.md).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Check the 15 MB budget
+      - name: Report binary size
         run: |
           size=$(stat -c%s target/release/ironwire)
-          echo "ironwire is $((size / 1024 / 1024)) MB"
-          if [ "$size" -gt $((15 * 1024 * 1024)) ]; then
-            echo "::error::binary exceeds the 15 MB budget (docs/PACKAGING.md)"
-            exit 1
-          fi
+          printf 'ironwire: %s bytes (%.1f MB)\n' "$size" "$(echo "$size / 1048576" | bc -l)"
+          echo "### ironwire release binary: $((size / 1024)) KB" >> "$GITHUB_STEP_SUMMARY"

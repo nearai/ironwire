@@ -82,12 +82,14 @@ async fn forward(
     body: Bytes,
     path: &str,
 ) -> Result<Response, FacadeError> {
+    let started_at = chrono::Utc::now();
     // Parse once, for the peek only. The bytes we forward are the bytes we
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
     let peek = RequestPeek::inspect(PROTOCOL, &parsed, body.len());
     let key = conversation_key(&parsed);
+    let conversation = key.0;
 
     let forwarded: Vec<(String, String)> = headers
         .iter()
@@ -123,8 +125,26 @@ async fn forward(
         .cloned()
         .expect("dispatch returned a registered backend");
 
+    // The observation closure runs when the stream ends *or is dropped*, so
+    // both quota accounting and the ledger entry survive a cancelled request.
+    let ledger = state.ledger.clone();
+    let entry = pipeline::LedgerContext {
+        started_at,
+        started: std::time::Instant::now(),
+        facade: "anthropic",
+        path: path.to_string(),
+        conversation: conversation.to_string(),
+        backend: routed.decision.backend.to_string(),
+        requested_model: peek.requested_model.clone(),
+        rung: format!("{:?}", routed.decision.rung).to_lowercase(),
+        attempts: routed.attempts,
+        status: response.status.as_u16(),
+    };
     let observed = pipeline::observe_boxed(response.body, dialect_for(PROTOCOL), move |obs| {
         pipeline::record(&backend, &obs);
+        if let Some(ledger) = ledger.as_ref() {
+            entry.write(ledger, &obs);
+        }
     });
 
     let mut builder = Response::builder()

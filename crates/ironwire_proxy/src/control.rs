@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ironwire_core::protocol::BackendId;
 use ironwire_core::quota::Headroom;
+use ironwire_ledger::{Exchange, Summary};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -108,12 +109,52 @@ pub struct PinRequest {
     pub model: Option<String>,
 }
 
+/// One backend's live-probe verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeView {
+    /// Stable id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Whether the probe succeeded.
+    pub ok: bool,
+    /// Round-trip milliseconds.
+    pub latency_ms: u64,
+    /// What went wrong, when it did.
+    pub error: Option<String>,
+}
+
+/// Query for `GET /_ironwire/log`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogQuery {
+    /// How many exchanges to return, newest first.
+    #[serde(default = "default_log_limit")]
+    pub limit: usize,
+}
+
+fn default_log_limit() -> usize {
+    20
+}
+
+/// What `GET /_ironwire/log` returns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogView {
+    /// Whether local capture is on at all.
+    pub enabled: bool,
+    /// Recent exchanges, newest first.
+    pub exchanges: Vec<Exchange>,
+    /// Aggregate over the last 24 hours.
+    pub last_24h: Summary,
+}
+
 /// Routes for the control API.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(status))
         .route("/backends", get(status))
         .route("/pin", post(pin))
+        .route("/probe", post(probe))
+        .route("/log", get(log))
         .route("/health", get(health))
 }
 
@@ -185,6 +226,56 @@ async fn pin(
         request.model,
     );
     (StatusCode::OK, axum::Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+/// Hit every backend for real. This is what makes `ironwire doctor` worth
+/// running: a credential that parses proves nothing.
+async fn probe(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let mut views = Vec::new();
+    for backend in state.backends.all() {
+        let started = std::time::Instant::now();
+        let outcome = backend.probe().await;
+        let latency = started.elapsed();
+        views.push(ProbeView {
+            id: backend.id().to_string(),
+            name: backend.name().to_string(),
+            ok: outcome.is_ok(),
+            latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+            error: outcome.err().map(|e| e.to_string()),
+        });
+    }
+    axum::Json(views).into_response()
+}
+
+async fn log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<LogQuery>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let Some(ledger) = state.ledger.as_ref() else {
+        return axum::Json(LogView {
+            enabled: false,
+            exchanges: Vec::new(),
+            last_24h: Summary::default(),
+        })
+        .into_response();
+    };
+
+    let since = chrono::Utc::now() - chrono::Duration::hours(24);
+    let exchanges = ledger.recent(query.limit.min(1000)).unwrap_or_default();
+    let last_24h = ledger.summary(since).unwrap_or_default();
+    axum::Json(LogView {
+        enabled: true,
+        exchanges,
+        last_24h,
+    })
+    .into_response()
 }
 
 /// Constant-time-ish token check. The token is a local file, so this is a guard

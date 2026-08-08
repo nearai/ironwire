@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 ironwire_core.workspace = true
 ironwire_creds.workspace = true
+ironwire_ledger.workspace = true
 ironwire_proxy.workspace = true
 ironwire_upstream.workspace = true
 

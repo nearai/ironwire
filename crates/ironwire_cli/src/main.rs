@@ -51,8 +51,18 @@ enum Command {
         subscription: bool,
     },
 
-    /// Check every connection end to end.
+    /// Check every connection end to end, with a real request per backend.
     Doctor,
+
+    /// Show recent exchanges from the local trace ledger.
+    Log {
+        /// How many exchanges to show, newest first.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
@@ -91,6 +101,7 @@ async fn main() -> Result<()> {
             subscription,
         } => commands::connect::disconnect(&target, subscription),
         Command::Doctor => commands::doctor::run(cli.port).await,
+        Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Env => commands::connect::print_env(cli.port),
         Command::Pin { backend, model } => commands::pin::run(cli.port, backend, model).await,
     }

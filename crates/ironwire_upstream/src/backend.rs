@@ -192,6 +192,22 @@ pub trait Backend: Send + Sync {
 
     /// Latest observed quota.
     fn quota(&self) -> QuotaSnapshot;
+
+    /// Verify this backend actually works, right now, over the network.
+    ///
+    /// `ironwire doctor` calls this because a config that parses and a
+    /// credential that exists prove nothing: the failures that matter — an
+    /// expired token, a beta flag the provider stopped honouring, an account
+    /// not entitled to a model — only appear on the wire.
+    ///
+    /// Implementations must probe **without** claiming another product's
+    /// identity (`docs/TRUST.md` §3). For subscription backends that rules out
+    /// a synthetic inference call and leaves an auth-only check.
+    ///
+    /// # Errors
+    ///
+    /// Any [`UpstreamError`] the probe surfaces.
+    async fn probe(&self) -> Result<(), UpstreamError>;
 }
 
 #[cfg(test)]

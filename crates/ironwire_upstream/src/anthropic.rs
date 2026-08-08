@@ -207,6 +207,130 @@ impl Backend for AnthropicBackend {
         })?;
         self.check_host(&bearer)?;
 
+        match self.send_once(request.clone(), &bearer).await {
+            // A 401 on a subscription usually means Claude Code rotated the
+            // token between our read and our send. Re-read and retry once.
+            //
+            // We deliberately do *not* drive a refresh ourselves. Doing so
+            // means writing to another product's credential store, and racing
+            // its own rotation could invalidate the user's Claude Code session
+            // — breaking the thing they actually care about in order to fix
+            // something they did not ask us to fix. Re-reading is enough,
+            // because Claude Code refreshes in the background anyway.
+            Err(UpstreamError::NeedsAuth { .. })
+                if matches!(self.auth, AnthropicAuth::Subscription) =>
+            {
+                let refreshed = self.credential().map_err(|e| UpstreamError::NeedsAuth {
+                    backend: self.id.clone(),
+                    detail: e.to_string(),
+                })?;
+                if refreshed.token.expose_secret() == bearer.token.expose_secret() {
+                    // Same token, same answer. Retrying would just burn a
+                    // request and delay telling the user to re-authenticate.
+                    return Err(UpstreamError::NeedsAuth {
+                        backend: self.id.clone(),
+                        detail: "the stored Claude Code token was rejected; \
+                                 re-authenticate by running `claude` and logging in"
+                            .to_string(),
+                    });
+                }
+                tracing::debug!(
+                    backend = %self.id,
+                    "credential rotated under us; retrying once with the fresh token"
+                );
+                self.send_once(request, &refreshed).await
+            }
+            other => other,
+        }
+    }
+
+    fn record(&self, observation: &Observation) {
+        let now = Utc::now();
+        let mut quota = match self.quota.lock() {
+            Ok(q) => q,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(reading) = observation.primary.clone() {
+            quota.primary = reading.into_headroom(now);
+        }
+        if let Some(secs) = observation.retry_after_secs {
+            // A provider-stated wait always wins over a percentage: it is the
+            // more specific fact, and it is the one that is actionable.
+            quota.primary = Headroom::Exhausted {
+                until: now + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)),
+            };
+        }
+    }
+
+    fn quota(&self) -> QuotaSnapshot {
+        match self.quota.lock() {
+            Ok(q) => q.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    async fn probe(&self) -> Result<(), UpstreamError> {
+        let bearer = self.credential().map_err(|e| UpstreamError::NeedsAuth {
+            backend: self.id.clone(),
+            detail: e.to_string(),
+        })?;
+        self.check_host(&bearer)?;
+
+        // `GET /v1/models` validates the credential without an inference call.
+        //
+        // For the subscription backend this is the *only* honest probe: a real
+        // message would have to carry Claude Code's identity to be accepted,
+        // and synthesising that identity is exactly what `docs/TRUST.md` §3
+        // forbids. Checking auth without pretending to be another product is
+        // both cheaper and the only version we are willing to ship.
+        let mut builder = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .timeout(std::time::Duration::from_secs(15));
+        builder = match &self.auth {
+            AnthropicAuth::Subscription => builder
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {}", bearer.token.expose_secret()),
+                )
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+            AnthropicAuth::ApiKey(_) => builder.header("x-api-key", bearer.token.expose_secret()),
+        };
+
+        let response = builder.send().await.map_err(|e| UpstreamError::Transport {
+            backend: self.id.clone(),
+            detail: e.to_string(),
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            let body = response.bytes().await.unwrap_or_default();
+            return Err(UpstreamError::NeedsAuth {
+                backend: self.id.clone(),
+                detail: String::from_utf8_lossy(&body).chars().take(200).collect(),
+            });
+        }
+        Err(UpstreamError::Upstream {
+            backend: self.id.clone(),
+            status: http::StatusCode::from_u16(status.as_u16())
+                .unwrap_or(http::StatusCode::BAD_GATEWAY),
+            body: response.bytes().await.unwrap_or_default(),
+        })
+    }
+}
+
+impl AnthropicBackend {
+    /// One attempt with a specific credential. No retry, no failover — both are
+    /// the router's decision, because only it knows whether a byte has already
+    /// reached the client (`docs/PROTOCOL.md` §5).
+    async fn send_once(
+        &self,
+        request: UpstreamRequest,
+        bearer: &Bearer,
+    ) -> Result<UpstreamResponse, UpstreamError> {
         let url = format!("{}{}", self.base_url, request.path);
         let mut builder = self.client.post(&url);
 
@@ -335,31 +459,6 @@ impl Backend for AnthropicBackend {
             headers,
             body,
         })
-    }
-
-    fn record(&self, observation: &Observation) {
-        let now = Utc::now();
-        let mut quota = match self.quota.lock() {
-            Ok(q) => q,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(reading) = observation.primary.clone() {
-            quota.primary = reading.into_headroom(now);
-        }
-        if let Some(secs) = observation.retry_after_secs {
-            // A provider-stated wait always wins over a percentage: it is the
-            // more specific fact, and it is the one that is actionable.
-            quota.primary = Headroom::Exhausted {
-                until: now + chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX)),
-            };
-        }
-    }
-
-    fn quota(&self) -> QuotaSnapshot {
-        match self.quota.lock() {
-            Ok(q) => q.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
     }
 }
 

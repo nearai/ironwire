@@ -55,8 +55,9 @@ without a network belongs — which is most of the interesting logic, on purpose
   `CompletionRequest` family. Those are a chat-completions-shaped common
   denominator — correct for an agent that owns its prompts, wrong for a pipe.
 - Heavy dependencies (`rig-core` via `ironclaw_llm`) stay behind off-by-default
-  features. The default binary has a **15 MB stripped** budget because
-  brew/npx/apt/pip all ship it (`docs/PACKAGING.md`).
+  features. Five ecosystems ship this binary, so keep it lean — but there is no
+  hard size gate. CI reports the size; growing it is a decision you make in a
+  review, not a threshold you trip (`docs/PACKAGING.md`).
 
 ## Tests
 
