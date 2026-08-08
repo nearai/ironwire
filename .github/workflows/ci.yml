@@ -50,6 +50,18 @@ jobs:
       - name: Packaging scripts
         run: ./scripts/test-packaging.sh
 
+  # The commands a person actually runs, in the order they run them, against a
+  # mock provider. Every integration bug found in this project so far was found
+  # this way and none of them were visible from inside a unit test.
+  journey:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --bin ironwire
+      - run: ./scripts/journey.sh
+
   size:
     # brew/npx/apt/pip all ship this binary, so size is worth watching — but it
     # is a signal, not a gate. A feature worth its bytes should never be blocked

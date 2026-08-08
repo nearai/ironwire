@@ -16,13 +16,28 @@ pub enum Error {
     },
 
     /// A config file was not valid TOML, or had the wrong shape.
-    #[error("invalid config at {path}: {source}")]
+    ///
+    /// The message names the fix, because this error blocks *every* command —
+    /// a user who cannot parse their config also cannot run `status` to find
+    /// out what is wrong, and a bare TOML diagnostic leaves them guessing
+    /// whether IronWire is broken or their file is.
+    #[error(
+        "{path} could not be read as configuration.\n\n{detail}\n\n\
+         IronWire runs fine with no config at all — move that file aside to get \
+         the defaults back, or run `ironwire init --write` afterwards for a \
+         commented one."
+    )]
     ConfigParse {
         /// Path we tried.
         path: PathBuf,
         /// Underlying parse error.
-        #[source]
-        source: toml::de::Error,
+        ///
+        /// Named `detail` rather than `source` on purpose. `thiserror` treats a
+        /// field called `source` as the error chain, and since the message
+        /// above already quotes it, the chain would print the same TOML
+        /// diagnostic a second time with the actionable sentence buried between
+        /// the two copies.
+        detail: toml::de::Error,
     },
 
     /// The home directory could not be determined.

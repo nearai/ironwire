@@ -334,9 +334,9 @@ impl Config {
     /// As [`Config::load`].
     pub fn load_from(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| Error::ConfigParse {
+            Ok(text) => toml::from_str(&text).map_err(|detail| Error::ConfigParse {
                 path: path.to_path_buf(),
-                source,
+                detail,
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(Error::ConfigRead {
