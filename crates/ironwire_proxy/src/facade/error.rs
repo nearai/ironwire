@@ -83,6 +83,25 @@ impl FacadeError {
                     ),
                 )
             }
+            // The caller named a backend explicitly, so this is a *request*
+            // error, not a capacity one — 400, and it lists what exists so the
+            // answer is actionable rather than just a refusal.
+            NoRoute::UnknownRoute {
+                requested,
+                available,
+            } => Self::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "X-IronWire-Route asked for `{requested}`, which is not a \
+                     connected backend. Available: {}.",
+                    if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ),
+            ),
             NoRoute::RequiresClientIdentity => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",

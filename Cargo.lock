@@ -1313,6 +1313,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "futures-util",
  "ironwire_core",
  "ironwire_creds",
  "ironwire_ledger",

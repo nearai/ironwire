@@ -222,12 +222,61 @@ pub fn router() -> Router<AppState> {
         .route("/pin", post(pin))
         .route("/probe", post(probe))
         .route("/log", get(log))
+        .route("/events", get(events))
         .route("/health", get(health))
 }
 
 /// Unauthenticated: it reveals nothing and is what a service manager probes.
 async fn health() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+/// Live route and health events, as SSE.
+///
+/// What `ironwire watch` and the menu bar app both read. IronWire cannot put a
+/// line in a coding agent's transcript — the only writable channel is the
+/// response stream itself, and injecting there would put words in the model's
+/// mouth — so this side channel is how a user finds out that their family
+/// changed (`crate::events`).
+async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+
+    let mut rx = state.events.subscribe();
+    let stream = async_stream::stream! {
+        // A comment frame immediately, so a client knows it is connected before
+        // anything has happened — otherwise `ironwire watch` looks hung on a
+        // quiet system, which is the normal state.
+        yield Ok::<_, std::convert::Infallible>(
+            axum::body::Bytes::from_static(b": connected\n\n"),
+        );
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let payload = serde_json::to_string(&event)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    yield Ok(axum::body::Bytes::from(format!("data: {payload}\n\n")));
+                }
+                // The bus is lossy on purpose: a subscriber that fell behind is
+                // told so rather than silently shown a gap.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    yield Ok(axum::body::Bytes::from(format!(
+                        ": lagged {n}\n\n"
+                    )));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {

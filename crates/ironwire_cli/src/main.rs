@@ -71,6 +71,18 @@ enum Command {
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
 
+    /// Watch routing decisions as they happen.
+    ///
+    /// IronWire cannot write into your agent's transcript — the only channel
+    /// is the response stream, and putting a line there would put words in the
+    /// model's mouth. So this is the channel: a second terminal.
+    Watch {
+        /// Only show family changes and failures — the events that mean
+        /// something. On a healthy system this prints nothing.
+        #[arg(long)]
+        only_changes: bool,
+    },
+
     /// Run the daemon in the background as a user agent.
     ///
     /// Always a *user* agent, never a system service: IronWire holds your
@@ -126,6 +138,7 @@ async fn main() -> Result<()> {
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env => commands::connect::print_env(cli.port),
+        Command::Watch { only_changes } => commands::watch::run(cli.port, only_changes).await,
         Command::Service { action } => commands::service::run(&action, cli.port),
         Command::Completions { shell } => {
             clap_complete::generate(

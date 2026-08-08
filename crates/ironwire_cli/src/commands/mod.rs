@@ -13,6 +13,7 @@ pub(crate) mod serve;
 pub(crate) mod service;
 pub(crate) mod status;
 pub(crate) mod update;
+pub(crate) mod watch;
 
 use anyhow::{Context, Result};
 use ironwire_core::config::PathsConfig;

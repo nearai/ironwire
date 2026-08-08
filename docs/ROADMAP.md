@@ -121,12 +121,20 @@ OpenAI-compatible endpoint), gated on the turn-boundary rule.
 - [x] `mid_tool_loop` gate — switch families at a turn boundary only
 - [x] `ChatCompletionsBackend` (NEAR AI + arbitrary OpenAI-compatible)
 - [x] End-to-end test: `tests/claude_code_on_nearai.rs`
-- [ ] Rung-3 announcement UX — the user is told when the family changes. Still
-      open, and still the unresolved product question: IronWire has no UI channel
-      into Claude Code (`docs/CRITIQUE.md` open questions).
-- [ ] `ironwire pin` / `X-IronWire-Route` honoured for cross-family routes
-- [ ] `ironwire connect near` (device-key enrolment; today the backend appears
-      when `NEARAI_API_KEY` is set)
+- [x] Rung-3 announcement UX, via a **side channel** rather than an in-band one.
+      IronWire's only writable channel into a coding agent is the response
+      stream, and putting a line there would put words in the model's mouth and
+      corrupt the transcript the agent stores and replays. So: `/_ironwire/events`
+      (SSE) and `ironwire watch [--only-changes]`, which prints nothing on a
+      healthy system and one line when the family changes. The bus is lossy and
+      non-blocking by construction — the same rule as the observation tee
+- [x] `ironwire pin` and `X-IronWire-Route` honoured for cross-family routes.
+      The header is per-request and outranks the daemon-wide pin; it is stripped
+      before forwarding, and naming a backend that does not exist is a 400 that
+      lists what is available rather than a silent fall-through
+- [x] `ironwire connect near`, plus `connect anthropic-api` / `connect openai-api`.
+      Device-key enrolment still belongs to M6; today the key is all that is
+      needed, and the command says so rather than implying more
 
 **Known limitation, deliberately not fixed yet:** a session cannot change
 families *mid tool loop*. It waits for the next clean turn. Lifting this needs

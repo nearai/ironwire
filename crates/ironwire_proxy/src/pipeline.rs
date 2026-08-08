@@ -58,6 +58,41 @@ pub enum PipelineError {
     Upstream(UpstreamError),
 }
 
+/// A per-request route override from the `X-IronWire-Route` header.
+///
+/// Distinct from `ironwire pin`, which is a daemon-wide mode a user turns on
+/// and forgets. This is one request, named by the caller — the escape hatch for
+/// a script that wants a specific backend without disturbing anyone else's
+/// session (`docs/DESIGN.md` §3).
+///
+/// Like a pin, it overrides *preference* but never *eligibility*: a route that
+/// would corrupt the request is still refused. Obeying a caller into producing
+/// a broken response is not obedience, it is a bug.
+pub const ROUTE_OVERRIDE_HEADER: &str = "x-ironwire-route";
+
+/// Read and remove the route override from the forwarded header list.
+///
+/// Removed, not just read: it is IronWire's own header and forwarding it to a
+/// provider would leak our routing vocabulary into someone else's API.
+#[must_use]
+pub fn take_route_override(
+    headers: &mut Vec<(String, String)>,
+) -> Option<(String, Option<String>)> {
+    let index = headers
+        .iter()
+        .position(|(name, _)| name.eq_ignore_ascii_case(ROUTE_OVERRIDE_HEADER))?;
+    let (_, value) = headers.remove(index);
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    // `backend` or `backend:model`.
+    Some(match value.split_once(':') {
+        Some((backend, model)) => (backend.trim().to_string(), Some(model.trim().to_string())),
+        None => (value.to_string(), None),
+    })
+}
+
 /// Route and dispatch one request, failing over while it is still safe to.
 ///
 /// # Errors
@@ -72,6 +107,39 @@ pub async fn dispatch(
     body: Bytes,
     headers: Vec<(String, String)>,
 ) -> Result<(UpstreamResponse, Routed), PipelineError> {
+    let conversation = key.0.to_string();
+    let result = dispatch_inner(state, inbound, path, peek, key, body, headers).await;
+    // Every failure exit publishes, not just the one at the bottom: `dispatch`
+    // returns early from inside the failover loop too, and a channel that
+    // reports only some failures is worse than one that reports none — a user
+    // would learn to read silence as success.
+    if let Err(error) = &result {
+        state.events.publish(crate::events::Event::Failed {
+            at: Utc::now(),
+            conversation,
+            detail: error.to_string(),
+        });
+    }
+    result
+}
+
+async fn dispatch_inner(
+    state: &AppState,
+    inbound: Protocol,
+    path: &str,
+    peek: &RequestPeek,
+    key: ConversationKey,
+    body: Bytes,
+    headers: Vec<(String, String)>,
+) -> Result<(UpstreamResponse, Routed), PipelineError> {
+    let mut headers = headers;
+    let route_override = take_route_override(&mut headers).map(|(backend, model)| {
+        (
+            ironwire_core::protocol::BackendId::from(backend.as_str()),
+            model,
+        )
+    });
+
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
     let candidates = state.backends.candidates(&statuses, &consent);
@@ -98,6 +166,13 @@ pub async fn dispatch(
         healthy
     };
 
+    // Where this conversation was before we decided anything, so a genuine
+    // route change can be told apart from a request that stayed put.
+    let previous = match state.policy.lock() {
+        Ok(policy) => policy.current_backend(&key),
+        Err(poisoned) => poisoned.into_inner().current_backend(&key),
+    };
+
     let mut rejected: Vec<(String, String)> = Vec::new();
     let mut attempts = 0usize;
     let mut last_error: Option<UpstreamError> = None;
@@ -121,7 +196,14 @@ pub async fn dispatch(
                 Ok(p) => p,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            match policy.decide(key.clone(), inbound, peek, &available, Utc::now()) {
+            match policy.decide_with_override(
+                key.clone(),
+                inbound,
+                peek,
+                &available,
+                Utc::now(),
+                route_override.clone(),
+            ) {
                 Ok(decision) => decision,
                 Err(no_route) => {
                     return Err(last_error.map_or(PipelineError::NoRoute(no_route), |last| {
@@ -175,6 +257,20 @@ pub async fn dispatch(
                 // open stream by `resilience` — a breaker cannot help there,
                 // because by then the client is already committed.
                 state.breakers.record_success(&decision.backend);
+                // Announce only a real change. A sticky conversation producing
+                // one "routed" line per turn would bury the one line that
+                // means something (`crate::events`).
+                if previous.as_ref() != Some(&decision.backend) {
+                    state.events.publish(crate::events::Event::Routed {
+                        at: Utc::now(),
+                        conversation: key.0.to_string(),
+                        from: previous.as_ref().map(ToString::to_string),
+                        to: decision.backend.to_string(),
+                        rung: decision.rung,
+                        translated: decision.translated,
+                        reason: decision.reason.clone(),
+                    });
+                }
                 return Ok((
                     response,
                     Routed {
@@ -241,10 +337,10 @@ pub async fn dispatch(
         }
     }
 
-    match last_error {
-        Some(last) => Err(PipelineError::AllFailed { last, rejected }),
-        None => Err(PipelineError::NoRoute(NoRoute::AllExhausted)),
-    }
+    Err(match last_error {
+        Some(last) => PipelineError::AllFailed { last, rejected },
+        None => PipelineError::NoRoute(NoRoute::AllExhausted),
+    })
 }
 
 /// How many times to retry the *same* backend on a transient failure before

@@ -33,10 +33,20 @@ pub(crate) fn run(
     match target {
         "claude" => connect_claude(subscription, dry_run, port),
         "codex" => connect_codex(subscription, dry_run, port),
-        "anthropic-api" | "openai-api" | "near" => {
-            bail!("`ironwire connect {target}` lands in M2 — see docs/ROADMAP.md")
+        "near" => connect_near(port),
+        "anthropic-api" => connect_api_key(
+            "Anthropic",
+            "ANTHROPIC_API_KEY",
+            "https://console.anthropic.com/settings/keys",
+        ),
+        "openai-api" => connect_api_key(
+            "OpenAI",
+            "OPENAI_API_KEY",
+            "https://platform.openai.com/api-keys",
+        ),
+        other => {
+            bail!("unknown target `{other}`\n\ntry: claude, codex, near, anthropic-api, openai-api")
         }
-        other => bail!("unknown target `{other}` (try: claude, codex)"),
     }
 }
 
@@ -277,6 +287,75 @@ fn codex_config_path() -> Result<std::path::PathBuf> {
     }
     let home = dirs::home_dir().context("could not locate your home directory")?;
     Ok(home.join(".codex").join("config.toml"))
+}
+
+/// NEAR AI credits — the cross-family fallback lane.
+fn connect_near(port: u16) -> Result<()> {
+    println!("NEAR AI → IronWire");
+    println!();
+
+    match std::env::var("NEARAI_API_KEY") {
+        Ok(key) if !key.is_empty() => {
+            // Never the key itself, here or anywhere (`docs/TRUST.md` §5).
+            println!(
+                "Found NEARAI_API_KEY in your environment ({} chars).",
+                key.len()
+            );
+            println!();
+            println!("Restart the daemon to pick it up, then check it end to end:");
+            println!();
+            println!("    ironwire serve --port {port}");
+            println!("    ironwire doctor");
+        }
+        _ => {
+            println!("No NEARAI_API_KEY found.");
+            println!();
+            println!("Get a key at https://app.near.ai, then:");
+            println!();
+            println!("    export NEARAI_API_KEY=...");
+            println!("    ironwire serve");
+        }
+    }
+
+    println!();
+    println!("NEAR AI is a different API family, so IronWire reaches it through");
+    println!("the translated lane — and only at a turn boundary, never mid tool");
+    println!("loop (docs/PROTOCOL.md §6). When a conversation moves there, your");
+    println!("agent is talking to a different model family; `ironwire watch`");
+    println!("tells you the moment it happens.");
+    println!();
+    println!("Device-key enrolment and trace-contribution credits land with M6");
+    println!("(docs/ROADMAP.md). Today the key is all that is needed.");
+    Ok(())
+}
+
+/// A metered API key. Nothing to write — IronWire keeps no secrets in
+/// `config.toml` (`docs/TRUST.md` §5) — so this explains and verifies.
+fn connect_api_key(vendor: &str, env: &str, url: &str) -> Result<()> {
+    println!("{vendor} API key → IronWire");
+    println!();
+    match std::env::var(env) {
+        Ok(key) if !key.is_empty() => {
+            println!("Found {env} in your environment ({} chars).", key.len());
+            println!();
+            println!("Restart the daemon to pick it up:");
+            println!();
+            println!("    ironwire serve");
+            println!("    ironwire doctor");
+        }
+        _ => {
+            println!("No {env} found.");
+            println!();
+            println!("Get a key at {url}, then:");
+            println!();
+            println!("    export {env}=...");
+            println!("    ironwire serve");
+        }
+    }
+    println!();
+    println!("IronWire reads this from the environment and never writes it to");
+    println!("disk. There is no `ironwire` config field that holds a secret.");
+    Ok(())
 }
 
 /// The consent prompt. `docs/TRUST.md` §2 fixes its content; changing what it

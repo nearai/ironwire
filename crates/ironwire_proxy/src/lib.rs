@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 pub mod control;
+pub mod events;
 pub mod facade;
 pub mod pipeline;
 pub mod resilience;

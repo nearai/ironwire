@@ -40,7 +40,7 @@ impl ControlClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| not_running(&e))?;
+            .map_err(|e| not_running_inner(&e))?;
         if !response.status().is_success() {
             bail!("control API returned {}", response.status());
         }
@@ -55,7 +55,7 @@ impl ControlClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| not_running(&e))?;
+            .map_err(|e| not_running_inner(&e))?;
         if !response.status().is_success() {
             bail!("control API returned {}", response.status());
         }
@@ -73,7 +73,7 @@ impl ControlClient {
             .timeout(std::time::Duration::from_secs(45))
             .send()
             .await
-            .map_err(|e| not_running(&e))?;
+            .map_err(|e| not_running_inner(&e))?;
         if !response.status().is_success() {
             bail!("control API returned {}", response.status());
         }
@@ -89,7 +89,7 @@ impl ControlClient {
             .json(&serde_json::json!({ "backend": backend, "model": model }))
             .send()
             .await
-            .map_err(|e| not_running(&e))?;
+            .map_err(|e| not_running_inner(&e))?;
         if !response.status().is_success() {
             bail!("control API returned {}", response.status());
         }
@@ -97,9 +97,24 @@ impl ControlClient {
     }
 }
 
+/// Base URL and token for a caller that needs to hold its own long-lived
+/// connection — `watch` streams for hours, which the shared client's timeout
+/// would cut off.
+pub(crate) fn endpoint(port: Option<u16>) -> Result<(String, String)> {
+    let paths = paths()?;
+    let config = ironwire_core::config::Config::load(&paths)?;
+    let port = port.unwrap_or(config.server.port);
+    Ok((format!("http://127.0.0.1:{port}"), control_token(&paths)?))
+}
+
+/// Public form of [`not_running`], for callers outside this module.
+pub(crate) fn not_running(_port: Option<u16>, error: &reqwest::Error) -> anyhow::Error {
+    not_running_inner(error)
+}
+
 /// A connection refused here almost always means the daemon is not running,
 /// and saying that beats surfacing a transport error the user has to decode.
-fn not_running(error: &reqwest::Error) -> anyhow::Error {
+fn not_running_inner(error: &reqwest::Error) -> anyhow::Error {
     if error.is_connect() {
         anyhow::anyhow!("IronWire is not running. Start it with `ironwire serve`.")
     } else {

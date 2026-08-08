@@ -13,6 +13,8 @@ use ironwire_update::UpdateStatus;
 use ironwire_upstream::backend::{Backend, BackendStatus};
 use ironwire_upstream::breaker::BreakerBoard;
 
+use crate::events::EventBus;
+
 /// The set of backends this daemon can route to.
 #[derive(Clone, Default)]
 pub struct BackendRegistry {
@@ -116,6 +118,9 @@ pub struct AppState {
     /// Per-backend circuit state, so a failure is remembered past the end of
     /// the request that hit it (`ironwire_upstream::breaker`).
     pub breakers: Arc<BreakerBoard>,
+    /// Route and health events, for `ironwire watch` and the menu bar app.
+    /// Lossy and non-blocking by construction (`crate::events`).
+    pub events: EventBus,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -139,6 +144,7 @@ impl AppState {
             quirks: Arc::new(QuirksStore::new(ironwire_quirks::QUIRKS_PUBLIC_KEY)),
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             breakers: Arc::new(BreakerBoard::default()),
+            events: EventBus::new(),
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),

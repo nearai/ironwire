@@ -137,6 +137,17 @@ pub enum NoRoute {
     /// The only backends that could serve this need a client identity the
     /// request does not carry.
     RequiresClientIdentity,
+    /// An `X-IronWire-Route` header named a backend that does not exist.
+    ///
+    /// An error rather than a fall-through: the caller asked for something
+    /// specific, and quietly serving them from somewhere else would be worse
+    /// than saying we could not.
+    UnknownRoute {
+        /// What they asked for.
+        requested: String,
+        /// What exists, so the answer is actionable.
+        available: Vec<String>,
+    },
 }
 
 /// Sticky per-conversation route state.
@@ -188,6 +199,16 @@ impl Policy {
         self.pin.as_ref()
     }
 
+    /// Where a conversation is currently pinned, if anywhere.
+    ///
+    /// Read *before* deciding, so the caller can tell a genuine route change
+    /// from a request that simply stayed put. Announcing every request as a
+    /// "route" would drown the one announcement that matters.
+    #[must_use]
+    pub fn current_backend(&self, key: &ConversationKey) -> Option<BackendId> {
+        self.affinities.get(key).map(|a| a.backend.clone())
+    }
+
     /// Forget a conversation's affinity.
     pub fn forget(&mut self, key: &ConversationKey) {
         self.affinities.remove(key);
@@ -216,8 +237,41 @@ impl Policy {
         candidates: &[Candidate],
         now: DateTime<Utc>,
     ) -> Result<RouteDecision, NoRoute> {
+        self.decide_with_override(key, inbound, peek, candidates, now, None)
+    }
+
+    /// [`Self::decide`], with a per-request route override from
+    /// `X-IronWire-Route`.
+    ///
+    /// The override outranks a daemon-wide pin: it is the more specific
+    /// instruction, and it came with this request.
+    ///
+    /// # Errors
+    ///
+    /// [`NoRoute::UnknownRoute`] when the override names a backend that does
+    /// not exist, and [`NoRoute::AllIneligible`] when it names one that cannot
+    /// serve this request.
+    pub fn decide_with_override(
+        &mut self,
+        key: ConversationKey,
+        inbound: Protocol,
+        peek: &RequestPeek,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+        route_override: Option<(BackendId, Option<String>)>,
+    ) -> Result<RouteDecision, NoRoute> {
         if candidates.is_empty() {
             return Err(NoRoute::NoBackendsConfigured);
+        }
+
+        // A named backend that does not exist is an error, not a fall-through.
+        if let Some((requested, _)) = &route_override
+            && !candidates.iter().any(|c| c.id == *requested)
+        {
+            return Err(NoRoute::UnknownRoute {
+                requested: requested.to_string(),
+                available: candidates.iter().map(|c| c.id.to_string()).collect(),
+            });
         }
 
         let tier = peek
@@ -228,7 +282,8 @@ impl Policy {
         // A pin bypasses preference but not eligibility: an unusable route is
         // still unusable, and silently corrupting a request because the user
         // asked for a backend is not obedience, it is a bug.
-        if let Some((pinned, model)) = self.pin.clone()
+        let forced = route_override.clone().or_else(|| self.pin.clone());
+        if let Some((pinned, model)) = forced
             && let Some(candidate) = candidates.iter().find(|c| c.id == pinned)
         {
             let cross = candidate.caps.protocol.family() != inbound.family();
@@ -246,7 +301,11 @@ impl Policy {
                     Rung::Preferred
                 },
                 translated: cross,
-                reason: "pinned by user".to_string(),
+                reason: if route_override.is_some() {
+                    "X-IronWire-Route".to_string()
+                } else {
+                    "pinned by user".to_string()
+                },
             });
         }
 

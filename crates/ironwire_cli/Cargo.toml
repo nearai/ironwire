@@ -26,6 +26,7 @@ ironwire_upstream.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 clap_complete = "4"
 dirs.workspace = true
 reqwest.workspace = true
