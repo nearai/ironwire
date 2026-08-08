@@ -1,0 +1,75 @@
+//! Talking to the running daemon.
+//!
+//! Every inspection and every routing change goes through here rather than
+//! reading state off disk, so `ironwire status` reports what the daemon is
+//! *actually* doing (`docs/DESIGN.md` §6).
+
+use anyhow::{Context, Result, bail};
+use ironwire_proxy::control::StatusView;
+
+use super::{control_token, paths};
+
+/// A client for the local control API.
+pub(crate) struct ControlClient {
+    base: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl ControlClient {
+    /// Build a client for the daemon on `port`.
+    pub(crate) fn new(port: Option<u16>) -> Result<Self> {
+        let paths = paths()?;
+        let config = ironwire_core::config::Config::load(&paths)?;
+        let port = port.unwrap_or(config.server.port);
+        Ok(Self {
+            base: format!("http://127.0.0.1:{port}/_ironwire"),
+            token: control_token(&paths)?,
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .context("building the control client")?,
+        })
+    }
+
+    /// Fetch the daemon's state.
+    pub(crate) async fn status(&self) -> Result<StatusView> {
+        let response = self
+            .client
+            .get(format!("{}/status", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| not_running(&e))?;
+        if !response.status().is_success() {
+            bail!("control API returned {}", response.status());
+        }
+        response.json().await.context("parsing the status response")
+    }
+
+    /// Force all traffic onto a backend, or clear the force.
+    pub(crate) async fn pin(&self, backend: Option<String>, model: Option<String>) -> Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/pin", self.base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "backend": backend, "model": model }))
+            .send()
+            .await
+            .map_err(|e| not_running(&e))?;
+        if !response.status().is_success() {
+            bail!("control API returned {}", response.status());
+        }
+        Ok(())
+    }
+}
+
+/// A connection refused here almost always means the daemon is not running,
+/// and saying that beats surfacing a transport error the user has to decode.
+fn not_running(error: &reqwest::Error) -> anyhow::Error {
+    if error.is_connect() {
+        anyhow::anyhow!("IronWire is not running. Start it with `ironwire serve`.")
+    } else {
+        anyhow::anyhow!("could not reach the IronWire daemon: {error}")
+    }
+}

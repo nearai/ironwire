@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ironwire_core",
+    "crates/ironwire_creds",
+    "crates/ironwire_upstream",
+    "crates/ironwire_proxy",
+    "crates/ironwire_cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+authors = ["NEAR AI <support@near.ai>"]
+homepage = "https://github.com/nearai/ironwire"
+repository = "https://github.com/nearai/ironwire"
+
+[workspace.dependencies]
+ironwire_core = { path = "crates/ironwire_core", version = "0.1.0" }
+ironwire_creds = { path = "crates/ironwire_creds", version = "0.1.0" }
+ironwire_upstream = { path = "crates/ironwire_upstream", version = "0.1.0" }
+ironwire_proxy = { path = "crates/ironwire_proxy", version = "0.1.0" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+futures-util = "0.3"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "process"] }
+tokio-util = { version = "0.7" }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+todo = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

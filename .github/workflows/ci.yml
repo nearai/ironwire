@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo test --all-features
+
+  size-budget:
+    # brew/npx/apt/pip all ship this binary; a bloated default build makes the
+    # whole distribution story worse (docs/PACKAGING.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Check the 15 MB budget
+        run: |
+          size=$(stat -c%s target/release/ironwire)
+          echo "ironwire is $((size / 1024 / 1024)) MB"
+          if [ "$size" -gt $((15 * 1024 * 1024)) ]; then
+            echo "::error::binary exceeds the 15 MB budget (docs/PACKAGING.md)"
+            exit 1
+          fi

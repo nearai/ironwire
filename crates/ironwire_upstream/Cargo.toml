@@ -1,0 +1,31 @@
+[package]
+name = "ironwire_upstream"
+description = "IronWire upstream backends: native-lane passthrough and observation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ironwire_core.workspace = true
+ironwire_creds.workspace = true
+
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+http.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

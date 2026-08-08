@@ -1,0 +1,172 @@
+//! Observed quota. Never estimated.
+//!
+//! Inferring subscription headroom from token counts is hopeless — the windows
+//! are rolling, opaque and model-weighted — and one confidently wrong
+//! percentage costs us the user's trust in every other number we show
+//! (`docs/CRITIQUE.md` §4). So [`Headroom`] has no variant for a guess:
+//! either the provider told us, or we say `unknown`.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+
+/// What we know about a backend's remaining capacity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Headroom {
+    /// The provider reported a usage percentage. Carries the observation time
+    /// so callers can show its age instead of implying it is live.
+    Observed {
+        /// Percentage of the window consumed, 0.0–100.0.
+        used_pct: f32,
+        /// When the window resets, if the provider said.
+        resets_at: Option<DateTime<Utc>>,
+        /// When we read this.
+        observed_at: DateTime<Utc>,
+    },
+    /// We are inside a 429's `retry-after` window.
+    Exhausted {
+        /// Earliest time this backend is worth trying again.
+        until: DateTime<Utc>,
+    },
+    /// Authenticated, but the provider has told us nothing yet.
+    Unknown,
+}
+
+impl Headroom {
+    /// Whether the router should consider this backend right now.
+    #[must_use]
+    pub fn is_available(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Exhausted { until } => now >= *until,
+            // An unknown backend is available: refusing to try it is how we'd
+            // end up with a router that never discovers anything.
+            Self::Observed { .. } | Self::Unknown => true,
+        }
+    }
+
+    /// Age of the observation, if there is one.
+    #[must_use]
+    pub fn age(&self, now: DateTime<Utc>) -> Option<Duration> {
+        match self {
+            Self::Observed { observed_at, .. } => Some(now - *observed_at),
+            Self::Exhausted { .. } | Self::Unknown => None,
+        }
+    }
+
+    /// Whether headroom is tight enough to justify descending the ladder.
+    ///
+    /// Deliberately conservative: descending costs a cache, so we only do it
+    /// when the provider says we are genuinely near the wall.
+    #[must_use]
+    pub fn is_pressured(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Observed { used_pct, .. } => *used_pct >= 90.0,
+            Self::Exhausted { until } => now < *until,
+            Self::Unknown => false,
+        }
+    }
+}
+
+/// A backend's observed capacity state, as shown by `ironwire status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    /// Primary rate-limit window (Anthropic unified, or Codex primary).
+    pub primary: Headroom,
+    /// Secondary window where the provider exposes one (Codex weekly).
+    pub secondary: Option<Headroom>,
+    /// Metered spend since local midnight, in USD. An estimate — computed from
+    /// observed token counts and a price table — and labelled as one.
+    pub spend_today_usd: Option<f64>,
+}
+
+impl Default for QuotaSnapshot {
+    fn default() -> Self {
+        Self {
+            primary: Headroom::Unknown,
+            secondary: None,
+            spend_today_usd: None,
+        }
+    }
+}
+
+impl QuotaSnapshot {
+    /// Whether the router should consider this backend right now.
+    #[must_use]
+    pub fn is_available(&self, now: DateTime<Utc>) -> bool {
+        self.primary.is_available(now)
+            && self.secondary.as_ref().is_none_or(|h| h.is_available(now))
+    }
+
+    /// Whether either window is under pressure.
+    #[must_use]
+    pub fn is_pressured(&self, now: DateTime<Utc>) -> bool {
+        self.primary.is_pressured(now)
+            || self.secondary.as_ref().is_some_and(|h| h.is_pressured(now))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(offset_secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + offset_secs, 0).expect("valid timestamp")
+    }
+
+    #[test]
+    fn exhausted_becomes_available_after_retry_after() {
+        let h = Headroom::Exhausted { until: t(60) };
+        assert!(!h.is_available(t(0)));
+        assert!(h.is_available(t(60)));
+        assert!(h.is_available(t(61)));
+    }
+
+    #[test]
+    fn unknown_is_tried_rather_than_avoided() {
+        // A router that skips backends it hasn't measured never measures any.
+        assert!(Headroom::Unknown.is_available(t(0)));
+        assert!(!Headroom::Unknown.is_pressured(t(0)));
+    }
+
+    #[test]
+    fn pressure_needs_the_provider_to_say_so() {
+        let mild = Headroom::Observed {
+            used_pct: 71.0,
+            resets_at: None,
+            observed_at: t(0),
+        };
+        let tight = Headroom::Observed {
+            used_pct: 96.0,
+            resets_at: None,
+            observed_at: t(0),
+        };
+        assert!(!mild.is_pressured(t(0)));
+        assert!(tight.is_pressured(t(0)));
+    }
+
+    #[test]
+    fn secondary_window_can_block_an_otherwise_healthy_backend() {
+        let snapshot = QuotaSnapshot {
+            primary: Headroom::Observed {
+                used_pct: 10.0,
+                resets_at: None,
+                observed_at: t(0),
+            },
+            secondary: Some(Headroom::Exhausted { until: t(3600) }),
+            spend_today_usd: None,
+        };
+        assert!(!snapshot.is_available(t(0)));
+        assert!(snapshot.is_pressured(t(0)));
+    }
+
+    #[test]
+    fn observation_age_is_reportable() {
+        let h = Headroom::Observed {
+            used_pct: 50.0,
+            resets_at: None,
+            observed_at: t(0),
+        };
+        assert_eq!(h.age(t(40)), Some(Duration::seconds(40)));
+        assert_eq!(Headroom::Unknown.age(t(40)), None);
+    }
+}

@@ -1,0 +1,14 @@
+//! The IronWire loopback daemon.
+//!
+//! Mounts the provider façades and the control API on one `127.0.0.1` listener
+//! (`docs/TRUST.md` I1 — there is deliberately no way to bind anything else).
+#![warn(missing_docs)]
+
+pub mod control;
+pub mod facade;
+pub mod pipeline;
+pub mod server;
+pub mod state;
+
+pub use server::{ServeError, serve};
+pub use state::{AppState, BackendRegistry};
