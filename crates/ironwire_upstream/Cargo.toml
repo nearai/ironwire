@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 ironwire_core.workspace = true
 ironwire_creds.workspace = true
+ironwire_quirks.workspace = true
 
 async-trait.workspace = true
 bytes.workspace = true

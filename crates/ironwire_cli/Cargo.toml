@@ -18,6 +18,8 @@ path = "src/main.rs"
 ironwire_core.workspace = true
 ironwire_creds.workspace = true
 ironwire_ledger.workspace = true
+ironwire_quirks.workspace = true
+ironwire_update.workspace = true
 ironwire_proxy.workspace = true
 ironwire_upstream.workspace = true
 

@@ -10,6 +10,7 @@ use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_ledger::Ledger;
 use ironwire_proxy::server::ServeError;
 use ironwire_proxy::state::{AppState, BackendRegistry};
+use ironwire_quirks::QuirksStore;
 use ironwire_upstream::anthropic::AnthropicBackend;
 use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use secrecy::SecretString;
@@ -22,6 +23,7 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let config = Config::load(&paths).context("loading config.toml")?;
     let port = port_override.unwrap_or(config.server.port);
     let consent = ConsentLedger::load(&paths.consent_file());
+    let config_updates_enabled = config.updates.check;
     let token = control_token(&paths)?;
 
     let registry = build_registry(&config)?;
@@ -41,9 +43,19 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     };
 
     let ledger = open_ledger(&paths, &config);
+    // Provider values that may have been refreshed since this binary shipped.
+    // A missing or untrusted document silently leaves the built-ins in force.
+    let quirks = QuirksStore::load(ironwire_quirks::QUIRKS_PUBLIC_KEY, &paths.quirks_file());
+    if quirks.serial() > 0 {
+        println!("  provider quirks: serial {}", quirks.serial());
+    }
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
-        .with_ledger(ledger);
+        .with_ledger(ledger)
+        .with_quirks(quirks);
+
+    // Notify-only: check rarely, tell the user, never act. See docs/UPDATES.md.
+    super::update::spawn_check(state.clone(), &paths, config_updates_enabled);
 
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");

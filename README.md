@@ -119,6 +119,10 @@ pass. That position comes with hard commitments, not defaults
 - **Subscription backends are off until you say yes**, once, to a specific
   question that names the risk and whose account bears it.
 - **Traces stay local by default.** Upload is a separate, explicit decision.
+- **IronWire never updates itself.** `ironwire update` tells you a release
+  exists and prints your package manager's command. The only thing it refreshes
+  on its own is a signed provider-quirks document — which, by construction,
+  cannot name a host, so it can never redirect where a credential goes.
 
 ## Documentation
 
@@ -130,6 +134,7 @@ pass. That position comes with hard commitments, not defaults
 | [`docs/TRUST.md`](docs/TRUST.md) | Credentials, consent, traces |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestones |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | brew / npx / apt / pip |
+| [`docs/UPDATES.md`](docs/UPDATES.md) | notify-only updates, and the signed quirks channel |
 
 ## Layout
 
@@ -138,6 +143,8 @@ crates/
   ironwire_core       protocols, capability gate, routing policy, quota
   ironwire_creds      credential discovery + consent
   ironwire_ledger     the local trace ledger
+  ironwire_quirks     the signed provider-quirks channel
+  ironwire_update     notify-only update checking
   ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   backends: native passthrough and observation
   ironwire_proxy      axum façades, pipeline, control API

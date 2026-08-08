@@ -7,6 +7,7 @@
 
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_proxy::control::{BackendView, HeadroomView, LogView, StatusView};
+use ironwire_update::UpdateStatus;
 
 /// Render `ironwire log`.
 #[must_use]
@@ -144,7 +145,42 @@ pub(crate) fn status(status: &StatusView) -> String {
         "{} conversation(s) with a sticky route\n",
         status.tracked_conversations
     ));
+    if status.quirks_serial > 0 {
+        out.push_str(&format!(
+            "provider quirks: serial {}\n",
+            status.quirks_serial
+        ));
+    }
+    out.push_str(&update_line(&status.update));
     out
+}
+
+/// Notify-only: say a newer release exists and how to get it. Never act.
+fn update_line(update: &UpdateStatus) -> String {
+    match update {
+        UpdateStatus::Available {
+            latest,
+            upgrade_command,
+            ..
+        } => match upgrade_command {
+            Some(command) => format!("\nironwire {latest} is available — {command}\n"),
+            None => format!("\nironwire {latest} is available\n"),
+        },
+        UpdateStatus::Unsupported {
+            latest,
+            minimum_supported,
+            upgrade_command,
+        } => {
+            let how = upgrade_command
+                .as_deref()
+                .map_or_else(String::new, |c| format!(" — {c}"));
+            format!(
+                "\nThis build is below the supported floor ({minimum_supported}); providers may \n\
+                 have changed in ways it does not handle. {latest} is available{how}\n"
+            )
+        }
+        UpdateStatus::UpToDate | UpdateStatus::Unknown => String::new(),
+    }
 }
 
 fn backend_block(backend: &BackendView) -> String {
@@ -425,6 +461,8 @@ mod tests {
             tracked_conversations: 0,
             pin: None,
             backends: vec![],
+            quirks_serial: 0,
+            update: UpdateStatus::Unknown,
         });
         assert!(rendered.contains("ironwire connect claude"));
     }

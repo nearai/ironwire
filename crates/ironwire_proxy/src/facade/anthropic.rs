@@ -87,7 +87,7 @@ async fn forward(
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
-    let peek = RequestPeek::inspect(PROTOCOL, &parsed, body.len());
+    let peek = RequestPeek::inspect_with(PROTOCOL, &parsed, body.len(), &state.identity_markers());
     let key = conversation_key(&parsed);
     let conversation = key.0;
 

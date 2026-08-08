@@ -21,9 +21,9 @@ pub mod protocol;
 pub mod quota;
 
 pub use capability::{Capabilities, Ineligible, ReasoningNeed, RequestRequirements};
-pub use config::{Config, PathsConfig, ServerConfig};
+pub use config::{Config, PathsConfig, ServerConfig, UpdateConfig};
 pub use error::{Error, Result};
-pub use peek::RequestPeek;
+pub use peek::{IdentityMarkers, RequestPeek};
 pub use policy::{ConversationKey, RouteDecision, Rung};
 pub use protocol::{BackendId, BackendKind, Facade, ModelTier, Protocol};
 pub use quota::{Headroom, QuotaSnapshot};

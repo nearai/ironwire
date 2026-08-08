@@ -11,6 +11,7 @@ pub(crate) mod log;
 pub(crate) mod pin;
 pub(crate) mod serve;
 pub(crate) mod status;
+pub(crate) mod update;
 
 use anyhow::{Context, Result};
 use ironwire_core::config::PathsConfig;

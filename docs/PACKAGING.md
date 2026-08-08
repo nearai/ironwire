@@ -97,6 +97,8 @@ $IRONWIRE_HOME              default ~/.ironwire   (0700)
 ├── control.token           control-API token (0600)
 ├── daemon.lock             single-daemon lockfile
 ├── ledger.sqlite           local trace ledger
+├── quirks.json             signed provider quirks (docs/UPDATES.md)
+├── update.json             cached update check, at most one a day
 └── bodies/                 captured bodies, only if capture.bodies = true
 ```
 
@@ -122,5 +124,9 @@ installer tells you to run, and it is what `doctor` assumes.
    macos-arm64 and linux-x64, and reports the binary size.
 3. `cargo-dist` publishes the GitHub release, the tap commit and the npm
    packages; `nfpm` pushes the `.deb`; the wheel job pushes to PyPI.
-4. `install.sh` and `ironwire update` both read the release manifest, so there
-   is one source of truth for "what is latest".
+4. Sign the release and publish `manifest.json` (`latest`, `minimum_supported`,
+   `summary`) at the pinned URL. `install.sh` and `ironwire update` both read
+   it, so there is one source of truth for "what is latest".
+5. `ironwire update` **notifies only** — it never downloads or applies anything,
+   and it prints the command belonging to the user's install. See
+   [`UPDATES.md`](./UPDATES.md).

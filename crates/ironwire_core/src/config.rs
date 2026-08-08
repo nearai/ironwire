@@ -69,6 +69,18 @@ impl PathsConfig {
     pub fn ledger_file(&self) -> PathBuf {
         self.home.join("ledger.sqlite")
     }
+
+    /// Cached signed provider-quirks document.
+    #[must_use]
+    pub fn quirks_file(&self) -> PathBuf {
+        self.home.join("quirks.json")
+    }
+
+    /// Cached result of the last update check.
+    #[must_use]
+    pub fn update_cache_file(&self) -> PathBuf {
+        self.home.join("update.json")
+    }
 }
 
 /// Listener settings.
@@ -113,6 +125,22 @@ impl Default for CaptureConfig {
     }
 }
 
+/// Update-check settings. IronWire never applies an update itself; this only
+/// governs whether it *looks* (`docs/UPDATES.md`, `docs/TRUST.md` §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Check for a newer release, at most once a day. The one request IronWire
+    /// makes that is not the user's own work, and switchable off.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
+    }
+}
+
 /// A user-configured backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +179,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Trace capture settings.
     pub capture: CaptureConfig,
+    /// Update-check settings.
+    pub updates: UpdateConfig,
     /// Configured backends, in preference order for ties.
     pub backends: Vec<BackendConfig>,
 }
@@ -211,6 +241,7 @@ mod tests {
                 enabled: true,
                 bodies: true,
             },
+            updates: UpdateConfig { check: false },
             backends: vec![BackendConfig {
                 id: "claude-sub".into(),
                 kind: "claude-subscription".into(),

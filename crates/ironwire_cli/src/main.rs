@@ -64,6 +64,9 @@ enum Command {
         json: bool,
     },
 
+    /// Report whether a newer IronWire exists. Never applies it.
+    Update,
+
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
 
@@ -102,6 +105,7 @@ async fn main() -> Result<()> {
         } => commands::connect::disconnect(&target, subscription),
         Command::Doctor => commands::doctor::run(cli.port).await,
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
+        Command::Update => commands::update::run(cli.port).await,
         Command::Env => commands::connect::print_env(cli.port),
         Command::Pin { backend, model } => commands::pin::run(cli.port, backend, model).await,
     }

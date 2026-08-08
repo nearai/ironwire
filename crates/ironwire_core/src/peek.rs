@@ -21,7 +21,30 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 /// presence is how the Claude-subscription backend decides a request is
 /// genuinely Claude Code (`docs/TRUST.md` §3) — IronWire reads this signal, and
 /// never writes it.
+///
+/// Compiled-in default. The live value can be refreshed through the signed
+/// quirks channel (`docs/UPDATES.md`), because a marker string is exactly the
+/// kind of thing that changes without notice.
 pub const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code";
+
+/// Markers used to recognise a client's own identity, so the caller can supply
+/// refreshed ones without this crate depending on the quirks channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityMarkers {
+    /// Prefix of Claude Code's first system block.
+    pub claude_code_system_prefix: String,
+    /// Substring identifying Codex in a Responses `instructions` field.
+    pub codex_instructions_marker: String,
+}
+
+impl Default for IdentityMarkers {
+    fn default() -> Self {
+        Self {
+            claude_code_system_prefix: CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
+            codex_instructions_marker: "Codex".to_string(),
+        }
+    }
+}
 
 /// What policy learned from one look at the body.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,13 +71,26 @@ impl RequestPeek {
     /// analysed.
     #[must_use]
     pub fn inspect(protocol: Protocol, body: &Value, raw_len: usize) -> Self {
+        Self::inspect_with(protocol, body, raw_len, &IdentityMarkers::default())
+    }
+
+    /// Inspect with caller-supplied identity markers.
+    #[must_use]
+    pub fn inspect_with(
+        protocol: Protocol,
+        body: &Value,
+        raw_len: usize,
+        markers: &IdentityMarkers,
+    ) -> Self {
         match protocol {
-            Protocol::AnthropicMessages => Self::inspect_anthropic(body, raw_len),
-            Protocol::OpenAiResponses | Protocol::OpenAiChat => Self::inspect_openai(body, raw_len),
+            Protocol::AnthropicMessages => Self::inspect_anthropic(body, raw_len, markers),
+            Protocol::OpenAiResponses | Protocol::OpenAiChat => {
+                Self::inspect_openai(body, raw_len, markers)
+            }
         }
     }
 
-    fn inspect_anthropic(body: &Value, raw_len: usize) -> Self {
+    fn inspect_anthropic(body: &Value, raw_len: usize, markers: &IdentityMarkers) -> Self {
         let messages = body.get("messages").and_then(Value::as_array);
         let system = body.get("system");
 
@@ -143,13 +179,13 @@ impl RequestPeek {
                 .map(str::to_string),
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             carries_client_identity: anthropic_system_prefix(system)
-                .is_some_and(|s| s.starts_with(CLAUDE_CODE_SYSTEM_PREFIX)),
+                .is_some_and(|s| s.starts_with(&markers.claude_code_system_prefix)),
             message_count: messages.map_or(0, Vec::len),
             requirements,
         }
     }
 
-    fn inspect_openai(body: &Value, raw_len: usize) -> Self {
+    fn inspect_openai(body: &Value, raw_len: usize, markers: &IdentityMarkers) -> Self {
         // `input` is the Responses API; `messages` is Chat Completions.
         let items = body
             .get("input")
@@ -228,7 +264,7 @@ impl RequestPeek {
             carries_client_identity: body
                 .get("instructions")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s.contains("Codex")),
+                .is_some_and(|s| s.contains(&markers.codex_instructions_marker)),
             message_count: items.map_or(0, Vec::len),
             requirements,
         }

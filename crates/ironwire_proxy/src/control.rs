@@ -16,6 +16,7 @@ use axum::routing::{get, post};
 use ironwire_core::protocol::BackendId;
 use ironwire_core::quota::Headroom;
 use ironwire_ledger::{Exchange, Summary};
+use ironwire_update::UpdateStatus;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -98,6 +99,12 @@ pub struct StatusView {
     pub pin: Option<String>,
     /// Every configured backend.
     pub backends: Vec<BackendView>,
+    /// Serial of the signed quirks document in force; `0` means the values this
+    /// binary shipped with (`docs/UPDATES.md`).
+    pub quirks_serial: u64,
+    /// What the last update check concluded. IronWire never applies an update
+    /// itself — this is notification, not action.
+    pub update: UpdateStatus,
 }
 
 /// Body of `POST /_ironwire/pin`.
@@ -205,6 +212,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         tracked_conversations: tracked,
         pin,
         backends,
+        quirks_serial: state.quirks.serial(),
+        update: state.update_status(),
     })
     .into_response()
 }

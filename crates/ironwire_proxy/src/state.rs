@@ -3,10 +3,13 @@
 use std::sync::{Arc, Mutex};
 
 use ironwire_core::config::Config;
+use ironwire_core::peek::IdentityMarkers;
 use ironwire_core::policy::{Candidate, Policy};
 use ironwire_core::protocol::BackendId;
 use ironwire_creds::ConsentLedger;
 use ironwire_ledger::Ledger;
+use ironwire_quirks::QuirksStore;
+use ironwire_update::UpdateStatus;
 use ironwire_upstream::backend::{Backend, BackendStatus};
 
 /// The set of backends this daemon can route to.
@@ -103,6 +106,12 @@ pub struct AppState {
     /// ledger could not be opened — a ledger problem must never stop the proxy
     /// from doing its actual job.
     pub ledger: Option<Ledger>,
+    /// Provider values refreshed through the signed quirks channel
+    /// (`docs/UPDATES.md`). Read-mostly, so a plain snapshot rather than a lock.
+    pub quirks: Arc<QuirksStore>,
+    /// What the last update check concluded. Notify-only — IronWire never
+    /// applies an update itself.
+    pub update: Arc<Mutex<UpdateStatus>>,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -123,9 +132,45 @@ impl AppState {
             policy: Arc::new(Mutex::new(Policy::new())),
             consent: Arc::new(Mutex::new(consent)),
             ledger: None,
+            quirks: Arc::new(QuirksStore::new(ironwire_quirks::QUIRKS_PUBLIC_KEY)),
+            update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),
+        }
+    }
+
+    /// Install a quirks store loaded at startup.
+    #[must_use]
+    pub fn with_quirks(mut self, quirks: QuirksStore) -> Self {
+        self.quirks = Arc::new(quirks);
+        self
+    }
+
+    /// Record what the last update check concluded.
+    pub fn set_update_status(&self, status: UpdateStatus) {
+        match self.update.lock() {
+            Ok(mut slot) => *slot = status,
+            Err(poisoned) => *poisoned.into_inner() = status,
+        }
+    }
+
+    /// The last update check's conclusion.
+    #[must_use]
+    pub fn update_status(&self) -> UpdateStatus {
+        match self.update.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Identity markers currently in force.
+    #[must_use]
+    pub fn identity_markers(&self) -> IdentityMarkers {
+        let quirks = self.quirks.current();
+        IdentityMarkers {
+            claude_code_system_prefix: quirks.client_identity.claude_code_system_prefix.clone(),
+            codex_instructions_marker: quirks.client_identity.codex_instructions_marker.clone(),
         }
     }
 

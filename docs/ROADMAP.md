@@ -102,15 +102,44 @@ correctly waits rather than switching. Not yet run against live NEAR AI.
 
 ---
 
-## M4 — Distribution
+## M4 — Distribution and updates
 
-- CI release matrix: macos-arm64/x64, linux-x64/arm64 (gnu + musl), windows-x64
-- `cargo-dist`: shell installer, Homebrew tap, npm package, MSI
-- `.deb` + hosted apt repo
-- pip wheel with platform tags
-- `ironwire update`
+- [ ] CI release matrix: macos-arm64/x64, linux-x64/arm64 (gnu + musl), windows-x64
+- [ ] `cargo-dist`: shell installer, Homebrew tap, npm package, MSI
+- [ ] `.deb` + hosted apt repo
+- [ ] pip wheel with platform tags
+- [ ] **Signed releases** — minisign/cosign, verified against a key in the
+      binary. A checksum served from the same host as the binary proves nothing.
 
-See [`PACKAGING.md`](./PACKAGING.md).
+### Updates: notify-only ✅ built
+
+`ironwire` never updates its own binary — it is a daemon holding credentials in
+the middle of a streamed response (`docs/UPDATES.md` §1).
+
+- [x] `InstallMethod::detect` — defer to whoever owns the install (`brew
+      upgrade`, `apt install --only-upgrade`, …). Self-updating a managed
+      install desyncs its package manager.
+- [x] Once-a-day check, cached, never blocking startup, kill switch honoured
+      before the first request
+- [x] `minimum_supported` floor, so "probably broken" reads differently from
+      "a bit old"
+- [x] `ironwire update`; `ironwire status` surfaces it
+- [ ] Publish `manifest.json` at the pinned URL (needs the release job)
+
+### Provider-quirks channel ✅ built
+
+Signed data, refreshed independently of the binary, so a changed
+`anthropic-beta` flag is a minutes-long fix rather than a five-ecosystem release
+(`docs/UPDATES.md` §2).
+
+- [x] Bounded schema — **no field can express a host, URL, or path**, so
+      `TRUST.md` I2 holds even against a compromised signing key
+- [x] ed25519 verification before parse, rollback guard on `serial`, fail-closed
+      onto compiled-in defaults
+- [x] Wired into the Anthropic protocol constants and the client-identity markers
+- [ ] Real signing key + a published document (the compiled-in key is a
+      placeholder that verifies nothing, so the channel is inert until then)
+- [ ] Periodic refresh in the daemon (today it loads at startup)
 
 ---
 
