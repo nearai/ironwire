@@ -70,6 +70,11 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     // Provider quirks refresh while running, so a changed `anthropic-beta`
     // flag is a minutes-long fix rather than a restart (docs/UPDATES.md §2).
     super::quirks::spawn_refresh(state.clone(), &paths, config_updates_enabled);
+    // Ask each backend what it serves, once, in the background. Without this
+    // the catalogue was only ever learned by `ironwire doctor`, so a daemon
+    // nobody ran doctor against routed on compiled-in guesses for its whole
+    // life — and picked models accordingly.
+    spawn_catalogue_discovery(state.clone());
 
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
@@ -79,6 +84,28 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     ironwire_proxy::server::serve_on(listener, state, shutdown_signal())
         .await
         .context("serving")
+}
+
+/// Learn every backend's catalogue in the background, once, at startup.
+///
+/// In the background because a probe is a network round trip per backend and
+/// the daemon must be answering requests immediately; a request that arrives
+/// first simply routes on the compiled-in list, which is what it did before.
+/// Failures are logged at debug and otherwise ignored — this is an
+/// optimisation of what we know, not a health check, and `ironwire doctor`
+/// remains the place that reports whether a backend actually works.
+fn spawn_catalogue_discovery(state: ironwire_proxy::state::AppState) {
+    tokio::spawn(async move {
+        for backend in state.backends.all() {
+            if let Err(error) = backend.probe().await {
+                tracing::debug!(
+                    backend = %backend.id(),
+                    %error,
+                    "could not learn this backend's catalogue at startup"
+                );
+            }
+        }
+    });
 }
 
 /// Open the trace ledger, or explain why we are running without one.
@@ -234,7 +261,13 @@ fn nearai_models(config: &Config) -> Vec<(String, ModelTier)> {
         .find(|b| b.id == "nearai")
         .and_then(|b| b.models.clone())
         .map_or_else(
-            || vec![("deepseek-v3".to_string(), ModelTier::Frontier)],
+            // Empty, not a guess. The previous default named `deepseek-v3`,
+            // which is not a model this endpoint has ever served under that id
+            // — so a fallback route was built on a name that could only 400.
+            // With nothing here the catalogue comes from the provider, and
+            // until it does this backend has no model to offer, which is the
+            // truth.
+            Vec::new,
             |models| {
                 models
                     .into_iter()

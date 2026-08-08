@@ -596,20 +596,84 @@ pub fn parse_model_list(body: &[u8]) -> Option<Catalogue> {
         .and_then(serde_json::Value::as_array)
         .or_else(|| value.as_array())?;
 
+    let mut priced: Vec<(String, ModelTier, Option<f64>)> = items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("slug"))
+                .or_else(|| item.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.as_str())?;
+            if !serves_text_chat(item) {
+                return None;
+            }
+            let price = output_price(item);
+            let tier = price.map_or_else(|| ModelTier::from_model_hint(id), tier_from_price);
+            Some((id.to_string(), tier, price))
+        })
+        .collect();
+
+    // Best first, by what the provider charges for it. Only when the provider
+    // priced the catalogue: elsewhere the order it gave us *is* its ranking
+    // (Codex sends an explicit `priority`), and re-sorting on a name would be
+    // us overruling the provider with a guess.
+    //
+    // This matters because `pick_model` takes the first entry at a tier. Across
+    // a fifty-model catalogue, "first" without an ordering means alphabetical —
+    // which is how a fallback ended up on an old DeepSeek while the same
+    // account could reach Claude and GPT-5.
+    if priced.iter().any(|(_, _, price)| price.is_some()) {
+        priced.sort_by(|a, b| {
+            b.2.unwrap_or(0.0)
+                .partial_cmp(&a.2.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     Some(
-        items
-            .iter()
-            .filter_map(|item| {
-                let id = item
-                    .get("id")
-                    .or_else(|| item.get("slug"))
-                    .or_else(|| item.get("model"))
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| item.as_str())?;
-                serves_text_chat(item).then(|| (id.to_string(), ModelTier::from_model_hint(id)))
-            })
+        priced
+            .into_iter()
+            .map(|(id, tier, _)| (id, tier))
             .collect(),
     )
+}
+
+/// Dollars per million output tokens, where the catalogue states them.
+fn output_price(item: &serde_json::Value) -> Option<f64> {
+    let pricing = item.get("pricing")?;
+    let read = |key: &str| -> Option<f64> {
+        let value = pricing.get(key)?;
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+    };
+    // `output` is per million; `completion` is the same number per token, and
+    // some catalogues carry only one of the two.
+    read("output")
+        .or_else(|| read("completion").map(|per_token| per_token * 1_000_000.0))
+        .filter(|price| price.is_finite() && *price > 0.0)
+}
+
+/// Which tier a price puts a model in.
+///
+/// Price is the provider's own statement of what a model is worth, which is a
+/// better tier signal than its name: a name test has to be updated for every
+/// vendor's naming scheme and silently misfiles everything it has not seen,
+/// while every catalogue that prices its models prices the capable ones higher.
+///
+/// The thresholds are in dollars per million output tokens, and they are chosen
+/// where the market actually separates: frontier models sit at $10 and above
+/// (Opus, GPT-5, Sonnet), the working middle from ~$2, and the small fast
+/// models below that.
+fn tier_from_price(output_usd_per_million: f64) -> ModelTier {
+    if output_usd_per_million >= 10.0 {
+        ModelTier::Frontier
+    } else if output_usd_per_million >= 2.0 {
+        ModelTier::Balanced
+    } else {
+        ModelTier::Fast
+    }
 }
 
 /// Whether an entry describes something that can answer a chat turn.
@@ -664,6 +728,78 @@ mod tests {
 
     fn subscription(base: &str) -> ResponsesBackend {
         ResponsesBackend::codex_subscription(Some(base.to_string()), 60).expect("client builds")
+    }
+
+    /// A slice of what NEAR AI actually returns, prices and all. Alphabetical,
+    /// as the endpoint sends it — which is exactly the order that used to
+    /// decide which model a fallback got.
+    const PRICED_CATALOGUE: &str = r#"{"object":"list","data":[
+        {"id":"anthropic/claude-opus-4-8","pricing":{"input":5.0,"output":25.0},
+         "input_modalities":["text","image"],"output_modalities":["text"]},
+        {"id":"deepseek-ai/DeepSeek-V4-Flash","pricing":{"input":0.17,"output":0.35},
+         "input_modalities":["text"],"output_modalities":["text"]},
+        {"id":"deepseek/deepseek-v3.2","pricing":{"input":0.27,"output":0.4},
+         "input_modalities":["text"],"output_modalities":["text"]},
+        {"id":"z-ai/glm-5.2","pricing":{"input":0.6,"output":4.4},
+         "input_modalities":["text"],"output_modalities":["text"]},
+        {"id":"Qwen/Qwen3-Embedding-0.6B","pricing":{"input":0.01,"output":0.01},
+         "input_modalities":["text"],"output_modalities":["embedding"]}
+    ]}"#;
+
+    #[test]
+    fn a_priced_catalogue_is_ordered_by_what_the_provider_charges() {
+        let models = parse_model_list(PRICED_CATALOGUE.as_bytes()).expect("parses");
+        let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-opus-4-8",
+                "z-ai/glm-5.2",
+                "deepseek/deepseek-v3.2",
+                "deepseek-ai/DeepSeek-V4-Flash",
+            ],
+            "the embedding model must be gone, and the rest ranked by price"
+        );
+    }
+
+    /// The bug this ordering exists for: `pick_model` takes the first entry at
+    /// a tier, so without a ranking a frontier request got whatever happened to
+    /// sort first alphabetically.
+    #[test]
+    fn the_best_model_is_the_one_a_frontier_request_reaches_first() {
+        let models = parse_model_list(PRICED_CATALOGUE.as_bytes()).expect("parses");
+        let first_frontier = models
+            .iter()
+            .find(|(_, tier)| *tier == ModelTier::Frontier)
+            .expect("a frontier model");
+        assert_eq!(first_frontier.0, "anthropic/claude-opus-4-8");
+    }
+
+    #[test]
+    fn price_places_a_model_in_its_tier() {
+        let models = parse_model_list(PRICED_CATALOGUE.as_bytes()).expect("parses");
+        let tier = |id: &str| {
+            models
+                .iter()
+                .find(|(name, _)| name == id)
+                .map(|(_, tier)| *tier)
+        };
+        assert_eq!(tier("anthropic/claude-opus-4-8"), Some(ModelTier::Frontier));
+        assert_eq!(tier("z-ai/glm-5.2"), Some(ModelTier::Balanced));
+        assert_eq!(
+            tier("deepseek-ai/DeepSeek-V4-Flash"),
+            Some(ModelTier::Fast)
+        );
+    }
+
+    /// Codex's catalogue carries no prices but does carry its own `priority`
+    /// order. Re-sorting it on a name would be us overruling the provider.
+    #[test]
+    fn an_unpriced_catalogue_keeps_the_order_the_provider_sent() {
+        let body = br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.4"},{"slug":"gpt-5.4-mini"}]}"#;
+        let models = parse_model_list(body).expect("parses");
+        let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.4", "gpt-5.4-mini"]);
     }
 
     #[test]

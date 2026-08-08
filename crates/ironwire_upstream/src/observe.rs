@@ -100,8 +100,19 @@ impl Observation {
 
 /// Read Anthropic's rate-limit headers.
 ///
-/// Anthropic reports *remaining* against a limit; we convert to used-percent so
-/// every provider lands in the same vocabulary.
+/// A subscription is not rate limited on one axis. Anthropic reports a
+/// five-hour window and a seven-day window side by side, each with its own
+/// utilization and reset, and then names which of the two is currently binding
+/// in `anthropic-ratelimit-unified-representative-claim`. That last header is
+/// the provider answering the question we would otherwise have to guess at, so
+/// it decides which window we report; without it we take whichever is fuller,
+/// because the fuller one is what will stop the user first.
+///
+/// Utilization arrives as a *fraction* — `0.05` for five percent — which is the
+/// detail that made this read `unknown` forever: the code before this looked
+/// for `-used-percent`, `-remaining` and `-limit`, and Anthropic sends none of
+/// them. A real Claude Max account therefore never reported capacity at all,
+/// on the one screen built to show it.
 #[must_use]
 pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitReading> {
     let get = |name: &str| {
@@ -110,32 +121,67 @@ pub fn anthropic_rate_limit(headers: &[(String, String)]) -> Option<RateLimitRea
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     };
+    let timestamp = |value: &str| {
+        value
+            .parse::<i64>()
+            .ok()
+            .and_then(|secs| DateTime::from_timestamp(secs, 0))
+            .or_else(|| {
+                DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc))
+            })
+    };
 
-    let resets_at = get("anthropic-ratelimit-unified-reset")
-        .and_then(|v| v.parse::<i64>().ok())
-        .and_then(|secs| DateTime::from_timestamp(secs, 0))
-        .or_else(|| {
-            get("anthropic-ratelimit-unified-reset")
-                .and_then(|v| DateTime::parse_from_rfc3339(v).ok())
-                .map(|d| d.with_timezone(&Utc))
-        });
+    let overall_reset = get("anthropic-ratelimit-unified-reset").and_then(timestamp);
 
-    // Prefer an explicit percentage where the provider gives one; otherwise
-    // derive it from remaining/limit. If neither is present we return None —
-    // that becomes `Headroom::Unknown`, not a guess.
-    // `parse::<f32>` accepts "NaN" and "inf". A NaN survives `clamp` — it
-    // propagates — and then `used_pct >= 90.0` is false forever, so a backend
-    // reporting NaN would look permanently healthy while `status` printed
-    // "NaN% used". Rejecting it yields `Unknown`, which is the honest answer.
+    // Each window, where it was reported. `is_finite` because `parse::<f32>`
+    // accepts "NaN" and "inf": a NaN survives `clamp` by propagating, and then
+    // `used_pct >= 90.0` is false forever — a backend would look permanently
+    // healthy while `status` printed "NaN% used".
+    let window = |prefix: &str| -> Option<RateLimitReading> {
+        let raw = get(&format!("anthropic-ratelimit-unified-{prefix}-utilization"))?
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())?;
+        // Observed as a fraction of one. A value above 1 can only be a
+        // percentage already, and reading it as a fraction would report 4300%.
+        let used_pct = if raw > 1.0 { raw } else { raw * 100.0 };
+        Some(RateLimitReading {
+            used_pct: used_pct.clamp(0.0, 100.0),
+            resets_at: get(&format!("anthropic-ratelimit-unified-{prefix}-reset"))
+                .and_then(timestamp)
+                .or(overall_reset),
+        })
+    };
+    let five_hour = window("5h");
+    let seven_day = window("7d");
+
+    let binding = match get("anthropic-ratelimit-unified-representative-claim") {
+        Some("five_hour") => five_hour.clone().or_else(|| seven_day.clone()),
+        Some("seven_day") => seven_day.clone().or_else(|| five_hour.clone()),
+        _ => None,
+    };
+    if let Some(reading) = binding.or_else(|| match (five_hour, seven_day) {
+        (Some(a), Some(b)) if b.used_pct > a.used_pct => Some(b),
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    }) {
+        return Some(reading);
+    }
+
+    // Older shapes, kept because a provider that changed once can change back,
+    // and because a self-hosted Anthropic-compatible endpoint may speak either.
     if let Some(pct) = get("anthropic-ratelimit-unified-used-percent")
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|pct| pct.is_finite())
     {
         return Some(RateLimitReading {
             used_pct: pct.clamp(0.0, 100.0),
-            resets_at,
+            resets_at: overall_reset,
         });
     }
+    let resets_at = overall_reset;
 
     let remaining = get("anthropic-ratelimit-unified-remaining")?
         .parse::<f64>()
@@ -250,6 +296,78 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp")
+    }
+
+    /// Exactly what a live Claude Max account answered with, headers and
+    /// values. The parser before this looked for `-used-percent`, `-remaining`
+    /// and `-limit` — none of which appear here — so capacity read `unknown`
+    /// forever no matter how much of the window was gone.
+    fn live_claude_headers() -> Vec<(String, String)> {
+        headers(&[
+            ("anthropic-ratelimit-unified-5h-reset", "1786235400"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.05"),
+            ("anthropic-ratelimit-unified-7d-reset", "1786777200"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.03"),
+            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+            ("anthropic-ratelimit-unified-reset", "1786235400"),
+            ("anthropic-ratelimit-unified-status", "allowed"),
+        ])
+    }
+
+    #[test]
+    fn a_real_subscription_response_reports_its_capacity() {
+        let reading = anthropic_rate_limit(&live_claude_headers()).expect("observed");
+        // 0.05 is a fraction, not a percentage.
+        assert!((reading.used_pct - 5.0).abs() < 1e-3, "got {}", reading.used_pct);
+        assert_eq!(
+            reading.resets_at,
+            DateTime::from_timestamp(1_786_235_400, 0),
+            "the reset must come from the window that binds"
+        );
+    }
+
+    /// The provider says which window is binding. Believing it is the whole
+    /// difference between reporting the limit that will stop you and the one
+    /// that will not.
+    #[test]
+    fn the_representative_claim_chooses_the_window() {
+        let mut pairs = live_claude_headers();
+        for (name, value) in &mut pairs {
+            if name.ends_with("representative-claim") {
+                *value = "seven_day".to_string();
+            }
+        }
+        let reading = anthropic_rate_limit(&pairs).expect("observed");
+        assert!((reading.used_pct - 3.0).abs() < 1e-3, "got {}", reading.used_pct);
+        assert_eq!(reading.resets_at, DateTime::from_timestamp(1_786_777_200, 0));
+    }
+
+    /// Without the claim, the fuller window wins: it is the one that stops the
+    /// user first, and reporting the emptier one would be reassurance we cannot
+    /// support.
+    #[test]
+    fn without_a_claim_the_fuller_window_is_reported() {
+        let pairs = headers(&[
+            ("anthropic-ratelimit-unified-5h-utilization", "0.10"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.80"),
+        ]);
+        let reading = anthropic_rate_limit(&pairs).expect("observed");
+        assert!((reading.used_pct - 80.0).abs() < 1e-3, "got {}", reading.used_pct);
+    }
+
+    /// A value above 1 cannot be a fraction. Multiplying it would report 4300%.
+    #[test]
+    fn a_percentage_is_not_multiplied_again() {
+        let pairs = headers(&[("anthropic-ratelimit-unified-5h-utilization", "43")]);
+        let reading = anthropic_rate_limit(&pairs).expect("observed");
+        assert!((reading.used_pct - 43.0).abs() < 1e-3, "got {}", reading.used_pct);
+    }
+
+    #[test]
+    fn a_response_with_no_rate_limit_headers_stays_unknown() {
+        assert!(anthropic_rate_limit(&headers(&[("content-type", "application/json")])).is_none());
     }
 
     #[test]
