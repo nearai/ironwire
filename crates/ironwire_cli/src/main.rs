@@ -1,5 +1,6 @@
 //! The `ironwire` command-line interface.
 
+mod claude_settings;
 mod codex_config;
 mod commands;
 mod render;
@@ -37,6 +38,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Print one line of IronWire state, for an agent's status line.
+    ///
+    /// IronWire will not write into a response stream — the only text channel
+    /// there is the model's own. A status line is the harness's own furniture,
+    /// so this is where IronWire gets to say something without putting words in
+    /// the model's mouth. Wired up by `ironwire connect claude`.
+    Statusline,
 
     /// Connect a coding agent or a capacity source.
     Connect {
@@ -97,9 +106,10 @@ enum Command {
 
     /// Watch routing decisions as they happen.
     ///
-    /// IronWire cannot write into your agent's transcript — the only channel
-    /// is the response stream, and putting a line there would put words in the
-    /// model's mouth. So this is the channel: a second terminal.
+    /// IronWire will not write into your agent's transcript — the only channel
+    /// there is the response stream, and putting a line in it would put words
+    /// in the model's mouth. The channels that are not the transcript: this,
+    /// and `ironwire statusline` in the agent's own status bar.
     Watch {
         /// Only show family changes and failures — the events that mean
         /// something. On a healthy system this prints nothing.
@@ -150,6 +160,7 @@ async fn main() -> Result<()> {
         Command::Init { write } => commands::init::run(cli.port, write),
         Command::Serve => commands::serve::run(cli.port).await,
         Command::Status { json } => commands::status::run(cli.port, json).await,
+        Command::Statusline => commands::statusline::run(cli.port).await,
         Command::Connect {
             target,
             subscription,

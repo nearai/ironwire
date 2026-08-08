@@ -136,6 +136,28 @@ pub struct StatusView {
     /// What the last update check concluded. IronWire never applies an update
     /// itself — this is notification, not action.
     pub update: UpdateStatus,
+    /// The most recent route this daemon took, for a status line to display.
+    ///
+    /// Defaulted on the way in so a newer CLI can read an older daemon's status
+    /// instead of refusing it.
+    #[serde(default)]
+    pub last_route: Option<LastRouteView>,
+}
+
+/// The most recent routing decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastRouteView {
+    /// Backend chosen.
+    pub backend: String,
+    /// Model sent upstream, when policy named one. `None` means the client's
+    /// own choice went through untouched, which is the ordinary case.
+    pub model: Option<String>,
+    /// Backend the conversation was on before, when this was a change. This is
+    /// the field a status line exists for: a fallback that nobody notices is
+    /// one the user cannot act on.
+    pub from: Option<String>,
+    /// When it happened.
+    pub at: DateTime<Utc>,
 }
 
 /// Every pool, seen as one balance.
@@ -368,6 +390,12 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .map(|filter| filter.summary().to_string()),
         quirks_serial: state.quirks().serial(),
         update: state.update_status(),
+        last_route: state.last_route().map(|route| LastRouteView {
+            backend: route.backend,
+            model: route.model,
+            from: route.from,
+            at: route.at,
+        }),
     })
     .into_response()
 }

@@ -18,6 +18,7 @@ use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::CodexCredentials;
 use ironwire_creds::consent::ConsentLedger;
 
+use crate::claude_settings;
 use crate::codex_config;
 
 use super::paths;
@@ -74,7 +75,9 @@ pub(crate) fn disconnect(target: &str, subscription: bool) -> Result<()> {
             println!("Remove the IronWire setting you added for Claude Code:");
             println!("  unset ANTHROPIC_BASE_URL");
             println!("  (and remove it from your shell profile)");
-            Ok(())
+            // The status line, unlike the variable, is in a file we wrote — so
+            // it is ours to take back out.
+            remove_status_line()
         }
         // Codex is pointed here by a file we wrote, so we can undo it.
         "codex" => disconnect_codex(),
@@ -123,6 +126,8 @@ fn connect_claude(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
     println!();
     println!("    eval \"$(ironwire env)\"");
     println!();
+
+    install_status_line(dry_run)?;
 
     match ClaudeCodeCredentials::discover() {
         Ok(creds) => {
@@ -299,6 +304,102 @@ fn write_codex_config(path: &std::path::Path, existing: &str, contents: &str) ->
         println!("  (previous contents saved to {})", backup.display());
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Offer Claude Code's status line as IronWire's one line of screen space.
+///
+/// IronWire will not write into a response stream, so without this the only
+/// place it can say "your traffic just moved" is a second terminal nobody is
+/// looking at (`ironwire watch`). The status line is the harness's own
+/// furniture, outside the transcript, and it is the honest channel.
+fn install_status_line(dry_run: bool) -> Result<()> {
+    let path = claude_settings_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let command = format!("{} statusline", our_binary()?);
+    let edit = claude_settings::connect(&existing, &command).with_context(|| {
+        format!(
+            "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
+            path.display()
+        )
+    })?;
+
+    if let Some(theirs) = &edit.occupied_by {
+        println!("You already have a status line (`{theirs}`), so IronWire left it alone.");
+        println!("To include IronWire in it, add the output of:");
+        println!();
+        println!("    {command}");
+        println!();
+        return Ok(());
+    }
+    if edit.is_noop() {
+        return Ok(());
+    }
+
+    println!("This will change {}:", path.display());
+    for change in &edit.changes {
+        println!("  · {change}");
+    }
+    if dry_run {
+        println!("[dry run] nothing was written.");
+        println!();
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if !existing.is_empty() {
+        let backup = path.with_extension("json.ironwire-backup");
+        std::fs::write(&backup, &existing)
+            .with_context(|| format!("writing {}", backup.display()))?;
+        println!("  (previous contents saved to {})", backup.display());
+    }
+    std::fs::write(&path, &edit.contents)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("Written. Claude Code picks it up on its next start.");
+    println!();
+    Ok(())
+}
+
+/// Undo [`install_status_line`], removing only what it added.
+fn remove_status_line() -> Result<()> {
+    let path = claude_settings_path()?;
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let edit = claude_settings::disconnect(&existing).with_context(|| {
+        format!(
+            "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
+            path.display()
+        )
+    })?;
+    if edit.is_noop() {
+        return Ok(());
+    }
+    std::fs::write(&path, &edit.contents).with_context(|| format!("writing {}", path.display()))?;
+    for change in &edit.changes {
+        println!("  · {change}");
+    }
+    Ok(())
+}
+
+/// This binary's own path, so the status line keeps working for someone who
+/// installed IronWire somewhere that is not on `PATH` — which is most people
+/// running it from a build.
+fn our_binary() -> Result<String> {
+    let path = std::env::current_exe().context("locating the ironwire binary")?;
+    Ok(path.display().to_string())
+}
+
+/// Where Claude Code keeps its settings. `CLAUDE_CONFIG_DIR` wins, as it does
+/// for Claude Code.
+fn claude_settings_path() -> Result<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(dir).join("settings.json"));
+    }
+    let home = dirs::home_dir().context("could not locate your home directory")?;
+    Ok(home.join(".claude").join("settings.json"))
 }
 
 /// Where Codex keeps its config. `CODEX_HOME` wins, as it does for Codex.

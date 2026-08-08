@@ -23,7 +23,25 @@ pub struct FacadeError {
     kind: &'static str,
     message: String,
     retry_after_secs: Option<u64>,
+    /// A line for Codex's own limit banner. See
+    /// [`FacadeError::on_openai_facade`].
+    codex_notice: Option<String>,
+    /// Whether to render OpenAI's error envelope rather than Anthropic's.
+    openai_envelope: bool,
 }
+
+/// The one response header Codex renders as free text.
+///
+/// Codex parses `x-codex-promo-message` on a usage-limit response and prints it
+/// inside its own sentence: "You've hit your usage limit. <message>, or try
+/// again later." Verified against Codex 0.145 — the matching `promo_message`
+/// field in the body is *not* read, only this header.
+///
+/// It is the only channel a proxy has into that UI, and this is the one moment
+/// worth using it: the user has just been stopped, and what they need is what
+/// IronWire tried and what is left — which otherwise lives in a terminal they
+/// are not looking at.
+const CODEX_NOTICE_HEADER: &str = "x-codex-promo-message";
 
 impl FacadeError {
     /// Build directly.
@@ -34,6 +52,8 @@ impl FacadeError {
             kind,
             message: message.into(),
             retry_after_secs: None,
+            codex_notice: None,
+            openai_envelope: false,
         }
     }
 
@@ -41,6 +61,42 @@ impl FacadeError {
     #[must_use]
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+    }
+
+    /// Render this error the way the OpenAI façade's clients expect it.
+    ///
+    /// The envelope is not cosmetic. Every error here was leaving on the
+    /// *Anthropic* shape regardless of which façade it came from, so a Codex
+    /// client received `{"type":"error",…}`, failed to recognise it, and
+    /// retried a hopeless request five times before giving up with a message
+    /// about retries rather than about capacity.
+    ///
+    /// For a rate limit from a client that identified as Codex it goes
+    /// further, into the one shape Codex renders specially — and then into the
+    /// only text channel a proxy has into that UI. Verified against Codex
+    /// 0.145: `error.type = "usage_limit_reached"` produces the limit banner,
+    /// and `x-codex-promo-message` supplies the clause inside it ("You've hit
+    /// your usage limit. <ours>, or try again later."). Hence a clause: no
+    /// capital, no full stop.
+    ///
+    /// Nothing is invented to get there. Codex's own limit responses also carry
+    /// a plan type and a reset time; those are the provider's facts, we do not
+    /// have them, and the banner renders without them.
+    #[must_use]
+    pub fn on_openai_facade(mut self, client_is_codex: bool) -> Self {
+        self.openai_envelope = true;
+        if client_is_codex && self.status == StatusCode::TOO_MANY_REQUESTS {
+            self.kind = "usage_limit_reached";
+            // ASCII only: this rides in a header, and `HeaderValue` rejects
+            // anything above 0x7f — an em dash here silently drops the whole
+            // notice, which looks exactly like the channel not working.
+            self.codex_notice = Some(
+                "IronWire had no capacity left on any other connected pool either; \
+                 run `ironwire status` to see when each returns"
+                    .to_string(),
+            );
+        }
+        self
     }
 
     /// Render a pipeline failure.
@@ -123,6 +179,8 @@ impl FacadeError {
                 message: error.to_string(),
                 // The provider's own delay, never one of ours.
                 retry_after_secs: *retry_after_secs,
+                codex_notice: None,
+                openai_envelope: false,
             },
             UpstreamError::NeedsAuth { .. } => Self::new(
                 StatusCode::UNAUTHORIZED,
@@ -154,12 +212,22 @@ impl IntoResponse for FacadeError {
         {
             headers.insert("retry-after", value);
         }
-        // Anthropic's error envelope. Claude Code parses this shape, so an
-        // IronWire failure reaches it as a failure it already handles.
-        let body = json!({
-            "type": "error",
-            "error": { "type": self.kind, "message": self.message },
-        });
+        if let Some(notice) = &self.codex_notice
+            && let Ok(value) = HeaderValue::from_str(notice)
+        {
+            headers.insert(CODEX_NOTICE_HEADER, value);
+        }
+        // Each façade's own error envelope, so an IronWire failure arrives as
+        // a failure the client already has a path for — which is this module's
+        // whole reason to exist.
+        let body = if self.openai_envelope {
+            json!({ "error": { "type": self.kind, "message": self.message } })
+        } else {
+            json!({
+                "type": "error",
+                "error": { "type": self.kind, "message": self.message },
+            })
+        };
         (self.status, headers, Json(body)).into_response()
     }
 }
@@ -182,6 +250,61 @@ mod tests {
         assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(err.retry_after_secs, Some(30));
         assert_eq!(err.kind, "rate_limit_error");
+    }
+
+    /// Codex reads this header only on a usage-limit response, so attaching it
+    /// anywhere else is noise on a path that already has an explanation.
+    #[test]
+    fn the_codex_notice_rides_only_on_a_limit_response() {
+        let limited = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllExhausted))
+            .on_openai_facade(true);
+        assert!(limited.codex_notice.is_some());
+
+        let other =
+            FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::NoBackendsConfigured))
+                .on_openai_facade(true);
+        assert!(other.codex_notice.is_none());
+    }
+
+    /// A client that did not identify as Codex is not shown a Codex banner —
+    /// and would not render it anyway.
+    #[test]
+    fn a_non_codex_client_gets_no_codex_notice() {
+        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllExhausted))
+            .on_openai_facade(false);
+        assert!(err.codex_notice.is_none());
+    }
+
+    /// The notice travels as a header value, and `HeaderValue` refuses
+    /// anything non-ASCII. An em dash in this string dropped the header
+    /// entirely, which is indistinguishable from the channel not existing.
+    #[test]
+    fn the_notice_survives_being_a_header_value() {
+        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllExhausted))
+            .on_openai_facade(true);
+        let notice = err.codex_notice.clone().expect("attached");
+        assert!(notice.is_ascii(), "not header-safe: {notice}");
+        assert!(HeaderValue::from_str(&notice).is_ok());
+
+        let response = err.into_response();
+        assert!(
+            response.headers().contains_key(CODEX_NOTICE_HEADER),
+            "the notice never reached the response"
+        );
+    }
+
+    /// Codex prints the message inside a sentence of its own, so ours has to
+    /// read as a clause rather than start a new one.
+    #[test]
+    fn the_notice_reads_as_a_clause() {
+        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllExhausted))
+            .on_openai_facade(true);
+        let notice = err.codex_notice.expect("attached");
+        assert!(!notice.ends_with('.'), "got: {notice}");
+        assert!(
+            notice.starts_with(|c: char| !c.is_uppercase()) || notice.starts_with("IronWire"),
+            "got: {notice}"
+        );
     }
 
     #[test]

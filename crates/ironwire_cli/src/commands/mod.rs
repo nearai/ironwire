@@ -17,6 +17,7 @@ pub(crate) mod quirks;
 pub(crate) mod serve;
 pub(crate) mod service;
 pub(crate) mod status;
+pub(crate) mod statusline;
 pub(crate) mod update;
 pub(crate) mod watch;
 

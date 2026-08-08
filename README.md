@@ -140,6 +140,31 @@ backend does not have, images it cannot see, a context that does not fit) is
 still refused outright rather than silently degraded. See
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §6.
 
+## How it tells you
+
+IronWire will not write into your agent's transcript. The only channel there is
+the response stream, and a line in it would be a line the model appears to have
+said. So it uses the places a harness keeps for something other than the model:
+
+```bash
+ironwire connect claude    # also offers to install the status line
+ironwire statusline        # what it prints there, if you want to see it
+```
+
+In Claude Code that is the status bar, via the `statusLine` hook — which
+IronWire fills only if you have not written your own, and removes on
+`ironwire disconnect claude`. It stays quiet: where traffic is going, a
+substituted model, a pool above a third used, a fallback for the ten minutes
+after it happens, and a release when one exists.
+
+Codex has no status-line hook (`tui.status_line` exists in its config and
+renders nothing in 0.145), but it does render one line from the server on a
+usage-limit response. That is where IronWire says whether it had anywhere else
+to go — the moment you are stopped is the moment that matters.
+
+`ironwire watch` is still there for a second terminal, and is still the only
+place that shows every decision as it is made.
+
 ## The optional privacy filter
 
 Off by default. When you turn it on, IronWire substitutes sensitive values on

@@ -198,7 +198,10 @@ async fn forward(
     .await
     .map_err(|e| {
         tracing::warn!(error = %e, "no route for request");
-        FacadeError::from_pipeline(&e)
+        // Codex renders a line from us on a limit response, and this is the
+        // moment it is worth using: the user has just been stopped and has no
+        // way to tell whether IronWire had somewhere else to go.
+        FacadeError::from_pipeline(&e).on_openai_facade(peek.carries_client_identity)
     })?;
 
     tracing::info!(

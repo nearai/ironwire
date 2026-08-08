@@ -260,6 +260,15 @@ async fn dispatch_inner(
                 // Announce only a real change. A sticky conversation producing
                 // one "routed" line per turn would bury the one line that
                 // means something (`crate::events`).
+                state.set_last_route(crate::state::LastRoute {
+                    backend: decision.backend.to_string(),
+                    model: decision.model.clone(),
+                    from: previous
+                        .as_ref()
+                        .filter(|p| *p != &decision.backend)
+                        .map(ToString::to_string),
+                    at: Utc::now(),
+                });
                 if previous.as_ref() != Some(&decision.backend) {
                     state.events.publish(crate::events::Event::Routed {
                         at: Utc::now(),

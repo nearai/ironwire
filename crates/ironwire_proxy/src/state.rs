@@ -135,6 +135,26 @@ pub struct AppState {
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
     pub port: u16,
+    /// The most recent route this daemon took.
+    ///
+    /// Kept here rather than read back from the ledger because the ledger is
+    /// optional and this is not: a status line has to be able to say where the
+    /// last turn went on a machine where trace capture is off.
+    last_route: Arc<Mutex<Option<LastRoute>>>,
+}
+
+/// The most recent routing decision, for anything that needs to display it.
+#[derive(Debug, Clone)]
+pub struct LastRoute {
+    /// Backend chosen.
+    pub backend: String,
+    /// Model sent upstream, when policy named one. `None` means the client's
+    /// own choice was forwarded untouched.
+    pub model: Option<String>,
+    /// Backend this conversation was on before, when this was a change.
+    pub from: Option<String>,
+    /// When.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 impl AppState {
@@ -161,6 +181,24 @@ impl AppState {
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),
+            last_route: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Remember where the last turn went.
+    pub fn set_last_route(&self, route: LastRoute) {
+        match self.last_route.lock() {
+            Ok(mut slot) => *slot = Some(route),
+            Err(poisoned) => *poisoned.into_inner() = Some(route),
+        }
+    }
+
+    /// Where the last turn went, if there has been one.
+    #[must_use]
+    pub fn last_route(&self) -> Option<LastRoute> {
+        match self.last_route.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 

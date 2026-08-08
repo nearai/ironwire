@@ -601,6 +601,7 @@ mod tests {
             privacy: None,
             quirks_serial: 0,
             update: UpdateStatus::Unknown,
+            last_route: None,
         });
         assert!(rendered.contains("ironwire connect claude"));
     }
