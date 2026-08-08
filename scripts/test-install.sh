@@ -130,7 +130,7 @@ fi
 
 # ------------------------------------------------------- corrupted download
 
-rm -rf "${work}/release" "${work}/bin"
+rm -rf "${work:?}/release" "${work:?}/bin"
 make_release "x86_64-unknown-linux-gnu" "${work}/release"
 # Publish a checksum that does not match what is actually there.
 echo "0000000000000000000000000000000000000000000000000000000000000000  ironwire-x86_64-unknown-linux-gnu.tar.gz" \
@@ -146,7 +146,7 @@ fi
 
 # ------------------------------------------------------------ missing release
 
-rm -rf "${work}/release" "${work}/bin"
+rm -rf "${work:?}/release" "${work:?}/bin"
 mkdir -p "${work}/release/latest/download"
 if out=$(run_installer 2>&1); then
     bad "fails when no artifact exists" "installer exited 0"

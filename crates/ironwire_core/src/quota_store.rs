@@ -156,10 +156,7 @@ pub fn load(path: &Path, now: DateTime<Utc>) -> BTreeMap<String, PersistedQuota>
 /// disconnected — must not be resurrected, because quota for something we will
 /// never route to is not a fact about anything.
 #[must_use]
-pub fn for_backend(
-    stored: &BTreeMap<String, PersistedQuota>,
-    id: &str,
-) -> Option<QuotaSnapshot> {
+pub fn for_backend(stored: &BTreeMap<String, PersistedQuota>, id: &str) -> Option<QuotaSnapshot> {
     stored.get(id).map(|quota| QuotaSnapshot {
         primary: quota.primary.clone(),
         secondary: quota.secondary.clone(),

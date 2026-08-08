@@ -345,7 +345,8 @@ fn install_status_line(dry_run: bool) -> Result<()> {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     if !existing.is_empty() {
         let backup = path.with_extension("json.ironwire-backup");
@@ -353,8 +354,7 @@ fn install_status_line(dry_run: bool) -> Result<()> {
             .with_context(|| format!("writing {}", backup.display()))?;
         println!("  (previous contents saved to {})", backup.display());
     }
-    std::fs::write(&path, &edit.contents)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, &edit.contents).with_context(|| format!("writing {}", path.display()))?;
     println!("Written. Claude Code picks it up on its next start.");
     println!();
     Ok(())

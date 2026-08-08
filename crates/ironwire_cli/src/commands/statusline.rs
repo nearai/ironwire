@@ -106,13 +106,13 @@ fn routing(status: &StatusView, client: Option<&ClientContext>) -> Option<String
         .and_then(|m| m.id.as_deref());
     let served = status.last_route.as_ref();
     match (asked, served) {
-        (Some(asked), Some(route)) if route.model.as_deref().is_some_and(|m| m != asked) => Some(
-            format!(
+        (Some(asked), Some(route)) if route.model.as_deref().is_some_and(|m| m != asked) => {
+            Some(format!(
                 "ironwire → {} ({} for {asked})",
                 route.backend,
                 route.model.as_deref().unwrap_or("?")
-            ),
-        ),
+            ))
+        }
         (_, Some(route)) => Some(format!("ironwire → {}", route.backend)),
         (_, None) => Some(format!("ironwire → {}", serving.id)),
     }
@@ -144,9 +144,9 @@ fn capacity(status: &StatusView) -> Vec<String> {
 fn update(status: &UpdateStatus) -> Option<String> {
     match status {
         UpdateStatus::Available { latest, .. } => Some(format!("ironwire {latest} available")),
-        UpdateStatus::Unsupported { latest, .. } => {
-            Some(format!("ironwire {latest} available (this build is unsupported)"))
-        }
+        UpdateStatus::Unsupported { latest, .. } => Some(format!(
+            "ironwire {latest} available (this build is unsupported)"
+        )),
         UpdateStatus::UpToDate | UpdateStatus::Unknown => None,
     }
 }
@@ -185,7 +185,10 @@ mod tests {
                 "cost":{"total_cost_usd":0},"something_new":{"nested":true}}"#,
         )
         .expect("parses");
-        assert_eq!(parsed.model.and_then(|m| m.id).as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            parsed.model.and_then(|m| m.id).as_deref(),
+            Some("claude-opus-5")
+        );
     }
 
     #[test]
@@ -221,10 +224,7 @@ mod tests {
         }
     }
 
-    fn route(
-        from: Option<&str>,
-        ago: chrono::Duration,
-    ) -> ironwire_proxy::control::LastRouteView {
+    fn route(from: Option<&str>, ago: chrono::Duration) -> ironwire_proxy::control::LastRouteView {
         ironwire_proxy::control::LastRouteView {
             backend: "nearai".into(),
             model: None,

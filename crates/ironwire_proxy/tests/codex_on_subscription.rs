@@ -304,7 +304,10 @@ async fn a_client_that_is_not_codex_is_refused_the_subscription() {
     let (_dir, auth) = codex_auth_fixture();
 
     let response = app(state_for(&base_url, &auth))
-        .oneshot(third_party_request("/openai/v1/responses", THIRD_PARTY_BODY))
+        .oneshot(third_party_request(
+            "/openai/v1/responses",
+            THIRD_PARTY_BODY,
+        ))
         .await
         .expect("served");
     assert_eq!(

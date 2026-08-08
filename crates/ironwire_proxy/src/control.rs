@@ -431,9 +431,7 @@ fn balance(
         subscription_used: statuses
             .iter()
             .filter(|s| {
-                s.kind.requires_consent()
-                    && s.authenticated
-                    && consent.is_granted(s.id.as_str())
+                s.kind.requires_consent() && s.authenticated && consent.is_granted(s.id.as_str())
             })
             .map(|s| SubscriptionUse {
                 name: s.name.clone(),

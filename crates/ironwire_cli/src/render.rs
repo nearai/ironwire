@@ -234,7 +234,12 @@ fn backend_block(backend: &BackendView) -> String {
         // turns the one screen a user checks under pressure into a wall of
         // text — the count still says how many there are.
         const SHOWN: usize = 6;
-        let shown = backend.models.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+        let shown = backend
+            .models
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>();
         let rest = backend.models.len().saturating_sub(shown.len());
         let more = if rest > 0 {
             format!(" (+{rest} more)")

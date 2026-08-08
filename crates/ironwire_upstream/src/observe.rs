@@ -313,7 +313,10 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-reset", "1786777200"),
             ("anthropic-ratelimit-unified-7d-status", "allowed"),
             ("anthropic-ratelimit-unified-7d-utilization", "0.03"),
-            ("anthropic-ratelimit-unified-representative-claim", "five_hour"),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                "five_hour",
+            ),
             ("anthropic-ratelimit-unified-reset", "1786235400"),
             ("anthropic-ratelimit-unified-status", "allowed"),
         ])
@@ -323,7 +326,11 @@ mod tests {
     fn a_real_subscription_response_reports_its_capacity() {
         let reading = anthropic_rate_limit(&live_claude_headers()).expect("observed");
         // 0.05 is a fraction, not a percentage.
-        assert!((reading.used_pct - 5.0).abs() < 1e-3, "got {}", reading.used_pct);
+        assert!(
+            (reading.used_pct - 5.0).abs() < 1e-3,
+            "got {}",
+            reading.used_pct
+        );
         assert_eq!(
             reading.resets_at,
             DateTime::from_timestamp(1_786_235_400, 0),
@@ -343,8 +350,15 @@ mod tests {
             }
         }
         let reading = anthropic_rate_limit(&pairs).expect("observed");
-        assert!((reading.used_pct - 3.0).abs() < 1e-3, "got {}", reading.used_pct);
-        assert_eq!(reading.resets_at, DateTime::from_timestamp(1_786_777_200, 0));
+        assert!(
+            (reading.used_pct - 3.0).abs() < 1e-3,
+            "got {}",
+            reading.used_pct
+        );
+        assert_eq!(
+            reading.resets_at,
+            DateTime::from_timestamp(1_786_777_200, 0)
+        );
     }
 
     /// Without the claim, the fuller window wins: it is the one that stops the
@@ -357,7 +371,11 @@ mod tests {
             ("anthropic-ratelimit-unified-7d-utilization", "0.80"),
         ]);
         let reading = anthropic_rate_limit(&pairs).expect("observed");
-        assert!((reading.used_pct - 80.0).abs() < 1e-3, "got {}", reading.used_pct);
+        assert!(
+            (reading.used_pct - 80.0).abs() < 1e-3,
+            "got {}",
+            reading.used_pct
+        );
     }
 
     /// A value above 1 cannot be a fraction. Multiplying it would report 4300%.
@@ -365,7 +383,11 @@ mod tests {
     fn a_percentage_is_not_multiplied_again() {
         let pairs = headers(&[("anthropic-ratelimit-unified-5h-utilization", "43")]);
         let reading = anthropic_rate_limit(&pairs).expect("observed");
-        assert!((reading.used_pct - 43.0).abs() < 1e-3, "got {}", reading.used_pct);
+        assert!(
+            (reading.used_pct - 43.0).abs() < 1e-3,
+            "got {}",
+            reading.used_pct
+        );
     }
 
     #[test]

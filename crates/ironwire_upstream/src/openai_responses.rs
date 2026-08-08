@@ -637,12 +637,7 @@ pub fn parse_model_list(body: &[u8]) -> Option<Catalogue> {
         });
     }
 
-    Some(
-        priced
-            .into_iter()
-            .map(|(id, tier, _)| (id, tier))
-            .collect(),
-    )
+    Some(priced.into_iter().map(|(id, tier, _)| (id, tier)).collect())
 }
 
 /// Dollars per million output tokens, where the catalogue states them.
@@ -792,17 +787,15 @@ mod tests {
         };
         assert_eq!(tier("anthropic/claude-opus-4-8"), Some(ModelTier::Frontier));
         assert_eq!(tier("z-ai/glm-5.2"), Some(ModelTier::Balanced));
-        assert_eq!(
-            tier("deepseek-ai/DeepSeek-V4-Flash"),
-            Some(ModelTier::Fast)
-        );
+        assert_eq!(tier("deepseek-ai/DeepSeek-V4-Flash"), Some(ModelTier::Fast));
     }
 
     /// Codex's catalogue carries no prices but does carry its own `priority`
     /// order. Re-sorting it on a name would be us overruling the provider.
     #[test]
     fn an_unpriced_catalogue_keeps_the_order_the_provider_sent() {
-        let body = br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.4"},{"slug":"gpt-5.4-mini"}]}"#;
+        let body =
+            br#"{"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-5.4"},{"slug":"gpt-5.4-mini"}]}"#;
         let models = parse_model_list(body).expect("parses");
         let ids: Vec<&str> = models.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, vec!["gpt-5.6-sol", "gpt-5.4", "gpt-5.4-mini"]);
