@@ -736,7 +736,9 @@ mod tests {
     }
 
     #[test]
-    fn load_bearing_reasoning_refuses_cross_family_entirely() {
+    fn a_conversation_mid_tool_loop_waits_for_the_turn_boundary() {
+        // The corrected rule: a family change is deferred to the next clean
+        // turn, not refused for the life of the conversation.
         let mut policy = Policy::new();
         let mut exhausted = candidate(
             "claude-sub",
@@ -746,28 +748,44 @@ mod tests {
         exhausted.quota.primary = Headroom::Exhausted { until: t(3600) };
         let near = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
 
-        let mut p = peek("claude-opus-4-6");
-        p.requirements.reasoning = ReasoningNeed::LoadBearing;
+        let mut mid_loop = peek("claude-opus-4-6");
+        mid_loop.requirements.reasoning = ReasoningNeed::LoadBearing;
+        mid_loop.requirements.mid_tool_loop = true;
 
         let err = policy
             .decide(
                 key(),
                 Protocol::AnthropicMessages,
-                &p,
-                &[exhausted, near],
+                &mid_loop,
+                &[exhausted.clone(), near.clone()],
                 t(0),
             )
-            .expect_err("cross-family must be refused");
+            .expect_err("a family change mid tool loop must be refused");
         match err {
             NoRoute::AllIneligible { reasons } => {
                 assert!(
                     reasons
                         .iter()
-                        .any(|(_, why)| *why == Ineligible::LoadBearingReasoning)
+                        .any(|(_, why)| *why == Ineligible::MidToolLoop)
                 );
             }
             other => panic!("expected ineligibility, got {other:?}"),
         }
+
+        // Same conversation, next turn boundary: NEAR AI is now eligible.
+        let mut boundary = mid_loop;
+        boundary.requirements.mid_tool_loop = false;
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &boundary,
+                &[exhausted, near],
+                t(0),
+            )
+            .expect("a turn boundary is a clean switch point");
+        assert_eq!(decision.backend.as_str(), "nearai");
+        assert!(decision.translated);
     }
 
     #[test]

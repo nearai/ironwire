@@ -178,11 +178,11 @@ mod tests {
     #[test]
     fn an_ineligible_route_explains_itself_rather_than_degrading() {
         let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllIneligible {
-            reasons: vec![(BackendId::from("nearai"), Ineligible::LoadBearingReasoning)],
+            reasons: vec![(BackendId::from("nearai"), Ineligible::MidToolLoop)],
         }));
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.message.contains("nearai"));
-        assert!(err.message.contains("LoadBearingReasoning"));
+        assert!(err.message.contains("MidToolLoop"));
     }
 
     #[test]

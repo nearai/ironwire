@@ -72,19 +72,33 @@ simultaneously, each on its own native lane, with independent quota tracking.
 
 ---
 
-## M3 — First translation pair
+## M3 — First translation pair  ✅ core done
 
-**Anthropic façade → OpenAI Chat Completions backend** (the well-trodden
-direction), gated by `eligible()`.
+**Anthropic façade → OpenAI Chat Completions backend** (NEAR AI and any
+OpenAI-compatible endpoint), gated on the turn-boundary rule.
 
-- Canonical IR + capability matrix, wired to hard ineligibility rules
-- Conversation-lifetime tool-ID map
-- Rung-3 announcement UX — the user is told when family changes
-- `ironwire pin` and `X-IronWire-Route`
+- [x] `ironwire_translate`: request, response, and streaming translation
+- [x] Stateless reversible tool-id mapping (no per-conversation map to lose)
+- [x] `mid_tool_loop` gate — switch families at a turn boundary only
+- [x] `ChatCompletionsBackend` (NEAR AI + arbitrary OpenAI-compatible)
+- [x] End-to-end test: `tests/claude_code_on_nearai.rs`
+- [ ] Rung-3 announcement UX — the user is told when the family changes. Still
+      open, and still the unresolved product question: IronWire has no UI channel
+      into Claude Code (`docs/CRITIQUE.md` open questions).
+- [ ] `ironwire pin` / `X-IronWire-Route` honoured for cross-family routes
+- [ ] `ironwire connect near` (device-key enrolment; today the backend appears
+      when `NEARAI_API_KEY` is set)
 
-**Exit criterion:** Claude Code, at rung 3 on a NEAR AI model, completes the
-scripted acceptance task (PROTOCOL §7.5). Any conversation carrying signed
-thinking blocks is correctly refused rung 3 rather than degraded.
+**Known limitation, deliberately not fixed yet:** a session cannot change
+families *mid tool loop*. It waits for the next clean turn. Lifting this needs
+the return path to synthesize the reasoning state a foreign assistant turn
+lacks, and the exact tolerance for a missing block is undocumented — so it needs
+validating against the live API before shipping. `docs/PROTOCOL.md` §6 has the
+two candidate approaches.
+
+**Exit criterion:** met at the wire level — Claude Code completes a turn on
+NEAR AI, including a tool call whose id round-trips, and a mid-loop conversation
+correctly waits rather than switching. Not yet run against live NEAR AI.
 
 ---
 

@@ -4,6 +4,7 @@ members = [
     "crates/ironwire_core",
     "crates/ironwire_creds",
     "crates/ironwire_ledger",
+    "crates/ironwire_translate",
     "crates/ironwire_upstream",
     "crates/ironwire_proxy",
     "crates/ironwire_cli",
@@ -22,6 +23,7 @@ repository = "https://github.com/nearai/ironwire"
 ironwire_core = { path = "crates/ironwire_core", version = "0.1.0" }
 ironwire_creds = { path = "crates/ironwire_creds", version = "0.1.0" }
 ironwire_ledger = { path = "crates/ironwire_ledger", version = "0.1.0" }
+ironwire_translate = { path = "crates/ironwire_translate", version = "0.1.0" }
 ironwire_upstream = { path = "crates/ironwire_upstream", version = "0.1.0" }
 ironwire_proxy = { path = "crates/ironwire_proxy", version = "0.1.0" }
 

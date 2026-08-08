@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ironwire_core::config::{Config, PathsConfig};
+use ironwire_core::protocol::ModelTier;
 use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_ledger::Ledger;
 use ironwire_proxy::server::ServeError;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_upstream::anthropic::AnthropicBackend;
+use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use secrecy::SecretString;
 
 use super::{control_token, paths};
@@ -134,7 +136,49 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         ));
     }
 
+    // NEAR AI is a different API family, so it is only ever reached through the
+    // translated lane — and only at a turn boundary (`docs/PROTOCOL.md` §6).
+    if let Ok(key) = std::env::var("NEARAI_API_KEY")
+        && !key.is_empty()
+    {
+        registry.push(Arc::new(
+            ChatCompletionsBackend::nearai(
+                SecretString::from(key),
+                base_url_for(config, "nearai")
+                    .or_else(|| std::env::var("IRONWIRE_NEARAI_BASE_URL").ok()),
+                nearai_models(config),
+                timeout,
+            )
+            .context("building the NEAR AI backend")?,
+        ));
+    }
+
     Ok(registry)
+}
+
+/// Models to offer from NEAR AI.
+///
+/// Configurable because the catalogue moves faster than our releases; the
+/// default is one frontier-tier slug so a user with only a key still gets a
+/// working fallback.
+fn nearai_models(config: &Config) -> Vec<(String, ModelTier)> {
+    config
+        .backends
+        .iter()
+        .find(|b| b.id == "nearai")
+        .and_then(|b| b.models.clone())
+        .map_or_else(
+            || vec![("deepseek-v3".to_string(), ModelTier::Frontier)],
+            |models| {
+                models
+                    .into_iter()
+                    .map(|m| {
+                        let tier = ModelTier::from_model_hint(&m);
+                        (m, tier)
+                    })
+                    .collect()
+            },
+        )
 }
 
 /// Base-URL override for a backend.

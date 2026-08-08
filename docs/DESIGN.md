@@ -85,6 +85,13 @@ Native pairs in the plan:
 | `/openai/v1/responses` | OpenAI API key | M2 |
 | `/openai/v1/chat/completions` | NEAR AI, OpenAI-compatible, Ollama | M2 |
 
+### Translated pairs in the plan
+
+| Façade | Backend | Status |
+|---|---|---|
+| `/anthropic/v1/messages` | NEAR AI / any OpenAI-compatible endpoint | **done** — `ironwire_translate`, gated on the turn-boundary rule |
+| `/openai/v1/responses` | Anthropic family | later |
+
 ### Translated lane — fallback only
 
 Inbound protocol != backend protocol. IR-mediated, and **capability-gated: a
@@ -92,23 +99,29 @@ route that cannot preserve the request's semantics is ineligible, not
 best-effort.**
 
 ```rust
-/// A route is eligible only if every requirement the request carries is
-/// preserved by the target. Anything else is a refusal, not a downgrade.
+/// A route is eligible only if the target can serve the request without
+/// *breaking* it. A route that would merely be worse is not refused — it is
+/// announced.
 struct RequestRequirements {
     tools: bool,
-    parallel_tool_calls: bool,
+    parallel_tool_calls: bool,    // history already issues several calls per turn
     images: bool,
-    reasoning: ReasoningNeed,     // None | Requested | LoadBearing (signed blocks present)
-    prompt_cache: bool,           // cache_control breakpoints present
-    structured_output: bool,      // strict JSON schema
+    reasoning: ReasoningNeed,     // informational: continuity lost, not illegal
+    prompt_cache: bool,
+    cached_prefix_tokens: u32,
+    structured_output: bool,
     min_context_tokens: u32,
-    continuation: Option<Continuation>, // prior signed/encrypted state in-flight
+    mid_tool_loop: bool,          // the cross-family gate
 }
 ```
 
-`ReasoningNeed::LoadBearing` and `Continuation::Some` make **every** cross-family
-route ineligible, permanently, for that conversation. That is not a limitation
-to engineer away — it is a property of signed and encrypted provider state.
+The one cross-family correctness rule is **switch at a turn boundary, never mid
+tool loop**. A conversation caught mid-loop waits for the next clean turn; it is
+not disqualified. Provider-private reasoning state (signed Anthropic thinking,
+encrypted OpenAI reasoning) is a *quality* signal, not an eligibility one — a
+foreign provider never validates it and the originating API drops rather than
+rejects it. `docs/PROTOCOL.md` §6 has the full reasoning, including why an
+earlier version of this document got it wrong.
 
 ---
 
@@ -216,8 +229,10 @@ hard rule, not a default. See [`TRUST.md`](./TRUST.md).
 
 ```
 crates/
-  ironwire_core       types, config, capability registry, policy, quota ledger
-  ironwire_creds      credential discovery + refresh (Claude Code, Codex, keys)
+  ironwire_core       types, config, capability gate, policy, quota
+  ironwire_creds      credential discovery + consent
+  ironwire_ledger     the local trace ledger
+  ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   Backend trait; native passthrough clients; observation
   ironwire_proxy      axum façades, router wiring, control API, trace sink
   ironwire_cli        the `ironwire` binary

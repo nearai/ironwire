@@ -133,6 +133,10 @@ pub struct BackendConfig {
     /// stores no secrets in `config.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Model slugs this backend should offer, best first. Configurable because
+    /// third-party catalogues move faster than our release cadence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -213,6 +217,7 @@ mod tests {
                 enabled: true,
                 base_url: None,
                 api_key_env: None,
+                models: None,
             }],
         };
         let text = toml::to_string(&cfg).expect("serializes");

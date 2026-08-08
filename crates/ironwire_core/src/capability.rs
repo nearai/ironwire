@@ -4,8 +4,15 @@
 //! the request's semantics**. Anything less is a refusal, not a downgrade
 //! (`docs/DESIGN.md` §2). This module is where that rule is enforced, and it is
 //! deliberately the smallest, most testable thing in the codebase: everything
-//! about routing quality is a heuristic, but everything here is a hard fact
-//! about what the wire can carry.
+//! about routing quality is a heuristic, but everything here should be a hard
+//! fact about what the wire can carry.
+//!
+//! Keeping that distinction honest is the whole job. A gate that refuses a
+//! route which would merely be *worse* is not caution — it is a bug that
+//! silently deletes capacity the user is paying for. Every rule below is either
+//! "the agent breaks" or "the user loses more money than the route saves";
+//! anything that is only a quality loss belongs in the route's reason string,
+//! not here.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,11 +20,14 @@ use crate::protocol::Protocol;
 
 /// How much the request depends on model reasoning state.
 ///
-/// The distinction that matters is [`ReasoningNeed::LoadBearing`]: once a
-/// conversation carries *signed* Anthropic thinking blocks or *encrypted*
-/// OpenAI reasoning items, that state cannot be reproduced by any other
-/// provider. It is cryptography, not a mapping gap, so no amount of translator
-/// work will ever make a cross-family route legal for that conversation.
+/// [`ReasoningNeed::LoadBearing`] means the history carries *signed* Anthropic
+/// thinking blocks or *encrypted* OpenAI reasoning items. That state cannot be
+/// reproduced by another provider — but it does not have to be: a foreign
+/// provider never validates it, and the API that minted it **drops** such
+/// blocks from the prompt rather than rejecting them. So this is a *quality*
+/// signal (reasoning continuity is lost across a family change), not an
+/// eligibility one. The eligibility rule lives in
+/// [`RequestRequirements::mid_tool_loop`] — see `docs/PROTOCOL.md` §6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningNeed {
@@ -25,11 +35,11 @@ pub enum ReasoningNeed {
     #[default]
     None,
     /// Reasoning requested for this turn, but nothing in the history depends
-    /// on provider-private state. Translatable to an effort knob.
+    /// on provider-private state.
     Requested,
-    /// The conversation history contains signed or encrypted provider reasoning
-    /// state that will be replayed. Cross-family routes are permanently
-    /// ineligible.
+    /// The conversation history contains signed or encrypted provider
+    /// reasoning state that will be replayed. Crossing families drops it and
+    /// loses continuity; it does not make the route illegal.
     LoadBearing,
 }
 
@@ -39,11 +49,13 @@ pub enum ReasoningNeed {
 pub struct RequestRequirements {
     /// Tool definitions are present.
     pub tools: bool,
-    /// The client permits (or expects) more than one tool call per turn.
+    /// The history contains an assistant turn that issued more than one tool
+    /// call at once — so the client genuinely depends on parallel calls, rather
+    /// than merely permitting them.
     pub parallel_tool_calls: bool,
     /// Image content blocks are present.
     pub images: bool,
-    /// Reasoning dependency; see [`ReasoningNeed`].
+    /// Reasoning dependency; see [`ReasoningNeed`]. Informational.
     pub reasoning: ReasoningNeed,
     /// `cache_control` breakpoints are present.
     pub prompt_cache: bool,
@@ -54,6 +66,16 @@ pub struct RequestRequirements {
     pub structured_output: bool,
     /// Minimum usable context window, in tokens.
     pub min_context_tokens: u32,
+    /// The conversation is **mid tool loop**: the client is replaying tool
+    /// results and expects the model to continue an exchange already in flight.
+    ///
+    /// This is the cross-family gate. Switching families here means the next
+    /// assistant turn comes back without the provider-private reasoning state
+    /// its `tool_use` block is expected to carry, and replaying that history to
+    /// the original family then risks a hard rejection. At a turn boundary
+    /// there is no in-flight state to be missing, so the switch is clean.
+    /// See `docs/PROTOCOL.md` §6.
+    pub mid_tool_loop: bool,
 }
 
 /// What a backend+model can preserve.
@@ -67,7 +89,8 @@ pub struct Capabilities {
     pub parallel_tool_calls: bool,
     /// Image inputs.
     pub images: bool,
-    /// Any form of reasoning/thinking.
+    /// Any form of reasoning/thinking. Informational: a model without it still
+    /// answers, just without extended reasoning.
     pub reasoning: bool,
     /// Prompt caching with explicit breakpoints.
     pub prompt_cache: bool,
@@ -78,9 +101,9 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// A conservative unknown-backend baseline: tools and images, no reasoning,
-    /// no cache, 128k context. Used only for user-configured OpenAI-compatible
-    /// endpoints we have never seen.
+    /// A conservative unknown-backend baseline: serial tool calls, no images,
+    /// no reasoning, no cache, 128k context. Used only for user-configured
+    /// OpenAI-compatible endpoints we have never seen.
     #[must_use]
     pub fn conservative(protocol: Protocol) -> Self {
         Self {
@@ -102,19 +125,22 @@ impl Capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ineligible {
-    /// The conversation replays signed/encrypted reasoning state.
-    LoadBearingReasoning,
+    /// The conversation is mid tool loop, so a family change would leave the
+    /// next assistant turn missing the reasoning state its `tool_use` is
+    /// expected to carry. Eligible again at the next turn boundary.
+    MidToolLoop,
     /// Losing a large warm prefix would cost more than the route saves.
     WouldDiscardLargePromptCache,
-    /// Request uses tools; backend has none.
+    /// Request uses tools; backend has none. The agent would hang waiting for
+    /// a call that can never come.
     ToolsUnsupported,
-    /// Request sends more than one tool call per turn; backend is serial.
+    /// The client already issues several tool calls per turn; a serial backend
+    /// would silently drop all but one.
     ParallelToolsUnsupported,
-    /// Request carries images; backend is text-only.
+    /// Request carries images; backend is text-only and simply cannot see them.
     ImagesUnsupported,
-    /// Request needs reasoning; backend has none.
-    ReasoningUnsupported,
-    /// Request needs a strict schema; backend cannot guarantee one.
+    /// Request needs a strict schema; backend cannot guarantee one, and the
+    /// client will fail to parse the answer.
     StructuredOutputUnsupported,
     /// Prompt does not fit.
     ContextTooSmall,
@@ -129,15 +155,11 @@ pub enum Ineligible {
 /// fallback has hysteresis (`docs/CRITIQUE.md` §1).
 pub const CACHE_SACRIFICE_THRESHOLD_TOKENS: u32 = 4_000;
 
-/// Decide whether `caps` can serve `req` without losing semantics.
+/// Decide whether `caps` can serve `req` without breaking it.
 ///
 /// `cross_family` is true when taking this route means translating between API
-/// families. Some refusals apply only then: dropping a prompt cache is a cost
-/// we accept within a family (rung 2) but not across one (rung 3), because
-/// crossing families already sacrifices reasoning continuity.
-///
-/// Returns `Ok(())` when the route preserves the request, or the first reason
-/// it does not.
+/// families. Two rules apply only then: the mid-tool-loop rule, and the
+/// prompt-cache economics.
 ///
 /// # Errors
 ///
@@ -147,9 +169,10 @@ pub fn eligible(
     caps: &Capabilities,
     cross_family: bool,
 ) -> Result<(), Ineligible> {
-    // Hard, permanent, and independent of how good the translator gets.
-    if cross_family && req.reasoning == ReasoningNeed::LoadBearing {
-        return Err(Ineligible::LoadBearingReasoning);
+    // The one cross-family rule that is about correctness rather than cost:
+    // switch families at a turn boundary, never mid tool loop.
+    if cross_family && req.mid_tool_loop {
+        return Err(Ineligible::MidToolLoop);
     }
     if req.tools && !caps.tools {
         return Err(Ineligible::ToolsUnsupported);
@@ -160,9 +183,6 @@ pub fn eligible(
     if req.images && !caps.images {
         return Err(Ineligible::ImagesUnsupported);
     }
-    if req.reasoning != ReasoningNeed::None && !caps.reasoning {
-        return Err(Ineligible::ReasoningUnsupported);
-    }
     if req.structured_output && !caps.structured_output {
         return Err(Ineligible::StructuredOutputUnsupported);
     }
@@ -170,8 +190,7 @@ pub fn eligible(
         return Err(Ineligible::ContextTooSmall);
     }
     // Economic rather than semantic, but it belongs in the same gate: a route
-    // that "works" while costing the user 10x is not a route we should take
-    // silently.
+    // that "works" while costing the user 10x is not a route we take silently.
     if cross_family
         && req.prompt_cache
         && !caps.prompt_cache
@@ -199,19 +218,112 @@ mod tests {
         }
     }
 
-    #[test]
-    fn load_bearing_reasoning_is_permanently_cross_family_ineligible() {
-        let req = RequestRequirements {
+    /// What Claude Code actually sends between turns: thinking enabled, signed
+    /// blocks in history, tools declared, a big cached prefix.
+    fn claude_code_turn() -> RequestRequirements {
+        RequestRequirements {
+            tools: true,
+            parallel_tool_calls: false,
+            images: false,
             reasoning: ReasoningNeed::LoadBearing,
+            prompt_cache: true,
+            cached_prefix_tokens: 120_000,
+            structured_output: false,
+            min_context_tokens: 40_000,
+            mid_tool_loop: false,
+        }
+    }
+
+    fn nearai_caps() -> Capabilities {
+        Capabilities {
+            protocol: Protocol::OpenAiChat,
+            tools: true,
+            parallel_tool_calls: true,
+            images: false,
+            reasoning: false,
+            prompt_cache: false,
+            structured_output: false,
+            context_tokens: 128_000,
+        }
+    }
+
+    #[test]
+    fn signed_thinking_alone_does_not_block_a_family_change() {
+        // The correction that motivated this gate's rewrite: a foreign provider
+        // never validates an Anthropic signature, and Anthropic drops rather
+        // than rejects foreign reasoning state. Refusing here deleted a whole
+        // capacity pool for no reason.
+        let mut req = claude_code_turn();
+        req.prompt_cache = false; // isolate the reasoning question
+        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+    }
+
+    #[test]
+    fn a_family_change_is_refused_mid_tool_loop() {
+        let mut req = claude_code_turn();
+        req.prompt_cache = false;
+        req.mid_tool_loop = true;
+        assert_eq!(
+            eligible(&req, &nearai_caps(), true),
+            Err(Ineligible::MidToolLoop)
+        );
+    }
+
+    #[test]
+    fn the_same_conversation_becomes_eligible_at_the_next_turn_boundary() {
+        // This is the whole point of the rule: it defers a switch, it does not
+        // permanently disqualify the conversation.
+        let mut req = claude_code_turn();
+        req.prompt_cache = false;
+        req.mid_tool_loop = true;
+        assert!(eligible(&req, &nearai_caps(), true).is_err());
+        req.mid_tool_loop = false;
+        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+    }
+
+    #[test]
+    fn mid_tool_loop_is_fine_within_a_family() {
+        // Rung 2 replays the same history to the same wire format; nothing is
+        // missing, so there is nothing to refuse.
+        let mut req = claude_code_turn();
+        req.mid_tool_loop = true;
+        assert_eq!(eligible(&req, &full_caps(), false), Ok(()));
+    }
+
+    #[test]
+    fn requesting_thinking_does_not_require_a_thinking_backend() {
+        // A model without extended reasoning still answers; that is a quality
+        // loss, not a broken request.
+        let req = RequestRequirements {
+            reasoning: ReasoningNeed::Requested,
             ..Default::default()
         };
-        // Even against a backend that supports everything.
+        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+    }
+
+    #[test]
+    fn a_serial_backend_is_refused_only_once_parallel_calls_are_actually_used() {
+        // Permitting parallel calls is the Anthropic default; depending on them
+        // is what a serial backend would break.
+        let serial = Capabilities {
+            parallel_tool_calls: false,
+            ..nearai_caps()
+        };
+        let unused = RequestRequirements {
+            tools: true,
+            parallel_tool_calls: false,
+            ..Default::default()
+        };
+        assert_eq!(eligible(&unused, &serial, true), Ok(()));
+
+        let used = RequestRequirements {
+            parallel_tool_calls: true,
+            ..unused
+        };
         assert_eq!(
-            eligible(&req, &full_caps(), true),
-            Err(Ineligible::LoadBearingReasoning)
+            eligible(&used, &serial, true),
+            Err(Ineligible::ParallelToolsUnsupported)
         );
-        // But staying inside the family is fine — the state round-trips.
-        assert_eq!(eligible(&req, &full_caps(), false), Ok(()));
     }
 
     #[test]
@@ -259,6 +371,22 @@ mod tests {
         assert_eq!(
             eligible(&req, &text_only, false),
             Err(Ineligible::ImagesUnsupported)
+        );
+    }
+
+    #[test]
+    fn tools_without_a_tool_capable_backend_would_hang_the_agent() {
+        let req = RequestRequirements {
+            tools: true,
+            ..Default::default()
+        };
+        let toolless = Capabilities {
+            tools: false,
+            ..full_caps()
+        };
+        assert_eq!(
+            eligible(&req, &toolless, true),
+            Err(Ineligible::ToolsUnsupported)
         );
     }
 

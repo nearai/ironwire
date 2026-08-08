@@ -15,6 +15,7 @@ pub mod anthropic;
 pub mod backend;
 pub mod headers;
 pub mod observe;
+pub mod openai_chat;
 pub mod sse;
 
 pub use backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};

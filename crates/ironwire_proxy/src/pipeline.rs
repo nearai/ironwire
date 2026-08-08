@@ -20,6 +20,7 @@ use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::{ConversationKey, NoRoute, RouteDecision};
 use ironwire_core::protocol::Protocol;
 use ironwire_ledger::{Exchange, Ledger};
+use ironwire_translate::ChatToAnthropicStream;
 use ironwire_upstream::backend::{Backend, UpstreamError, UpstreamRequest, UpstreamResponse};
 use ironwire_upstream::observe::Observation;
 use ironwire_upstream::sse::{Dialect, SseObserver};
@@ -113,15 +114,39 @@ pub async fn dispatch(
         };
 
         attempts += 1;
-        let request = UpstreamRequest {
-            path: path.to_string(),
-            body: apply_model(&body, decision.model.as_deref()),
-            headers: headers.clone(),
-            stream: peek.stream,
+        let request = if decision.translated {
+            match translate_request(&body, path, &decision, peek) {
+                Ok(request) => request,
+                Err(reason) => {
+                    // Refusing beats sending a body the target cannot parse.
+                    rejected.push((decision.backend.to_string(), reason.clone()));
+                    excluded.push(decision.backend.clone());
+                    if let Ok(mut policy) = state.policy.lock() {
+                        policy.forget(&key);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            UpstreamRequest {
+                path: path.to_string(),
+                body: apply_model(&body, decision.model.as_deref()),
+                headers: headers.clone(),
+                stream: peek.stream,
+            }
         };
 
         match backend.send(request).await {
             Ok(response) => {
+                let response = if decision.translated {
+                    translate_response(
+                        response,
+                        peek.requested_model.as_deref().unwrap_or("unknown"),
+                        peek.stream,
+                    )
+                } else {
+                    response
+                };
                 return Ok((
                     response,
                     Routed {
@@ -167,6 +192,145 @@ pub async fn dispatch(
         Some(last) => Err(PipelineError::AllFailed { last, rejected }),
         None => Err(PipelineError::NoRoute(NoRoute::AllExhausted)),
     }
+}
+
+/// Build a Chat Completions request out of an Anthropic Messages body.
+///
+/// Only the messages endpoint is translatable. `count_tokens` has no
+/// Chat Completions equivalent, and answering it with a guess would corrupt the
+/// client's context accounting — so it is refused rather than approximated.
+///
+/// # Errors
+///
+/// A human-readable reason when this path cannot be translated.
+fn translate_request(
+    body: &Bytes,
+    path: &str,
+    decision: &RouteDecision,
+    peek: &RequestPeek,
+) -> Result<UpstreamRequest, String> {
+    if !path.ends_with("/v1/messages") {
+        return Err(format!("{path} has no cross-family equivalent"));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| format!("could not parse the request body for translation: {e}"))?;
+    let model = decision
+        .model
+        .as_deref()
+        .or(peek.requested_model.as_deref())
+        .unwrap_or("default");
+
+    let (translated, dropped) =
+        ironwire_translate::anthropic_to_chat_completions(&parsed, model, peek.stream);
+    if !dropped.is_empty() {
+        tracing::info!(
+            backend = %decision.backend,
+            thinking_blocks = dropped.thinking_blocks,
+            cache_breakpoints = dropped.cache_breakpoints,
+            images = dropped.images,
+            "translated across API families; these did not survive"
+        );
+    }
+    let body = serde_json::to_vec(&translated)
+        .map_err(|e| format!("could not serialise the translated request: {e}"))?;
+
+    Ok(UpstreamRequest {
+        path: "/v1/chat/completions".to_string(),
+        body: Bytes::from(body),
+        // The inbound headers describe the Anthropic protocol; none of them
+        // mean anything to a Chat Completions endpoint.
+        headers: Vec::new(),
+        stream: peek.stream,
+    })
+}
+
+/// Map a Chat Completions response back into the Anthropic shape the client is
+/// waiting for.
+fn translate_response(
+    response: UpstreamResponse,
+    requested_model: &str,
+    stream: bool,
+) -> UpstreamResponse {
+    let mut headers: Vec<(String, String)> = response
+        .headers
+        .into_iter()
+        // Length and encoding describe the pre-translation body.
+        .filter(|(name, _)| name != "content-length" && name != "content-encoding")
+        .collect();
+    headers.retain(|(name, _)| name != "content-type");
+    headers.push((
+        "content-type".to_string(),
+        if stream {
+            "text/event-stream".to_string()
+        } else {
+            "application/json".to_string()
+        },
+    ));
+
+    let body = if stream {
+        translated_stream(response.body, requested_model.to_string()).boxed()
+    } else {
+        translated_body(response.body, requested_model.to_string()).boxed()
+    };
+
+    UpstreamResponse {
+        status: response.status,
+        headers,
+        body,
+    }
+}
+
+/// Buffer a non-streaming response and re-emit it in the Anthropic shape.
+fn translated_body(
+    inner: futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>>,
+    requested_model: String,
+) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
+    futures_util::stream::once(async move {
+        let collected: Vec<Bytes> = inner.filter_map(|c| async move { c.ok() }).collect().await;
+        let mut raw = Vec::new();
+        for chunk in collected {
+            raw.extend_from_slice(&chunk);
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        let translated =
+            ironwire_translate::chat_completion_to_anthropic(&parsed, &requested_model);
+        Ok(Bytes::from(
+            serde_json::to_vec(&translated).unwrap_or_else(|_| b"{}".to_vec()),
+        ))
+    })
+}
+
+/// Translate the event stream chunk by chunk, so text still arrives live.
+fn translated_stream(
+    inner: futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>>,
+    requested_model: String,
+) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
+    let state = (inner, Some(ChatToAnthropicStream::new(requested_model)));
+    futures_util::stream::unfold(state, |(mut inner, mut translator)| async move {
+        let mut active = translator.take()?;
+        loop {
+            match inner.next().await {
+                Some(Ok(chunk)) => {
+                    let out = active.push(&chunk);
+                    if out.is_empty() {
+                        // Nothing to forward yet — keep reading rather than
+                        // emitting an empty frame.
+                        continue;
+                    }
+                    translator = Some(active);
+                    return Some((Ok(Bytes::from(out)), (inner, translator)));
+                }
+                // The upstream failed mid-stream. We are past the point of no
+                // return (PROTOCOL.md §5), so close the client's stream
+                // properly instead of leaving it hanging.
+                Some(Err(_)) | None => {
+                    let out = active.finish();
+                    return Some((Ok(Bytes::from(out)), (inner, None)));
+                }
+            }
+        }
+    })
 }
 
 /// Rewrite the `model` key, and only that key.

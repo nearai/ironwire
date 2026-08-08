@@ -92,8 +92,15 @@ explicit ladder:
 | 3 | different API family | cold | dropped | **yes** |
 
 Rungs 0–2 need no translation at all — IronWire forwards your request's bytes
-untouched. Rung 3 does, and is capability-gated: a route that cannot preserve
-the request's semantics is refused, not silently degraded.
+untouched. Rung 3 does: a Claude Code session can keep working on NEAR AI (or
+any OpenAI-compatible endpoint) when your Anthropic capacity runs out.
+
+The rule that makes rung 3 safe is **switch families at a turn boundary, never
+mid tool loop** — a conversation caught mid-loop waits one turn rather than
+being refused. Everything that would genuinely *break* the request (tools a
+backend does not have, images it cannot see, a context that does not fit) is
+still refused outright rather than silently degraded. See
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) §6.
 
 ## What IronWire promises about your credentials
 
@@ -128,9 +135,10 @@ pass. That position comes with hard commitments, not defaults
 
 ```
 crates/
-  ironwire_core       protocols, capabilities, routing policy, quota
+  ironwire_core       protocols, capability gate, routing policy, quota
   ironwire_creds      credential discovery + consent
   ironwire_ledger     the local trace ledger
+  ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   backends: native passthrough and observation
   ironwire_proxy      axum façades, pipeline, control API
   ironwire_cli        the `ironwire` binary
@@ -150,6 +158,7 @@ Three suites carry the fidelity claim:
 | `tests/passthrough.rs` | request and response bytes are identical to the originals, modulo the mutations `docs/PROTOCOL.md` §2 enumerates |
 | `tests/multi_turn.rs` | a three-turn tool loop — signed thinking, replayed tool ids, cache breakpoints — survives, and stays on one backend |
 | `tests/cancellation.rs` | an abandoned request stops the upstream, and still records what it consumed |
+| `tests/claude_code_on_nearai.rs` | a Claude Code session keeps working on NEAR AI when Anthropic capacity is exhausted — and waits for a turn boundary rather than switching mid tool loop |
 
 `scripts/acceptance.sh` is the manual check the mocks cannot replace: a real
 Claude Code task, through IronWire, against real providers. It costs

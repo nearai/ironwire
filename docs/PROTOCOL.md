@@ -128,33 +128,90 @@ followed by stream close. For Responses, `response.failed`.
 
 ## 6. Where translation is lossy, and what we do about it
 
-The translated lane refuses rather than degrades. The gate:
+### The rule: switch families at a turn boundary, never mid tool loop
 
-| Request carries | Anthropic → Chat Completions | Anthropic → Responses | Responses → Anthropic |
-|---|---|---|---|
-| tools | ✅ shape-mapped | ✅ | ✅ |
-| parallel tool calls | ✅ | ✅ | ✅ |
-| images | ✅ (base64 → data URL) | ✅ | ✅ |
-| `thinking` requested | ⚠️ maps to `reasoning_effort` | ✅ | ⚠️ |
-| **signed `thinking` blocks in history** | ❌ **ineligible** | ❌ **ineligible** | ❌ |
-| **encrypted reasoning items in history** | ❌ | ❌ | ❌ **ineligible** |
-| `cache_control` breakpoints | ❌ dropped → **ineligible unless prefix < 4k tokens** | ❌ same | ❌ |
-| strict JSON schema | ✅ | ✅ | ⚠️ |
-| tool IDs | ✅ via session-lifetime bidirectional map | ✅ | ✅ |
+This section originally claimed that a signed `thinking` block made a
+cross-family route permanently ineligible. **That was wrong**, and the error was
+expensive: it deleted an entire capacity pool for the product's flagship use
+case, because Claude Code runs with thinking on and therefore carries signed
+blocks from turn one.
 
-❌ entries are hard ineligibility in `ironwire_core::policy::eligible()`. A
-conversation that has ever received a signed thinking block is pinned to the
-Anthropic family for its lifetime. This is a property of the provider's
-cryptography, not a gap in our mapper.
+What actually happens:
 
-### Tool-call ID mapping
+| Direction | Behaviour |
+|---|---|
+| Anthropic thinking blocks → a foreign provider | The provider never validates them. We drop them during translation. Nothing errors. |
+| Foreign reasoning state → Anthropic | Anthropic **drops** it from the prompt rather than rejecting it — silently, and unbilled. |
+| Anthropic thinking blocks → Anthropic | Must be replayed **unchanged**. Modifying one is rejected; *removing* one can trigger an ordering/signature 400. |
 
-Cross-family routes require a bidirectional `toolu_* ↔ call_*` map that lives as
-long as the conversation, because the client replays IDs we minted, forever.
-The map is memory-resident, keyed by conversation, and its loss (daemon restart)
-downgrades the conversation to rung ≤ 2 rather than producing invalid IDs.
+The third row is the whole constraint, and it bites on the **return** path. A
+turn served by a foreign provider produces an assistant turn with a `tool_use`
+and no thinking block. Replay that to Anthropic mid-loop — where the block is
+expected — and you get a 400 the user cannot diagnose. At a turn boundary
+(the last message is a fresh user turn, not a replayed `tool_result`) there is
+no in-flight state to be missing.
 
----
+So the gate is **one boolean**, `RequestRequirements::mid_tool_loop`:
+
+```rust
+if cross_family && req.mid_tool_loop {
+    return Err(Ineligible::MidToolLoop);
+}
+```
+
+It **defers** a switch to the next clean turn rather than disqualifying the
+conversation. In a coding session that is at most one turn of waiting.
+
+### What crossing a family actually costs
+
+None of these are refusals. They are what the rung-3 announcement is for:
+
+| Lost | Consequence |
+|---|---|
+| Signed thinking / encrypted reasoning | No reasoning continuity across the switch. Quality drop, no error. |
+| Prompt cache | Cold start. Refused only when the warm prefix exceeds `CACHE_SACRIFICE_THRESHOLD_TOKENS` — an economic call, not a semantic one. |
+| Client-specific system-prompt tuning | The prompt was written for Claude; another model follows it less precisely. |
+
+### What is still a hard refusal
+
+| Request carries | Why it breaks, not degrades |
+|---|---|
+| tools, backend has none | The agent waits forever for a call that cannot come |
+| **used** parallel tool calls, backend is serial | All but one call is silently dropped |
+| images, backend is text-only | The model cannot see the input it is being asked about |
+| strict JSON schema, backend cannot guarantee one | The client fails to parse the answer |
+| a prompt larger than the context window | — |
+
+Note the second row: the gate fires on *history that already issued several
+calls in one turn*, not on the permissive Anthropic default. Reading "permitted"
+as "required" would refuse every serial backend for every request — the same
+class of over-strictness as the original reasoning rule.
+
+### Tool-call identity
+
+Cross-family routes need `toolu_* ↔ call_*` to survive both directions, because
+the client replays whatever id we returned, forever.
+
+The obvious design is a conversation-lifetime map. IronWire deliberately does
+**not** use one: a map is state that can be lost (restart, eviction), and losing
+it mints *invalid ids* — undiagnosable and unrecoverable. Instead the mapping is
+a stateless reversible encoding (`ironwire_translate::tool_ids`): a foreign id
+becomes `toolu_xw_<original>`, and the prefix is stripped on the way back. Two
+processes agree without sharing anything, and a restart changes nothing.
+
+### Not yet done: switching mid-loop
+
+The turn-boundary rule is the conservative choice, and it leaves capacity on the
+table: a session that spends most of its life inside tool loops can wait a while
+for a boundary. Lifting it means synthesizing the missing state on the return
+path — either an empty/placeholder thinking block on the foreign assistant turn,
+or stripping the whole turn's `tool_use`/`tool_result` pair and re-issuing it
+natively.
+
+Both need to be validated against the live API before shipping, since the exact
+tolerance for a missing block at each position is not documented. Until then,
+mid-loop switching is a **known limitation, not a design position**. It is
+tracked in `ROADMAP.md` under M3.
 
 ## 7. Conformance testing
 
@@ -183,7 +240,13 @@ Fidelity claims are worthless without a harness that proves them.
 
    `doctor` also skips any backend that is authenticated but not consented:
    probing it would use the very credential the user has not authorised.
-5. **Agent-level acceptance.** A scripted Claude Code task (edit a file, run a
+5. **Cross-family acceptance.** `tests/claude_code_on_nearai.rs` runs a Claude
+   Code-shaped session against an exhausted Anthropic backend and a NEAR AI
+   stand-in: it asserts the fallback happens, that the client receives a
+   well-formed Anthropic stream, that a NEAR AI tool call arrives as a valid
+   `tool_use` block whose id round-trips, that a mid-loop conversation does
+   **not** switch, and that the same conversation does switch one turn later.
+6. **Agent-level acceptance.** A scripted Claude Code task (edit a file, run a
    test, fix the failure) must complete through IronWire with the same
    turn count as direct. This is the only test that catches subtle behavioral
    regressions from a mis-mapped field.
