@@ -83,9 +83,32 @@ pub(crate) fn disconnect(target: &str, subscription: bool) -> Result<()> {
 }
 
 /// Print the environment a client needs.
-pub(crate) fn print_env(port: Option<u16>) -> Result<()> {
+pub(crate) fn print_env(port: Option<u16>, shell: Option<String>) -> Result<()> {
     let port = port.unwrap_or(DEFAULT_PORT);
-    println!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
+    let url = format!("http://127.0.0.1:{port}/anthropic");
+
+    // Default to the shell the user is actually running, not to bash. Someone
+    // in fish who pipes `export FOO=bar` into `eval` gets a syntax error and no
+    // idea why, which is a miserable first five minutes.
+    let shell = shell.unwrap_or_else(|| {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|path| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "sh".to_string())
+    });
+
+    match shell.as_str() {
+        "fish" => println!("set -gx ANTHROPIC_BASE_URL {url}"),
+        "powershell" | "pwsh" => println!("$env:ANTHROPIC_BASE_URL = \"{url}\""),
+        "cmd" => println!("set ANTHROPIC_BASE_URL={url}"),
+        "nu" | "nushell" => println!("$env.ANTHROPIC_BASE_URL = \"{url}\""),
+        // bash, zsh, ksh, dash, sh, and anything else POSIX-ish.
+        _ => println!("export ANTHROPIC_BASE_URL={url}"),
+    }
     Ok(())
 }
 

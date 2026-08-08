@@ -69,7 +69,12 @@ enum Command {
     Update,
 
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
-    Env,
+    Env {
+        /// Shell syntax to emit. Defaults to `$SHELL`, so piping this into
+        /// `eval` works without anyone having to think about it.
+        #[arg(long)]
+        shell: Option<String>,
+    },
 
     /// Inspect the optional privacy filter.
     ///
@@ -149,7 +154,7 @@ async fn main() -> Result<()> {
         Command::Doctor => commands::doctor::run(cli.port).await,
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Update => commands::update::run(cli.port).await,
-        Command::Env => commands::connect::print_env(cli.port),
+        Command::Env { shell } => commands::connect::print_env(cli.port, shell),
         Command::Privacy { action, path } => commands::privacy::run(&action, path),
         Command::Watch { only_changes } => commands::watch::run(cli.port, only_changes).await,
         Command::Service { action } => commands::service::run(&action, cli.port),

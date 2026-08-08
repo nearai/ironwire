@@ -222,6 +222,27 @@ Signed data, refreshed independently of the binary, so a changed
 
 ---
 
+## First-run and daily use
+
+The failures that actually cost people their first twenty minutes, none of
+which are routing problems.
+
+- [x] `ironwire doctor` checks the **clients**, before the backends. Every
+      backend can be green while the agent goes straight to the provider
+      because nothing points it here — the commonest real failure, and the one
+      the old output could not distinguish from working. It names the near-miss
+      cases too: a stale port in `ANTHROPIC_BASE_URL` or in Codex's config is a
+      silent bypass whose symptom is identical to the daemon being down
+- [x] `ironwire env` emits the syntax of the shell you are actually running,
+      defaulting from `$SHELL`. Piping `export FOO=bar` into fish's `eval`
+      gives a syntax error and no clue why
+- [x] `ironwire service install|uninstall|status`, `ironwire completions`
+- [x] `ironwire watch` for live routing, `ironwire privacy check` for the filter
+- [ ] A single `ironwire init` that walks a new user through connect → consent
+      → serve, instead of them reading `--help` to find the order
+
+---
+
 ## M5 — macOS menu bar app
 
 Thin SwiftUI client over `/_ironwire/status` and `/_ironwire/events`. Shows the
