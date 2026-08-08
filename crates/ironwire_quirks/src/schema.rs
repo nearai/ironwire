@@ -81,10 +81,20 @@ impl Default for AnthropicQuirks {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClientIdentityQuirks {
-    /// Prefix of Claude Code's first system block.
+    /// Prefix of one of Claude Code's system blocks.
     pub claude_code_system_prefix: String,
+    /// Prefix of the `user-agent` Claude Code sends. Refreshable for the same
+    /// reason as the Codex originator: it is the half that survives the client
+    /// rewriting its prompt, which Claude Code has already done.
+    #[serde(default = "default_claude_code_user_agent_prefix")]
+    pub claude_code_user_agent_prefix: String,
     /// Substring identifying Codex in a Responses `instructions` field.
     pub codex_instructions_marker: String,
+    /// Prefix of the `originator` header Codex sends. Refreshable because it is
+    /// the half that keeps working when Codex reshapes its request body — which
+    /// it has already done once, dropping `instructions` entirely.
+    #[serde(default = "default_codex_originator_prefix")]
+    pub codex_originator_prefix: String,
     /// Phrases suggesting a request is a compaction turn
     /// (`docs/PROTOCOL.md` §8).
     ///
@@ -94,6 +104,14 @@ pub struct ClientIdentityQuirks {
     /// costs a slightly worse routing decision, never a wrong answer.
     #[serde(default = "default_compaction_markers")]
     pub compaction_markers: Vec<String>,
+}
+
+fn default_claude_code_user_agent_prefix() -> String {
+    ironwire_core::peek::CLAUDE_CODE_USER_AGENT_PREFIX.to_string()
+}
+
+fn default_codex_originator_prefix() -> String {
+    ironwire_core::peek::CODEX_ORIGINATOR_PREFIX.to_string()
 }
 
 fn default_compaction_markers() -> Vec<String> {
@@ -107,7 +125,9 @@ impl Default for ClientIdentityQuirks {
     fn default() -> Self {
         Self {
             claude_code_system_prefix: "You are Claude Code".to_string(),
+            claude_code_user_agent_prefix: default_claude_code_user_agent_prefix(),
             codex_instructions_marker: "Codex".to_string(),
+            codex_originator_prefix: default_codex_originator_prefix(),
             compaction_markers: default_compaction_markers(),
         }
     }

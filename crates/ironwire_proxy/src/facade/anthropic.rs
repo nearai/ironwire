@@ -88,7 +88,23 @@ async fn forward(
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
-    let peek = RequestPeek::inspect_with(PROTOCOL, &parsed, body.len(), &state.identity_markers());
+    let markers = state.identity_markers();
+    let mut peek = RequestPeek::inspect_with(PROTOCOL, &parsed, body.len(), &markers);
+    // The system-block wording is prose and has already moved once; the
+    // user-agent has not. Without this, Claude Code 2.1.226 is not recognised
+    // as Claude Code and falls off its own subscription
+    // (`ironwire_core::peek::user_agent_names_claude_code`).
+    if !peek.carries_client_identity
+        && ironwire_core::peek::user_agent_names_claude_code(
+            headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            &markers.claude_code_user_agent_prefix,
+        )
+    {
+        peek.carries_client_identity = true;
+    }
+    let peek = peek;
     let key = conversation_key(&parsed);
     let conversation = key.0;
 

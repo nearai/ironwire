@@ -208,6 +208,24 @@ fn codex_request(uri: &str, body: &'static str) -> Request<Body> {
         .expect("request builds")
 }
 
+/// The same request as a client that is not Codex would send it: no
+/// `originator`, and a body with none of Codex's own instructions.
+///
+/// Both halves matter. Codex 0.145 dropped the `instructions` field entirely,
+/// so the body is no longer a reliable signal on its own and the `originator`
+/// header carries the identity — which means a fixture that sends Codex's
+/// header while claiming to be a third party is testing a spoofer, not a third
+/// party. Neither signal survives a client that deliberately copies it; the
+/// invariant is that IronWire never *synthesizes* one (`docs/TRUST.md` §3).
+fn third_party_request(uri: &str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("request builds")
+}
+
 #[tokio::test]
 async fn a_codex_request_reaches_chatgpt_byte_identical() {
     let (base_url, received) = spawn_mock().await;
@@ -226,7 +244,15 @@ async fn a_codex_request_reaches_chatgpt_byte_identical() {
         "the native lane must not re-encode the body — encrypted reasoning \
          state in particular does not survive a round trip"
     );
-    assert!(got.request_line.starts_with("POST /v1/responses "));
+    // The ChatGPT base URL is `…/backend-api/codex`, which already carries its
+    // own root — so the endpoint is `<base>/responses`, and re-appending the
+    // client's `/v1` would 404 against the real provider. The mock is mounted
+    // at the server root, so here that is a bare `/responses`.
+    assert!(
+        got.request_line.starts_with("POST /responses "),
+        "unexpected request line: {}",
+        got.request_line
+    );
 }
 
 #[tokio::test]
@@ -278,7 +304,7 @@ async fn a_client_that_is_not_codex_is_refused_the_subscription() {
     let (_dir, auth) = codex_auth_fixture();
 
     let response = app(state_for(&base_url, &auth))
-        .oneshot(codex_request("/openai/v1/responses", THIRD_PARTY_BODY))
+        .oneshot(third_party_request("/openai/v1/responses", THIRD_PARTY_BODY))
         .await
         .expect("served");
     assert_eq!(
@@ -291,6 +317,32 @@ async fn a_client_that_is_not_codex_is_refused_the_subscription() {
     assert!(
         received.lock().expect("lock").is_none(),
         "the request reached chatgpt.com despite carrying no Codex identity"
+    );
+}
+
+/// The regression that made the subscription unreachable from Codex itself.
+///
+/// Codex 0.145 sends no `instructions` field — its system prompt moved into
+/// `input` — so an identity check that reads only the body stops recognising
+/// the client the subscription belongs to, and the request quietly falls off
+/// onto some other backend. The `originator` header is what still names it.
+#[tokio::test]
+async fn codex_is_recognised_from_its_header_when_the_body_carries_no_marker() {
+    let (base_url, received) = spawn_mock().await;
+    let (_dir, auth) = codex_auth_fixture();
+
+    let response = app(state_for(&base_url, &auth))
+        .oneshot(codex_request("/openai/v1/responses", THIRD_PARTY_BODY))
+        .await
+        .expect("served");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Codex must reach its own subscription without an `instructions` field"
+    );
+    assert!(
+        received.lock().expect("lock").is_some(),
+        "nothing was dialled"
     );
 }
 

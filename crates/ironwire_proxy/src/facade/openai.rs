@@ -100,7 +100,22 @@ async fn forward(
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
-    let peek = RequestPeek::inspect_with(protocol, &parsed, body.len(), &state.identity_markers());
+    let markers = state.identity_markers();
+    let mut peek = RequestPeek::inspect_with(protocol, &parsed, body.len(), &markers);
+    // The body-side marker is only half the signal, and it is the half that
+    // Codex stopped sending: since 0.145 there is no `instructions` field, so
+    // the `originator` header is what identifies the client. Without this the
+    // ChatGPT subscription is unreachable from Codex itself
+    // (`ironwire_core::peek::originator_names_codex`).
+    if !peek.carries_client_identity
+        && ironwire_core::peek::originator_names_codex(
+            headers.get("originator").and_then(|v| v.to_str().ok()),
+            &markers.codex_originator_prefix,
+        )
+    {
+        peek.carries_client_identity = true;
+    }
+    let peek = peek;
     let key = conversation_key(protocol, &parsed);
     let conversation = key.0;
 

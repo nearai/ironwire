@@ -211,7 +211,12 @@ impl AppState {
         let quirks = store.current();
         IdentityMarkers {
             claude_code_system_prefix: quirks.client_identity.claude_code_system_prefix.clone(),
+            claude_code_user_agent_prefix: quirks
+                .client_identity
+                .claude_code_user_agent_prefix
+                .clone(),
             codex_instructions_marker: quirks.client_identity.codex_instructions_marker.clone(),
+            codex_originator_prefix: quirks.client_identity.codex_originator_prefix.clone(),
             compaction_markers: quirks.client_identity.compaction_markers.clone(),
         }
     }

@@ -270,7 +270,7 @@ impl Backend for ResponsesBackend {
 
         let mut builder = self
             .client
-            .post(format!("{}{}", self.base_url, request.path))
+            .post(crate::endpoint_url(&self.base_url, &request.path))
             .bearer_auth(bearer.token.expose_secret())
             .header("content-type", "application/json");
         // The ChatGPT backend only speaks SSE.

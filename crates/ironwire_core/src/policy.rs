@@ -381,9 +381,12 @@ impl Policy {
         let mut identity_blocked = false;
         let mut any_available = false;
 
-        // Rungs 0-2 are all "same family"; rung 3 is "different family". Within
-        // same-family we prefer free capacity, then exact tier, then anything.
-        let mut same_family: Vec<&Candidate> = Vec::new();
+        // Rungs 0-2 all forward the request's own bytes, so they need a backend
+        // speaking the *same wire* — not merely one in the same family, which
+        // would put a Chat Completions backend on a Responses request. Rung 3
+        // is the translated lane. Within each we prefer free capacity, then
+        // exact tier, then anything.
+        let mut same_wire: Vec<&Candidate> = Vec::new();
         let mut cross_family: Vec<&Candidate> = Vec::new();
 
         for candidate in candidates {
@@ -400,8 +403,8 @@ impl Policy {
                 Err(Unusable::Unavailable) => continue,
             }
             any_available = true;
-            if candidate.caps.protocol.family() == inbound.family() {
-                same_family.push(candidate);
+            if candidate.caps.protocol == inbound {
+                same_wire.push(candidate);
             } else {
                 cross_family.push(candidate);
             }
@@ -426,10 +429,31 @@ impl Policy {
                 (pressured, cost, u8::from(pick_model(c, tier).is_none()))
             }
         };
-        same_family.sort_by_key(sort_key);
+        same_wire.sort_by_key(sort_key);
         cross_family.sort_by_key(sort_key);
 
-        if let Some(best) = same_family.first() {
+        if let Some(best) = same_wire.first() {
+            // A model string we do not recognise is not a model that does not
+            // exist. Our catalogue is a compiled-in snapshot and the providers
+            // ship faster than we do, so "never heard of `claude-opus-5`" means
+            // our list is old — not that the client asked for something wrong.
+            // On the native lane, with capacity to spare, forward the client's
+            // own string and let the provider be the authority. Substituting
+            // the newest model *we* know about is a silent downgrade to a name
+            // that may not even be current, which is the failure this replaces.
+            let unrecognised = peek.requested_model.as_deref().is_some_and(|requested| {
+                !best.models.iter().any(|(known, _)| known == requested)
+            });
+            if unrecognised && !best.quota.is_pressured(now) {
+                return Ok(RouteDecision {
+                    backend: best.id.clone(),
+                    model: None,
+                    rung: Rung::Preferred,
+                    translated: false,
+                    reason: format!("native lane, {} capacity", kind_label(best.kind)),
+                });
+            }
+
             let model = pick_model(best, tier);
             let served_tier = model.as_deref().map_or(tier, ModelTier::from_model_hint);
             // Same credential, lesser model is rung 1; a different credential
@@ -496,7 +520,12 @@ fn usable(
     if candidate.requires_client_identity && !peek.carries_client_identity {
         return Err(Unusable::NeedsClientIdentity);
     }
-    let cross = candidate.caps.protocol.family() != inbound.family();
+    // "Needs translation" is a question about the wire, not about the family:
+    // Responses and Chat Completions share a family and are different wires.
+    let cross = candidate.caps.protocol != inbound;
+    if cross && !inbound.translates_to(candidate.caps.protocol) {
+        return Err(Unusable::Ineligible(Ineligible::NoTranslationPath));
+    }
     eligible(&peek.requirements, &candidate.caps, cross).map_err(Unusable::Ineligible)
 }
 

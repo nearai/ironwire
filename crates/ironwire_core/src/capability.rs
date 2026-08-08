@@ -144,6 +144,10 @@ pub enum Ineligible {
     StructuredOutputUnsupported,
     /// Prompt does not fit.
     ContextTooSmall,
+    /// The backend speaks a different wire, and this build has no translation
+    /// between the two. Not a quality loss — the request would arrive in a
+    /// shape the backend cannot read at all.
+    NoTranslationPath,
 }
 
 /// The tokens-of-warm-cache threshold above which discarding the cache makes a

@@ -21,13 +21,32 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// The API family. Routes within a family never need translation.
+    /// The API family. Used for reporting, not for deciding a route.
+    ///
+    /// Two protocols can share a family and still be different wires: Responses
+    /// and Chat Completions do. Routing on this instead of on the protocol
+    /// itself is what once let a Codex Responses body be forwarded to a Chat
+    /// Completions backend as though the native lane applied — see
+    /// [`Self::translates_to`].
     #[must_use]
     pub fn family(self) -> &'static str {
         match self {
             Self::AnthropicMessages => "anthropic",
             Self::OpenAiResponses | Self::OpenAiChat => "openai",
         }
+    }
+
+    /// Whether a request that arrived on `self` can be re-expressed on `other`.
+    ///
+    /// This is one arm because `ironwire_translate` implements one mapping:
+    /// Anthropic Messages onto Chat Completions. Anything else — including
+    /// Responses onto Chat Completions, which *looks* like the same family —
+    /// has no translator, so a backend speaking it cannot serve the request at
+    /// all. Saying so here keeps the routing policy from inventing a lane that
+    /// does not exist.
+    #[must_use]
+    pub fn translates_to(self, other: Self) -> bool {
+        matches!((self, other), (Self::AnthropicMessages, Self::OpenAiChat))
     }
 }
 

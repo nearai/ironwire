@@ -45,14 +45,58 @@ pub const COMPACTION_MARKERS: &[&str] = &[
     "condense the conversation",
 ];
 
+/// Prefix of the `originator` header Codex sends on every request
+/// (`codex_cli_rs` from the TUI, `codex_exec` from `codex exec`).
+pub const CODEX_ORIGINATOR_PREFIX: &str = "codex";
+
+/// Prefix of the `user-agent` Claude Code sends (`claude-cli/2.1.226 …`).
+pub const CLAUDE_CODE_USER_AGENT_PREFIX: &str = "claude-cli";
+
+/// Whether a `user-agent` names Claude Code.
+///
+/// The system-block prefix below is prose, and prose moves: by 2.1.226 the
+/// first block is a billing header and the identifying one reads "You are a
+/// Claude agent, built on Anthropic's Claude Agent SDK". An identity check
+/// anchored only on the old wording stops recognising Claude Code and drops the
+/// session off the subscription it belongs to. The user-agent has been stable
+/// across all of that, so it is the load-bearing half and the prose is the
+/// backstop.
+#[must_use]
+pub fn user_agent_names_claude_code(user_agent: Option<&str>, prefix: &str) -> bool {
+    user_agent.is_some_and(|value| value.trim().starts_with(prefix))
+}
+
+/// Whether an `originator` header names Codex.
+///
+/// The body-side marker below is not enough on its own. Codex 0.145 sends no
+/// `instructions` field at all on a Responses request — its system prompt moved
+/// into `input` — so a body-only check silently stops recognising the very
+/// client the ChatGPT subscription belongs to, and the request falls off the
+/// subscription without anything looking broken.
+///
+/// Trusting this header is the same order of trust as trusting the body: both
+/// are the client's own claim about itself, and reading one is not IronWire
+/// *synthesizing* an identity to unlock someone else's subscription, which is
+/// the thing `docs/TRUST.md` §3 forbids.
+#[must_use]
+pub fn originator_names_codex(originator: Option<&str>, prefix: &str) -> bool {
+    originator.is_some_and(|value| value.trim().starts_with(prefix))
+}
+
 /// Markers used to recognise a client's own identity, so the caller can supply
 /// refreshed ones without this crate depending on the quirks channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityMarkers {
-    /// Prefix of Claude Code's first system block.
+    /// Prefix of one of Claude Code's system blocks.
     pub claude_code_system_prefix: String,
+    /// Prefix of the `user-agent` Claude Code sends. See
+    /// [`user_agent_names_claude_code`].
+    pub claude_code_user_agent_prefix: String,
     /// Substring identifying Codex in a Responses `instructions` field.
     pub codex_instructions_marker: String,
+    /// Prefix of the `originator` header Codex sends. See
+    /// [`originator_names_codex`].
+    pub codex_originator_prefix: String,
     /// Phrases suggesting a compaction turn. Advisory only.
     pub compaction_markers: Vec<String>,
 }
@@ -61,7 +105,9 @@ impl Default for IdentityMarkers {
     fn default() -> Self {
         Self {
             claude_code_system_prefix: CLAUDE_CODE_SYSTEM_PREFIX.to_string(),
+            claude_code_user_agent_prefix: CLAUDE_CODE_USER_AGENT_PREFIX.to_string(),
             codex_instructions_marker: "Codex".to_string(),
+            codex_originator_prefix: CODEX_ORIGINATOR_PREFIX.to_string(),
             compaction_markers: COMPACTION_MARKERS
                 .iter()
                 .map(|m| (*m).to_string())
@@ -220,8 +266,10 @@ impl RequestPeek {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-            carries_client_identity: anthropic_system_prefix(system)
-                .is_some_and(|s| s.starts_with(&markers.claude_code_system_prefix)),
+            carries_client_identity: anthropic_system_names(
+                system,
+                &markers.claude_code_system_prefix,
+            ),
             message_count: messages.map_or(0, Vec::len),
             likely_compaction: looks_like_compaction(
                 messages.map_or(0, Vec::len),
@@ -423,14 +471,20 @@ fn openai_mid_tool_loop(items: Option<&Vec<Value>>) -> bool {
 
 /// Anthropic's `system` is either a string or an array of blocks. Return the
 /// text of the first block either way.
-fn anthropic_system_prefix(system: Option<&Value>) -> Option<&str> {
-    match system? {
-        Value::String(s) => Some(s.as_str()),
-        Value::Array(blocks) => blocks
-            .first()
-            .and_then(|b| b.get("text"))
-            .and_then(Value::as_str),
-        _ => None,
+/// Whether any system block starts with `prefix`.
+///
+/// Every block, not just the first: Claude Code 2.1.226 puts a billing header
+/// in block 0 and its identifying text after it, so a check anchored on the
+/// first block alone sees a string that identifies nothing.
+fn anthropic_system_names(system: Option<&Value>, prefix: &str) -> bool {
+    let starts = |s: &str| s.starts_with(prefix);
+    match system {
+        Some(Value::String(s)) => starts(s),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .any(starts),
+        _ => false,
     }
 }
 
@@ -516,6 +570,61 @@ mod tests {
             "messages": [],
         }));
         assert!(!p.carries_client_identity);
+    }
+
+    /// Claude Code 2.1.226 leads with a billing header, so the identifying
+    /// block is no longer block 0 — a first-block-only check saw a string that
+    /// identifies nothing and dropped the session off its own subscription.
+    #[test]
+    fn the_identifying_block_is_found_when_it_is_not_the_first() {
+        let p = peek_anthropic(json!({
+            "model": "claude-opus-5",
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.226;"},
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI."},
+            ],
+            "messages": [],
+        }));
+        assert!(p.carries_client_identity);
+    }
+
+    /// The other half of the same regression: by 2.1.226 the `-p` entrypoint
+    /// says "You are a Claude agent", which no system-prose marker matches. The
+    /// user-agent is what still names the client.
+    #[test]
+    fn the_user_agent_names_claude_code_when_the_prose_does_not() {
+        let markers = IdentityMarkers::default();
+        assert!(user_agent_names_claude_code(
+            Some("claude-cli/2.1.226 (external, sdk-cli)"),
+            &markers.claude_code_user_agent_prefix,
+        ));
+        assert!(!user_agent_names_claude_code(
+            Some("aider/0.90.0"),
+            &markers.claude_code_user_agent_prefix,
+        ));
+        assert!(!user_agent_names_claude_code(
+            None,
+            &markers.claude_code_user_agent_prefix
+        ));
+    }
+
+    #[test]
+    fn the_originator_names_codex_when_the_body_does_not() {
+        let markers = IdentityMarkers::default();
+        for originator in ["codex_cli_rs", "codex_exec"] {
+            assert!(originator_names_codex(
+                Some(originator),
+                &markers.codex_originator_prefix
+            ));
+        }
+        assert!(!originator_names_codex(
+            Some("some_other_tool"),
+            &markers.codex_originator_prefix
+        ));
+        assert!(!originator_names_codex(
+            None,
+            &markers.codex_originator_prefix
+        ));
     }
 
     #[test]

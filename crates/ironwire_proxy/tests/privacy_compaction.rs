@@ -22,6 +22,7 @@ use ironwire_creds::ConsentLedger;
 use ironwire_proxy::server::app;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_upstream::anthropic::AnthropicBackend;
+use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use ironwire_upstream::openai_responses::ResponsesBackend;
 use secrecy::SecretString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -188,10 +189,26 @@ fn state_for(harness: Harness, base_url: &str) -> AppState {
             )
             .expect("client builds"),
         )),
-        _ => registry.push(Arc::new(
+        Protocol::OpenAiResponses => registry.push(Arc::new(
             ResponsesBackend::openai_api_key(
                 SecretString::from("sk-test"),
                 Some(base_url.to_string()),
+                10,
+            )
+            .expect("client builds"),
+        )),
+        // A Chat Completions client needs a Chat Completions backend. Handing
+        // it a Responses one used to "work" only because the routing policy
+        // treated the two as interchangeable — they share a family and are
+        // different wires, and the body would have arrived unreadable.
+        Protocol::OpenAiChat => registry.push(Arc::new(
+            ChatCompletionsBackend::new(
+                ironwire_core::protocol::BackendId::from("openai-chat"),
+                "OpenAI-compatible",
+                ironwire_core::protocol::BackendKind::ApiKey,
+                SecretString::from("sk-test"),
+                base_url.to_string(),
+                Vec::new(),
                 10,
             )
             .expect("client builds"),

@@ -179,7 +179,7 @@ impl Backend for ChatCompletionsBackend {
     }
 
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
-        let url = format!("{}{}", self.base_url, request.path);
+        let url = crate::endpoint_url(&self.base_url, &request.path);
         let mut builder = self
             .client
             .post(&url)
