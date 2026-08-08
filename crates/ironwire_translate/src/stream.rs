@@ -20,7 +20,34 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+    /// Set when we refused a fragment because the accumulated arguments grew
+    /// past what we accept. Such a call is dropped rather than emitted with
+    /// truncated JSON.
+    overflowed: bool,
 }
+
+/// Largest SSE frame we will accumulate before giving up on finding a boundary.
+///
+/// The buffer holds bytes until a `\n\n` arrives. An upstream that never sends
+/// one — broken, or hostile — would otherwise grow it without limit. Real Chat
+/// Completions frames are a few kilobytes; a megabyte is far past anything
+/// legitimate and still small enough that discarding one costs nothing.
+const MAX_FRAME_BYTES: usize = 1 << 20;
+
+/// Most parallel tool calls a single response may declare.
+///
+/// The index comes from the upstream and drives a `Vec::resize`, so without a
+/// bound a single frame saying `"index": 4000000000` allocates until the
+/// process dies. IronWire lets a user point at an arbitrary
+/// OpenAI-compatible endpoint, which makes that reachable rather than
+/// theoretical. No model emits anywhere near this many.
+const MAX_TOOL_CALLS: usize = 256;
+
+/// Most bytes of accumulated arguments across all tool calls in one response.
+///
+/// Arguments arrive as fragments that are concatenated, so this is the third
+/// place an upstream controls how much we allocate.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 4 << 20;
 
 /// Translates a Chat Completions event stream into an Anthropic event stream.
 ///
@@ -44,6 +71,13 @@ pub struct ChatToAnthropicStream {
     /// Set once the terminal events have been written, so a duplicate `finish`
     /// or a trailing `[DONE]` cannot emit a second `message_stop`.
     closed: bool,
+    /// Bytes of tool-call arguments accumulated across the whole response.
+    tool_argument_bytes: usize,
+    /// Set after discarding an oversized frame: the bytes we dropped may have
+    /// been the middle of one, so everything until the next boundary is
+    /// unusable too. Clearing the buffer alone is not enough — the surviving
+    /// junk prefix would be glued to the next real frame and swallow it.
+    resyncing: bool,
 }
 
 impl ChatToAnthropicStream {
@@ -60,6 +94,8 @@ impl ChatToAnthropicStream {
             finish_reason: None,
             usage: None,
             closed: false,
+            tool_argument_bytes: 0,
+            resyncing: false,
         }
     }
 
@@ -67,9 +103,40 @@ impl ChatToAnthropicStream {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
+
+        // Discard through the next boundary before parsing anything: after an
+        // oversized frame we are mid-garbage, and treating the remainder as a
+        // frame would glue it to the next real one.
+        if self.resyncing {
+            match find_boundary(&self.buffer) {
+                Some(pos) => {
+                    self.buffer.drain(..pos);
+                    self.resyncing = false;
+                }
+                None => {
+                    self.buffer.clear();
+                    return out;
+                }
+            }
+        }
+
         while let Some(pos) = find_boundary(&self.buffer) {
             let frame: Vec<u8> = self.buffer.drain(..pos).collect();
             self.consume_frame(&frame, &mut out);
+        }
+
+        // No boundary in sight and the buffer is past anything a real frame
+        // could be: the upstream is broken or hostile. Drop what we have and
+        // pick up at the next boundary rather than growing without limit — a
+        // lost frame is a lost delta, and an OOM is every conversation on the
+        // machine.
+        if self.buffer.len() > MAX_FRAME_BYTES {
+            tracing::warn!(
+                bytes = self.buffer.len(),
+                "discarding an oversized SSE frame with no boundary"
+            );
+            self.buffer.clear();
+            self.resyncing = true;
         }
         out
     }
@@ -77,6 +144,11 @@ impl ChatToAnthropicStream {
     /// Close the stream, emitting whatever terminal events are still owed.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        // A tail we were discarding is not a frame; parsing it would be reading
+        // the middle of one.
+        if self.resyncing {
+            self.buffer.clear();
+        }
         if !self.buffer.is_empty() {
             let frame = std::mem::take(&mut self.buffer);
             self.consume_frame(&frame, &mut out);
@@ -159,6 +231,14 @@ impl ChatToAnthropicStream {
             .and_then(Value::as_u64)
             .and_then(|i| usize::try_from(i).ok())
             .unwrap_or(0);
+        // The index is upstream-controlled and drives the resize below. Without
+        // this check a single frame claiming `"index": 4000000000` allocates
+        // until the process dies, and IronWire will point at any
+        // OpenAI-compatible endpoint a user names.
+        if index >= MAX_TOOL_CALLS {
+            tracing::warn!(index, "ignoring a tool call with an implausible index");
+            return;
+        }
         if self.tool_calls.len() <= index {
             self.tool_calls
                 .resize(index + 1, PartialToolCall::default());
@@ -175,6 +255,18 @@ impl ChatToAnthropicStream {
             slot.name = name.to_string();
         }
         if let Some(fragment) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            // Third upstream-controlled growth path. Truncating would produce a
+            // `tool_use` block with unparseable input, which the client would
+            // hand to a tool; refusing the fragment and letting `close` drop
+            // the call is the lesser failure.
+            if self.tool_argument_bytes + fragment.len() > MAX_TOOL_ARGUMENT_BYTES {
+                if !slot.overflowed {
+                    tracing::warn!("tool-call arguments exceeded the accepted size");
+                }
+                slot.overflowed = true;
+                return;
+            }
+            self.tool_argument_bytes += fragment.len();
             slot.arguments.push_str(fragment);
         }
     }
@@ -244,6 +336,16 @@ impl ChatToAnthropicStream {
         let calls = std::mem::take(&mut self.tool_calls);
         for partial in calls {
             if partial.name.is_empty() {
+                continue;
+            }
+            // A call whose arguments we refused is not a call we can emit: the
+            // client would pass truncated JSON to a tool. Dropping it makes the
+            // turn visibly incomplete rather than silently wrong.
+            if partial.overflowed {
+                tracing::warn!(
+                    name = %partial.name,
+                    "dropping a tool call whose arguments exceeded the accepted size"
+                );
                 continue;
             }
             let index = self.next_index;
