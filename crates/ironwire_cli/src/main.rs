@@ -5,7 +5,7 @@ mod commands;
 mod render;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 /// IronWire — one local inference endpoint for all your AI capacity.
 #[derive(Debug, Parser)]
@@ -71,6 +71,15 @@ enum Command {
     /// Print the environment a client needs, for `eval "$(ironwire env)"`.
     Env,
 
+    /// Emit a shell completion script.
+    ///
+    /// Packaged installs wire this up for you; `eval "$(ironwire completions
+    /// bash)"` does it by hand.
+    Completions {
+        /// bash, zsh, fish, powershell, or elvish.
+        shell: clap_complete::Shell,
+    },
+
     /// Force all traffic onto one backend, or clear the force.
     Pin {
         /// Backend id. Omit to clear.
@@ -108,6 +117,15 @@ async fn main() -> Result<()> {
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env => commands::connect::print_env(cli.port),
+        Command::Completions { shell } => {
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "ironwire",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
         Command::Pin { backend, model } => commands::pin::run(cli.port, backend, model).await,
     }
 }

@@ -26,6 +26,26 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       - run: cargo test --all-features
 
+  # The packaging scripts only otherwise run inside a tag build, which is the
+  # worst place to find a typo: the tag is already pushed and a fix needs
+  # another one. So they run here, against fake release artifacts.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install pyyaml
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck dash zip
+      - name: Lint shell
+        run: shellcheck -S warning scripts/*.sh
+      - name: Installer behaviour
+        run: ./scripts/test-install.sh
+      - name: Packaging scripts
+        run: ./scripts/test-packaging.sh
+
   size:
     # brew/npx/apt/pip all ship this binary, so size is worth watching — but it
     # is a signal, not a gate. A feature worth its bytes should never be blocked
