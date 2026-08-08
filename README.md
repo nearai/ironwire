@@ -138,6 +138,7 @@ pass. That position comes with hard commitments, not defaults
 | [`docs/CRITIQUE.md`](docs/CRITIQUE.md) | The design review that produced it |
 | [`docs/PROTOCOL.md`](docs/PROTOCOL.md) | Wire fidelity: what is mutated, what is refused |
 | [`docs/TRUST.md`](docs/TRUST.md) | Credentials, consent, traces |
+| [`docs/PRIVACY.md`](docs/PRIVACY.md) | The optional privacy filter — designed, not built |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestones |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | brew / npx / apt / pip |
 | [`docs/UPDATES.md`](docs/UPDATES.md) | notify-only updates, and the signed quirks channel |

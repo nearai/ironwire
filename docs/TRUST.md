@@ -18,6 +18,7 @@ defaults: changing one is a product decision, not a config change.
 | I4 | **Single user.** No multi-tenant routing, no shared pools, no capacity resale. | No tenancy concept exists in the type system. |
 | I5 | **No identity forgery.** IronWire never synthesizes another product's client identity to unlock a subscription. | See §3. |
 | I6 | **Nothing is uploaded without a recorded, specific consent.** | See §4. |
+| I7 | **IronWire never claims to protect data more than it does.** The optional privacy filter is described by what it is *doing*, never by what the user is *safe from*. | See §8 and `docs/PRIVACY.md` §7. |
 
 I1–I4 are the line between *using capacity the user already pays for, on the
 user's own machine, for the workload it was sold for* and *reselling
@@ -199,3 +200,31 @@ local router against their own subscription, with a documented endpoint and a
 client identity of its own. Until then IronWire is careful, local, honest with
 the user about the risk, and does not build a business on someone else's
 ambiguity.
+
+---
+
+## 8. The privacy filter (I7)
+
+The filter (`docs/PRIVACY.md`) is optional and off by default. Three things
+about it are trust commitments rather than implementation details.
+
+**It is a mutation, and mutations are opt-in.** Everything else in this document
+rests on IronWire forwarding bytes it did not change (`PROTOCOL.md` §2). The
+filter changes the request body and the response stream by design. So it is
+never on unless the user turned it on, `ironwire status` says so permanently
+while it is, and the ledger marks every exchange it touched — a filtered
+exchange is not comparable to an unfiltered one and the log must not imply it is.
+
+**It never claims safety.** The mechanism has a false-negative rate we cannot
+measure on the user's own data. The interface therefore states what is *running*
+("secrets + named values"), never what the user is *protected from*. No
+compliance language, no green checkmark, no "protected" badge. A privacy tool
+that manufactures confidence is worse than no privacy tool, because it changes
+what people are willing to paste into an agent.
+
+**Nothing about it leaves the machine.** Tier 3 uses a local model and makes no
+network call — asserted by a test, because a privacy feature that phones out is
+the worst available outcome and exactly the kind of thing that arrives through a
+dependency. The substitution map is derived per request and never written to
+disk (`PRIVACY.md` §4): a persistent map would be a purpose-built plaintext PII
+database created in the course of trying not to expose PII.

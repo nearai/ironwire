@@ -199,6 +199,114 @@ in Swift** — the daemon is the only brain (DESIGN §6).
 
 ---
 
+## Compaction-aware routing
+
+Found while designing M7, but not a privacy issue — worth doing on its own.
+`docs/PROTOCOL.md` §8 has the reasoning.
+
+A compaction turn's output *becomes the conversation*: it is written into the
+client's permanent history and resent every turn afterwards. Degrading it to
+save money buys one cheaper request and pays for it for the rest of the session.
+
+- [ ] Fidelity dominates marginal cost on a compaction turn — do not descend a
+      rung, and prefer the same backend even under mild pressure
+- [ ] Note that our own turn-boundary gate currently *permits* a cross-family
+      switch here: `mid_tool_loop` is false during compaction by construction,
+      so `capability::eligible` allows a switch at the one moment it is most
+      expensive. The gate is not wrong — it answers whether a switch is
+      *correct*, not whether it is *wise* — but the policy layer should decline
+- [ ] Compaction turns are the largest and slowest of a session, so they are
+      where `resilience` earns its keep. Confirm the keepalive and stall
+      timeouts are sized for a summary of a full context, not a normal turn
+- [ ] Recognition is optional and lives in the quirks channel; nothing may
+      depend on it being right
+
+---
+
+## M7 — Privacy filter
+
+**Optional, off by default.** Remove sensitive values on the way out, restore
+them on the way back, so an agent can run against a provider the user does not
+fully trust. Design and critique in **`docs/PRIVACY.md`**; that document is the
+spec and this is the checklist.
+
+The order below is deliberate: the reversal machinery and its test suite come
+*before* any detector beyond the trivial one, because reversal is where every
+hard failure lives and a detector is worthless without it.
+
+### Foundation — reversal
+
+- [ ] `ironwire_privacy` crate: deterministic
+      `HMAC(conversation_salt, plaintext) → placeholder`, map derived per
+      request and never persisted (PRIVACY §4)
+- [ ] Substitution over parsed request bodies, per façade, without disturbing
+      anything it did not match
+- [ ] Streaming reversal across SSE chunk boundaries, bounded buffer, tested at
+      **every** byte offset — the likeliest place for a silent bug
+- [ ] **Fail loudly on partial reversal.** A half-reversed response is never
+      forwarded; the exchange fails with a provider-shaped error and the
+      client's transcript is left untouched
+- [ ] Filter state visible in `ironwire status` and per-exchange substitution
+      counts in `ironwire log` (PRIVACY §7)
+
+### Tier 1 — secrets (deterministic)
+
+- [ ] Reuse `ironclaw_safety::LeakDetector` and its pattern set directly
+- [ ] Map its one-way `LeakAction::Redact` onto our reversible substitution
+
+### Tier 2 — named values (deterministic)
+
+- [ ] User-nominated exact strings via `ironclaw_safety::redact_exact_values` +
+      `redaction_values_for_secret` (which already expands URL-encoded variants)
+- [ ] `ironwire privacy check <file>` — show what would and would not be caught,
+      so the false-negative rate is something a user can see
+
+### Compaction — one case per harness
+
+Every harness compacts, and a compaction summary becomes *permanent* client-side
+history. An unreversed placeholder there is self-perpetuating corruption
+(PRIVACY §5). Correctness must not depend on recognizing a compaction request.
+
+- [ ] Claude Code (`/v1/messages`, trigger driven off `count_tokens`)
+- [ ] Codex (`/v1/responses`)
+- [ ] Aider (`/v1/chat/completions`)
+- [ ] Cline / Roo ("Condense context")
+- [ ] Mangled-placeholder case for each: fail loudly, never a partial write
+- [ ] Stale placeholder from a previous salt is passed through, never
+      mis-reversed
+- [ ] Optional compaction fingerprints in the **quirks channel**, as an
+      optimization only — a client-shape fingerprint is exactly the thing that
+      breaks silently on a client update
+- [ ] Detection cache invalidation across a compaction boundary, measured
+
+### Tier 3 — inferred PII (local model, non-deterministic)
+
+- [ ] Local classifier, offline; a test asserts the path makes **no** network
+      call
+- [ ] Bounded per-request latency; exceeding the budget degrades to tier 2 and
+      says so rather than stalling the agent
+- [ ] Published precision/recall against a labelled corpus. A tier that cannot
+      state its error rate does not ship
+
+### False positives — the coding-agent-specific hazard
+
+Much of what a PII detector flags in a coding session is load-bearing *code*.
+
+- [ ] Never substitute inside fenced code blocks or `tool_result` content by
+      default
+- [ ] Never substitute reserved ranges (`example.com`, RFC 5737, RFC 1918, `555`)
+- [ ] Corpus test: real-looking fixtures pass tiers 1–2 with zero substitutions
+- [ ] Decide opaque tokens vs. format-preserving surrogates **with data** —
+      opaque tokens preserve the value but destroy the structure the model needs
+      to reason about (PRIVACY §6)
+
+**Exit criterion:** a full Claude Code session, including at least one
+compaction, runs end to end with tiers 1+2 on; the provider receives no
+nominated value; the client's transcript contains no placeholder; and
+`tests/passthrough.rs` still passes with the filter off.
+
+---
+
 ## Later
 
 - Local backends (Ollama, vLLM, LM Studio) as a rung-3 target

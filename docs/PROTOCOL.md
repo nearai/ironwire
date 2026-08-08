@@ -46,6 +46,14 @@ For a native-lane request, IronWire performs exactly these mutations:
    targeted JSON edit of that one key — never a full re-serialize.
 5. **Nothing else.** The body is otherwise the bytes the client sent.
 
+> **The one documented exception, and it is opt-in.** The privacy filter
+> (`docs/PRIVACY.md`) substitutes values on the way out and restores them on the
+> way back. That is a mutation of both the body and the response stream, so it
+> is off by default, announced in `ironwire status` while it is on, and marked
+> per exchange in the ledger. This enumeration — and `tests/passthrough.rs` —
+> describe the filter-off path, which is the only path that makes the
+> byte-identity claim.
+
 Everything IronWire needs for policy comes from a **peek**: a bounded,
 non-consuming scan of the parsed body for `model`, `stream`, `system[0]`,
 message count, `tools[].name`, and the presence of `cache_control`, `thinking`,
@@ -299,3 +307,65 @@ Fidelity claims are worthless without a harness that proves them.
    test, fix the failure) must complete through IronWire with the same
    turn count as direct. This is the only test that catches subtle behavioral
    regressions from a mis-mapped field.
+
+---
+
+## 8. Compaction
+
+Every serious harness compacts: as a conversation approaches the context limit
+it asks the model to summarize what has happened so far, then continues from
+that summary. IronWire sees the compaction turn as an ordinary request, which
+is convenient and also the source of the problem — **it is not an ordinary
+request, and treating it as one is wrong in three separate ways.**
+
+| Harness | Trigger | Reaches us as |
+|---|---|---|
+| Claude Code | auto near the limit, plus `/compact`; the trigger is computed from `POST /v1/messages/count_tokens` | `POST /v1/messages` |
+| Codex | auto, plus `/compact` | `POST /v1/responses` |
+| Aider | chat-history summarization above a threshold | `POST /v1/chat/completions` |
+| Cline / Roo | "Condense context" | whichever façade is configured |
+
+### What makes it different
+
+**Its output is permanent.** An ordinary turn is disposable — a bad answer is
+visible and retryable. A compaction summary *becomes the conversation*: it is
+written into the client's history and resent on every subsequent turn for the
+rest of the session. A degraded summary degrades everything after it, and the
+user has no way to tell that is what happened.
+
+**It is the largest request of the session and the slowest.** The whole history
+goes up; a long summary comes back after a long think. It is therefore the turn
+most likely to hit a stall, an overload, or a read timeout — precisely where
+`resilience` (§5) matters most, and precisely where a same-backend retry is
+worth more than descending the ladder.
+
+**Our own turn-boundary rule permits a family switch here.** `mid_tool_loop` is
+false during compaction — it is a clean boundary by construction. So the
+cross-family gate in `capability::eligible` *allows* a switch at the one moment
+in the session when a switch is most expensive. The gate is not wrong; it is
+answering a different question (is a switch *correct*) than the one that matters
+here (is a switch *wise*).
+
+### Consequences
+
+1. **Fidelity should dominate cost on a compaction turn.** Descending a rung to
+   save money buys one cheaper request and pays for it on every turn afterwards.
+   Not yet implemented — tracked in `ROADMAP.md`.
+2. **Recognition must stay optional.** Fingerprinting each harness's compaction
+   request is the obvious approach and is exactly the kind of client-shape
+   detail that breaks silently on a client update. Any fingerprint belongs in
+   the signed quirks channel (`docs/UPDATES.md`), and nothing may depend on it
+   being right — behaviour without recognition must be correct, just less
+   tuned.
+3. **`count_tokens` must keep working and must be routed like the turn it
+   predicts.** Claude Code computes its compaction trigger from it (§1). It
+   already goes through the same routing so the count comes from the model that
+   will serve the turn; if that ever stops being true, the client will compact
+   at the wrong moment in both directions.
+4. **Affinity survives, and should.** The conversation key is derived from the
+   system preamble and tool names (`DESIGN.md` §3), which compaction does not
+   change. A compacted conversation keeps its sticky route — which is what we
+   want, since the provider-side prompt cache is about to be rebuilt either way.
+5. **For the privacy filter, this is the hardest case in the product.** An
+   unreversed placeholder in a summary is permanent, self-perpetuating
+   corruption of the user's transcript. See `docs/PRIVACY.md` §5.
