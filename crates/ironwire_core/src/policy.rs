@@ -160,6 +160,16 @@ pub enum NoRoute {
     },
 }
 
+/// One turn's routing inputs, travelling together because they always do.
+#[derive(Clone, Copy)]
+struct Turn<'a> {
+    inbound: Protocol,
+    peek: &'a RequestPeek,
+    tier: ModelTier,
+    candidates: &'a [Candidate],
+    now: DateTime<Utc>,
+}
+
 /// Sticky per-conversation route state.
 #[derive(Debug, Clone)]
 pub struct Affinity {
@@ -181,6 +191,10 @@ pub struct Affinity {
     /// First time we saw sustained pressure on the current backend. Cleared
     /// when pressure lifts; a descent needs this to be older than the debounce.
     pub pressure_since: Option<DateTime<Utc>>,
+    /// First time a better rung was available again. The mirror of
+    /// [`Self::pressure_since`], cleared whenever pressure returns, and a
+    /// promotion needs it older than [`PROMOTION_DEBOUNCE`].
+    pub recovery_since: Option<DateTime<Utc>>,
 }
 
 /// How long pressure must persist before a conversation descends a rung.
@@ -188,6 +202,19 @@ pub struct Affinity {
 /// A single 429 with a three-second `retry-after` must not throw away a
 /// 200k-token warm cache. Waiting is almost always cheaper than moving.
 pub const DESCENT_DEBOUNCE: Duration = Duration::seconds(20);
+
+/// How long a better rung must stay available before a conversation climbs back
+/// to it.
+///
+/// Deliberately far longer than [`DESCENT_DEBOUNCE`], and the asymmetry is the
+/// design rather than an oversight. Descending is urgent: the alternative is a
+/// failed turn. Promoting is not, because the conversation is working. And
+/// `Headroom::is_pressured` is a step function at 90% with no hysteresis band
+/// of its own, so this debounce is the only thing standing between a provider
+/// hovering at that threshold and a conversation that discards a warm prompt
+/// cache every twenty seconds — which would be strictly worse than never
+/// promoting at all.
+pub const PROMOTION_DEBOUNCE: Duration = Duration::minutes(5);
 
 /// How long a conversation may go unheard from before its route is forgotten.
 ///
@@ -390,7 +417,7 @@ impl Policy {
         if inherit_affinity
             && let Some(affinity) = self.affinities.get(&key).cloned()
             && let Some(candidate) = candidates.iter().find(|c| c.id == affinity.backend)
-            && usable(candidate, peek, inbound, now).is_ok()
+            && incumbent_is_usable(candidate, peek, inbound, now)
         {
             let pressured = candidate.quota.is_pressured(now);
             let entry = self.affinities.get_mut(&key).expect("just found above");
@@ -399,10 +426,23 @@ impl Policy {
             // the common one — and every healthy conversation ages out while
             // actively in use.
             entry.last_seen = now;
-            if pressured {
-                let since = *entry.pressure_since.get_or_insert(now);
+            // Scoped so the mutable borrow ends before `select` needs `&self`
+            // below. Everything the rest of this block depends on is read out
+            // here.
+            let pressure_started = if pressured {
+                // A return to pressure discards accumulated recovery: a backend
+                // hovering at the 90% threshold must not creep towards a
+                // promotion one unpressured turn at a time.
+                entry.recovery_since = None;
+                Some(*entry.pressure_since.get_or_insert(now))
+            } else {
+                entry.pressure_since = None;
+                None
+            };
+
+            match pressure_started {
                 // Hysteresis: only descend once pressure has persisted.
-                if now - since < DESCENT_DEBOUNCE {
+                Some(since) if now - since < DESCENT_DEBOUNCE => {
                     return Ok(RouteDecision {
                         backend: affinity.backend,
                         model: affinity.model,
@@ -411,15 +451,30 @@ impl Policy {
                         reason: "sticky: pressure not yet sustained".to_string(),
                     });
                 }
-            } else {
-                entry.pressure_since = None;
-                return Ok(RouteDecision {
-                    backend: affinity.backend,
-                    model: affinity.model,
-                    rung: affinity.rung,
-                    translated: affinity.rung == Rung::CrossFamily,
-                    reason: "sticky affinity".to_string(),
-                });
+                // Sustained pressure: fall through to a fresh selection.
+                Some(_) => {}
+                None => {
+                    if let Some(promoted) = self.consider_promotion(
+                        &key,
+                        &affinity,
+                        Turn {
+                            inbound,
+                            peek,
+                            tier,
+                            candidates,
+                            now,
+                        },
+                    ) {
+                        return Ok(promoted);
+                    }
+                    return Ok(RouteDecision {
+                        backend: affinity.backend,
+                        model: affinity.model,
+                        rung: affinity.rung,
+                        translated: affinity.rung == Rung::CrossFamily,
+                        reason: "sticky affinity".to_string(),
+                    });
+                }
             }
         }
 
@@ -433,6 +488,7 @@ impl Policy {
                 since: now,
                 last_seen: now,
                 pressure_since: None,
+                recovery_since: None,
             },
         );
         // After the insert, not before: sweeping first leaves room for one more
@@ -442,6 +498,98 @@ impl Policy {
         // that `expect`.
         self.sweep(now);
         Ok(decision)
+    }
+
+    /// Climb back up the ladder, if a better rung has been available long
+    /// enough to believe in.
+    ///
+    /// Descent is a one-way door without this: a conversation that fell to a
+    /// cross-family backend at nine in the morning finds it perfectly usable
+    /// and unpressured all afternoon, and stays there on a cold cache while the
+    /// capacity the user pays for sits idle. A state machine with no path back
+    /// is not a transition, it is a trap.
+    ///
+    /// `None` means stay put, which is the answer on the overwhelming majority
+    /// of turns — an undegraded conversation does not even reach here.
+    fn consider_promotion(
+        &mut self,
+        key: &ConversationKey,
+        affinity: &Affinity,
+        turn: Turn<'_>,
+    ) -> Option<RouteDecision> {
+        let Turn {
+            inbound,
+            peek,
+            tier,
+            candidates,
+            now,
+        } = turn;
+        // A conversation already at the top has nowhere to climb, and this is
+        // the common case: no `select` runs for it.
+        if affinity.rung == Rung::Preferred {
+            return None;
+        }
+
+        // Ask the ladder rather than asking whether the preferred backend's
+        // quota recovered. `select` already encodes eligibility, consent,
+        // client identity, circuit state, catalogue and tier fit; a
+        // reimplementation here would drift from it and would miss a backend
+        // whose quota came back while its circuit stayed open.
+        //
+        // Compared by *rung*, never by backend id: rung 1 to rung 0 can be a
+        // model change on the very same backend.
+        let better = self
+            .select(inbound, peek, tier, candidates, now)
+            .ok()
+            .filter(|decision| decision.rung < affinity.rung);
+        let Some(candidate) = better else {
+            // The improvement went away again. Recovery accumulated so far is
+            // discarded rather than banked: a backend crossing in and out of
+            // availability must not creep towards a promotion one good turn at
+            // a time, because each promotion costs a warm prompt cache.
+            if let Some(entry) = self.affinities.get_mut(key) {
+                entry.recovery_since = None;
+            }
+            return None;
+        };
+
+        let entry = self.affinities.get_mut(key)?;
+        // Recovery starts the first turn a better rung is available, whether or
+        // not this turn can act on it.
+        let recovering_since = *entry.recovery_since.get_or_insert(now);
+        if now - recovering_since < PROMOTION_DEBOUNCE {
+            return None;
+        }
+
+        // The same rule as the descent that created this route
+        // (`docs/PROTOCOL.md` §6), and for the same reason rather than out of
+        // symmetry: the recent assistant turns were produced by the foreign
+        // family and carry none of this family's signed reasoning state, so
+        // replaying that history mid-loop is the rejection risk the gate
+        // exists to prevent. Blocked is not cancelled — `recovery_since`
+        // stands, so the next turn boundary promotes rather than restarting
+        // the wait.
+        if affinity.rung == Rung::CrossFamily && peek.requirements.mid_tool_loop {
+            return None;
+        }
+
+        *entry = Affinity {
+            backend: candidate.backend.clone(),
+            model: candidate.model.clone(),
+            rung: candidate.rung,
+            since: now,
+            last_seen: now,
+            pressure_since: None,
+            recovery_since: None,
+        };
+        // The decision `select` produced, not a patched copy of the old one:
+        // `translated` has to come from the new route. Updating the rung while
+        // leaving `translated` derived from the stale one would translate a
+        // request to a native backend and corrupt it.
+        Some(RouteDecision {
+            reason: format!("recovered to {:?}", candidate.rung).to_lowercase(),
+            ..candidate
+        })
     }
 
     /// Fresh selection, ignoring affinity. Walks the ladder rung by rung.
@@ -597,6 +745,30 @@ enum Unusable {
     Unavailable,
     NeedsClientIdentity,
     Ineligible(Ineligible),
+}
+
+/// Whether the backend a conversation is *already on* can serve this turn.
+///
+/// Everything `usable` refuses, except the mid-tool-loop rule — which does not
+/// apply to the incumbent, and applying it here inverts the rule it comes from.
+///
+/// `eligible` refuses a cross-family route mid tool loop to stop a conversation
+/// *switching* families in the middle of a loop (`docs/PROTOCOL.md` §6). A
+/// conversation already on that backend is not switching; it is continuing, on
+/// the backend whose reasoning state the loop is built from. Treating it as
+/// ineligible meant a mid-loop turn found its own backend unusable and fell
+/// through to a fresh selection, which dragged it back to the native family —
+/// mid tool loop, which is the exact move the rule exists to prevent.
+fn incumbent_is_usable(
+    candidate: &Candidate,
+    peek: &RequestPeek,
+    inbound: Protocol,
+    now: DateTime<Utc>,
+) -> bool {
+    matches!(
+        usable(candidate, peek, inbound, now),
+        Ok(()) | Err(Unusable::Ineligible(Ineligible::MidToolLoop))
+    )
 }
 
 fn usable(
@@ -786,6 +958,177 @@ mod tests {
             )
             .expect("routes");
         assert_eq!(decision.backend.as_str(), "ollama");
+    }
+
+    /// Descent without promotion is a trap rather than a transition: a
+    /// conversation that fell to a cross-family backend in the morning stays
+    /// there all day, cold cache and all, while the capacity the user pays for
+    /// sits idle.
+    mod promotion {
+        use super::*;
+
+        /// The preferred backend, and the foreign-family one below it.
+        ///
+        /// Exhausted rather than merely pressured: a same-wire backend that is
+        /// *usable* always wins its partition, so a cross-family descent only
+        /// happens once the preferred one is genuinely unavailable. Pressure
+        /// alone moves a conversation down a model tier, not across a family.
+        fn ladder(exhausted_until: Option<DateTime<Utc>>) -> Vec<Candidate> {
+            let mut preferred = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            if let Some(until) = exhausted_until {
+                preferred.quota.primary = Headroom::Exhausted { until };
+            }
+            let fallback = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+            vec![preferred, fallback]
+        }
+
+        fn route(
+            policy: &mut Policy,
+            peek: &RequestPeek,
+            candidates: &[Candidate],
+            at: DateTime<Utc>,
+        ) -> RouteDecision {
+            policy
+                .decide(key(), Protocol::AnthropicMessages, peek, candidates, at)
+                .expect("routes")
+        }
+
+        /// A conversation stranded on the foreign family, as a morning rate
+        /// limit would leave it.
+        fn stranded() -> (Policy, DateTime<Utc>) {
+            let mut policy = Policy::new();
+            let recovers_at = t(600);
+            let decision = route(
+                &mut policy,
+                &peek("claude-opus-4-6"),
+                &ladder(Some(recovers_at)),
+                t(0),
+            );
+            assert_eq!(decision.backend.as_str(), "nearai");
+            assert_eq!(decision.rung, Rung::CrossFamily);
+            assert!(decision.translated);
+            (policy, recovers_at)
+        }
+
+        #[test]
+        fn a_recovered_backend_takes_the_conversation_back() {
+            let (mut policy, recovers_at) = stranded();
+            let ordinary = peek("claude-opus-4-6");
+            // The first turn after recovery starts the clock; it does not move.
+            route(&mut policy, &ordinary, &ladder(None), recovers_at);
+            let decision = route(
+                &mut policy,
+                &ordinary,
+                &ladder(None),
+                recovers_at + PROMOTION_DEBOUNCE,
+            );
+            assert_eq!(decision.backend.as_str(), "claude-sub");
+            assert_eq!(decision.rung, Rung::Preferred);
+            assert!(
+                !decision.translated,
+                "a promoted route must not still be marked translated"
+            );
+        }
+
+        #[test]
+        fn it_does_not_climb_back_the_moment_pressure_lifts() {
+            let (mut policy, recovers_at) = stranded();
+            let ordinary = peek("claude-opus-4-6");
+            route(&mut policy, &ordinary, &ladder(None), recovers_at);
+            let decision = route(
+                &mut policy,
+                &ordinary,
+                &ladder(None),
+                recovers_at + Duration::seconds(30),
+            );
+            assert_eq!(
+                decision.backend.as_str(),
+                "nearai",
+                "promoted before the debounce elapsed"
+            );
+        }
+
+        /// The debounce is the only damping there is — `is_pressured` is a step
+        /// function at 90% — so a backend crossing the line repeatedly must not
+        /// accumulate its way to a promotion one good turn at a time.
+        #[test]
+        fn a_flapping_backend_never_promotes() {
+            let (mut policy, recovers_at) = stranded();
+            let ordinary = peek("claude-opus-4-6");
+            let mut at = recovers_at;
+            for _ in 0..10 {
+                // Available: recovery starts accruing.
+                route(&mut policy, &ordinary, &ladder(None), at);
+                at += Duration::minutes(2);
+                // Gone again before the debounce elapsed: it starts over.
+                route(
+                    &mut policy,
+                    &ordinary,
+                    &ladder(Some(at + Duration::hours(1))),
+                    at,
+                );
+                at += Duration::minutes(2);
+            }
+            assert_eq!(
+                policy.current_backend(&key()).map(|b| b.to_string()),
+                Some("nearai".to_string()),
+                "a flapping backend promoted a conversation"
+            );
+        }
+
+        /// Leaving the foreign family is the same hazard as entering it: the
+        /// recent assistant turns carry none of this family's signed reasoning
+        /// state, so replaying them mid-loop is the rejection risk the gate
+        /// exists to prevent (`docs/PROTOCOL.md` §6).
+        #[test]
+        fn a_cross_family_promotion_waits_for_a_turn_boundary() {
+            let (mut policy, recovers_at) = stranded();
+            let mut mid_loop = peek("claude-opus-4-6");
+            mid_loop.requirements.mid_tool_loop = true;
+
+            route(&mut policy, &mid_loop, &ladder(None), recovers_at);
+            let blocked = route(
+                &mut policy,
+                &mid_loop,
+                &ladder(None),
+                recovers_at + PROMOTION_DEBOUNCE,
+            );
+            assert_eq!(
+                blocked.backend.as_str(),
+                "nearai",
+                "promoted across families mid tool loop"
+            );
+
+            // The next clean turn promotes immediately: being blocked is not
+            // being reset, or a busy tool loop would postpone recovery forever.
+            let promoted = route(
+                &mut policy,
+                &peek("claude-opus-4-6"),
+                &ladder(None),
+                recovers_at + PROMOTION_DEBOUNCE + Duration::seconds(1),
+            );
+            assert_eq!(promoted.backend.as_str(), "claude-sub");
+        }
+
+        #[test]
+        fn a_conversation_at_the_top_stays_where_it_is() {
+            let mut policy = Policy::new();
+            let ordinary = peek("claude-opus-4-6");
+            let first = route(&mut policy, &ordinary, &ladder(None), t(0));
+            assert_eq!(first.rung, Rung::Preferred);
+            let later = route(
+                &mut policy,
+                &ordinary,
+                &ladder(None),
+                t(0) + PROMOTION_DEBOUNCE * 10,
+            );
+            assert_eq!(later.reason, "sticky affinity");
+            assert_eq!(later.backend.as_str(), "claude-sub");
+        }
     }
 
     /// A distinct conversation per index, so a test can fill the map.

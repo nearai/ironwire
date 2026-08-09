@@ -219,6 +219,31 @@ if cross_family && req.mid_tool_loop {
 It **defers** a switch to the next clean turn rather than disqualifying the
 conversation. In a coding session that is at most one turn of waiting.
 
+The rule is about *switching*, so it does not apply to the backend a
+conversation is already on. Continuing on the foreign backend mid-loop is where
+that loop's state lives; treating the incumbent as ineligible inverted the rule,
+because the conversation then fell through to a fresh selection and was dragged
+back to the native family — mid tool loop, which is the move the rule exists to
+prevent.
+
+### Climbing back
+
+The ladder is descended *and* climbed. A conversation that fell to rung 3
+returns to a better rung once one has been continuously available for
+`PROMOTION_DEBOUNCE` — five minutes, against twenty seconds for a descent, and
+the asymmetry is deliberate. Descending is urgent, because the alternative is a
+failed turn. Promoting is not, because the conversation is working; and
+`Headroom::is_pressured` is a step function at 90% with no hysteresis of its
+own, so without a long debounce a provider hovering at that line would move the
+conversation — discarding a warm prompt cache — every twenty seconds. That is
+strictly worse than never promoting.
+
+Leaving a foreign family is gated by exactly the same turn boundary as entering
+it, for exactly the same reason: the recent assistant turns carry none of the
+native family's signed reasoning state. A blocked promotion waits for a clean
+turn without losing its accumulated recovery, so a busy tool loop postpones the
+climb rather than cancelling it.
+
 ### What crossing a family actually costs
 
 None of these are refusals. They are what the rung-3 announcement is for:

@@ -133,6 +133,13 @@ Rungs 0–2 need no translation at all — IronWire forwards your request's byte
 untouched. Rung 3 does: a Claude Code session can keep working on NEAR AI (or
 any OpenAI-compatible endpoint) when your Anthropic capacity runs out.
 
+**The ladder goes both ways.** A conversation climbs back once a better rung has
+been available for five continuous minutes — against twenty seconds to descend.
+The asymmetry is the point: falling is urgent because the alternative is a
+failed turn, while climbing is not, and a provider hovering at its limit would
+otherwise move your session, and throw away its warm cache, every twenty
+seconds.
+
 The rule that makes rung 3 safe is **switch families at a turn boundary, never
 mid tool loop** — a conversation caught mid-loop waits one turn rather than
 being refused. Everything that would genuinely *break* the request (tools a
