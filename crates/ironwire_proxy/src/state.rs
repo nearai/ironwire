@@ -12,6 +12,7 @@ use ironwire_quirks::QuirksStore;
 use ironwire_update::UpdateStatus;
 use ironwire_upstream::backend::{Backend, BackendStatus};
 use ironwire_upstream::breaker::BreakerBoard;
+use ironwire_usage::UsageReport;
 
 use crate::events::EventBus;
 use crate::privacy::PrivacyFilter;
@@ -141,7 +142,26 @@ pub struct AppState {
     /// optional and this is not: a status line has to be able to say where the
     /// last turn went on a machine where trace capture is off.
     last_route: Arc<Mutex<Option<LastRoute>>>,
+    /// Most recent usage report, and when it was built.
+    ///
+    /// `ironwire statusline` calls `/status` on *every render of somebody's
+    /// editor*, and building this reads every ledger row in the history window
+    /// — eight days, thousands of rows on a working machine. Recomputing that
+    /// per keystroke would put a SQLite scan on an interactive path for a
+    /// figure that cannot meaningfully change between two renders.
+    usage: Arc<Mutex<Option<CachedUsage>>>,
 }
+
+/// A usage report, when it was built, and the ledger write token it was built
+/// against.
+type CachedUsage = (chrono::DateTime<chrono::Utc>, u64, UsageReport);
+
+/// How long a usage report may be reused *while the ledger has not moved*.
+///
+/// Only time drifts under this — "closes in 4h" ages by up to ten seconds on
+/// an idle machine. New traffic does not wait for it: the write token is what
+/// makes a report stale, and it moves the instant an exchange is recorded.
+const USAGE_MAX_AGE: chrono::Duration = chrono::Duration::seconds(10);
 
 /// The most recent routing decision, for anything that needs to display it.
 #[derive(Debug, Clone)]
@@ -182,7 +202,41 @@ impl AppState {
             config: Arc::new(config),
             control_token: Arc::new(control_token),
             last_route: Arc::new(Mutex::new(None)),
+            usage: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// A usage report, reusing the last one only if nothing has changed.
+    ///
+    /// `writes` is the ledger's change token: a report is reused only when the
+    /// ledger has not moved since it was built *and* it is younger than
+    /// [`USAGE_MAX_AGE`]. Both halves are load-bearing. Without the token, a
+    /// request arriving a millisecond after a report was built stays invisible
+    /// until the timer expires — which is exactly how a fast end-to-end run
+    /// sees a status screen with no session on it at all.
+    ///
+    /// Deliberately not a background task: on a machine where nobody runs
+    /// `status`, this costs nothing.
+    pub fn usage_report(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        writes: u64,
+        build: impl FnOnce() -> UsageReport,
+    ) -> UsageReport {
+        let mut slot = match self.usage.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((built_at, built_writes, report)) = slot.as_ref()
+            && *built_writes == writes
+            && now >= *built_at
+            && now - *built_at < USAGE_MAX_AGE
+        {
+            return report.clone();
+        }
+        let report = build();
+        *slot = Some((now, writes, report.clone()));
+        report
     }
 
     /// Remember where the last turn went.
@@ -456,5 +510,84 @@ mod quirks_tests {
         let a = state.quirks();
         let b = state.quirks();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+}
+
+#[cfg(test)]
+mod usage_cache_tests {
+    use super::*;
+    use ironwire_core::config::Config;
+    use ironwire_creds::ConsentLedger;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn state() -> AppState {
+        AppState::new(
+            BackendRegistry::new(),
+            Config::default(),
+            ConsentLedger::default(),
+            "t".to_string(),
+        )
+    }
+
+    fn report(completed: usize) -> UsageReport {
+        UsageReport {
+            completed_sessions: completed,
+            ..UsageReport::default()
+        }
+    }
+
+    #[test]
+    fn a_status_line_rendering_repeatedly_scans_the_ledger_once() {
+        // `ironwire statusline` calls `/status` on every render of somebody's
+        // editor. Without this, each one is an eight-day SQLite scan on an
+        // interactive path.
+        let state = state();
+        let builds = AtomicUsize::new(0);
+        let now = chrono::Utc::now();
+        for _ in 0..20 {
+            state.usage_report(now, 7, || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                report(1)
+            });
+        }
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_single_new_exchange_invalidates_it_immediately() {
+        // The failure this exists to stop: an end-to-end run that asks for
+        // status, sends traffic and asks again inside one second, and is shown
+        // the empty report from before the traffic.
+        let state = state();
+        let now = chrono::Utc::now();
+        assert_eq!(
+            state.usage_report(now, 0, || report(0)).completed_sessions,
+            0
+        );
+        assert_eq!(
+            state.usage_report(now, 1, || report(1)).completed_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn a_stale_report_is_rebuilt_so_status_reflects_work_done_since() {
+        let state = state();
+        let now = chrono::Utc::now();
+        let first = state.usage_report(now, 1, || report(1));
+        assert_eq!(first.completed_sessions, 1);
+        let later = state.usage_report(now + USAGE_MAX_AGE, 1, || report(2));
+        assert_eq!(later.completed_sessions, 2);
+    }
+
+    #[test]
+    fn a_clock_that_jumps_backwards_rebuilds_rather_than_serving_the_future() {
+        // Suspend/resume and NTP corrections both do this, and a cached entry
+        // stamped in the future would otherwise never expire.
+        let state = state();
+        let now = chrono::Utc::now();
+        state.usage_report(now, 1, || report(1));
+        let earlier = state.usage_report(now - chrono::Duration::hours(1), 1, || report(2));
+        assert_eq!(earlier.completed_sessions, 2);
     }
 }

@@ -208,6 +208,47 @@ Metered backends (API keys) report *spend*, which we compute from observed
 usage tokens × the price table (`ironclaw_common::llm_costs`), and label as an
 estimate because it is one.
 
+### 4a. What we *do* measure: our own traffic
+
+There is a second question the quota rule does not answer, and users ask it
+constantly: **how fast is this going, and will it last?** A rate-limit header
+says where you are; it does not say whether the next hour is affordable.
+
+`ironwire_usage` answers that from the trace ledger — the tokens IronWire
+watched go past, cut into session windows, differentiated into a burn rate and
+carried forward to the window's close. This is not an exception to §4, for one
+structural reason: **it never claims to describe a provider's books.** It
+describes the requests this machine made. `Headroom` gains no variant, nothing
+computed there reaches routing or eligibility, and `capacity:` on the status
+screen still says `unknown` for any pool the provider has not spoken about.
+
+Every figure it produces carries a `Basis`:
+
+| Basis            | Means                                     | Example |
+| ---------------- | ----------------------------------------- | ------- |
+| `Measured`       | summed from the ledger; happened          | `100.0k tokens · 12 exchanges` |
+| `Projected`      | a measured rate × the time left           | `2.5M tokens by the time it closes` |
+| `SelfCalibrated` | the user's own completed windows          | `your own p90 over 14 past sessions` |
+| `Declared`       | a limit the user wrote in their config    | `the Max 5× limit you declared` |
+
+There is deliberately no fifth variant meaning "a limit we assumed". Published
+per-window token limits do not exist; the figures in circulation are
+reverse-engineered. So IronWire ships that table (`usage::plan`) but never
+consults it unless `usage.plan` is set — at which point the ceiling is the
+user's claim about their own subscription, and the screen says so. Unset, the
+comparison is against their own history, which needs no table. A backend with
+neither yields no percentage and no bar rather than a plausible one.
+
+The algorithms — five-hour windows rounded to the hour, gap blocks,
+overlap-weighted hourly rate, and a p90 taken over sessions that look like they
+hit a cap — are ported from
+[`Maciek-roboblog/Claude-Code-Usage-Monitor`](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)
+(MIT), which worked them out against real Claude Code transcripts. The
+percentile deliberately matches Python's `statistics.quantiles` estimator so
+the two tools agree on the same machine. One behaviour is not carried over:
+there, a lone request reports its whole token count as a per-minute rate. One
+request is a point, not an interval, so here it reports no rate at all.
+
 ---
 
 ## 5. Eligibility and identity
@@ -232,6 +273,7 @@ crates/
   ironwire_core       types, config, capability gate, policy, quota
   ironwire_creds      credential discovery + consent
   ironwire_ledger     the local trace ledger
+  ironwire_usage      session windows, burn rate, projections (§4a)
   ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   Backend trait; native passthrough clients; observation
   ironwire_proxy      axum façades, router wiring, control API, trace sink

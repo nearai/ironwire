@@ -17,6 +17,11 @@ documents mean for code you are about to write.
    deliberately has no variant for a guess. If you find yourself wanting one,
    the answer is a better observation path, not a better estimate.
 
+   The one thing that looks like an exception is `ironwire_usage`, and is not:
+   it measures *IronWire's own traffic* out of the ledger and labels every
+   figure with the basis it came from. It never claims to know a provider's
+   remaining capacity, and nothing in it reaches routing (`docs/DESIGN.md` §4a).
+
 3. **Refuse rather than degrade.** A route that cannot preserve the request's
    semantics is ineligible. `eligible()` in
    [`capability.rs`](crates/ironwire_core/src/capability.rs) is the only place
@@ -32,6 +37,8 @@ documents mean for code you are about to write.
 ironwire_core  ← no I/O, no deps on our other crates
      ↑
 ironwire_creds ← credential discovery, consent
+     ↑
+ironwire_usage ← burn rate and projections, over ironwire_ledger's rows
      ↑
 ironwire_upstream ← HTTP to providers
      ↑

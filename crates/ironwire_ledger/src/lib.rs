@@ -146,6 +146,15 @@ pub struct Summary {
 #[derive(Clone)]
 pub struct Ledger {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Exchanges appended since this process started.
+    ///
+    /// Exists so a reader can cheaply ask "is anything I derived from this
+    /// ledger still current?" without a query. Anything cached off the rows —
+    /// the burn rate on `ironwire status` — is stale the moment this moves,
+    /// and a time-based expiry alone cannot see that: a request arriving one
+    /// millisecond after a report was built would be invisible until the
+    /// timer ran out.
+    writes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -207,6 +216,7 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -248,7 +258,19 @@ impl Ledger {
                 exchange.error,
             ],
         )?;
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// How many exchanges have been appended since this process started.
+    ///
+    /// Not a row count and not persisted — it is a change token. Equal on two
+    /// reads means nothing was written between them, which is the only thing a
+    /// cache built from these rows needs to know.
+    #[must_use]
+    pub fn writes(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Most recent exchanges, newest first.
@@ -258,36 +280,31 @@ impl Ledger {
     /// [`LedgerError::Sqlite`] on a read failure.
     pub fn recent(&self, limit: usize) -> Result<Vec<Exchange>> {
         let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
-                    requested_model, served_model, rung, attempts,
-                    input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                    cost_usd, substitutions, status, error
-             FROM exchanges ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map([limit], |row| {
-            Ok(Exchange {
-                started_at: parse_time(&row.get::<_, String>(0)?),
-                ttfb_ms: row.get(1)?,
-                total_ms: row.get(2)?,
-                facade: row.get(3)?,
-                path: row.get(4)?,
-                conversation: row.get(5)?,
-                backend: row.get(6)?,
-                requested_model: row.get(7)?,
-                served_model: row.get(8)?,
-                rung: row.get(9)?,
-                attempts: row.get(10)?,
-                input_tokens: row.get(11)?,
-                cache_read_tokens: row.get(12)?,
-                cache_write_tokens: row.get(13)?,
-                output_tokens: row.get(14)?,
-                cost_usd: row.get(15)?,
-                substitutions: row.get(16)?,
-                status: row.get(17)?,
-                error: row.get(18)?,
-            })
-        })?;
+        let mut statement = conn.prepare(&format!(
+            "{COLUMNS} FROM exchanges ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = statement.query_map([limit], read_exchange)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
+    }
+
+    /// Every exchange since `from`, oldest first.
+    ///
+    /// Unlike [`Ledger::recent`] this is unbounded by count, because the
+    /// window is the bound: callers pass a cutoff, not a page size. What reads
+    /// it is [`ironwire_usage`](https://docs.rs/ironwire_usage), which cuts
+    /// these rows into session windows and cannot do that from a truncated
+    /// tail — a missing first request moves the window's start.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn since(&self, from: DateTime<Utc>) -> Result<Vec<Exchange>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(&format!(
+            "{COLUMNS} FROM exchanges WHERE started_at >= ?1 ORDER BY started_at ASC"
+        ))?;
+        let rows = statement.query_map([from.to_rfc3339()], read_exchange)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(LedgerError::from)
     }
@@ -367,6 +384,38 @@ impl Ledger {
             Err(poisoned) => poisoned.into_inner(),
         }
     }
+}
+
+/// The column list every read shares, in the order [`read_exchange`] expects.
+/// Kept in one place because the two are only correct together, and a column
+/// added to one and not the other shifts every index after it.
+const COLUMNS: &str = "SELECT started_at, ttfb_ms, total_ms, facade, path, conversation, backend,
+            requested_model, served_model, rung, attempts,
+            input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+            cost_usd, substitutions, status, error";
+
+fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
+    Ok(Exchange {
+        started_at: parse_time(&row.get::<_, String>(0)?),
+        ttfb_ms: row.get(1)?,
+        total_ms: row.get(2)?,
+        facade: row.get(3)?,
+        path: row.get(4)?,
+        conversation: row.get(5)?,
+        backend: row.get(6)?,
+        requested_model: row.get(7)?,
+        served_model: row.get(8)?,
+        rung: row.get(9)?,
+        attempts: row.get(10)?,
+        input_tokens: row.get(11)?,
+        cache_read_tokens: row.get(12)?,
+        cache_write_tokens: row.get(13)?,
+        output_tokens: row.get(14)?,
+        cost_usd: row.get(15)?,
+        substitutions: row.get(16)?,
+        status: row.get(17)?,
+        error: row.get(18)?,
+    })
 }
 
 /// Timestamps are written by us in RFC 3339, so a parse failure means the row
@@ -483,6 +532,37 @@ mod tests {
             .expect("records");
         let summary = ledger.summary(at(5_000)).expect("summarises");
         assert_eq!(summary.exchanges, 1);
+    }
+
+    #[test]
+    fn the_write_token_moves_on_a_write_and_not_on_a_read() {
+        // What tells a cache built from these rows that it has gone stale. A
+        // clock cannot: a request landing a millisecond after a report was
+        // built would stay invisible until the timer ran out.
+        let ledger = Ledger::in_memory().expect("opens");
+        let before = ledger.writes();
+        ledger.record(&exchange("claude-sub", 0)).expect("records");
+        let after = ledger.writes();
+        assert_ne!(before, after);
+        let _ = ledger.recent(10).expect("reads");
+        let _ = ledger.summary(at(-1)).expect("summarises");
+        assert_eq!(ledger.writes(), after, "a read is not a change");
+        // Clones share it: the daemon hands copies around.
+        assert_eq!(ledger.clone().writes(), after);
+    }
+
+    #[test]
+    fn since_returns_the_whole_window_oldest_first() {
+        // Oldest first, and uncapped: session windows are cut from the first
+        // request in them, and a truncated tail would move where they start.
+        let ledger = Ledger::in_memory().expect("opens");
+        for i in [5_000, 0, 10_000, 1_000] {
+            ledger.record(&exchange("claude-sub", i)).expect("records");
+        }
+        let rows = ledger.since(at(1_000)).expect("reads");
+        assert_eq!(rows.len(), 3, "the one before the cutoff is excluded");
+        assert_eq!(rows[0].started_at, at(1_000));
+        assert_eq!(rows[2].started_at, at(10_000));
     }
 
     #[test]

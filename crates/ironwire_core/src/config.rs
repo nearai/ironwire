@@ -144,6 +144,47 @@ impl Default for CaptureConfig {
     }
 }
 
+/// What `ironwire status` may say about how fast capacity is going.
+///
+/// Everything here describes *IronWire's own traffic*, measured from the local
+/// ledger — never a provider's quota, which is reported or `unknown` and never
+/// estimated (`AGENTS.md` rule 2, `docs/CRITIQUE.md` §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageConfig {
+    /// Show the session section on `ironwire status`. Needs `capture.enabled`
+    /// — with no ledger there is nothing to measure.
+    pub enabled: bool,
+    /// Length of a session window, in hours. Five is Claude Code's, and the
+    /// figure the whole comparison is calibrated against; change it only if
+    /// your provider's window really is a different length.
+    pub session_hours: u32,
+    /// How far back to look for completed windows when calibrating against
+    /// your own history. Eight days: long enough for a working week, short
+    /// enough that a change in how you work shows up inside one.
+    pub history_hours: u32,
+    /// Your subscription plan: `pro`, `max5`, `max20`, or `team`.
+    ///
+    /// There is deliberately no default. Published per-window token limits do
+    /// not exist — the figures in circulation are reverse-engineered — so
+    /// IronWire will not assert one. Setting this makes the ceiling *your*
+    /// claim about *your* plan, and the status screen says so. Left unset, the
+    /// comparison is against your own past sessions, which needs no table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            session_hours: 5,
+            history_hours: 192,
+            plan: None,
+        }
+    }
+}
+
 /// Update-check settings. IronWire never applies an update itself; this only
 /// governs whether it *looks* (`docs/UPDATES.md`, `docs/TRUST.md` §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,6 +446,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Trace capture settings.
     pub capture: CaptureConfig,
+    /// What the status screen may say about burn rate and projections.
+    pub usage: UsageConfig,
     /// Update-check settings.
     pub updates: UpdateConfig,
     /// Stream-resilience settings.
@@ -825,6 +868,12 @@ mod tests {
                 enabled: true,
                 bodies: true,
                 retain_days: 30,
+            },
+            usage: UsageConfig {
+                enabled: true,
+                session_hours: 5,
+                history_hours: 192,
+                plan: Some("max5".into()),
             },
             updates: UpdateConfig { check: false },
             resilience: ResilienceConfig::default(),

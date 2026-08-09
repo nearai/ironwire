@@ -171,6 +171,29 @@ says "status shows the backend"          "Anthropic API"   "$bin" status --port 
 says "status reports observed capacity"  "% used"          "$bin" status --port "$port"
 says "status counts the conversation"    "conversation(s)" "$bin" status --port "$port"
 says "status aggregates a balance"       "Balance:"        "$bin" status --port "$port"
+says "status measures the session from our own ledger" \
+    "measured from IronWire's own ledger" "$bin" status --port "$port"
+says "status says how fast the window is going" "tokens/min" "$bin" status --port "$port"
+# No completed windows yet and no declared plan, so there is nothing to be a
+# percentage *of* — and saying so beats inventing a ceiling to fill the bar.
+says "status claims no ceiling it was never given" \
+    "nothing to compare against yet" "$bin" status --port "$port"
+
+# Colour has to survive being piped: `says` already captures through a pipe, so
+# any escape sequence reaching here would also reach a user's grep or log file.
+out=$("$bin" status --port "$port" 2>&1)
+if grep -q $'\033' <<<"$out"; then
+    bad "piped output carries no escape sequences" "$out"
+else
+    ok "piped output carries no escape sequences"
+fi
+out=$("$bin" status --color always --port "$port" 2>&1)
+if grep -q $'\033' <<<"$out"; then
+    ok "--color always overrides the pipe"
+else
+    bad "--color always overrides the pipe" "$out"
+fi
+
 says "log lists the exchanges"           "claude-opus-4-6" "$bin" log --port "$port"
 says "log reports what it cost"          "last 24h"        "$bin" log --port "$port"
 says "log shows the tokens the provider reported" "cached" "$bin" log --port "$port"

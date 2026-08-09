@@ -260,6 +260,22 @@ bodies = false
 # which is a real choice but not a good default for a file nobody watches.
 retain_days = 90
 
+[usage]
+# The session section on `ironwire status`: burn rate, and where this window
+# ends up at that rate. Measured from the ledger above — your own traffic,
+# never a provider's quota, which is reported or `unknown` and never guessed.
+enabled = true
+# Length of a session window, in hours. Five is Claude Code's.
+session_hours = 5
+# How far back to look when calibrating against your own past windows.
+history_hours = 192
+# Your plan: pro, max5, max20, or team. Deliberately unset by default —
+# per-window token limits are not published, and IronWire will not assert one
+# on your behalf. Set it and the ceiling becomes your claim about your own
+# subscription, labelled as such. Left unset, the comparison is against your
+# own completed sessions, which needs no table at all.
+# plan = "max5"
+
 [resilience]
 # Emit an SSE ping after this many seconds of upstream silence, so a client
 # whose patience is shorter than the model's thinking time does not give up.

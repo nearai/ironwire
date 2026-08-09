@@ -140,6 +140,45 @@ backend does not have, images it cannot see, a context that does not fit) is
 still refused outright rather than silently degraded. See
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §6.
 
+## How fast it is going
+
+`ironwire status` has two kinds of number on it, and it keeps them apart.
+
+**What the provider said.** `capacity:` is a rate-limit header, or `unknown`.
+There is no third option — IronWire will not guess a subscription's remaining
+headroom, because one confidently wrong percentage costs you belief in every
+other number on the screen.
+
+**What IronWire measured.** The `Session` block is arithmetic on your own
+traffic, out of the local trace ledger: a five-hour window, how fast you are
+spending it, and where that lands by the time it closes.
+
+```
+Session (5h window) — measured from IronWire's own ledger, not reported by the provider
+  claude-sub opened 1h ago · closes in 4h
+    [█████░░░░░] 50% of your own p90 over 14 past session(s)
+    used: 100.0k tokens · 12 exchange(s) · $2.00 at metered rates
+    burn: 10.0k tokens/min · $12.00/hour · 1.7k/min last hour
+    at this rate: 2.5M tokens by the time it closes · $50.00
+    you reach your usual ceiling in 10m — 3h50m before the window closes
+```
+
+The ceiling is **your own history**, not a table: the ninetieth percentile of
+your past windows, preferring the ones that look like they ran into a limit.
+Per-window token limits are not published, so IronWire does not assert one. If
+you know your plan you can say so — `plan = "max5"` under `[usage]` — and the
+screen will label it as your claim rather than its measurement. With neither,
+you get the burn rate and no percentage, which is the honest answer.
+
+The window logic, the percentile and the burn-rate maths are ported from
+[Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)
+(MIT), which worked them out against real Claude Code transcripts.
+
+Output is coloured when it is going to a terminal, and never when it is not.
+`--color always|never` overrides that, and `NO_COLOR` overrides everything.
+Colour is only ever emphasis: every state it marks is also stated in words, so
+`ironwire status | grep` and a monochrome terminal see the same screen.
+
 ## How it tells you
 
 IronWire will not write into your agent's transcript. The only channel there is
@@ -228,6 +267,7 @@ crates/
   ironwire_core       protocols, capability gate, routing policy, quota
   ironwire_creds      credential discovery + consent
   ironwire_ledger     the local trace ledger
+  ironwire_usage      session windows, burn rate, projections (from the ledger)
   ironwire_quirks     the signed provider-quirks channel
   ironwire_update     notify-only update checking
   ironwire_privacy    reversible substitution (the optional filter)

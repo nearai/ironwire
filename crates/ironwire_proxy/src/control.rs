@@ -19,6 +19,7 @@ use ironwire_core::quota::Headroom;
 use ironwire_creds::ConsentLedger;
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_update::UpdateStatus;
+use ironwire_usage::UsageReport;
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
@@ -142,6 +143,18 @@ pub struct StatusView {
     /// instead of refusing it.
     #[serde(default)]
     pub last_route: Option<LastRouteView>,
+    /// How fast capacity is going, measured from the local ledger.
+    ///
+    /// Not quota. [`HeadroomView`] is still the only thing on this screen that
+    /// claims to describe a *provider's* remaining capacity, and it still says
+    /// `unknown` when the provider has not spoken. This is a measurement of
+    /// IronWire's own traffic and every figure in it carries the basis it was
+    /// derived from (`ironwire_usage`).
+    ///
+    /// Empty when capture is off, when `usage.enabled = false`, or when there
+    /// is no open window. Defaulted so an older daemon still parses.
+    #[serde(default)]
+    pub usage: UsageReport,
 }
 
 /// The most recent routing decision.
@@ -403,8 +416,66 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             from: route.from,
             at: route.at,
         }),
+        usage: usage(&state, now),
     })
     .into_response()
+}
+
+/// Measure IronWire's own traffic from the ledger.
+///
+/// A ledger read failure yields an empty report rather than a failed status
+/// call: the capacity numbers above are the reason someone ran this command,
+/// and losing them because a burn-rate query could not run would be the wrong
+/// trade every time.
+/// Memoised by [`AppState::usage_report`], keyed on the ledger's write token:
+/// `ironwire statusline` calls this endpoint on every render of somebody's
+/// editor, and the scan behind it reads eight days of ledger rows. The token
+/// is what keeps that from ever showing a report built before the traffic the
+/// caller is asking about.
+fn usage(state: &AppState, now: DateTime<Utc>) -> UsageReport {
+    let config = &state.config.usage;
+    if !config.enabled {
+        return UsageReport::default();
+    }
+    let Some(ledger) = state.ledger.as_ref() else {
+        return UsageReport::default();
+    };
+
+    state.usage_report(now, ledger.writes(), || build_usage(config, ledger, now))
+}
+
+fn build_usage(
+    config: &ironwire_core::config::UsageConfig,
+    ledger: &ironwire_ledger::Ledger,
+    now: DateTime<Utc>,
+) -> UsageReport {
+    let options = ironwire_usage::Options {
+        session_hours: i64::from(config.session_hours.max(1)),
+        history_hours: i64::from(config.history_hours.max(1)),
+        // An unparseable plan is dropped rather than guessed at, and said out
+        // loud: silently falling back to a default would put a limit on the
+        // user's screen that they never declared.
+        plan: config.plan.as_deref().and_then(|name| {
+            let parsed = ironwire_usage::Plan::parse(name);
+            if parsed.is_none() {
+                tracing::warn!(
+                    plan = name,
+                    "unknown usage.plan; comparing against your own history instead. \
+                     Known plans: pro, max5, max20, team"
+                );
+            }
+            parsed
+        }),
+        ..ironwire_usage::Options::default()
+    };
+
+    match ledger.since(now - options.history()) {
+        Ok(exchanges) => ironwire_usage::report(&exchanges, now, &options),
+        Err(error) => {
+            tracing::debug!(%error, "could not read the ledger for usage estimates");
+            UsageReport::default()
+        }
+    }
 }
 
 /// Collapse every pool into one balance — see [`BalanceView`] for why this

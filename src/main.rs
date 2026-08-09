@@ -4,6 +4,7 @@ mod claude_settings;
 mod codex_config;
 mod commands;
 mod render;
+mod style;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -15,6 +16,13 @@ struct Cli {
     /// Port the daemon listens on.
     #[arg(long, env = "IRONWIRE_PORT", global = true)]
     port: Option<u16>,
+
+    /// When to colour the output.
+    ///
+    /// `auto` colours only a terminal, so a pipe stays greppable. `NO_COLOR`
+    /// in the environment overrides `auto` and is honoured everywhere.
+    #[arg(long, value_enum, default_value_t = style::ColorChoice::Auto, global = true)]
+    color: style::ColorChoice,
 
     #[command(subcommand)]
     command: Command,
@@ -156,10 +164,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let style = style::Style::resolve(cli.color);
     match cli.command {
         Command::Init { write } => commands::init::run(cli.port, write).await,
         Command::Serve => commands::serve::run(cli.port).await,
-        Command::Status { json } => commands::status::run(cli.port, json).await,
+        Command::Status { json } => commands::status::run(cli.port, json, style).await,
         Command::Statusline => commands::statusline::run(cli.port).await,
         Command::Connect {
             target,
@@ -171,7 +180,7 @@ async fn main() -> Result<()> {
             subscription,
         } => commands::connect::disconnect(&target, subscription),
         Command::Doctor => commands::doctor::run(cli.port).await,
-        Command::Log { limit, json } => commands::log::run(cli.port, limit, json).await,
+        Command::Log { limit, json } => commands::log::run(cli.port, limit, json, style).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env { shell } => commands::connect::print_env(cli.port, shell),
         Command::Privacy { action, path } => commands::privacy::run(&action, path),
