@@ -234,7 +234,9 @@ crates/
   ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   backends: native passthrough and observation
   ironwire_proxy      axum façades, pipeline, control API
-  ironwire_cli        the `ironwire` binary
+src/
+  the `ironwire` binary — the workspace root package, so `cargo run` and
+  `cargo install --path .` work from a fresh clone
 ```
 
 ## Development

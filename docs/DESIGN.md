@@ -235,7 +235,9 @@ crates/
   ironwire_translate  cross-family translation (the fallback lane)
   ironwire_upstream   Backend trait; native passthrough clients; observation
   ironwire_proxy      axum façades, router wiring, control API, trace sink
-  ironwire_cli        the `ironwire` binary
+src/
+  the `ironwire` binary — the workspace root package, so `cargo run` and
+  `cargo install --path .` work without knowing the layout
 ```
 
 Dependency direction is strictly downward; `core` depends on nothing of ours.

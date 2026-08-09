@@ -86,7 +86,7 @@ see the carried items above.
 - ✅ `ironwire connect codex` / `ironwire disconnect codex` — edits
   `~/.codex/config.toml` as *text*, so comments and hand-edits survive, backs
   up the previous contents, and restores the previous `model_provider` on
-  disconnect (`ironwire_cli::codex_config`)
+  disconnect (`src/codex_config.rs`)
 - ✅ NEAR AI backend over Chat Completions (landed with M3)
 - ✅ Per-backend circuit breaker (`ironwire_upstream::breaker`), wired into
   routing so a dead backend is not rediscovered every turn — with the

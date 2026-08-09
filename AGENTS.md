@@ -37,7 +37,7 @@ ironwire_upstream ← HTTP to providers
      ↑
 ironwire_proxy ← axum, façades, pipeline
      ↑
-ironwire_cli
+src/ (the `ironwire` binary, at the workspace root)
 ```
 
 Dependencies point one way only. `ironwire_core` is where anything testable
