@@ -761,12 +761,30 @@ impl Policy {
 
             let model = pick_model(best, tier);
             let served_tier = model.as_deref().map_or(tier, ModelTier::from_model_hint);
-            // Same credential, lesser model is rung 1; a different credential
-            // that speaks the same wire is rung 2.
-            let rung = if served_tier < tier {
-                Rung::SmallerModel
-            } else {
-                Rung::Preferred
+            // Two independent ways a same-wire route can be degraded, and the
+            // rung is the worse of them. Deriving it from the model tier alone
+            // — as this did — recorded a fall from a subscription to a metered
+            // key as `Preferred`, because the key serves the same tier. That
+            // made the most expensive fallback in the product invisible in the
+            // ledger and, worse, permanent: `consider_promotion` returns early
+            // on `Preferred`, so the conversation never went back to the
+            // subscription once its window reset.
+            //
+            // "Better credential" is `marginal_cost_rank`, which is already the
+            // router's own statement of preference — a second definition of
+            // which backend the user wanted would drift from it. Only
+            // candidates that could actually have served this request count, so
+            // a cheaper backend skipped for tier reasons does not make every
+            // route look degraded.
+            let passed_over_a_cheaper_credential = candidates
+                .iter()
+                .filter(|c| c.caps.protocol == inbound && c.id != best.id)
+                .filter(|c| serves_tier(c, tier))
+                .any(|c| c.kind.marginal_cost_rank() < best.kind.marginal_cost_rank());
+            let rung = match (served_tier < tier, passed_over_a_cheaper_credential) {
+                (_, true) => Rung::AlternateCredential,
+                (true, false) => Rung::SmallerModel,
+                (false, false) => Rung::Preferred,
             };
             return Ok(RouteDecision {
                 backend: best.id.clone(),
@@ -1222,6 +1240,134 @@ mod tests {
             );
             assert_eq!(later.reason, "sticky affinity");
             assert_eq!(later.backend.as_str(), "claude-sub");
+        }
+    }
+
+    /// Rung 2 was declared, documented in the ladder, and never produced — so
+    /// a fall from a subscription to a metered key looked undegraded, and the
+    /// promotion that should carry it back never fired.
+    mod alternate_credential {
+        use super::*;
+
+        fn subscription_and_key(subscription_exhausted: bool) -> Vec<Candidate> {
+            let mut subscription = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            if subscription_exhausted {
+                subscription.quota.primary = Headroom::Exhausted { until: t(600) };
+            }
+            let key = candidate(
+                "anthropic-key",
+                BackendKind::ApiKey,
+                Protocol::AnthropicMessages,
+            );
+            vec![subscription, key]
+        }
+
+        #[test]
+        fn falling_to_a_metered_key_is_recorded_as_a_credential_change() {
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &subscription_and_key(true),
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(
+                decision.rung,
+                Rung::AlternateCredential,
+                "a different credential on the same wire is rung 2, not rung 0"
+            );
+        }
+
+        /// The consequence that costs money: without a rung to compare, the
+        /// conversation stays on the paid key after the subscription resets.
+        #[test]
+        fn the_conversation_returns_to_the_subscription_when_it_recovers() {
+            let mut policy = Policy::new();
+            policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &subscription_and_key(true),
+                    t(0),
+                )
+                .expect("routes");
+
+            let recovered = subscription_and_key(false);
+            let ordinary = peek("claude-opus-4-6");
+            policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &ordinary,
+                    &recovered,
+                    t(700),
+                )
+                .expect("routes");
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &ordinary,
+                    &recovered,
+                    t(700) + PROMOTION_DEBOUNCE,
+                )
+                .expect("routes");
+            assert_eq!(
+                decision.backend.as_str(),
+                "claude-sub",
+                "the conversation stayed on the metered key after the \
+                 subscription came back"
+            );
+        }
+
+        /// Both dimensions at once reports the worse rung, not whichever check
+        /// happened to run last.
+        #[test]
+        fn a_cheaper_credential_and_a_smaller_model_reports_the_worse_rung() {
+            let mut candidates = subscription_and_key(true);
+            candidates[1].models = vec![("claude-sonnet-4-6".to_string(), ModelTier::Balanced)];
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &candidates,
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// Unchanged: descending a model tier on the *same* backend is rung 1.
+        #[test]
+        fn a_smaller_model_on_the_same_backend_is_still_rung_one() {
+            let mut only = vec![candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            )];
+            only[0].models = vec![("claude-sonnet-4-6".to_string(), ModelTier::Balanced)];
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &only,
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.rung, Rung::SmallerModel);
         }
     }
 
