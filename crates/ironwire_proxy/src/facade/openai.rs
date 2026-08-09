@@ -242,12 +242,18 @@ async fn forward(
             .map(|a| i64::try_from(a.substitutions).unwrap_or(i64::MAX)),
         status: response.status.as_u16(),
     };
-    let observed = pipeline::observe_boxed(response.body, dialect_for(protocol), move |obs| {
-        pipeline::record(&backend, &obs);
-        if let Some(ledger) = ledger.as_ref() {
-            entry.write(ledger, &spend, &obs);
-        }
-    });
+    let streaming = pipeline::is_event_stream(&response.headers);
+    let observed = pipeline::observe_boxed(
+        response.body,
+        dialect_for(protocol),
+        streaming,
+        move |obs| {
+            pipeline::record(&backend, &obs);
+            if let Some(ledger) = ledger.as_ref() {
+                entry.write(ledger, &spend, &obs);
+            }
+        },
+    );
 
     // Put the real values back before anything reaches the client. This runs
     // inside the resilience guard's input, so a reconnect gets its own
@@ -288,8 +294,15 @@ async fn forward(
                 match pipeline::dispatch(&state, protocol, &path, &peek, key, body, headers).await {
                     Ok((response, routed)) => {
                         tracing::info!(backend = %routed.decision.backend, "stream restarted");
-                        let restarted =
-                            pipeline::observe_boxed(response.body, dialect_for(protocol), |_| {});
+                        // The restarted stream's own shape, not the original
+                        // request's: a reconnect is a fresh response.
+                        let streaming = pipeline::is_event_stream(&response.headers);
+                        let restarted = pipeline::observe_boxed(
+                            response.body,
+                            dialect_for(protocol),
+                            streaming,
+                            |_| {},
+                        );
                         Some(match map {
                             Some(map) => Box::pin(crate::privacy::reverse_stream(restarted, map))
                                 as futures_util::stream::BoxStream<

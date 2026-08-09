@@ -683,6 +683,7 @@ pub fn dialect_for(protocol: Protocol) -> Dialect {
 pub fn observe_body<S>(
     inner: S,
     dialect: Dialect,
+    streaming: bool,
     on_finish: impl FnOnce(Observation) + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send
 where
@@ -742,7 +743,11 @@ where
 
     Tee {
         inner,
-        observer: Some(SseObserver::new(dialect)),
+        observer: Some(if streaming {
+            SseObserver::new(dialect)
+        } else {
+            SseObserver::for_document(dialect)
+        }),
         on_finish: Some(Box::new(on_finish)),
     }
 }
@@ -888,9 +893,23 @@ impl LedgerContext {
 pub fn observe_boxed(
     body: futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>>,
     dialect: Dialect,
+    streaming: bool,
     on_finish: impl FnOnce(Observation) + Send + 'static,
 ) -> futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>> {
-    observe_body(body, dialect, on_finish).boxed()
+    observe_body(body, dialect, streaming, on_finish).boxed()
+}
+
+/// Whether a response is an event stream, from what it says it is.
+///
+/// Read from the response rather than the request: a provider may answer a
+/// streaming request with a plain body when something goes wrong, and it is the
+/// shape that came back that decides how to read it.
+#[must_use]
+pub fn is_event_stream(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type")
+            && value.to_ascii_lowercase().contains("text/event-stream")
+    })
 }
 
 #[cfg(test)]
@@ -961,7 +980,7 @@ mod tests {
 
         let seen = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&seen);
-        let observed = observe_body(stream::iter(frames), Dialect::Anthropic, move |obs| {
+        let observed = observe_body(stream::iter(frames), Dialect::Anthropic, true, move |obs| {
             *sink.lock().expect("lock") = Some(obs);
         });
 
@@ -994,6 +1013,7 @@ mod tests {
         let mut observed = Box::pin(observe_body(
             stream::iter(frames),
             Dialect::Anthropic,
+            true,
             move |obs| {
                 *sink.lock().expect("lock") = Some(obs);
             },
@@ -1026,7 +1046,7 @@ mod tests {
         ];
         let seen = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&seen);
-        let observed = observe_body(stream::iter(frames), Dialect::Anthropic, move |obs| {
+        let observed = observe_body(stream::iter(frames), Dialect::Anthropic, true, move |obs| {
             *sink.lock().expect("lock") = Some(obs);
         });
         let _: Vec<_> = observed.collect().await;

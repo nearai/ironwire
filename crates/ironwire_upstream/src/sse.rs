@@ -36,6 +36,13 @@ pub struct SseObserver {
     /// Set when a frame exceeded the buffer cap, so callers can distinguish
     /// "nothing to report" from "we stopped looking".
     truncated: bool,
+    /// Whether the response is an event stream.
+    ///
+    /// A response that is not carries its usage in a single JSON document
+    /// rather than in frames, and reading only frames meant a non-streaming
+    /// client reported no tokens, no cost, and therefore nothing against a
+    /// spend cap — a cap that silently could not fire.
+    streaming: bool,
 }
 
 impl SseObserver {
@@ -47,11 +54,41 @@ impl SseObserver {
             buffer: Vec::new(),
             observation: Observation::default(),
             truncated: false,
+            streaming: true,
+        }
+    }
+
+    /// New observer for a response that is a single JSON document.
+    ///
+    /// Chosen from the response's own `content-type` rather than from the
+    /// request's `stream` flag: what matters is the shape that actually came
+    /// back, and a provider is free to answer a streaming request with a plain
+    /// body when something went wrong.
+    #[must_use]
+    pub fn for_document(dialect: Dialect) -> Self {
+        Self {
+            streaming: false,
+            ..Self::new(dialect)
         }
     }
 
     /// Feed a chunk. Infallible by construction.
     pub fn push(&mut self, chunk: &[u8]) {
+        if !self.streaming {
+            // Same ceiling as a frame, for the same reason: a hostile upstream
+            // must not be able to grow our memory without bound. Over it we
+            // stop accumulating and record nothing — the body still reaches the
+            // client untouched, because our bookkeeping never affects it.
+            if self.buffer.len().saturating_add(chunk.len()) > MAX_FRAME_BYTES {
+                self.truncated = true;
+                self.buffer.clear();
+                return;
+            }
+            if !self.truncated {
+                self.buffer.extend_from_slice(chunk);
+            }
+            return;
+        }
         if self.buffer.len().saturating_add(chunk.len()) > MAX_FRAME_BYTES {
             // Drop what we have and resynchronise at the next frame boundary
             // rather than growing without bound.
@@ -72,6 +109,15 @@ impl SseObserver {
     /// Finish and return what was learned.
     #[must_use]
     pub fn finish(mut self) -> Observation {
+        if !self.streaming {
+            let body = std::mem::take(&mut self.buffer);
+            if !self.truncated
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+            {
+                self.consume_document(&value);
+            }
+            return self.observation;
+        }
         if !self.buffer.is_empty() {
             let frame = std::mem::take(&mut self.buffer);
             self.consume_frame(&frame);
@@ -106,6 +152,27 @@ impl SseObserver {
             Dialect::Anthropic => self.consume_anthropic(&value),
             Dialect::OpenAiResponses => self.consume_openai_responses(&value),
             Dialect::OpenAiChat => self.consume_openai_chat(&value),
+        }
+    }
+
+    /// Read usage from a whole, non-streamed response.
+    ///
+    /// The same fields as the streamed shapes, one level up: a streamed
+    /// Anthropic response nests usage under `message`, and a streamed Responses
+    /// one under `response`, because each frame wraps the object it is
+    /// reporting on. A complete document *is* that object.
+    fn consume_document(&mut self, value: &serde_json::Value) {
+        if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
+            self.observation.served_model = Some(model.to_string());
+        }
+        let usage = match self.dialect {
+            Dialect::Anthropic => value.get("usage").and_then(anthropic_usage),
+            Dialect::OpenAiResponses | Dialect::OpenAiChat => {
+                value.get("usage").and_then(openai_usage)
+            }
+        };
+        if let Some(usage) = usage {
+            self.merge_usage(usage);
         }
     }
 
@@ -291,5 +358,100 @@ mod tests {
         observer
             .push(b"data: {\"type\":\"message_start\",\ndata: \"message\":{\"model\":\"m\"}}\n\n");
         assert_eq!(observer.finish().served_model.as_deref(), Some("m"));
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    fn observe(dialect: Dialect, body: &str) -> Observation {
+        let mut observer = SseObserver::for_document(dialect);
+        // In chunks, because a real body arrives in several.
+        for chunk in body.as_bytes().chunks(7) {
+            observer.push(chunk);
+        }
+        observer.finish()
+    }
+
+    /// The bug this exists for: a client that does not stream reported no
+    /// tokens, so no cost, so nothing against a spend cap — a cap that could
+    /// not fire.
+    #[test]
+    fn a_non_streamed_chat_completion_reports_its_usage() {
+        let observation = observe(
+            Dialect::OpenAiChat,
+            r#"{"id":"c1","model":"gpt-4.1","choices":[],
+                "usage":{"prompt_tokens":1200,"completion_tokens":340}}"#,
+        );
+        let usage = observation.usage.expect("usage was reported");
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.output_tokens, 340);
+        assert_eq!(observation.served_model.as_deref(), Some("gpt-4.1"));
+    }
+
+    /// A streamed Anthropic response nests usage under `message` because each
+    /// frame wraps the object it reports on; a whole document *is* that object.
+    #[test]
+    fn a_non_streamed_anthropic_message_reports_its_usage() {
+        let observation = observe(
+            Dialect::Anthropic,
+            r#"{"id":"m1","type":"message","model":"claude-opus-4-6",
+                "usage":{"input_tokens":12,"cache_read_input_tokens":98000,"output_tokens":40}}"#,
+        );
+        let usage = observation.usage.expect("usage was reported");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_tokens, 98_000);
+        assert_eq!(usage.output_tokens, 40);
+        assert_eq!(observation.served_model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn a_non_streamed_responses_body_reports_its_usage() {
+        let observation = observe(
+            Dialect::OpenAiResponses,
+            r#"{"id":"r1","model":"gpt-5.6","usage":{"input_tokens":7,"output_tokens":9}}"#,
+        );
+        let usage = observation.usage.expect("usage was reported");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 9);
+    }
+
+    /// An error body, or HTML from a proxy in the way, is not usage — and is
+    /// certainly not zero usage.
+    #[test]
+    fn a_body_that_is_not_json_reports_nothing_rather_than_zero() {
+        assert!(
+            observe(Dialect::OpenAiChat, "<html>502 Bad Gateway</html>")
+                .usage
+                .is_none()
+        );
+        assert!(observe(Dialect::OpenAiChat, "").usage.is_none());
+    }
+
+    /// The client's response must never be affected by our bookkeeping, so an
+    /// oversized body is simply not parsed. `push` is infallible either way —
+    /// what this pins is that it neither grows without bound nor panics.
+    #[test]
+    fn an_oversized_body_is_dropped_rather_than_buffered() {
+        let mut observer = SseObserver::for_document(Dialect::OpenAiChat);
+        let chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..(MAX_FRAME_BYTES / chunk.len() + 2) {
+            observer.push(&chunk);
+        }
+        assert!(observer.truncated(), "an unbounded body was accumulated");
+        assert!(observer.finish().usage.is_none());
+    }
+
+    /// A response that says it is a stream is still read as frames, whatever
+    /// the request asked for.
+    #[test]
+    fn the_streaming_path_is_untouched() {
+        let mut observer = SseObserver::new(Dialect::OpenAiChat);
+        observer.push(
+            b"data: {\"model\":\"gpt-4.1\",\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n",
+        );
+        let usage = observer.finish().usage.expect("usage was reported");
+        assert_eq!(usage.input_tokens, 5);
     }
 }
