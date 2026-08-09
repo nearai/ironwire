@@ -310,6 +310,23 @@ named_values = []
 scan_code_blocks = false
 scan_tool_results = false
 
+# [limits]
+# Spend caps, in dollars per day, measured over your local calendar day and
+# only against *metered* backends — a subscription is already paid for, and
+# capping it would cap capacity you bought. No cap unless you set one.
+#
+# daily_spend_usd = 10.0
+# on_breach = "descend"   # keep working on free capacity (default), or
+#                         # "refuse" to stop so you find out immediately
+#
+# [[limits.backends]]
+# id = "anthropic-key"
+# daily_spend_usd = 5.0
+#
+# A cap needs the trace ledger, which is where spend is measured; `ironwire
+# serve` refuses to start with a cap set and capture off, rather than leaving
+# you believing in a limit that can never fire.
+
 # Backends are discovered from your logins and environment, so this section is
 # usually unnecessary. Declare one to override how a discovered backend is
 # built, to switch one off, or to add an endpoint IronWire cannot discover.

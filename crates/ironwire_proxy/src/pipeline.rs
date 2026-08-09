@@ -58,6 +58,86 @@ pub enum PipelineError {
     Upstream(UpstreamError),
 }
 
+/// Build the candidate list with any breached spend cap applied.
+///
+/// A cap is expressed as `Headroom::CapReached` rather than as a filter of its
+/// own, so every existing consumer — `usable`, the sort key, the status
+/// renderer, the balance view — behaves correctly without a second exclusion
+/// mechanism that would drift from the first.
+fn capped_candidates(
+    state: &AppState,
+    statuses: &[ironwire_upstream::backend::BackendStatus],
+    consent: &ironwire_creds::ConsentLedger,
+    now: chrono::DateTime<Utc>,
+) -> (
+    Vec<ironwire_core::policy::Candidate>,
+    Option<(String, f64, f64)>,
+) {
+    let limits = &state.config.limits;
+    if !limits.any_cap() {
+        return (state.backends.candidates(statuses, consent), None);
+    }
+    let mut tracker = match state.spend.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut breached: Vec<(String, f64, f64)> = Vec::new();
+    let mut any_capped: Option<(String, f64, f64)> = None;
+    let candidates = state
+        .backends
+        .candidates_capped(statuses, consent, &mut |backend, quota| {
+            // Only metered money. A subscription is already paid for and its
+            // recorded cost is "what this would have cost on the meter", not
+            // money anyone was billed; capping on it would cap capacity the
+            // user bought. Prepaid credits are excluded for the same reason.
+            if !backend.kind().is_metered() {
+                return quota;
+            }
+            let Some(cap) = limits.cap_for(backend.id().as_str()) else {
+                return quota;
+            };
+            // The global cap is measured against the metered total, the
+            // per-backend one against that backend — whichever binds first.
+            let spent = tracker.spent(backend.id(), now).max(
+                if limits.daily_spend_usd.is_some_and(|c| c > 0.0) {
+                    tracker.total(now)
+                } else {
+                    0.0
+                },
+            );
+            if spent < cap {
+                return quota;
+            }
+            any_capped.get_or_insert_with(|| (backend.id().to_string(), spent, cap));
+            if tracker.announce_once(backend.id(), now) {
+                breached.push((backend.id().to_string(), spent, cap));
+            }
+            let mut capped = quota;
+            capped.primary = ironwire_core::quota::Headroom::CapReached {
+                spent_usd: spent,
+                cap_usd: cap,
+                resets_at: crate::spend::window_start(now) + chrono::Duration::days(1),
+            };
+            capped
+        });
+    drop(tracker);
+    // Published after the lock is released: this is the moment the user most
+    // needs to know, and it happens while nobody is watching `status`.
+    for (backend, spent_usd, cap_usd) in breached {
+        tracing::warn!(%backend, spent_usd, cap_usd, "spend cap reached; not routing here");
+        state.events.publish(crate::events::Event::CapReached {
+            at: now,
+            backend,
+            spent_usd,
+            cap_usd,
+        });
+    }
+    let refused = (limits.on_breach == ironwire_core::config::BreachAction::Refuse)
+        .then_some(any_capped)
+        .flatten();
+    (candidates, refused)
+}
+
 /// A per-request route override from the `X-IronWire-Route` header.
 ///
 /// Distinct from `ironwire pin`, which is a daemon-wide mode a user turns on
@@ -142,7 +222,19 @@ async fn dispatch_inner(
 
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
-    let candidates = state.backends.candidates(&statuses, &consent);
+    let (candidates, refused) = capped_candidates(state, &statuses, &consent, Utc::now());
+    // `on_breach = "refuse"` is a hard stop, so it is answered before routing
+    // rather than after the ladder has quietly found somewhere else to go.
+    // `descend` — the default — never reaches here: the capped backend is
+    // simply skipped, which is the whole point of expressing a cap as
+    // `Headroom`.
+    if let Some((backend, spent_usd, cap_usd)) = refused {
+        return Err(PipelineError::NoRoute(NoRoute::SpendCapReached {
+            backend,
+            spent_usd,
+            cap_usd,
+        }));
+    }
 
     // Skip backends whose circuit is open, so a known-dead one is not
     // rediscovered — at the cost of a round trip — on every single turn.
@@ -668,6 +760,8 @@ pub struct LedgerContext {
     pub conversation: String,
     /// Backend that served it.
     pub backend: String,
+    /// Whether that backend is metered, so its cost counts against a cap.
+    pub backend_is_metered: bool,
     /// Whether that backend is local capacity.
     ///
     /// Carried rather than inferred from the id, because the id is
@@ -695,7 +789,12 @@ impl LedgerContext {
     /// Never propagates: a ledger problem must not fail a user's inference
     /// request, and by the time this runs the response has already been
     /// delivered anyway.
-    pub fn write(self, ledger: &Ledger, observation: &Observation) {
+    pub fn write(
+        self,
+        ledger: &Ledger,
+        spend: &std::sync::Mutex<crate::spend::SpendTracker>,
+        observation: &Observation,
+    ) {
         let usage = observation.usage;
         // A local model has no price, and must not be given one. The price
         // table matches on the slug, so a local `llama3.3:70b` — or any slug
@@ -748,6 +847,24 @@ impl LedgerContext {
             status: i64::from(self.status),
             error: None,
         };
+        // Metered spend only, and recorded even when the exchange failed:
+        // tokens burned by a request that 500'd were still billed.
+        if self.backend_is_metered
+            && let Some(cost) = exchange.cost_usd
+        {
+            match spend.lock() {
+                Ok(mut tracker) => tracker.record(
+                    &ironwire_core::protocol::BackendId::from(exchange.backend.as_str()),
+                    cost,
+                    exchange.started_at,
+                ),
+                Err(poisoned) => poisoned.into_inner().record(
+                    &ironwire_core::protocol::BackendId::from(exchange.backend.as_str()),
+                    cost,
+                    exchange.started_at,
+                ),
+            }
+        }
         if let Err(error) = ledger.record(&exchange) {
             tracing::debug!(%error, "could not write the trace ledger entry");
         }

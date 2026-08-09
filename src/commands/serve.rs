@@ -29,6 +29,19 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let config_updates_enabled = config.updates.check;
     let token = control_token(&paths)?;
 
+    // A spend cap is computed from priced exchanges, which only exist when the
+    // ledger is on. A cap that silently never fires is worse than no cap at
+    // all — the user believes they are protected — so this is a refusal to
+    // start rather than a warning, and it happens before the port is bound.
+    if config.limits.any_cap() && !config.capture.enabled {
+        anyhow::bail!(
+            "[limits] sets a spend cap, but [capture] enabled = false.\n\n\
+             Spend is measured from the local trace ledger, so with capture off \
+             the cap could never fire and you would believe you were protected.\n\n\
+             Set capture.enabled = true, or remove the cap."
+        );
+    }
+
     let registry = build_registry(&config)?;
     // What the providers told us before the last shutdown, minus whatever has
     // since expired or gone stale. A backend inside a stated `retry-after`
@@ -69,6 +82,9 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
         .with_port(port)
         .with_ledger(ledger)
         .with_quirks(quirks);
+    // Resume today's spending rather than restarting it: a cap that could be
+    // reset by restarting the daemon is not a cap.
+    seed_spend(&state);
 
     // Notify-only: check rarely, tell the user, never act. See docs/UPDATES.md.
     super::update::spawn_check(state.clone(), &paths, config_updates_enabled);
@@ -193,6 +209,42 @@ fn restore_quota(registry: &BackendRegistry, paths: &PathsConfig) {
         {
             backend.restore_quota(quota);
         }
+    }
+}
+
+/// Seed the spend tracker from what the ledger already recorded today.
+///
+/// Metered backends only, and the same local-midnight window `status` reports.
+/// Without this a daemon restarted after $8 of a $10 cap would resume at zero,
+/// and the cap would be resettable by restarting.
+fn seed_spend(state: &ironwire_proxy::state::AppState) {
+    if !state.config.limits.any_cap() {
+        return;
+    }
+    let Some(ledger) = state.ledger.as_ref() else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let Ok(summary) = ledger.summary(ironwire_proxy::spend::window_start(now)) else {
+        return;
+    };
+    let metered: std::collections::HashSet<&str> = state
+        .backends
+        .all()
+        .iter()
+        .filter(|backend| backend.kind().is_metered())
+        .map(|backend| backend.id().as_str())
+        .collect();
+    let spent = summary
+        .cost_by_backend
+        .iter()
+        .filter(|(backend, _)| metered.contains(backend.as_str()))
+        .map(|(backend, cost)| (BackendId::from(backend.as_str()), *cost));
+
+    let seeded = ironwire_proxy::spend::SpendTracker::seeded(spent, now);
+    match state.spend.lock() {
+        Ok(mut tracker) => *tracker = seeded,
+        Err(poisoned) => *poisoned.into_inner() = seeded,
     }
 }
 

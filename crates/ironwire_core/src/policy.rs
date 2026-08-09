@@ -147,6 +147,20 @@ pub enum NoRoute {
     /// The only backends that could serve this need a client identity the
     /// request does not carry.
     RequiresClientIdentity,
+    /// Every backend that could have served this is stopped by a spend cap the
+    /// user set.
+    ///
+    /// Distinct from [`Self::AllExhausted`] on purpose: a cap the user set and
+    /// then cannot recognise in the error is worse than no cap, so the message
+    /// names their own number and the key they set it with.
+    SpendCapReached {
+        /// A backend that was capped, for the message.
+        backend: String,
+        /// Spent against the cap.
+        spent_usd: f64,
+        /// The cap.
+        cap_usd: f64,
+    },
     /// An `X-IronWire-Route` header named a backend that does not exist.
     ///
     /// An error rather than a fall-through: the caller asked for something
@@ -604,6 +618,7 @@ impl Policy {
         let mut ineligible = Vec::new();
         let mut identity_blocked = false;
         let mut any_available = false;
+        let mut capped: Vec<(BackendId, f64, f64)> = Vec::new();
 
         // Rungs 0-2 all forward the request's own bytes, so they need a backend
         // speaking the *same wire* — not merely one in the same family, which
@@ -624,7 +639,15 @@ impl Policy {
                     identity_blocked = true;
                     continue;
                 }
-                Err(Unusable::Unavailable) => continue,
+                Err(Unusable::Unavailable) => {
+                    if let crate::quota::Headroom::CapReached {
+                        spent_usd, cap_usd, ..
+                    } = candidate.quota.primary
+                    {
+                        capped.push((candidate.id.clone(), spent_usd, cap_usd));
+                    }
+                    continue;
+                }
             }
             any_available = true;
             if candidate.caps.protocol == inbound {
@@ -728,6 +751,16 @@ impl Policy {
             });
         }
 
+        // A cap is reported ahead of a generic exhaustion, and only when it is
+        // the *reason*: with `on_breach = "descend"` there is other capacity to
+        // fall to and we never reach here at all.
+        if let Some((backend, spent_usd, cap_usd)) = capped.first().cloned() {
+            return Err(NoRoute::SpendCapReached {
+                backend: backend.to_string(),
+                spent_usd,
+                cap_usd,
+            });
+        }
         if !ineligible.is_empty() {
             return Err(NoRoute::AllIneligible {
                 reasons: ineligible,

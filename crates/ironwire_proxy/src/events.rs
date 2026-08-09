@@ -33,6 +33,23 @@ const CAPACITY: usize = 256;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// A spend cap the user set has been reached, and IronWire has stopped
+    /// routing to that backend.
+    ///
+    /// Published once per backend per window. This is the moment the user most
+    /// needs to know and the moment they are least likely to be looking at
+    /// `status` — and a per-request event would be the thing overrunning a bus
+    /// that drops on lag.
+    CapReached {
+        /// When.
+        at: DateTime<Utc>,
+        /// Which backend stopped being routed to.
+        backend: String,
+        /// Spent against the cap in this window.
+        spent_usd: f64,
+        /// The cap itself.
+        cap_usd: f64,
+    },
     /// A conversation moved to a different backend.
     Routed {
         /// When.
@@ -82,6 +99,9 @@ impl Event {
         match self {
             Self::Routed { rung, .. } => rung.is_user_visible(),
             Self::Failed { .. } => true,
+            // The user set this cap and then stopped being able to see it
+            // working. Reaching it is exactly the moment worth announcing.
+            Self::CapReached { .. } => true,
             // Circuit changes are useful in a live view and noise as an alert:
             // the whole point of the breaker is that the user's request was
             // still served.
@@ -93,7 +113,10 @@ impl Event {
     #[must_use]
     pub fn at(&self) -> DateTime<Utc> {
         match self {
-            Self::Routed { at, .. } | Self::Health { at, .. } | Self::Failed { at, .. } => *at,
+            Self::Routed { at, .. }
+            | Self::Health { at, .. }
+            | Self::Failed { at, .. }
+            | Self::CapReached { at, .. } => *at,
         }
     }
 }
@@ -146,6 +169,16 @@ impl EventBus {
 #[must_use]
 pub fn line(event: &Event) -> String {
     match event {
+        Event::CapReached {
+            at,
+            backend,
+            spent_usd,
+            cap_usd,
+        } => format!(
+            "{}  spend cap reached on {backend}: ${spent_usd:.2} of ${cap_usd:.2} — \
+             not routing there until tomorrow ([limits] in config.toml)",
+            at.format("%H:%M:%S")
+        ),
         Event::Routed {
             at,
             conversation,

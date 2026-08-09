@@ -73,6 +73,22 @@ impl BackendRegistry {
         statuses: &[BackendStatus],
         consent: &ConsentLedger,
     ) -> Vec<Candidate> {
+        self.candidates_capped(statuses, consent, &mut |_, quota| quota)
+    }
+
+    /// [`Self::candidates`], with a hook that can replace a backend's quota —
+    /// which is how a spend cap makes one unavailable without a second
+    /// exclusion mechanism running alongside `Headroom`.
+    #[must_use]
+    pub fn candidates_capped(
+        &self,
+        statuses: &[BackendStatus],
+        consent: &ConsentLedger,
+        cap: &mut dyn FnMut(
+            &Arc<dyn Backend>,
+            ironwire_core::quota::QuotaSnapshot,
+        ) -> ironwire_core::quota::QuotaSnapshot,
+    ) -> Vec<Candidate> {
         self.backends
             .iter()
             .map(|backend| {
@@ -81,7 +97,7 @@ impl BackendRegistry {
                     id: backend.id().clone(),
                     kind: backend.kind(),
                     caps: backend.capabilities().clone(),
-                    quota: backend.quota(),
+                    quota: cap(backend, backend.quota()),
                     healthy: status.is_none_or(|s| s.authenticated),
                     consented: !backend.kind().requires_consent()
                         || consent.is_granted(backend.id().as_str()),
@@ -150,6 +166,10 @@ pub struct AppState {
     /// per keystroke would put a SQLite scan on an interactive path for a
     /// figure that cannot meaningfully change between two renders.
     usage: Arc<Mutex<Option<CachedUsage>>>,
+    /// What has been spent today against any configured cap
+    /// (`crate::spend`). Shared, because it is written from the response path
+    /// and read from the routing path.
+    pub spend: Arc<Mutex<crate::spend::SpendTracker>>,
 }
 
 /// A usage report, when it was built, and the ledger write token it was built
@@ -202,6 +222,7 @@ impl AppState {
             config: Arc::new(config),
             control_token: Arc::new(control_token),
             last_route: Arc::new(Mutex::new(None)),
+            spend: Arc::new(Mutex::new(crate::spend::SpendTracker::default())),
             usage: Arc::new(Mutex::new(None)),
         }
     }

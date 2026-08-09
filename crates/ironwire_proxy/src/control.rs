@@ -87,6 +87,15 @@ pub enum HeadroomView {
         /// Seconds until it is worth retrying.
         retry_in_secs: i64,
     },
+    /// Stopped by a spend cap the user set, not by the provider.
+    CapReached {
+        /// Spent against the cap in this window.
+        spent_usd: f64,
+        /// The cap.
+        cap_usd: f64,
+        /// Seconds until the window rolls over.
+        resets_in_secs: i64,
+    },
     /// The provider has told us nothing. Displayed as `unknown`, because
     /// showing a plausible number we made up is how the whole status surface
     /// stops being believed.
@@ -107,6 +116,15 @@ impl HeadroomView {
             },
             Headroom::Exhausted { until } => Self::Exhausted {
                 retry_in_secs: (*until - now).num_seconds().max(0),
+            },
+            Headroom::CapReached {
+                spent_usd,
+                cap_usd,
+                resets_at,
+            } => Self::CapReached {
+                spent_usd: *spent_usd,
+                cap_usd: *cap_usd,
+                resets_in_secs: (*resets_at - now).num_seconds().max(0),
             },
             Headroom::Unknown => Self::Unknown,
         }
@@ -208,6 +226,12 @@ pub struct BalanceView {
     /// summing all of it produced a "spend" figure for a day on which nothing
     /// was billed — the opposite of what this proxy exists to tell you.
     pub spend_today_usd: Option<f64>,
+    /// The configured daily spend cap and what has gone against it, when the
+    /// user set one. A permanent line rather than a startup message, following
+    /// the privacy filter's precedent: a limit you cannot see is one you cannot
+    /// trust.
+    #[serde(default)]
+    pub spend_cap: Option<SpendCapView>,
     /// What each subscription has used of its own window, as the provider
     /// reported it. The unit that matters for capacity already paid for: a
     /// percentage, not a price.
@@ -217,6 +241,15 @@ pub struct BalanceView {
     /// outlives the shell that talks to it, so the two versions *will* differ.
     #[serde(default)]
     pub subscription_used: Vec<SubscriptionUse>,
+}
+
+/// A configured spend cap, and progress against it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SpendCapView {
+    /// Spent against the cap in this window.
+    pub spent_usd: f64,
+    /// The cap.
+    pub cap_usd: f64,
 }
 
 /// One subscription's consumption of its own window.
@@ -381,7 +414,14 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         })
         .collect();
 
-    let balance = balance(&statuses, &consent, &health, state.ledger.as_ref(), now);
+    let balance = balance(
+        &statuses,
+        &consent,
+        &health,
+        state.ledger.as_ref(),
+        &state.config.limits,
+        now,
+    );
 
     let (tracked, pin) = {
         let policy = match state.policy.lock() {
@@ -485,11 +525,15 @@ fn balance(
     consent: &ConsentLedger,
     health: &[ironwire_upstream::breaker::BreakerStatus],
     ledger: Option<&ironwire_ledger::Ledger>,
+    limits: &ironwire_core::config::LimitsConfig,
     now: DateTime<Utc>,
 ) -> BalanceView {
     use ironwire_upstream::breaker::CircuitState;
 
-    let summary = ledger.and_then(|l| l.summary(now - chrono::Duration::hours(24)).ok());
+    // Local midnight, the same window a spend cap is measured over. A rolling
+    // 24 hours and a calendar day disagreeing about "today" on the one screen
+    // that reports both would be indefensible.
+    let summary = ledger.and_then(|l| l.summary(crate::spend::window_start(now)).ok());
     // Which backend is metered is knowable only here, where the registry is —
     // the ledger stores an id, not a kind. Everything else is priced but not
     // billed, and must not be added up as though it were.
@@ -506,6 +550,19 @@ fn balance(
                 .map(|(_, cost)| cost)
                 .sum()
         }),
+        spend_cap: limits
+            .daily_spend_usd
+            .filter(|cap| *cap > 0.0)
+            .map(|cap| SpendCapView {
+                spent_usd: summary.as_ref().map_or(0.0, |s| {
+                    s.cost_by_backend
+                        .iter()
+                        .filter(|(backend, _)| metered.contains(backend.as_str()))
+                        .map(|(_, cost)| cost)
+                        .sum()
+                }),
+                cap_usd: cap,
+            }),
         subscription_used: statuses
             .iter()
             .filter(|s| {
@@ -561,6 +618,13 @@ fn balance(
             Headroom::Exhausted { until } => {
                 view.unavailable += 1;
                 resets.push(until);
+            }
+            // A cap is not "no capacity left" — it is capacity the user
+            // declined to spend, so it counts as unavailable rather than
+            // unknown, and `next_available_at` points at the rollover.
+            Headroom::CapReached { resets_at, .. } => {
+                view.unavailable += 1;
+                resets.push(resets_at);
             }
             Headroom::Unknown => view.unknown += 1,
             Headroom::Observed { .. } => {

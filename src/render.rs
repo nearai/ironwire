@@ -407,6 +407,15 @@ fn balance_block(balance: &BalanceView, style: Style) -> String {
             used.join(" · ")
         ));
     }
+    // Permanent, like the privacy-filter line: a limit the user cannot see is
+    // one they cannot trust, and this is the number they set it against.
+    if let Some(cap) = &balance.spend_cap {
+        out.push_str(&format!(
+            "  spend today: ${:.2} of ${:.2} cap\n",
+            cap.spent_usd + 0.0,
+            cap.cap_usd
+        ));
+    }
     match balance.spend_today_usd {
         // Zero is a result, not an absence: it is the sentence "nothing was
         // billed today", which is the whole point of routing to a subscription.
@@ -448,6 +457,17 @@ fn headroom(headroom: &HeadroomView, style: Style) -> String {
         HeadroomView::Exhausted { retry_in_secs } => {
             style.bad(format!("exhausted · retry in {}", duration(*retry_in_secs)))
         }
+        // Said differently from `exhausted` on purpose: the provider would have
+        // served this. The user is the one who said stop, so the line names
+        // their own number rather than a provider's window.
+        HeadroomView::CapReached {
+            spent_usd,
+            cap_usd,
+            resets_in_secs,
+        } => style.bad(format!(
+            "cap reached — ${spent_usd:.2} of ${cap_usd:.2} · resets in {}",
+            duration(*resets_in_secs)
+        )),
         // Not "0%", not "healthy" — we genuinely do not know, and saying so is
         // what makes the other rows worth believing.
         HeadroomView::Unknown => style.dim("unknown (the provider has not reported yet)"),
@@ -902,6 +922,7 @@ mod tests {
                 unavailable: 0,
                 next_available_at: None,
                 spend_today_usd: Some(1.234),
+                spend_cap: None,
                 subscription_used: Vec::new(),
             },
             Style::plain(),
@@ -1212,6 +1233,7 @@ mod preview {
             unavailable: 0,
             next_available_at: None,
             spend_today_usd: Some(0.0),
+            spend_cap: None,
             subscription_used: vec![ironwire_proxy::control::SubscriptionUse {
                 name: "Claude subscription".into(),
                 used_pct: Some(74.0),

@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod privacy;
 pub mod resilience;
 pub mod server;
+pub mod spend;
 pub mod state;
 
 pub use server::{ServeError, serve};

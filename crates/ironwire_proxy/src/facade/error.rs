@@ -158,6 +158,23 @@ impl FacadeError {
                     }
                 ),
             ),
+            // 429 rather than 503: the client's own back-off is the right
+            // behaviour, and the window really does reopen — at midnight.
+            NoRoute::SpendCapReached {
+                backend,
+                spent_usd,
+                cap_usd,
+            } => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                format!(
+                    "Stopped by your own spend cap: {backend} has spent \
+                     ${spent_usd:.2} of its ${cap_usd:.2} daily limit, and \
+                     `[limits] on_breach = \"refuse\"` in config.toml says to stop \
+                     rather than fall back. Raise the cap, switch to \
+                     `on_breach = \"descend\"`, or wait for the window to reset."
+                ),
+            ),
             NoRoute::RequiresClientIdentity => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",

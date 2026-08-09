@@ -221,8 +221,10 @@ async fn forward(
     // Read before the `Arc` moves into the observation closure below. Local
     // capacity gets a longer stall timeout and no price.
     let backend_is_local = backend.kind() == ironwire_core::protocol::BackendKind::Local;
+    let backend_is_metered = backend.kind().is_metered();
 
     let ledger = state.ledger.clone();
+    let spend = std::sync::Arc::clone(&state.spend);
     let entry = pipeline::LedgerContext {
         started_at,
         started: std::time::Instant::now(),
@@ -231,6 +233,7 @@ async fn forward(
         conversation: conversation.to_string(),
         backend: routed.decision.backend.to_string(),
         backend_is_local,
+        backend_is_metered,
         requested_model: peek.requested_model.clone(),
         rung: format!("{:?}", routed.decision.rung).to_lowercase(),
         attempts: routed.attempts,
@@ -242,7 +245,7 @@ async fn forward(
     let observed = pipeline::observe_boxed(response.body, dialect_for(protocol), move |obs| {
         pipeline::record(&backend, &obs);
         if let Some(ledger) = ledger.as_ref() {
-            entry.write(ledger, &obs);
+            entry.write(ledger, &spend, &obs);
         }
     });
 

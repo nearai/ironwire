@@ -439,7 +439,7 @@ fn default_true() -> bool {
 }
 
 /// Top-level configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Listener settings.
@@ -456,6 +456,79 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     /// Configured backends, in preference order for ties.
     pub backends: Vec<BackendConfig>,
+    /// Spend caps. No cap unless the user sets one.
+    pub limits: LimitsConfig,
+}
+
+/// What to do when a spend cap is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BreachAction {
+    /// Keep working on whatever free capacity remains, following the ordinary
+    /// ladder. The default, because the product's promise is that the agent
+    /// does not die — a cap that killed the session by default would invert it.
+    #[default]
+    Descend,
+    /// Stop, so the user finds out immediately. For someone who wants a hard
+    /// stop and will set it deliberately.
+    Refuse,
+}
+
+/// A cap on one backend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendLimit {
+    /// Backend id this applies to.
+    pub id: String,
+    /// Dollars per day. `0` means no cap.
+    pub daily_spend_usd: f64,
+}
+
+/// Spend caps.
+///
+/// Money only, and metered money at that: a subscription is already paid for,
+/// and capping it would cap capacity the user bought (see
+/// `Summary::cost_by_backend`). Prepaid credits are excluded for the same
+/// reason — `BackendKind::is_metered` draws the line.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    /// Dollars per day across every metered backend. `None` or `0` is no cap.
+    pub daily_spend_usd: Option<f64>,
+    /// What happens when a cap is reached.
+    pub on_breach: BreachAction,
+    /// Per-backend caps, which apply on top of any global one.
+    pub backends: Vec<BackendLimit>,
+}
+
+impl LimitsConfig {
+    /// Whether any cap is actually set.
+    ///
+    /// A configured `[limits]` block with every value zero is not a cap, and
+    /// must not switch on the machinery — including the startup check that
+    /// refuses to run a cap without the ledger behind it.
+    #[must_use]
+    pub fn any_cap(&self) -> bool {
+        self.daily_spend_usd.is_some_and(|cap| cap > 0.0)
+            || self.backends.iter().any(|b| b.daily_spend_usd > 0.0)
+    }
+
+    /// The cap for one backend: its own, or the global one, whichever binds
+    /// first. `None` when neither is set.
+    #[must_use]
+    pub fn cap_for(&self, id: &str) -> Option<f64> {
+        let specific = self
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.daily_spend_usd)
+            .filter(|cap| *cap > 0.0);
+        let global = self.daily_spend_usd.filter(|cap| *cap > 0.0);
+        match (specific, global) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (only, None) | (None, only) => only,
+        }
+    }
 }
 
 impl Config {
@@ -837,6 +910,60 @@ mod tests {
         }
     }
 
+    /// A `[limits]` block with nothing in it is not a cap, and must not switch
+    /// on the machinery — including the startup refusal that a real cap
+    /// triggers when the ledger is off.
+    #[test]
+    fn an_empty_limits_block_is_not_a_cap() {
+        assert!(!LimitsConfig::default().any_cap());
+        assert!(
+            !LimitsConfig {
+                daily_spend_usd: Some(0.0),
+                ..LimitsConfig::default()
+            }
+            .any_cap()
+        );
+        assert!(
+            LimitsConfig {
+                daily_spend_usd: Some(10.0),
+                ..LimitsConfig::default()
+            }
+            .any_cap()
+        );
+    }
+
+    /// A per-backend cap and a global cap both apply; whichever binds first
+    /// wins, because the user meant both.
+    #[test]
+    fn the_tighter_of_two_caps_binds() {
+        let limits = LimitsConfig {
+            daily_spend_usd: Some(10.0),
+            on_breach: BreachAction::Descend,
+            backends: vec![BackendLimit {
+                id: "anthropic-key".into(),
+                daily_spend_usd: 5.0,
+            }],
+        };
+        assert_eq!(limits.cap_for("anthropic-key"), Some(5.0));
+        assert_eq!(
+            limits.cap_for("openai-key"),
+            Some(10.0),
+            "a backend with no cap of its own still counts against the global one"
+        );
+        assert_eq!(
+            LimitsConfig::default().cap_for("anthropic-key"),
+            None,
+            "no cap configured is not a cap of zero"
+        );
+    }
+
+    #[test]
+    fn descend_is_the_default_breach_action() {
+        // The product's promise is that the agent does not die. A cap that
+        // killed the session by default would invert it.
+        assert_eq!(LimitsConfig::default().on_breach, BreachAction::Descend);
+    }
+
     #[test]
     fn every_advertised_kind_parses() {
         for kind in BackendImpl::ALL {
@@ -886,6 +1013,14 @@ mod tests {
                 api_key_env: None,
                 models: None,
             }],
+            limits: LimitsConfig {
+                daily_spend_usd: Some(10.0),
+                on_breach: BreachAction::Refuse,
+                backends: vec![BackendLimit {
+                    id: "anthropic-key".into(),
+                    daily_spend_usd: 5.0,
+                }],
+            },
         };
         let text = toml::to_string(&cfg).expect("serializes");
         let back: Config = toml::from_str(&text).expect("deserializes");

@@ -28,6 +28,20 @@ pub enum Headroom {
         /// Earliest time this backend is worth trying again.
         until: DateTime<Utc>,
     },
+    /// A spend cap the *user* set has been reached.
+    ///
+    /// Deliberately not [`Self::Exhausted`]: the provider is willing and would
+    /// serve this request. Reporting a user's own budget as a provider limit
+    /// would put "resets in 4h" on a screen where the honest answer is "you
+    /// asked me to stop".
+    CapReached {
+        /// Spent against this cap in the current window.
+        spent_usd: f64,
+        /// The cap itself.
+        cap_usd: f64,
+        /// When the window rolls over — the next local midnight.
+        resets_at: DateTime<Utc>,
+    },
     /// Authenticated, but the provider has told us nothing yet.
     Unknown,
 }
@@ -38,6 +52,7 @@ impl Headroom {
     pub fn is_available(&self, now: DateTime<Utc>) -> bool {
         match self {
             Self::Exhausted { until } => now >= *until,
+            Self::CapReached { resets_at, .. } => now >= *resets_at,
             // An unknown backend is available: refusing to try it is how we'd
             // end up with a router that never discovers anything.
             Self::Observed { .. } | Self::Unknown => true,
@@ -49,7 +64,7 @@ impl Headroom {
     pub fn age(&self, now: DateTime<Utc>) -> Option<Duration> {
         match self {
             Self::Observed { observed_at, .. } => Some(now - *observed_at),
-            Self::Exhausted { .. } | Self::Unknown => None,
+            Self::Exhausted { .. } | Self::CapReached { .. } | Self::Unknown => None,
         }
     }
 
@@ -62,6 +77,7 @@ impl Headroom {
         match self {
             Self::Observed { used_pct, .. } => *used_pct >= 90.0,
             Self::Exhausted { until } => now < *until,
+            Self::CapReached { resets_at, .. } => now < *resets_at,
             Self::Unknown => false,
         }
     }
@@ -168,5 +184,46 @@ mod tests {
         };
         assert_eq!(h.age(t(40)), Some(Duration::seconds(40)));
         assert_eq!(Headroom::Unknown.age(t(40)), None);
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn t(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).expect("valid timestamp")
+    }
+
+    fn capped(resets_at: DateTime<Utc>) -> Headroom {
+        Headroom::CapReached {
+            spent_usd: 10.0,
+            cap_usd: 10.0,
+            resets_at,
+        }
+    }
+
+    /// The point of expressing a cap as `Headroom`: every consumer that
+    /// already asks "can I route here" gets the right answer with no new code
+    /// path.
+    #[test]
+    fn a_capped_backend_is_not_available_until_the_window_rolls() {
+        let headroom = capped(t(3600));
+        assert!(!headroom.is_available(t(0)));
+        assert!(headroom.is_available(t(3600)));
+    }
+
+    #[test]
+    fn a_capped_backend_reads_as_pressured() {
+        // So a conversation sitting on it descends rather than waiting.
+        assert!(capped(t(3600)).is_pressured(t(0)));
+        assert!(!capped(t(3600)).is_pressured(t(7200)));
+    }
+
+    /// A cap has no observation behind it, so it has no age — the same rule
+    /// that keeps a fabricated number off the status screen.
+    #[test]
+    fn a_cap_reports_no_observation_age() {
+        assert!(capped(t(3600)).age(t(0)).is_none());
     }
 }

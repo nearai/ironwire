@@ -188,7 +188,12 @@ fn still_true(headroom: Headroom, now: DateTime<Utc>) -> Headroom {
             resets_at,
             observed_at,
         },
-        Headroom::Observed { .. } | Headroom::Unknown => Headroom::Unknown,
+        // A spend cap is the user's own state, recomputed from the ledger at
+        // every start — restoring a stale one would be asserting a budget
+        // decision from a previous run against today's spending.
+        Headroom::CapReached { .. } | Headroom::Observed { .. } | Headroom::Unknown => {
+            Headroom::Unknown
+        }
     }
 }
 
