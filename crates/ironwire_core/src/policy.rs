@@ -171,6 +171,13 @@ pub struct Affinity {
     pub rung: Rung,
     /// When the affinity was established.
     pub since: DateTime<Utc>,
+    /// Last time a request actually routed under this affinity.
+    ///
+    /// Distinct from [`Self::since`], which is set once and never moves. Using
+    /// `since` to decide what to evict would throw out the longest-lived
+    /// healthy sessions first — exactly backwards, and invisible in a test
+    /// short enough that the two never diverge.
+    pub last_seen: DateTime<Utc>,
     /// First time we saw sustained pressure on the current backend. Cleared
     /// when pressure lifts; a descent needs this to be older than the debounce.
     pub pressure_since: Option<DateTime<Utc>>,
@@ -181,6 +188,21 @@ pub struct Affinity {
 /// A single 429 with a three-second `retry-after` must not throw away a
 /// 200k-token warm cache. Waiting is almost always cheaper than moving.
 pub const DESCENT_DEBOUNCE: Duration = Duration::seconds(20);
+
+/// How long a conversation may go unheard from before its route is forgotten.
+///
+/// A coding session is minutes to hours; a key untouched for a day is a session
+/// that ended. Forgetting is cheap and safe — the next request re-selects, and
+/// `select` is deterministic given the same candidates, so under unchanged
+/// conditions it lands on the same backend and pays one cold prompt cache.
+pub const AFFINITY_TTL: Duration = Duration::hours(24);
+
+/// Hard ceiling on tracked conversations, regardless of age.
+///
+/// The same number, for the same reason, as `PrivacyFilter::MAX_SALTS`: a
+/// daemon meant to run under launchd or systemd for weeks must not accumulate
+/// state for its whole life, and the thing being dropped costs one cold cache.
+pub const MAX_AFFINITIES: usize = 512;
 
 /// Routing policy over a set of candidate backends.
 #[derive(Debug, Default)]
@@ -224,10 +246,42 @@ impl Policy {
         self.affinities.remove(key);
     }
 
-    /// Number of conversations currently tracked.
+    /// Number of conversations currently tracked: those routed within
+    /// [`AFFINITY_TTL`], capped at [`MAX_AFFINITIES`].
+    ///
+    /// A description of the present, which is what `ironwire status` renders it
+    /// as. Before the map was bounded this was a lifetime counter that only
+    /// ever went up, and meant nothing after a day of use.
     #[must_use]
     pub fn tracked_conversations(&self) -> usize {
         self.affinities.len()
+    }
+
+    /// Drop conversations that have gone quiet, then any excess over the cap.
+    ///
+    /// A full `retain` per request is O(n) with n capped at 512 — microseconds,
+    /// lost entirely in the noise of an HTTP round trip, and this runs under
+    /// the lock that `AppState` holds across a decision. The alternative is an
+    /// LRU list, which `PrivacyFilter` already considered and rejected for the
+    /// same trade-off; a second, more complicated answer to the same question
+    /// in the same daemon is worse than a slightly slower one.
+    fn sweep(&mut self, now: DateTime<Utc>) {
+        self.affinities
+            .retain(|_, affinity| now - affinity.last_seen < AFFINITY_TTL);
+
+        // Oldest use first, so a busy conversation outlives an idle one even
+        // when both are inside the TTL.
+        while self.affinities.len() > MAX_AFFINITIES {
+            let Some(stalest) = self
+                .affinities
+                .iter()
+                .min_by_key(|(_, affinity)| affinity.last_seen)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.affinities.remove(&stalest);
+        }
     }
 
     /// Choose where a request goes.
@@ -340,6 +394,11 @@ impl Policy {
         {
             let pressured = candidate.quota.is_pressured(now);
             let entry = self.affinities.get_mut(&key).expect("just found above");
+            // Both early returns below leave through here, so this is the one
+            // place that has to be right: miss it on the unpressured branch —
+            // the common one — and every healthy conversation ages out while
+            // actively in use.
+            entry.last_seen = now;
             if pressured {
                 let since = *entry.pressure_since.get_or_insert(now);
                 // Hysteresis: only descend once pressure has persisted.
@@ -372,9 +431,16 @@ impl Policy {
                 model: decision.model.clone(),
                 rung: decision.rung,
                 since: now,
+                last_seen: now,
                 pressure_since: None,
             },
         );
+        // After the insert, not before: sweeping first leaves room for one more
+        // and the map settles at the cap plus one. This is also the only point
+        // the map grows, and it is safely clear of the `get`/`get_mut` pair
+        // above, where an eviction could have pulled the ground out from under
+        // that `expect`.
+        self.sweep(now);
         Ok(decision)
     }
 
@@ -639,6 +705,138 @@ mod tests {
             "You are Claude Code",
             &["Read"],
         )
+    }
+
+    /// A distinct conversation per index, so a test can fill the map.
+    fn key_n(n: usize) -> ConversationKey {
+        ConversationKey::derive(
+            Protocol::AnthropicMessages,
+            &format!("You are Claude Code, session {n}"),
+            &["Read"],
+        )
+    }
+
+    fn route(policy: &mut Policy, key: ConversationKey, at: DateTime<Utc>) {
+        policy
+            .decide(
+                key,
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &[candidate(
+                    "claude-sub",
+                    BackendKind::Subscription,
+                    Protocol::AnthropicMessages,
+                )],
+                at,
+            )
+            .expect("routes");
+    }
+
+    #[test]
+    fn the_affinity_map_is_bounded() {
+        // Left unbounded this grew one entry per distinct conversation for the
+        // life of a daemon that is meant to run for weeks.
+        let mut policy = Policy::new();
+        for n in 0..1000 {
+            route(&mut policy, key_n(n), t(0));
+        }
+        assert!(
+            policy.tracked_conversations() <= MAX_AFFINITIES,
+            "kept {} affinities",
+            policy.tracked_conversations()
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_goes_quiet_is_forgotten() {
+        let mut policy = Policy::new();
+        route(&mut policy, key(), t(0));
+        assert_eq!(policy.tracked_conversations(), 1);
+
+        // Advance the clock rather than sleep: `now` is a parameter precisely
+        // so this is testable.
+        route(&mut policy, key_n(99), t(AFFINITY_TTL.num_seconds() + 1));
+        assert_eq!(
+            policy.tracked_conversations(),
+            1,
+            "the idle conversation should have been swept, leaving only the new one"
+        );
+    }
+
+    /// The `since`-versus-`last_seen` trap. A conversation established days ago
+    /// but used a second ago is the *most* alive thing in the map; evicting on
+    /// `since` would drop it first.
+    #[test]
+    fn a_conversation_still_in_use_is_never_aged_out() {
+        let mut policy = Policy::new();
+        let hourly = AFFINITY_TTL.num_seconds() / 2;
+        for step in 0..6 {
+            route(&mut policy, key(), t(step * hourly));
+        }
+        assert_eq!(
+            policy.tracked_conversations(),
+            1,
+            "an actively used conversation was evicted by age"
+        );
+        assert_eq!(
+            policy.current_backend(&key()).map(|b| b.to_string()),
+            Some("claude-sub".to_string())
+        );
+    }
+
+    /// Over the cap, the entry that goes is the least recently *used* — not
+    /// whatever `HashMap` iteration happens to surface first.
+    #[test]
+    fn the_stalest_conversation_is_the_one_evicted() {
+        let mut policy = Policy::new();
+        for n in 0..MAX_AFFINITIES {
+            route(&mut policy, key_n(n), t(0));
+        }
+        // Touch every key except one, so that one is unambiguously the stalest.
+        for n in 1..MAX_AFFINITIES {
+            route(&mut policy, key_n(n), t(60));
+        }
+        assert!(
+            policy.current_backend(&key_n(0)).is_some(),
+            "not yet evicted"
+        );
+
+        // One more conversation puts us over the cap.
+        route(&mut policy, key_n(MAX_AFFINITIES), t(120));
+        assert!(
+            policy.current_backend(&key_n(0)).is_none(),
+            "the stalest conversation survived"
+        );
+        assert!(
+            policy.current_backend(&key_n(1)).is_some(),
+            "a recently used conversation was evicted instead"
+        );
+    }
+
+    /// Eviction is invisible: the next request re-selects and, conditions
+    /// unchanged, lands in the same place.
+    #[test]
+    fn an_evicted_conversation_simply_re_establishes_itself() {
+        let mut policy = Policy::new();
+        route(&mut policy, key(), t(0));
+        let later = t(AFFINITY_TTL.num_seconds() + 1);
+        route(&mut policy, key_n(1), later);
+        assert!(policy.current_backend(&key()).is_none(), "was swept");
+
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &[candidate(
+                    "claude-sub",
+                    BackendKind::Subscription,
+                    Protocol::AnthropicMessages,
+                )],
+                later,
+            )
+            .expect("routes again without error");
+        assert_eq!(decision.backend.as_str(), "claude-sub");
     }
 
     #[test]
