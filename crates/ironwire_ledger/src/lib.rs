@@ -146,6 +146,15 @@ pub struct Summary {
 #[derive(Clone)]
 pub struct Ledger {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Exchanges appended since this process started.
+    ///
+    /// Exists so a reader can cheaply ask "is anything I derived from this
+    /// ledger still current?" without a query. Anything cached off the rows —
+    /// the burn rate on `ironwire status` — is stale the moment this moves,
+    /// and a time-based expiry alone cannot see that: a request arriving one
+    /// millisecond after a report was built would be invisible until the
+    /// timer ran out.
+    writes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -207,6 +216,7 @@ impl Ledger {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -248,7 +258,19 @@ impl Ledger {
                 exchange.error,
             ],
         )?;
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// How many exchanges have been appended since this process started.
+    ///
+    /// Not a row count and not persisted — it is a change token. Equal on two
+    /// reads means nothing was written between them, which is the only thing a
+    /// cache built from these rows needs to know.
+    #[must_use]
+    pub fn writes(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Most recent exchanges, newest first.
@@ -510,6 +532,23 @@ mod tests {
             .expect("records");
         let summary = ledger.summary(at(5_000)).expect("summarises");
         assert_eq!(summary.exchanges, 1);
+    }
+
+    #[test]
+    fn the_write_token_moves_on_a_write_and_not_on_a_read() {
+        // What tells a cache built from these rows that it has gone stale. A
+        // clock cannot: a request landing a millisecond after a report was
+        // built would stay invisible until the timer ran out.
+        let ledger = Ledger::in_memory().expect("opens");
+        let before = ledger.writes();
+        ledger.record(&exchange("claude-sub", 0)).expect("records");
+        let after = ledger.writes();
+        assert_ne!(before, after);
+        let _ = ledger.recent(10).expect("reads");
+        let _ = ledger.summary(at(-1)).expect("summarises");
+        assert_eq!(ledger.writes(), after, "a read is not a change");
+        // Clones share it: the daemon hands copies around.
+        assert_eq!(ledger.clone().writes(), after);
     }
 
     #[test]

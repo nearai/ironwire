@@ -420,9 +420,11 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// call: the capacity numbers above are the reason someone ran this command,
 /// and losing them because a burn-rate query could not run would be the wrong
 /// trade every time.
-/// Memoised for a few seconds by [`AppState::usage_report`]: `ironwire
-/// statusline` calls this endpoint on every render of somebody's editor, and
-/// the scan behind it reads eight days of ledger rows.
+/// Memoised by [`AppState::usage_report`], keyed on the ledger's write token:
+/// `ironwire statusline` calls this endpoint on every render of somebody's
+/// editor, and the scan behind it reads eight days of ledger rows. The token
+/// is what keeps that from ever showing a report built before the traffic the
+/// caller is asking about.
 fn usage(state: &AppState, now: DateTime<Utc>) -> UsageReport {
     let config = &state.config.usage;
     if !config.enabled {
@@ -432,7 +434,7 @@ fn usage(state: &AppState, now: DateTime<Utc>) -> UsageReport {
         return UsageReport::default();
     };
 
-    state.usage_report(now, || build_usage(config, ledger, now))
+    state.usage_report(now, ledger.writes(), || build_usage(config, ledger, now))
 }
 
 fn build_usage(

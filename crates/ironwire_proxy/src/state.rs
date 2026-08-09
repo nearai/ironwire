@@ -152,14 +152,15 @@ pub struct AppState {
     usage: Arc<Mutex<Option<CachedUsage>>>,
 }
 
-/// A usage report and the instant it was built at.
-type CachedUsage = (chrono::DateTime<chrono::Utc>, UsageReport);
+/// A usage report, when it was built, and the ledger write token it was built
+/// against.
+type CachedUsage = (chrono::DateTime<chrono::Utc>, u64, UsageReport);
 
-/// How stale a usage report may be before it is rebuilt.
+/// How long a usage report may be reused *while the ledger has not moved*.
 ///
-/// Short enough that `ironwire status` twice in a row reflects work done in
-/// between; long enough that a status line rendering several times a second
-/// costs one ledger scan rather than dozens.
+/// Only time drifts under this — "closes in 4h" ages by up to ten seconds on
+/// an idle machine. New traffic does not wait for it: the write token is what
+/// makes a report stale, and it moves the instant an exchange is recorded.
 const USAGE_MAX_AGE: chrono::Duration = chrono::Duration::seconds(10);
 
 /// The most recent routing decision, for anything that needs to display it.
@@ -205,27 +206,36 @@ impl AppState {
         }
     }
 
-    /// A usage report no older than [`USAGE_MAX_AGE`], building one if needed.
+    /// A usage report, reusing the last one only if nothing has changed.
+    ///
+    /// `writes` is the ledger's change token: a report is reused only when the
+    /// ledger has not moved since it was built *and* it is younger than
+    /// [`USAGE_MAX_AGE`]. Both halves are load-bearing. Without the token, a
+    /// request arriving a millisecond after a report was built stays invisible
+    /// until the timer expires — which is exactly how a fast end-to-end run
+    /// sees a status screen with no session on it at all.
     ///
     /// Deliberately not a background task: on a machine where nobody runs
-    /// `status`, this should cost nothing at all.
+    /// `status`, this costs nothing.
     pub fn usage_report(
         &self,
         now: chrono::DateTime<chrono::Utc>,
+        writes: u64,
         build: impl FnOnce() -> UsageReport,
     ) -> UsageReport {
         let mut slot = match self.usage.lock() {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some((built_at, report)) = slot.as_ref()
-            && now - *built_at < USAGE_MAX_AGE
+        if let Some((built_at, built_writes, report)) = slot.as_ref()
+            && *built_writes == writes
             && now >= *built_at
+            && now - *built_at < USAGE_MAX_AGE
         {
             return report.clone();
         }
         let report = build();
-        *slot = Some((now, report.clone()));
+        *slot = Some((now, writes, report.clone()));
         report
     }
 
@@ -535,7 +545,7 @@ mod usage_cache_tests {
         let builds = AtomicUsize::new(0);
         let now = chrono::Utc::now();
         for _ in 0..20 {
-            state.usage_report(now, || {
+            state.usage_report(now, 7, || {
                 builds.fetch_add(1, Ordering::Relaxed);
                 report(1)
             });
@@ -544,12 +554,29 @@ mod usage_cache_tests {
     }
 
     #[test]
+    fn a_single_new_exchange_invalidates_it_immediately() {
+        // The failure this exists to stop: an end-to-end run that asks for
+        // status, sends traffic and asks again inside one second, and is shown
+        // the empty report from before the traffic.
+        let state = state();
+        let now = chrono::Utc::now();
+        assert_eq!(
+            state.usage_report(now, 0, || report(0)).completed_sessions,
+            0
+        );
+        assert_eq!(
+            state.usage_report(now, 1, || report(1)).completed_sessions,
+            1
+        );
+    }
+
+    #[test]
     fn a_stale_report_is_rebuilt_so_status_reflects_work_done_since() {
         let state = state();
         let now = chrono::Utc::now();
-        let first = state.usage_report(now, || report(1));
+        let first = state.usage_report(now, 1, || report(1));
         assert_eq!(first.completed_sessions, 1);
-        let later = state.usage_report(now + USAGE_MAX_AGE, || report(2));
+        let later = state.usage_report(now + USAGE_MAX_AGE, 1, || report(2));
         assert_eq!(later.completed_sessions, 2);
     }
 
@@ -559,8 +586,8 @@ mod usage_cache_tests {
         // stamped in the future would otherwise never expire.
         let state = state();
         let now = chrono::Utc::now();
-        state.usage_report(now, || report(1));
-        let earlier = state.usage_report(now - chrono::Duration::hours(1), || report(2));
+        state.usage_report(now, 1, || report(1));
+        let earlier = state.usage_report(now - chrono::Duration::hours(1), 1, || report(2));
         assert_eq!(earlier.completed_sessions, 2);
     }
 }
