@@ -105,8 +105,10 @@ see the carried items above.
   before asking
 - ✅ Expired-token handling — and a **deliberate decision not to refresh**.
   `ironclaw_llm::codex_auth::refresh_access_token` writes back to
-  `~/.codex/auth.json`, and that file is Codex's, not ours: a second writer
-  racing Codex's own refresh can log a user out of the tool they actually paid
+  `~/.codex/auth.json`, and that file is Codex's, not ours — and now *both*
+  Codex clients': the CLI and the desktop app share it, so IronWire would be a
+  third participant. A writer racing Codex's own refresh can log a user out of
+  the tool they actually paid
   for, and the failure would look like Codex's bug rather than IronWire's. So
   IronWire re-reads the file every request, picks up whatever Codex wrote, and
   when the token really is stale says so in one sentence with one command to

@@ -30,6 +30,49 @@ pub const CLIENT_VERSION_ENV: &str = "IRONWIRE_CODEX_CLIENT_VERSION";
 /// binary stalling a request.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Where the app installs on macOS, in the order a user is likely to have it.
+///
+/// A desktop-only user has no `codex` on `PATH` at all, so without this the
+/// chain falls straight through to the compiled-in constant and hands them a
+/// shortened model list with nothing to explain it.
+const APP_BUNDLE_PLISTS: &[&str] = &[
+    "/Applications/Codex.app/Contents/Info.plist",
+    "~/Applications/Codex.app/Contents/Info.plist",
+];
+
+/// Where a reported version came from.
+///
+/// Carried rather than discarded because the failure this module exists to
+/// prevent is invisible: a stale version returns a *shorter model list*, not an
+/// error, so "which source won" is the only diagnostic there is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionSource {
+    /// `IRONWIRE_CODEX_CLIENT_VERSION`.
+    Environment,
+    /// `codex --version`.
+    Cli,
+    /// The desktop app's `Info.plist`.
+    App,
+    /// Nothing answered; [`DEFAULT_CLIENT_VERSION`].
+    Fallback,
+}
+
+impl VersionSource {
+    /// One clause for `ironwire doctor`.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Environment => "from IRONWIRE_CODEX_CLIENT_VERSION",
+            Self::Cli => "from `codex --version`",
+            Self::App => "from the Codex app bundle",
+            Self::Fallback => {
+                "compiled-in fallback — no Codex CLI or app found, so the model \
+                 list may be shorter than your account allows"
+            }
+        }
+    }
+}
+
 static DETECTED: OnceCell<String> = OnceCell::const_new();
 
 /// The `client_version` to report, detected once per process.
@@ -39,15 +82,70 @@ static DETECTED: OnceCell<String> = OnceCell::const_new();
 pub async fn client_version() -> String {
     DETECTED
         .get_or_init(|| async {
-            if let Ok(override_value) = std::env::var(CLIENT_VERSION_ENV)
-                && !override_value.trim().is_empty()
-            {
-                return override_value.trim().to_string();
-            }
-            resolve(detect().await.as_deref())
+            let (version, source) = detect_with_source().await;
+            tracing::debug!(%version, ?source, "reporting a Codex client version");
+            version
         })
         .await
         .clone()
+}
+
+/// The version to report, and where it came from.
+///
+/// Ordered, first hit wins: an explicit override, then the CLI, then the
+/// installed app, then the constant. Every miss is a normal state — plenty of
+/// people run IronWire with neither Codex installed — so none of them is an
+/// error, and only the last one is worth warning about.
+pub async fn detect_with_source() -> (String, VersionSource) {
+    if let Ok(override_value) = std::env::var(CLIENT_VERSION_ENV)
+        && !override_value.trim().is_empty()
+    {
+        return (
+            override_value.trim().to_string(),
+            VersionSource::Environment,
+        );
+    }
+    if let Some(version) = detect().await {
+        return (version, VersionSource::Cli);
+    }
+    if let Some(version) = detect_app().await {
+        return (version, VersionSource::App);
+    }
+    (DEFAULT_CLIENT_VERSION.to_string(), VersionSource::Fallback)
+}
+
+/// Read `CFBundleShortVersionString` from an installed Codex app bundle.
+///
+/// Deliberately a substring scan rather than a plist parser: the file is XML or
+/// binary depending on how it was built, this is a diagnostic aid, and a
+/// dependency on a plist crate to read one string would be a poor trade. A miss
+/// is a normal state.
+async fn detect_app() -> Option<String> {
+    for path in APP_BUNDLE_PLISTS {
+        let expanded = match path.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()?.join(rest),
+            None => std::path::PathBuf::from(path),
+        };
+        let Ok(bytes) = tokio::time::timeout(PROBE_TIMEOUT, tokio::fs::read(&expanded)).await
+        else {
+            continue;
+        };
+        let Ok(bytes) = bytes else { continue };
+        if let Some(version) = parse_bundle_version(&String::from_utf8_lossy(&bytes)) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// Pull `CFBundleShortVersionString`'s value out of a plist.
+#[must_use]
+pub fn parse_bundle_version(plist: &str) -> Option<String> {
+    let key = plist.find("CFBundleShortVersionString")?;
+    let after = &plist[key..];
+    let open = after.find("<string>")? + "<string>".len();
+    let close = after[open..].find("</string>")?;
+    parse(&after[open..open + close])
 }
 
 /// Fall back without pretending we detected anything.
@@ -103,6 +201,29 @@ pub fn parse(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bundle_version_is_read_from_either_plist_shape() {
+        let xml = r#"<?xml version="1.0"?><plist><dict>
+            <key>CFBundleName</key><string>Codex</string>
+            <key>CFBundleShortVersionString</key><string>0.145.0</string>
+            </dict></plist>"#;
+        assert_eq!(parse_bundle_version(xml).as_deref(), Some("0.145.0"));
+        assert_eq!(parse_bundle_version("no such key").as_deref(), None);
+    }
+
+    /// Every source missing is a normal state — plenty of people run IronWire
+    /// with no Codex at all — but it is the one that silently shortens the
+    /// model list, so it must be nameable.
+    #[test]
+    fn the_fallback_says_what_it_costs() {
+        assert!(
+            VersionSource::Fallback.describe().contains("shorter"),
+            "the one source worth warning about does not say why"
+        );
+        assert!(VersionSource::Cli.describe().contains("codex --version"));
+        assert!(VersionSource::App.describe().contains("app"));
+    }
 
     #[test]
     fn the_common_output_shapes_parse() {

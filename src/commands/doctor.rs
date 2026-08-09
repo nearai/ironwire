@@ -82,6 +82,16 @@ pub(crate) async fn run(port: Option<u16>) -> Result<()> {
         }
         println!();
     }
+    // The one line that makes a shortened model list falsifiable. The ChatGPT
+    // backend gates newer models on the reported client version, and a stale
+    // one returns fewer models rather than an error — so without this a user
+    // seeing fewer models than Codex has nothing at all to look at.
+    if status.backends.iter().any(|b| b.id == "codex-sub") {
+        let (version, source) = ironwire_upstream::codex_version::detect_with_source().await;
+        println!("codex version {version} — {}", source.describe());
+        println!();
+    }
+
     println!("Probing backends…");
     let mut failures = 0;
     for probe in client.probe().await? {

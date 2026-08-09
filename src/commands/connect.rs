@@ -205,11 +205,27 @@ fn connect_codex(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
             println!("  · {change}");
         }
         println!();
+        // Said before the edit, like every other change in this file. This one
+        // is not IronWire's limitation but IronWire is what makes the user meet
+        // it, and finding out afterwards — with a thread stuck on a model and
+        // no UI to change it — is the worst way to learn.
+        println!("Before you agree, one consequence worth knowing:");
+        println!();
+        println!("  Codex has no UI for changing the model on a custom provider");
+        println!("  (openai/codex#15364). A desktop-app thread keeps whatever model");
+        println!("  it was created with, and the CLI needs `-m` or `model =` in");
+        println!("  config.toml. `ironwire disconnect codex` puts it all back.");
+        println!();
         if dry_run {
             println!("[dry run] nothing was written.");
         } else {
             write_codex_config(&path, &existing, &edit.contents)?;
-            println!("Written. Restart Codex to pick it up.");
+            // One file drives both clients, and "restart" means different
+            // things to each.
+            println!("Written. It applies to every Codex client on this machine:");
+            println!("  CLI:     start a new `codex` session");
+            println!("  desktop: quit the app and relaunch it — reopening a window");
+            println!("           is not enough, it keeps the old config");
         }
         println!();
     }

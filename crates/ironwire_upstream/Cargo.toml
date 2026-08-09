@@ -11,6 +11,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+dirs.workspace = true
 ironwire_core.workspace = true
 ironwire_creds.workspace = true
 ironclaw_llm.workspace = true

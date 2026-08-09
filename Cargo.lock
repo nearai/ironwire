@@ -1486,6 +1486,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "dirs",
  "futures-util",
  "http",
  "ironclaw_llm",

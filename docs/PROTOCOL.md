@@ -411,3 +411,30 @@ here (is a switch *wise*).
 5. **For the privacy filter, this is the hardest case in the product.** An
    unreversed placeholder in a summary is permanent, self-perpetuating
    corruption of the user's transcript. See `docs/PRIVACY.md` §5.
+
+---
+
+## Codex clients
+
+The CLI and the desktop app read the same `~/.codex/config.toml` and the same
+`~/.codex/auth.json`, so `ironwire connect codex` configures both with one edit
+and neither needs a separate mechanism. Two consequences follow, and both are
+stated by that command before it writes anything:
+
+- "Restart Codex" means different things. A CLI session picks the change up on
+  its next start; the desktop app has to be quit and relaunched, because
+  reopening a window keeps the old config.
+- Codex offers no UI for changing the model on a custom provider
+  ([openai/codex#15364](https://github.com/openai/codex/issues/15364)), so a
+  desktop thread keeps the model it was created with. That is Codex's
+  limitation, but pointing it at IronWire is what makes a user meet it.
+
+**What has not been verified.** The client-identity gate (`docs/TRUST.md` §3)
+recognises the CLI by its `originator` header and its `instructions` preamble.
+Neither has been observed from the desktop app, which is an Electron client with
+a different HTTP stack — so it is not known whether the app reaches the ChatGPT
+subscription through IronWire or is refused as an unrecognised client. That
+needs a capture from a running app, and until there is one this section states
+the uncertainty rather than implying coverage. The markers live in the signed
+quirks channel precisely so the answer can ship in minutes rather than a
+release.
