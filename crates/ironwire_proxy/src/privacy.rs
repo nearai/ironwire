@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use ironwire_core::config::PrivacyConfig;
+use ironwire_core::config::{PrivacyConfig, PrivacyMode};
 use ironwire_core::policy::ConversationKey;
 use ironwire_privacy::{Detector, Exemptions, Map, ReverseError, Reverser, Salt, Tiers};
 use ironwire_upstream::backend::UpstreamError;
@@ -64,8 +64,11 @@ impl PrivacyFilter {
         }
         Some(Self {
             detector: Detector::new(&Tiers {
-                secrets: config.secrets,
+                // Every level above `off` substitutes credentials; the ladder is
+                // cumulative, so this is the one place that mapping lives.
+                secrets: config.secrets || config.mode() >= PrivacyMode::Pii,
                 named_values: config.named_values.clone(),
+                pii: config.mode() >= PrivacyMode::Pii,
             }),
             exemptions: Exemptions {
                 code_blocks: !config.scan_code_blocks,

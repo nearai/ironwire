@@ -126,6 +126,15 @@ Three consequences worth stating plainly:
 
 ---
 
+### Measured cost
+
+`credentials` costs ~1.5 ms per turn on a 333 KB history; `pii` costs ~8 ms —
+three more deterministic passes over the same text. Both are invisible next to a
+model's time to first token, which is why there is still no detection cache
+(`crates/ironwire_privacy/tests/cost.rs` asserts the budget and prints the
+figure). A tier-3 classifier would not be, and that is where the per-block cache
+becomes necessary rather than optional.
+
 ## 5. Compaction, per harness
 
 This is the hard case, and the one most likely to produce a permanent, visible

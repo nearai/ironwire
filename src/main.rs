@@ -110,6 +110,10 @@ enum Command {
         action: String,
         /// File to scan, for `check`.
         path: Option<std::path::PathBuf>,
+        /// Check against a mode other than the configured one, to see what it
+        /// would catch before switching to it.
+        #[arg(long)]
+        mode: Option<String>,
     },
 
     /// Watch routing decisions as they happen.
@@ -183,7 +187,7 @@ async fn main() -> Result<()> {
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json, style).await,
         Command::Update => commands::update::run(cli.port).await,
         Command::Env { shell } => commands::connect::print_env(cli.port, shell),
-        Command::Privacy { action, path } => commands::privacy::run(&action, path),
+        Command::Privacy { action, path, mode } => commands::privacy::run(&action, path, mode),
         Command::Watch { only_changes } => commands::watch::run(cli.port, only_changes).await,
         Command::Service { action } => commands::service::run(&action, cli.port),
         Command::Completions { shell } => {

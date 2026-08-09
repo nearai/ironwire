@@ -185,6 +185,7 @@ mod tests {
         Detector::new(&Tiers {
             secrets: true,
             named_values: named.iter().map(|s| (*s).to_string()).collect(),
+            pii: false,
         })
     }
 

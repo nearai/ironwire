@@ -53,19 +53,29 @@ pub struct Tiers {
     pub secrets: bool,
     /// Tier 2: exact strings the user nominated.
     pub named_values: Vec<String>,
+    /// Deterministic PII: email addresses, IP addresses, phone numbers.
+    ///
+    /// Pattern-matched, so it has tier 1's properties rather than tier 3's —
+    /// the same input always produces the same output and every match can be
+    /// shown to the user. Human names are deliberately *not* here: they need
+    /// the tier-3 classifier, and a regex for them would be a false-negative
+    /// machine that reads as protection (`docs/PRIVACY.md` §2).
+    pub pii: bool,
 }
 
 impl Tiers {
     /// Whether anything is enabled.
     #[must_use]
     pub fn is_off(&self) -> bool {
-        !self.secrets && self.named_values.is_empty()
+        !self.secrets && !self.pii && self.named_values.is_empty()
     }
 }
 
 /// Finds substitutable values in text.
 pub struct Detector {
     secrets: Option<LeakDetector>,
+    /// Whether the deterministic PII classes are on.
+    pii: bool,
     /// Nominated values, expanded to their encoded variants and sorted
     /// longest-first so an overlapping shorter value cannot win.
     named: Vec<String>,
@@ -100,6 +110,7 @@ impl Detector {
 
         Self {
             secrets: tiers.secrets.then(LeakDetector::new),
+            pii: tiers.pii,
             named,
         }
     }
@@ -124,6 +135,10 @@ impl Detector {
             }
         }
 
+        if self.pii {
+            findings.extend(find_pii(text));
+        }
+
         // Longest-first, so `alice@corp.com` wins over a nominated `corp.com`
         // that overlaps it.
         for value in &self.named {
@@ -141,6 +156,202 @@ impl Detector {
 
         resolve_overlaps(findings, text)
     }
+}
+
+/// Deterministic PII, by shape.
+///
+/// Everything here goes through the same `resolve_overlaps` -> `is_reserved`
+/// path as tier 1, which already excludes documentation domains, RFC 1918 and
+/// RFC 5737 ranges, `2001:db8`, loopback and the NANP fictional exchange. That
+/// exclusion list was written for exactly these classes and has been guarding
+/// matches that never included one.
+fn find_pii(text: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let bytes = text.as_bytes();
+
+    // Email. A conservative RFC 5322 subset: the liberal grammar matches things
+    // that are not addresses, and a false positive here rewrites code.
+    let mut index = 0;
+    while let Some(offset) = text[index..].find('@') {
+        let at = index + offset;
+        index = at + 1;
+        let start = text[..at]
+            .rfind(|c: char| !is_email_local(c))
+            .map_or(0, |boundary| boundary + 1);
+        let after = &text[at + 1..];
+        let host_len = after
+            .find(|c: char| !is_email_host(c))
+            .unwrap_or(after.len());
+        let host = &after[..host_len];
+        // A domain needs a dot and a plausible TLD; `user@localhost` and
+        // `@mention` are not addresses.
+        if start == at || host_len == 0 {
+            continue;
+        }
+        let Some((_, tld)) = host.rsplit_once('.') else {
+            continue;
+        };
+        if tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        findings.push(Finding {
+            range: start..at + 1 + host.trim_end_matches('.').len(),
+            class: Class::Email,
+            rule: "email".to_string(),
+        });
+    }
+
+    // IPv4 dotted quad, with each octet in range so a version string like
+    // `1.2.3.4.5` or `999.1.1.1` cannot match.
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_digit()
+            || (cursor > 0 && (bytes[cursor - 1].is_ascii_digit() || bytes[cursor - 1] == b'.'))
+        {
+            cursor += 1;
+            continue;
+        }
+        let rest = &text[cursor..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        // A sentence-ending period is part of the run of dots-and-digits and is
+        // not part of the address: `…is 203.0.114.9.` would otherwise split
+        // into five groups and never match.
+        let token = rest[..end].trim_end_matches('.');
+        if is_ipv4(token) {
+            findings.push(Finding {
+                range: cursor..cursor + token.len(),
+                class: Class::IpAddress,
+                rule: "ipv4".to_string(),
+            });
+        }
+        cursor += end.max(1);
+    }
+
+    // IPv6, only in its unambiguous forms: at least two colons and only hex
+    // digits and colons around them.
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find(':') {
+        let colon = cursor + offset;
+        let start = text[..colon]
+            .rfind(|c: char| !is_ipv6_char(c))
+            .map_or(0, |boundary| boundary + 1);
+        let after = &text[start..];
+        let len = after
+            .find(|c: char| !is_ipv6_char(c))
+            .unwrap_or(after.len());
+        let token = &after[..len];
+        cursor = start + len.max(1);
+        if is_ipv6(token) {
+            findings.push(Finding {
+                range: start..start + token.len(),
+                class: Class::IpAddress,
+                rule: "ipv6".to_string(),
+            });
+        }
+    }
+
+    // Phone. The highest-false-positive class of the three, and the one most
+    // likely to corrupt code, so it requires real structure: an explicit
+    // country code, or a separated NANP number. A bare run of digits — a port
+    // range, a version, a timestamp, a SHA fragment — never matches.
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte != b'+' && !byte.is_ascii_digit() && byte != b'(' {
+            cursor += 1;
+            continue;
+        }
+        if cursor > 0 && (bytes[cursor - 1].is_ascii_digit() || bytes[cursor - 1] == b'.') {
+            cursor += 1;
+            continue;
+        }
+        let rest = &text[cursor..];
+        let len = rest.find(|c: char| !is_phone_char(c)).unwrap_or(rest.len());
+        let token = rest[..len].trim_end_matches(|c: char| !c.is_ascii_digit());
+        if is_phone(token) {
+            findings.push(Finding {
+                range: cursor..cursor + token.len(),
+                class: Class::Phone,
+                rule: "phone".to_string(),
+            });
+        }
+        cursor += len.max(1);
+    }
+
+    findings
+}
+
+fn is_email_local(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
+fn is_email_host(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-')
+}
+
+fn is_ipv6_char(c: char) -> bool {
+    c.is_ascii_hexdigit() || c == ':'
+}
+
+fn is_phone_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ')
+}
+
+/// A dotted quad whose octets are all in range.
+fn is_ipv4(token: &str) -> bool {
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.len() <= 3 && part.parse::<u8>().is_ok())
+}
+
+/// An IPv6 address in a form that cannot be confused with the other
+/// colon-separated shapes a repository is full of.
+///
+/// Those shapes are MAC addresses (`aa:bb:cc:dd:ee:ff`) and clock times
+/// (`01:23:45`), and both are "hex groups separated by colons" — the naive
+/// test matches them, and substituting either rewrites something that has to
+/// keep working. So a match needs one of the two things only a real address
+/// has: a `::` elision, or the full eight groups.
+fn is_ipv6(token: &str) -> bool {
+    let groups: Vec<&str> = token.split(':').collect();
+    let elided = token.contains("::");
+    if !elided && groups.len() != 8 {
+        return false;
+    }
+    if elided && token.matches("::").count() > 1 {
+        return false;
+    }
+    if groups.len() > 8 {
+        return false;
+    }
+    groups.iter().all(|group| {
+        group.is_empty() || (group.len() <= 4 && group.chars().all(|c| c.is_ascii_hexdigit()))
+    }) && groups.iter().any(|group| !group.is_empty())
+}
+
+/// A phone number with enough structure to be one.
+///
+/// The strictest of the three rules, because this is the class most likely to
+/// corrupt code and the one with the most lookalikes. "Ten digits and a
+/// separator" is not enough: a port range (`30000-32767`), a version, a
+/// timestamp and a SHA fragment all clear that bar. Without an explicit country
+/// code, the digits must fall into the NANP grouping — 3-3-4, optionally behind
+/// a `1` — which a port range does not.
+fn is_phone(token: &str) -> bool {
+    if token.starts_with('+') {
+        // E.164: the `+` is the claim, and the length is the check.
+        return (8..=15).contains(&token.chars().filter(char::is_ascii_digit).count());
+    }
+    let groups: Vec<usize> = token
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .map(str::len)
+        .collect();
+    matches!(groups.as_slice(), [3, 3, 4] | [1, 3, 3, 4])
 }
 
 /// Patterns whose shape alone is not evidence of a secret.
@@ -239,8 +450,23 @@ fn is_reserved(text: &str, range: &Range<usize>) -> bool {
     if lower.starts_with("2001:db8") {
         return true;
     }
-    // NANP reserved fictional exchange.
-    lower.contains("555-01") || lower.contains("55501")
+    // Loopback, exactly — not as a substring, or `2606:4700:4700::1111` would
+    // be excluded for containing `::1`.
+    if lower == "::1" || lower == "::" {
+        return true;
+    }
+    // NANP numbers reserved for fiction. The substring forms catch the plain
+    // spellings; the digit test catches `(555) 010-0199`, where the separators
+    // fall between the characters the substrings are looking for.
+    if lower.contains("555-01") || lower.contains("55501") {
+        return true;
+    }
+    let digits: String = lower.chars().filter(char::is_ascii_digit).collect();
+    let national = digits.strip_prefix('1').unwrap_or(&digits);
+    if national.len() == 10 && (national.starts_with("555") || &national[3..6] == "555") {
+        return true;
+    }
+    false
 }
 
 /// `172.16.0.0/12` — the second octet is 16..=31, which a prefix test cannot
@@ -291,6 +517,7 @@ mod tests {
         Detector::new(&Tiers {
             secrets: true,
             named_values: Vec::new(),
+            pii: false,
         })
     }
 
@@ -327,6 +554,7 @@ mod tests {
                 "2001:db8::1".to_string(),
                 "555-0100".to_string(),
             ],
+            pii: false,
         });
         for text in [
             "assert_eq!(user.email, \"user@example.com\");",
@@ -351,6 +579,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["172.32.4.5".to_string()],
+            pii: false,
         });
         assert_eq!(detector.find("host 172.32.4.5").len(), 1);
     }
@@ -360,6 +589,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["Acme Holdings".to_string()],
+            pii: false,
         });
         let text = "Acme Holdings invoices Acme Holdings monthly";
         assert_eq!(detector.find(text).len(), 2);
@@ -372,6 +602,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["Acme Holdings".to_string()],
+            pii: false,
         });
         assert_eq!(detector.find("q=Acme%20Holdings&x=1").len(), 1);
         assert_eq!(detector.find("q=Acme+Holdings&x=1").len(), 1);
@@ -385,6 +616,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["alice@corp.com".to_string(), "corp.com".to_string()],
+            pii: false,
         });
         let findings = detector.find("mail alice@corp.com now");
         assert_eq!(findings.len(), 1);
@@ -396,6 +628,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["MyEmployerName".to_string()],
+            pii: false,
         });
         let rendered = format!("{detector:?}");
         assert!(!rendered.contains("MyEmployerName"), "got {rendered}");
@@ -419,6 +652,7 @@ mod tests {
         let detector = Detector::new(&Tiers {
             secrets: false,
             named_values: vec!["alpha".to_string(), "beta".to_string()],
+            pii: false,
         });
         let findings = detector.find("beta then alpha then beta");
         for pair in findings.windows(2) {

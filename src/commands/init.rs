@@ -298,7 +298,13 @@ check = true
 #
 # See `ironwire privacy check <file>` to find out what it would actually
 # catch before you rely on it, and docs/PRIVACY.md for what it cannot.
-enabled = false
+# off         — no substitution; requests are forwarded byte-identical.
+# credentials — API keys, tokens, private keys, and any named_values below.
+# pii         — credentials, plus emails, IP addresses and phone numbers.
+#               Deterministic classes only: names need a classifier that has
+#               to publish its precision and recall before it ships.
+# full        — pii, and only trusted backends are routed to.
+mode = "off"
 # API keys, tokens and private keys, by shape.
 secrets = true
 # Exact strings to substitute — your employer, a customer's domain. Note that
@@ -376,7 +382,18 @@ mod tests {
         let paths = ironwire_core::config::PathsConfig::rooted_at(dir.path());
         std::fs::write(paths.config_file(), config_template(DEFAULT_PORT)).expect("write");
 
-        let loaded = Config::load(&paths).expect("the generated config parses");
+        let mut loaded = Config::load(&paths).expect("the generated config parses");
+        // The template states `mode = "off"` where the struct default leaves it
+        // unset. That is the one intentional difference: the file exists to
+        // *document* the ladder, and a commented-out mode teaches nothing. It
+        // must still mean off, which is what this checks before comparing the
+        // rest field by field.
+        assert_eq!(
+            loaded.privacy.mode,
+            Some(ironwire_core::config::PrivacyMode::Off)
+        );
+        assert_eq!(loaded.privacy.mode(), Config::default().privacy.mode());
+        loaded.privacy.mode = None;
         assert_eq!(loaded, Config::default());
     }
 

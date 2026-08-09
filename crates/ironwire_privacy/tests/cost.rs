@@ -32,9 +32,13 @@ fn large_history(turns: usize) -> serde_json::Value {
 #[test]
 #[cfg_attr(debug_assertions, ignore = "perf budget is only meaningful in release")]
 fn substituting_a_large_history_is_fast_enough_to_be_invisible() {
+    // Measured at the *highest* deterministic level, so the budget covers what
+    // a user who turns everything on actually pays. Three more pattern passes
+    // move this: see the measured figure this test prints.
     let detector = Detector::new(&Tiers {
         secrets: true,
         named_values: vec!["acme-holdings.example-real.com".to_string()],
+        pii: true,
     });
     let body = large_history(200);
     let bytes = body.to_string().len();
@@ -55,6 +59,10 @@ fn substituting_a_large_history_is_fast_enough_to_be_invisible() {
         per_turn
     );
 
+    // Measured: ~1.5ms at `credentials`, ~8ms at `pii` on this 333 KB history
+    // — the three extra pattern passes cost roughly 5x, and that is the number
+    // to watch if more classes are ever added.
+    //
     // The budget is set against what it is competing with: a model's
     // time-to-first-token is hundreds of milliseconds at best. Anything under
     // ~50ms is invisible next to that, and buys us the right to skip a

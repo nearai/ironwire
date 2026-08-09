@@ -14,16 +14,27 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ironwire_core::config::Config;
+use ironwire_core::config::PrivacyMode;
 use ironwire_privacy::{Detector, Tiers};
 
 use super::paths;
 
 /// Run `ironwire privacy <action>`.
-pub(crate) fn run(action: &str, path: Option<PathBuf>) -> Result<()> {
+pub(crate) fn run(action: &str, path: Option<PathBuf>, mode: Option<String>) -> Result<()> {
+    let mode_override = mode
+        .as_deref()
+        .map(|name| match name {
+            "off" => Ok(PrivacyMode::Off),
+            "credentials" => Ok(PrivacyMode::Credentials),
+            "pii" => Ok(PrivacyMode::Pii),
+            "full" => Ok(PrivacyMode::Full),
+            other => anyhow::bail!("unknown mode `{other}` (try: off, credentials, pii, full)"),
+        })
+        .transpose()?;
     match action {
         "check" => {
             let path = path.context("usage: ironwire privacy check <file>")?;
-            check(&path)
+            check(&path, mode_override)
         }
         "status" => status(),
         other => anyhow::bail!("unknown action `{other}` (try: check, status)"),
@@ -37,14 +48,15 @@ fn load() -> Result<ironwire_core::config::PrivacyConfig> {
 
 fn status() -> Result<()> {
     let config = load()?;
+    let mode = config.mode();
     println!("Privacy filter: {}", config.summary());
+    println!("  {}", mode.describe());
     println!();
-    if !config.enabled {
+    if mode == PrivacyMode::Off {
         println!("Turn it on in $IRONWIRE_HOME/config.toml:");
         println!();
         println!("    [privacy]");
-        println!("    enabled = true");
-        println!("    secrets = true");
+        println!("    mode = \"credentials\"   # or \"pii\", or \"full\"");
         println!("    named_values = [\"your-employer\", \"a-customer-domain.com\"]");
         println!();
         println!("Then restart the daemon. See `ironwire privacy check <file>` to");
@@ -76,19 +88,26 @@ fn status() -> Result<()> {
     Ok(())
 }
 
-fn check(path: &std::path::Path) -> Result<()> {
+fn check(path: &std::path::Path, mode_override: Option<PrivacyMode>) -> Result<()> {
     let config = load()?;
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
+    // `--mode` lets someone see what a level would catch *before* switching to
+    // it, which is the only honest way to decide whether to trust it.
+    let mode = mode_override.unwrap_or_else(|| config.mode());
     let detector = Detector::new(&Tiers {
-        secrets: config.secrets,
+        secrets: config.secrets || mode >= PrivacyMode::Pii,
         named_values: config.named_values.clone(),
+        pii: mode >= PrivacyMode::Pii,
     });
     let findings = detector.find(&text);
 
     println!("{} — {} bytes", path.display(), text.len());
-    println!("Configuration: {}", config.summary());
+    match mode_override {
+        Some(mode) => println!("Mode: {mode:?} (asked for, not what is configured)"),
+        None => println!("Configuration: {}", config.summary()),
+    }
     println!();
 
     if findings.is_empty() {
@@ -102,7 +121,24 @@ fn check(path: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
+    // Grouped by class so the false-positive rate of each is visible on its
+    // own: a user deciding whether to trust `pii` needs to see how the phone
+    // rule behaves separately from the email one.
+    let mut by_class: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for finding in &findings {
+        *by_class
+            .entry(format!("{:?}", finding.class).to_lowercase())
+            .or_default() += 1;
+    }
     println!("{} match(es):", findings.len());
+    println!(
+        "  by class: {}",
+        by_class
+            .iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    );
     println!();
     for finding in &findings {
         let line = text[..finding.range.start].lines().count().max(1);

@@ -288,9 +288,18 @@ impl ResilienceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrivacyConfig {
-    /// Master switch.
+    /// How much the user wants substituted. See [`PrivacyMode`].
+    ///
+    /// `None` means the file predates the ladder and still says
+    /// `enabled`/`secrets`; [`PrivacyConfig::mode`] resolves the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PrivacyMode>,
+    /// Deprecated master switch, kept so an existing `config.toml` still loads
+    /// — `deny_unknown_fields` would otherwise reject every upgraded install.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub enabled: bool,
-    /// Tier 1: substitute values with a machine-checkable secret shape.
+    /// Deprecated. Superseded by `mode = "credentials"`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub secrets: bool,
     /// Tier 2: exact strings to substitute, nominated by the user.
     ///
@@ -308,9 +317,67 @@ pub struct PrivacyConfig {
     pub scan_tool_results: bool,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+/// How much of a request the user wants substituted.
+///
+/// A ladder rather than a set of independent switches, and every level is a
+/// strict superset of the one below — so `mode >= PrivacyMode::Pii` is the
+/// natural way to ask a question about it. A matrix of booleans is more
+/// expressive and strictly worse: it multiplies the states we have to test, and
+/// it lets someone assemble a configuration that sounds protective and is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// No substitution; requests are forwarded byte-identical.
+    ///
+    /// The default, and it stays the default. This is the one component that
+    /// modifies a request, and everything else IronWire promises rests on
+    /// forwarding bytes it did not change (`docs/TRUST.md` I7).
+    #[default]
+    Off,
+    /// API keys, tokens, private keys, and any `named_values`.
+    Credentials,
+    /// Credentials, plus the deterministic PII classes: email addresses, IP
+    /// addresses and phone numbers.
+    ///
+    /// Deliberately not human names: those need the tier-3 classifier, and a
+    /// regex for them would be a false-negative machine that reads as
+    /// protection (`docs/PRIVACY.md` §2).
+    Pii,
+    /// Everything in `pii`, and route only to backends the user marked
+    /// trusted rather than falling back to any other provider.
+    Full,
+}
+
+impl PrivacyMode {
+    /// What this level substitutes, in one clause.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Off => "off — requests are forwarded unchanged",
+            Self::Credentials => "credentials: API keys, tokens, private keys, and named values",
+            Self::Pii => {
+                "credentials, plus deterministic PII: emails, IP addresses, phone numbers \
+                 (not names — those need the tier-3 classifier)"
+            }
+            Self::Full => {
+                "credentials and deterministic PII, and only trusted backends are routed to"
+            }
+        }
+    }
+}
+
 impl Default for PrivacyConfig {
     fn default() -> Self {
         Self {
+            mode: None,
             enabled: false,
             secrets: true,
             named_values: Vec::new(),
@@ -321,34 +388,55 @@ impl Default for PrivacyConfig {
 }
 
 impl PrivacyConfig {
+    /// The mode in force, resolving a file that predates the ladder.
+    ///
+    /// `mode` wins outright when it is present. Otherwise the old booleans are
+    /// mapped: they could only ever express "off" or "credentials", so that is
+    /// what they map to, and an upgraded install keeps filtering exactly what
+    /// it filtered before.
+    #[must_use]
+    pub fn mode(&self) -> PrivacyMode {
+        if let Some(mode) = self.mode {
+            return mode;
+        }
+        if self.enabled && (self.secrets || !self.named_values.is_empty()) {
+            PrivacyMode::Credentials
+        } else {
+            PrivacyMode::Off
+        }
+    }
+
     /// Whether the filter would actually do anything.
     ///
-    /// Enabled-but-configured-with-nothing is a real state and it should read
-    /// as off, not as protection.
+    /// On-but-configured-with-nothing is a real state and it should read as
+    /// off, not as protection: `credentials` with `secrets` disabled and no
+    /// named values matches nothing at all.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.enabled && (self.secrets || !self.named_values.is_empty())
+        match self.mode() {
+            PrivacyMode::Off => false,
+            // `pii` and `full` always have patterns of their own to run.
+            PrivacyMode::Pii | PrivacyMode::Full => true,
+            PrivacyMode::Credentials => self.secrets || !self.named_values.is_empty(),
+        }
     }
 
     /// One line describing what is running — never what the user is safe from
     /// (`docs/TRUST.md` I7).
     #[must_use]
     pub fn summary(&self) -> String {
-        if !self.enabled {
+        let mode = self.mode();
+        if mode == PrivacyMode::Off {
             return "off".to_string();
         }
-        let mut parts = Vec::new();
-        if self.secrets {
-            parts.push("secrets".to_string());
+        if !self.is_active() {
+            return "on, but nothing configured to match".to_string();
         }
+        let mut parts = vec![format!("{mode:?}").to_lowercase()];
         if !self.named_values.is_empty() {
             parts.push(format!("{} named value(s)", self.named_values.len()));
         }
-        if parts.is_empty() {
-            "on, but nothing configured to match".to_string()
-        } else {
-            parts.join(" + ")
-        }
+        parts.join(" + ")
     }
 }
 
@@ -962,6 +1050,85 @@ mod tests {
         // The product's promise is that the agent does not die. A cap that
         // killed the session by default would invert it.
         assert_eq!(LimitsConfig::default().on_breach, BreachAction::Descend);
+    }
+
+    /// Every row of the upgrade table. `deny_unknown_fields` means an existing
+    /// `config.toml` that still says `enabled`/`secrets` has to keep loading,
+    /// and has to keep filtering exactly what it filtered before.
+    #[test]
+    fn a_config_predating_the_ladder_keeps_its_behaviour() {
+        let old_style = |toml: &str| -> PrivacyConfig {
+            load(toml)
+                .expect("an existing config must still load")
+                .privacy
+        };
+
+        assert_eq!(
+            old_style("[privacy]\nenabled = true\nsecrets = true\n").mode(),
+            PrivacyMode::Credentials
+        );
+        assert_eq!(
+            old_style("[privacy]\nenabled = true\nsecrets = false\nnamed_values = [\"acme\"]\n")
+                .mode(),
+            PrivacyMode::Credentials,
+            "named values alone were a working configuration and must stay one"
+        );
+        assert_eq!(
+            old_style("[privacy]\nenabled = false\n").mode(),
+            PrivacyMode::Off
+        );
+        assert_eq!(
+            old_style("[privacy]\nenabled = true\nsecrets = false\n").mode(),
+            PrivacyMode::Off,
+            "on with nothing to match reads as off, not as protection"
+        );
+        assert_eq!(
+            PrivacyConfig::default().mode(),
+            PrivacyMode::Off,
+            "the default is off, and that is a commitment rather than a default"
+        );
+    }
+
+    /// `mode` wins outright, so a user who adopts the ladder is not silently
+    /// still governed by a boolean they left behind.
+    #[test]
+    fn the_mode_overrides_the_deprecated_booleans() {
+        let config = load("[privacy]\nmode = \"pii\"\nenabled = false\nsecrets = false\n")
+            .expect("loads")
+            .privacy;
+        assert_eq!(config.mode(), PrivacyMode::Pii);
+        assert!(config.is_active());
+    }
+
+    #[test]
+    fn the_modes_are_ordered_as_a_ladder() {
+        assert!(PrivacyMode::Off < PrivacyMode::Credentials);
+        assert!(PrivacyMode::Credentials < PrivacyMode::Pii);
+        assert!(PrivacyMode::Pii < PrivacyMode::Full);
+    }
+
+    /// A round trip must not reintroduce the deprecated keys, or writing a
+    /// config back would undo the upgrade.
+    #[test]
+    fn a_round_trip_does_not_resurrect_the_old_switches() {
+        let config = Config {
+            privacy: PrivacyConfig {
+                mode: Some(PrivacyMode::Pii),
+                ..PrivacyConfig::default()
+            },
+            ..Config::default()
+        };
+        let text = toml::to_string(&config).expect("serializes");
+        let privacy = text
+            .split("[privacy]")
+            .nth(1)
+            .expect("a privacy section")
+            .to_string();
+        assert!(privacy.contains("mode = \"pii\""), "{privacy}");
+        assert!(
+            !privacy.contains("enabled") && !privacy.contains("secrets"),
+            "the deprecated switches came back on a round trip:\n{privacy}"
+        );
     }
 
     #[test]
