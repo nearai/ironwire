@@ -441,10 +441,11 @@ listing them here keeps them from looking finished when they are not.
 
 | Item | Needs | Milestone |
 |---|---|---|
-| Verify the ChatGPT lane end to end | a live ChatGPT/Codex subscription. Every assertion in `tests/codex_on_subscription.rs` runs against a mock; the header set the real backend requires is unverified | M2 |
-| Verify the Claude lane end to end, `scripts/acceptance.sh` against a real account | a live Claude subscription | M1 |
+| ~~Verify the ChatGPT lane end to end~~ ✅ done — `scripts/acceptance.sh` completes a real task on a live ChatGPT Pro account. It found that Codex 0.145 sends no `instructions` field, that the endpoint URL was built wrongly for the real host, and that `/models` is a different document from the public API's | M2 |
+| ~~Verify the Claude lane end to end~~ ✅ done — same script, a live Claude Max account. It found the identity marker rotted, the model substituted from a stale catalogue, and the rate-limit headers read under names Anthropic does not send | M1 |
+| The Codex desktop app | the app itself, to capture its `originator` and `instructions`; the CLI is verified and the app shares its config and credentials but not its HTTP stack | M2 |
 | Measure Claude Code's real stall timeout | a live session; `keepalive_secs` is currently a guess | M1 |
-| An 8-hour session including a real rate-limit descent | time, and a subscription to exhaust | M1 |
+| An 8-hour session including a real rate-limit descent | time, and a subscription to exhaust. Still the largest untested path: no provider has rate-limited us, so descent under real exhaustion, the cross-family lane and the climb back up are mock-only | M1 |
 | Signed releases | a real signing key, held somewhere that is not a repo | M4 |
 | Publish `manifest.json` | a pinned URL to serve it from | M4 |
 | Hosted apt repo | hosting, plus a signing key for the `Release` file | M4 |

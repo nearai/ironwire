@@ -33,21 +33,32 @@ only decides where each conversation's inference goes.
 
 ## Status
 
-**Built and tested at the wire level. Not yet run against a live
-subscription.** That distinction is the whole of this section, so it is stated
-before anything else.
+**Both native lanes now run against live subscriptions.**
+`scripts/acceptance.sh` completes a real coding task through IronWire on a
+Claude Max account and on a ChatGPT Pro account — a fresh crate, a failing test,
+the agent fixing it — and both lanes pass.
 
 Working, with tests that pin each claim: both native lanes (Claude Code →
 Anthropic, Codex → ChatGPT/OpenAI), the translated lane to NEAR AI, byte-identical
 passthrough, observed quota, consent-gated subscription access, per-backend
 circuit breaking, stream resilience, compaction-aware routing, a local trace
-ledger with real costs, and an optional privacy filter.
+ledger with real costs, spend caps, and an optional privacy filter.
 
-**Every one of those is verified against a mock.** A live Claude or ChatGPT
-subscription would exercise header sets and rate-limit shapes that no fixture
-can prove. `docs/ROADMAP.md` has a table of exactly which items need a real
-account, a signing key, or hosting — none of them are "not done yet", and
-listing them keeps them from reading as finished.
+**What the first live run found is the argument for doing it.** Every one of
+these passed the whole mock suite: both products had rotted out of their own
+identity checks (Codex 0.145 stopped sending `instructions`; Claude Code 2.1.226
+moved its system block and reworded it), so each was refused the subscription it
+owns. The URL for both real providers was built wrongly — a mock mounted at the
+server root is the one shape where the bug is invisible. A model the catalogue
+had never heard of was silently replaced with an older one. Anthropic's
+rate-limit headers were read under names it does not send, so capacity showed
+`unknown` forever.
+
+**What is still unproven, and it is the interesting half.** No provider has
+actually rate-limited us, so descent under real exhaustion, the cross-family
+fallback to NEAR AI, and the promotion back up the ladder are all still
+mock-only. `docs/ROADMAP.md` lists the rest — a signing key, hosting, a Mac —
+and none of them are "not done yet".
 
 ## Install
 
