@@ -40,6 +40,26 @@ pub enum Error {
         detail: toml::de::Error,
     },
 
+    /// The config parsed as TOML but says something IronWire cannot act on.
+    ///
+    /// Separate from [`Self::ConfigParse`] because the user's mistake is
+    /// different in kind: the file is well-formed and every key is spelled
+    /// right, but a value is one IronWire has no implementation for. A TOML
+    /// diagnostic cannot say that, so this says it, naming the entry.
+    #[error(
+        "{path}: the `{id}` backend cannot be built as configured.\n\n{detail}\n\n\
+         Fix that entry or remove it; IronWire discovers your logins on its own \
+         when no backend is declared."
+    )]
+    ConfigInvalid {
+        /// Path we read.
+        path: PathBuf,
+        /// The `[[backends]]` entry at fault.
+        id: String,
+        /// What is wrong, in one sentence, and what would be right.
+        detail: String,
+    },
+
     /// The home directory could not be determined.
     #[error("could not determine a home directory for $IRONWIRE_HOME")]
     NoHome,

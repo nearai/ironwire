@@ -248,6 +248,27 @@ named_values = []
 # substituting them makes the model write something that does not work.
 scan_code_blocks = false
 scan_tool_results = false
+
+# Backends are discovered from your logins and environment, so this section is
+# usually unnecessary. Declare one to override how a discovered backend is
+# built, to switch one off, or to add an endpoint IronWire cannot discover.
+# Commented out because an empty `[[backends]]` block is not the default —
+# declaring nothing and declaring an entry are different states.
+#
+# [[backends]]
+# id = "anthropic-key"          # matches a discovered backend: configures it
+# kind = "anthropic-api"        # claude-subscription, anthropic-api,
+#                               # codex-subscription, openai-api, nearai,
+#                               # openai-compatible
+# enabled = false               # a real kill switch: it is never registered
+# api_key_env = "ANTHROPIC_API_KEY_WORK"   # which variable holds the key
+#
+# [[backends]]
+# id = "local"                  # an id discovery does not produce: adds one
+# kind = "openai-compatible"
+# base_url = "http://127.0.0.1:11434/v1"   # required for this kind
+# api_key_env = "LOCAL_API_KEY"            # required; no secrets in this file
+# models = ["qwen3-coder"]                 # best first
 "#
     )
 }

@@ -344,7 +344,14 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .map(|s| BackendView {
             id: s.id.to_string(),
             name: s.name.clone(),
-            kind: format!("{:?}", s.kind).to_lowercase(),
+            // Serde's `snake_case` rename, not `Debug` lowercased: the latter
+            // renders `ApiKey` as `apikey`, which `status` then prints as the
+            // backend's kind. Nobody saw it until an API-key backend could
+            // actually be configured.
+            kind: serde_json::to_value(s.kind)
+                .ok()
+                .and_then(|value| value.as_str().map(ToString::to_string))
+                .unwrap_or_else(|| format!("{:?}", s.kind).to_lowercase()),
             authenticated: s.authenticated,
             consented: !s.kind.requires_consent() || consent.is_granted(s.id.as_str()),
             detail: s.detail.clone(),

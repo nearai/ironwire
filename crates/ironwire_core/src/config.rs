@@ -352,10 +352,17 @@ impl Config {
     /// As [`Config::load`].
     pub fn load_from(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|detail| Error::ConfigParse {
-                path: path.to_path_buf(),
-                detail,
-            }),
+            Ok(text) => {
+                let config: Self = toml::from_str(&text).map_err(|detail| Error::ConfigParse {
+                    path: path.to_path_buf(),
+                    detail,
+                })?;
+                // Only for a file that exists and parsed. A missing config must
+                // still start a fresh install, which is the commonest case of
+                // all.
+                config.validate(path)?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(Error::ConfigRead {
                 path: path.to_path_buf(),
@@ -363,11 +370,237 @@ impl Config {
             }),
         }
     }
+
+    /// Check what `deny_unknown_fields` cannot.
+    ///
+    /// Serde catches a misspelled *key*, which makes the file feel checked —
+    /// so a value that is accepted reads as a value that works. These are the
+    /// ways an entry can be well-formed and still describe a backend that
+    /// cannot exist, and every one of them is better said now than discovered
+    /// as a backend that silently never appears.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ConfigInvalid`], naming the entry at fault.
+    pub fn validate(&self, path: &Path) -> Result<()> {
+        let invalid = |id: &str, detail: String| Error::ConfigInvalid {
+            path: path.to_path_buf(),
+            id: id.to_string(),
+            detail,
+        };
+
+        let mut seen: Vec<&str> = Vec::new();
+        for backend in &self.backends {
+            // Two entries with one id means `BackendRegistry::get` answers with
+            // whichever was pushed first, and the other silently does nothing.
+            if seen.contains(&backend.id.as_str()) {
+                return Err(invalid(
+                    &backend.id,
+                    "declared twice. Ids must be unique: the router looks a \
+                     backend up by id, so a duplicate is silently ignored."
+                        .to_string(),
+                ));
+            }
+            seen.push(&backend.id);
+
+            let Some(kind) = BackendKind::parse(&backend.kind) else {
+                return Err(invalid(
+                    &backend.id,
+                    format!(
+                        "`kind = \"{}\"` is not a backend IronWire can build. \
+                         Valid kinds: {}.",
+                        backend.kind,
+                        BackendKind::ALL.join(", ")
+                    ),
+                ));
+            };
+
+            // The one kind with no defaults to fall back on: there is no
+            // canonical host for "some OpenAI-compatible server", and building
+            // it against nothing yields a backend that fails every request.
+            if kind == BackendKind::OpenAiCompatible {
+                if backend.base_url.is_none() {
+                    return Err(invalid(
+                        &backend.id,
+                        "`kind = \"openai-compatible\"` needs a `base_url`; there \
+                         is no default host to assume."
+                            .to_string(),
+                    ));
+                }
+                if backend.api_key_env.is_none() {
+                    return Err(invalid(
+                        &backend.id,
+                        "`kind = \"openai-compatible\"` needs an `api_key_env` \
+                         naming the environment variable that holds its key. \
+                         IronWire keeps no secrets in config.toml."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The backend implementations a `[[backends]]` entry can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Claude Code's stored subscription credential.
+    ClaudeSubscription,
+    /// The metered Anthropic API.
+    AnthropicApi,
+    /// Codex's stored ChatGPT credential.
+    CodexSubscription,
+    /// The metered OpenAI API.
+    OpenAiApi,
+    /// NEAR AI credits.
+    NearAi,
+    /// Any other endpoint speaking OpenAI Chat Completions.
+    OpenAiCompatible,
+}
+
+impl BackendKind {
+    /// Every accepted spelling, for the error message that lists them.
+    pub const ALL: &'static [&'static str] = &[
+        "claude-subscription",
+        "anthropic-api",
+        "codex-subscription",
+        "openai-api",
+        "nearai",
+        "openai-compatible",
+    ];
+
+    /// Parse the `kind` field. `None` for anything not in [`Self::ALL`].
+    #[must_use]
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "claude-subscription" => Some(Self::ClaudeSubscription),
+            "anthropic-api" => Some(Self::AnthropicApi),
+            "codex-subscription" => Some(Self::CodexSubscription),
+            "openai-api" => Some(Self::OpenAiApi),
+            "nearai" => Some(Self::NearAi),
+            "openai-compatible" => Some(Self::OpenAiCompatible),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(toml: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml).expect("write");
+        Config::load_from(&path)
+    }
+
+    /// The error has to name the entry. "invalid config" against a file with
+    /// five backends in it is a scavenger hunt.
+    fn rejection(toml: &str) -> String {
+        match load(toml) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("accepted a config that cannot describe a backend:\n{toml}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_is_refused_with_the_valid_ones_listed() {
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "typo"
+            kind = "anthropic"
+            "#,
+        );
+        assert!(message.contains("typo"), "{message}");
+        assert!(message.contains("anthropic-api"), "{message}");
+    }
+
+    /// `BackendRegistry::get` answers with the first match, so the second entry
+    /// would do nothing at all while looking like configuration.
+    #[test]
+    fn a_duplicate_id_is_refused() {
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "nearai"
+            kind = "nearai"
+
+            [[backends]]
+            id = "nearai"
+            kind = "nearai"
+            "#,
+        );
+        assert!(message.contains("nearai"), "{message}");
+    }
+
+    #[test]
+    fn an_openai_compatible_backend_needs_somewhere_to_send_requests() {
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "local"
+            kind = "openai-compatible"
+            api_key_env = "LOCAL_KEY"
+            "#,
+        );
+        assert!(message.contains("base_url"), "{message}");
+    }
+
+    #[test]
+    fn an_openai_compatible_backend_needs_a_named_key_variable() {
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "local"
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:11434/v1"
+            "#,
+        );
+        assert!(message.contains("api_key_env"), "{message}");
+    }
+
+    #[test]
+    fn a_well_formed_backend_entry_is_accepted() {
+        let config = load(
+            r#"
+            [[backends]]
+            id = "local"
+            kind = "openai-compatible"
+            base_url = "http://127.0.0.1:11434/v1"
+            api_key_env = "LOCAL_KEY"
+            models = ["qwen3-coder"]
+
+            [[backends]]
+            id = "anthropic-key"
+            kind = "anthropic-api"
+            enabled = false
+            "#,
+        )
+        .expect("valid");
+        assert_eq!(config.backends.len(), 2);
+        assert!(!config.backends[1].enabled);
+    }
+
+    /// Validation runs on a file that exists. A fresh install has none, and
+    /// must still start.
+    #[test]
+    fn a_config_with_no_backends_block_is_valid() {
+        assert!(load("[server]\nport = 8463\n").is_ok());
+    }
+
+    #[test]
+    fn every_advertised_kind_parses() {
+        for kind in BackendKind::ALL {
+            assert!(
+                BackendKind::parse(kind).is_some(),
+                "`{kind}` is advertised but not accepted"
+            );
+        }
+        assert!(BackendKind::parse("not-a-kind").is_none());
+    }
 
     #[test]
     fn a_missing_config_yields_defaults_rather_than_failing() {

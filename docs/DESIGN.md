@@ -242,6 +242,38 @@ src/
 
 Dependency direction is strictly downward; `core` depends on nothing of ours.
 
+### Where backends come from
+
+Discovery is the product: a fresh install with a Claude Code login has working
+backends and an empty `config.toml`, and `init --write` generates no
+`[[backends]]` section on purpose. Configuration adjusts that; it does not
+replace it.
+
+```
+for each [[backends]] entry:
+    enabled = false          → never registered, and not shown in status
+    id matches a discovered backend
+                             → discovery builds it; the entry overrides
+                               base_url, api_key_env and models
+    any other id             → built from `kind`
+then: every backend discovery can produce that no entry named
+```
+
+Config-declared backends are appended after the discovered ones. Registration
+order is the tie-break in `Policy::select`, so putting them first would silently
+change which backend wins a tie for everyone who already had a config.
+
+A backend whose credential is missing is still registered, so `status` can say
+"not logged in" rather than omitting it — which reads as though IronWire never
+heard of it. `enabled = false` is a different statement, and does omit it.
+
+`kind` must be one of `claude-subscription`, `anthropic-api`,
+`codex-subscription`, `openai-api`, `nearai`, `openai-compatible`. An unknown
+kind, a duplicate id, or an `openai-compatible` entry without both `base_url`
+and `api_key_env` fails at load, naming the entry — before the port is bound,
+because a backend that silently never appears is the worst way to learn about a
+typo.
+
 ### The daemon and its control API
 
 One daemon per machine, lockfile at `$IRONWIRE_HOME/daemon.lock`, listening on

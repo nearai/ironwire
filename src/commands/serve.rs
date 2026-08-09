@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ironwire_core::config::{Config, PathsConfig};
-use ironwire_core::protocol::ModelTier;
+use ironwire_core::protocol::{BackendId, ModelTier};
 use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
@@ -279,8 +279,20 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     let timeout = config.server.upstream_timeout_secs;
     let mut registry = BackendRegistry::new();
 
+    // `enabled = false` is filtered here, at the point of registration, rather
+    // than by skipping the config entry. A backend can arrive from discovery
+    // without any entry naming it, so filtering the config list would let a
+    // backend the user switched off come straight back.
+    let mut push = |backend: Arc<dyn ironwire_upstream::backend::Backend>| {
+        if is_disabled(config, backend.id().as_str()) {
+            tracing::info!(backend = %backend.id(), "disabled in config.toml; not registered");
+            return;
+        }
+        registry.push(backend);
+    };
+
     if ClaudeCodeCredentials::discover().is_ok() {
-        registry.push(Arc::new(
+        push(Arc::new(
             AnthropicBackend::subscription(
                 base_url_for(config, "claude-sub", "IRONWIRE_ANTHROPIC_BASE_URL"),
                 timeout,
@@ -289,12 +301,10 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         ));
     }
 
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
-        && !key.is_empty()
-    {
-        registry.push(Arc::new(
+    if let Some(key) = api_key_for(config, "anthropic-key", "ANTHROPIC_API_KEY", &real_env) {
+        push(Arc::new(
             AnthropicBackend::api_key(
-                SecretString::from(key),
+                key,
                 base_url_for(config, "anthropic-key", "IRONWIRE_ANTHROPIC_BASE_URL"),
                 timeout,
             )
@@ -306,7 +316,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     // the two are rungs of one ladder and falling between them costs nothing
     // but money (`docs/DESIGN.md` §3).
     if CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt) {
-        registry.push(Arc::new(
+        push(Arc::new(
             ResponsesBackend::codex_subscription(
                 base_url_for(config, "codex-sub", "IRONWIRE_CODEX_BASE_URL"),
                 timeout,
@@ -317,8 +327,10 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
 
     // A key from the environment, or the one Codex itself stored — a user who
     // ran `codex login --api-key` has exactly one place they expect it to live.
-    if let Some(key) = openai_api_key() {
-        registry.push(Arc::new(
+    if let Some(key) =
+        api_key_for(config, "openai-key", "OPENAI_API_KEY", &real_env).or_else(codex_stored_key)
+    {
+        push(Arc::new(
             ResponsesBackend::openai_api_key(
                 key,
                 base_url_for(config, "openai-key", "IRONWIRE_OPENAI_BASE_URL"),
@@ -330,63 +342,227 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
 
     // NEAR AI is a different API family, so it is only ever reached through the
     // translated lane — and only at a turn boundary (`docs/PROTOCOL.md` §6).
-    if let Ok(key) = std::env::var("NEARAI_API_KEY")
-        && !key.is_empty()
-    {
-        registry.push(Arc::new(
+    if let Some(key) = api_key_for(config, "nearai", "NEARAI_API_KEY", &real_env) {
+        push(Arc::new(
             ChatCompletionsBackend::nearai(
-                SecretString::from(key),
+                key,
                 base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
-                nearai_models(config),
+                models_for(config, "nearai").unwrap_or_default(),
                 timeout,
             )
             .context("building the NEAR AI backend")?,
         ));
     }
 
+    // Anything the user declared that discovery does not produce. Appended
+    // rather than prepended: registration order is the tie-break in
+    // `Policy::select`, so putting config entries first would silently change
+    // which backend wins a tie for every existing user.
+    for entry in &config.backends {
+        if !entry.enabled || DISCOVERED_IDS.contains(&entry.id.as_str()) {
+            continue;
+        }
+        if let Some(backend) = backend_from_config(entry, timeout, &real_env)? {
+            push(backend);
+        }
+    }
+
     Ok(registry)
 }
 
-/// The metered OpenAI key, from the environment or from Codex's own store.
-fn openai_api_key() -> Option<SecretString> {
-    if let Ok(key) = std::env::var("OPENAI_API_KEY")
-        && !key.is_empty()
-    {
-        return Some(SecretString::from(key));
+/// Ids that discovery produces on its own.
+///
+/// An entry naming one of these configures it; an entry naming anything else
+/// constructs it.
+const DISCOVERED_IDS: &[&str] = &[
+    "claude-sub",
+    "anthropic-key",
+    "codex-sub",
+    "openai-key",
+    "nearai",
+];
+
+/// Build a backend that discovery would not have produced.
+///
+/// `Ok(None)` when the credential is simply absent — the same rule discovery
+/// follows, where not being logged in is a normal state rather than an error.
+///
+/// # Errors
+///
+/// Propagates a client build failure. Configuration that cannot describe a
+/// backend at all is rejected earlier, by `Config::validate`, so that a bad
+/// file fails before the port is bound rather than at the first request.
+fn backend_from_config(
+    entry: &ironwire_core::config::BackendConfig,
+    timeout: u64,
+    env: EnvLookup<'_>,
+) -> Result<Option<Arc<dyn ironwire_upstream::backend::Backend>>> {
+    use ironwire_core::config::BackendKind;
+
+    let key = |default: &str| entry_key(entry, default, env);
+    let backend: Option<Arc<dyn ironwire_upstream::backend::Backend>> =
+        match BackendKind::parse(&entry.kind) {
+            Some(BackendKind::ClaudeSubscription) => ClaudeCodeCredentials::discover()
+                .is_ok()
+                .then(|| {
+                    AnthropicBackend::subscription(entry.base_url.clone(), timeout)
+                        .context("building a configured Claude subscription backend")
+                })
+                .transpose()?
+                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendKind::AnthropicApi) => key("ANTHROPIC_API_KEY")
+                .map(|key| {
+                    AnthropicBackend::api_key(key, entry.base_url.clone(), timeout)
+                        .context("building a configured Anthropic API backend")
+                })
+                .transpose()?
+                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendKind::CodexSubscription) => CodexCredentials::discover()
+                .is_ok_and(|c| c.mode == CodexMode::ChatGpt)
+                .then(|| {
+                    ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout)
+                        .context("building a configured ChatGPT subscription backend")
+                })
+                .transpose()?
+                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendKind::OpenAiApi) => key("OPENAI_API_KEY")
+                .or_else(codex_stored_key)
+                .map(|key| {
+                    ResponsesBackend::openai_api_key(key, entry.base_url.clone(), timeout)
+                        .context("building a configured OpenAI API backend")
+                })
+                .transpose()?
+                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendKind::NearAi) => key("NEARAI_API_KEY")
+                .map(|key| {
+                    ChatCompletionsBackend::nearai(
+                        key,
+                        entry.base_url.clone(),
+                        entry
+                            .models
+                            .as_ref()
+                            .map(|models| models_from(models))
+                            .unwrap_or_default(),
+                        timeout,
+                    )
+                    .context("building a configured NEAR AI backend")
+                })
+                .transpose()?
+                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendKind::OpenAiCompatible) => {
+                // `validate` has already established that both are present.
+                let (Some(base_url), Some(key)) = (entry.base_url.clone(), key("")) else {
+                    return Ok(None);
+                };
+                Some(Arc::new(
+                    ChatCompletionsBackend::new(
+                        BackendId::from(entry.id.as_str()),
+                        &entry.id,
+                        ironwire_core::protocol::BackendKind::ApiKey,
+                        key,
+                        base_url,
+                        entry
+                            .models
+                            .as_ref()
+                            .map(|models| models_from(models))
+                            .unwrap_or_default(),
+                        timeout,
+                    )
+                    .context("building a configured OpenAI-compatible backend")?,
+                )
+                    as Arc<dyn ironwire_upstream::backend::Backend>)
+            }
+            // Unreachable for a config that came through `Config::validate`.
+            None => None,
+        };
+    Ok(backend)
+}
+
+/// Reading an environment variable, as a value so tests need not mutate a
+/// global that every other test in the process shares.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The real environment.
+fn real_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The key for a config entry: the variable it names, or the default name.
+fn entry_key(
+    entry: &ironwire_core::config::BackendConfig,
+    default_env: &str,
+    env: EnvLookup<'_>,
+) -> Option<SecretString> {
+    let name = entry.api_key_env.as_deref().unwrap_or(default_env);
+    if name.is_empty() {
+        return None;
     }
+    env(name)
+        .filter(|key| !key.is_empty())
+        .map(SecretString::from)
+}
+
+/// The key for a discovered backend, honouring an `api_key_env` override.
+///
+/// A user whose key lives in `ANTHROPIC_API_KEY_WORK` had no way to say so:
+/// the name was hardcoded, and the field that exists to name it was never read.
+fn api_key_for(
+    config: &Config,
+    id: &str,
+    default_env: &str,
+    env: EnvLookup<'_>,
+) -> Option<SecretString> {
+    let name = config
+        .backends
+        .iter()
+        .find(|entry| entry.id == id)
+        .and_then(|entry| entry.api_key_env.as_deref())
+        .unwrap_or(default_env);
+    env(name)
+        .filter(|key| !key.is_empty())
+        .map(SecretString::from)
+}
+
+/// Whether the user switched this backend off.
+///
+/// Checked where a backend is registered rather than where a config entry is
+/// read: discovery produces backends no entry names, so filtering the config
+/// list would let a disabled backend come straight back.
+fn is_disabled(config: &Config, id: &str) -> bool {
+    config
+        .backends
+        .iter()
+        .any(|entry| entry.id == id && !entry.enabled)
+}
+
+/// The metered OpenAI key Codex itself stored, for a user who ran
+/// `codex login --api-key` and expects it to be found there.
+fn codex_stored_key() -> Option<SecretString> {
     let creds = CodexCredentials::discover().ok()?;
     (creds.mode == CodexMode::ApiKey).then(|| creds.bearer().token)
 }
 
-/// Models to offer from NEAR AI.
+/// Models configured for a backend, if the user listed any.
 ///
-/// Configurable because the catalogue moves faster than our releases; the
-/// default is one frontier-tier slug so a user with only a key still gets a
-/// working fallback.
-fn nearai_models(config: &Config) -> Vec<(String, ModelTier)> {
+/// Applies to every kind that accepts a catalogue, not only NEAR AI: a
+/// configured list was previously read for one id and silently ignored for
+/// every other. `None` means "nothing configured", which is different from an
+/// empty list and leaves the provider's own catalogue in charge.
+fn models_for(config: &Config, id: &str) -> Option<Vec<(String, ModelTier)>> {
     config
         .backends
         .iter()
-        .find(|b| b.id == "nearai")
-        .and_then(|b| b.models.clone())
-        .map_or_else(
-            // Empty, not a guess. The previous default named `deepseek-v3`,
-            // which is not a model this endpoint has ever served under that id
-            // — so a fallback route was built on a name that could only 400.
-            // With nothing here the catalogue comes from the provider, and
-            // until it does this backend has no model to offer, which is the
-            // truth.
-            Vec::new,
-            |models| {
-                models
-                    .into_iter()
-                    .map(|m| {
-                        let tier = ModelTier::from_model_hint(&m);
-                        (m, tier)
-                    })
-                    .collect()
-            },
-        )
+        .find(|entry| entry.id == id)
+        .and_then(|entry| entry.models.as_ref())
+        .map(|models| models_from(models))
+}
+
+/// Tier each configured slug by the same rule the rest of the router uses.
+fn models_from(models: &[String]) -> Vec<(String, ModelTier)> {
+    models
+        .iter()
+        .map(|model| (model.clone(), ModelTier::from_model_hint(model)))
+        .collect()
 }
 
 /// Base-URL override for a backend.
@@ -441,5 +617,133 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ironwire_core::config::BackendConfig;
+
+    fn entry(id: &str, kind: &str) -> BackendConfig {
+        BackendConfig {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key_env: None,
+            models: None,
+        }
+    }
+
+    fn env_with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| {
+            owned
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// The field existed and was never read, so a key that did not live under
+    /// the hardcoded name was unreachable.
+    #[test]
+    fn api_key_env_names_the_variable_the_key_is_read_from() {
+        let env = env_with(&[("WORK_KEY", "sk-work"), ("ANTHROPIC_API_KEY", "sk-default")]);
+        let mut config = Config::default();
+        let mut declared = entry("anthropic-key", "anthropic-api");
+        declared.api_key_env = Some("WORK_KEY".to_string());
+        config.backends.push(declared);
+
+        let key = api_key_for(&config, "anthropic-key", "ANTHROPIC_API_KEY", &env)
+            .expect("a key was configured");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-work");
+    }
+
+    #[test]
+    fn the_default_variable_is_used_when_none_is_named() {
+        let env = env_with(&[("ANTHROPIC_API_KEY", "sk-default")]);
+        let key = api_key_for(
+            &Config::default(),
+            "anthropic-key",
+            "ANTHROPIC_API_KEY",
+            &env,
+        )
+        .expect("a key was configured");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-default");
+    }
+
+    /// The kind that could not be built at all before this: the one documented
+    /// route to an endpoint IronWire does not discover.
+    #[test]
+    fn an_openai_compatible_entry_builds_a_backend_at_its_own_url() {
+        let mut declared = entry("local", "openai-compatible");
+        declared.base_url = Some("http://127.0.0.1:11434/v1".to_string());
+        declared.api_key_env = Some("LOCAL_KEY".to_string());
+        declared.models = Some(vec!["qwen3-coder".to_string()]);
+
+        let built = backend_from_config(&declared, 60, &env_with(&[("LOCAL_KEY", "sk-local")]))
+            .expect("builds")
+            .expect("a credential was available");
+        assert_eq!(built.id().as_str(), "local");
+        assert_eq!(
+            built.models(),
+            vec![("qwen3-coder".to_string(), ModelTier::Frontier)]
+        );
+    }
+
+    /// A missing credential is a normal state, not an error — the same rule
+    /// discovery follows.
+    #[test]
+    fn an_entry_whose_key_is_absent_is_skipped_rather_than_failing() {
+        let mut declared = entry("local", "openai-compatible");
+        declared.base_url = Some("http://127.0.0.1:11434/v1".to_string());
+        declared.api_key_env = Some("LOCAL_KEY".to_string());
+
+        let built = backend_from_config(&declared, 60, &env_with(&[])).expect("no error");
+        assert!(built.is_none());
+    }
+
+    /// The landmine: a backend discovery produces on its own must still be
+    /// switched off by config, or `enabled = false` is a no-op that reads like
+    /// a kill switch.
+    #[test]
+    fn a_discovered_backend_can_be_disabled_by_config() {
+        let mut config = Config::default();
+        let mut declared = entry("claude-sub", "claude-subscription");
+        declared.enabled = false;
+        config.backends.push(declared);
+
+        assert!(is_disabled(&config, "claude-sub"));
+        assert!(
+            !is_disabled(&config, "codex-sub"),
+            "unrelated backends stay"
+        );
+        assert!(
+            !is_disabled(&Config::default(), "claude-sub"),
+            "a config with no entries disables nothing"
+        );
+    }
+
+    #[test]
+    fn a_configured_catalogue_is_read_for_any_backend_not_just_nearai() {
+        let mut config = Config::default();
+        let mut declared = entry("anthropic-key", "anthropic-api");
+        declared.models = Some(vec!["claude-haiku-4-5".to_string()]);
+        config.backends.push(declared);
+
+        assert_eq!(
+            models_for(&config, "anthropic-key"),
+            Some(vec![("claude-haiku-4-5".to_string(), ModelTier::Fast)])
+        );
+        assert_eq!(
+            models_for(&config, "nearai"),
+            None,
+            "nothing configured is not the same as an empty catalogue"
+        );
     }
 }
