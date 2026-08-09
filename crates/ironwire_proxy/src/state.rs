@@ -330,12 +330,19 @@ impl AppState {
 
     /// Change the privacy mode, everywhere it is read from.
     ///
-    /// Two things have to move together, and the ordering matters. The filter
-    /// decides what gets substituted; the registry's copy decides which
-    /// backends are eligible at all under `full`. Installing the routing
-    /// constraint *first* means there is no instant at which requests could be
-    /// substituted-for-`full` while still eligible to reach an untrusted
-    /// backend — the direction that would leak.
+    /// Two things have to move, and they cannot move atomically: the filter,
+    /// which decides what gets substituted, and the registry's copy, which
+    /// decides which backends are eligible at all under `full`. A request
+    /// routed between the two sees one of them updated and not the other.
+    ///
+    /// The constraint goes first, because the combination worth avoiding is
+    /// *un*-substituted content reaching a backend the user has not named. That
+    /// is the state a raise to `full` starts from, so narrowing eligibility
+    /// before strengthening the filter shortens it rather than extending it.
+    /// The reverse order would leave the widest window in exactly the direction
+    /// that matters. (The mirror-image window — content substituted for `full`
+    /// reaching an untrusted backend — is strictly safer than what preceded it,
+    /// so it costs nothing.)
     ///
     /// Persistence is the caller's job: this is the running daemon's state, and
     /// a change that could not be written to `config.toml` is still a change
