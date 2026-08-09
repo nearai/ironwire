@@ -312,6 +312,16 @@ pub struct PrivacyConfig {
     /// nearly always the code being edited, and substituting it makes the model
     /// rewrite a file into something that does not work.
     pub scan_code_blocks: bool,
+    /// Backends that may receive requests under `mode = "full"`.
+    ///
+    /// No default, deliberately. Not `["nearai"]`, not "anything local": a
+    /// shipped default would be IronWire asserting that some operator is
+    /// trustworthy for someone else's data, which it has no basis to do. The
+    /// user names the destinations, or the daemon does not start.
+    ///
+    /// Ignored below `full`, with a warning at load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_backends: Vec<String>,
     /// Scan replayed tool results. Off by default — they are output from the
     /// user's own machine that the model needs verbatim to reason about.
     pub scan_tool_results: bool,
@@ -381,6 +391,7 @@ impl Default for PrivacyConfig {
             enabled: false,
             secrets: true,
             named_values: Vec::new(),
+            trusted_backends: Vec::new(),
             scan_code_blocks: false,
             scan_tool_results: false,
         }
@@ -404,6 +415,15 @@ impl PrivacyConfig {
         } else {
             PrivacyMode::Off
         }
+    }
+
+    /// Whether this backend may be routed to at all.
+    ///
+    /// Only `full` restricts anything; every lower level returns true for
+    /// everything, so this is safe to call unconditionally from the router.
+    #[must_use]
+    pub fn trusts(&self, backend: &str) -> bool {
+        self.mode() != PrivacyMode::Full || self.trusted_backends.iter().any(|id| id == backend)
     }
 
     /// Whether the filter would actually do anything.
@@ -436,7 +456,16 @@ impl PrivacyConfig {
         if !self.named_values.is_empty() {
             parts.push(format!("{} named value(s)", self.named_values.len()));
         }
-        parts.join(" + ")
+        let mut line = parts.join(" + ");
+        if mode == PrivacyMode::Full {
+            // What it is *doing*, never what the user is safe from: the trusted
+            // backend still receives the data (`docs/TRUST.md` I7).
+            line.push_str(&format!(
+                " — routing restricted to: {}",
+                self.trusted_backends.join(", ")
+            ));
+        }
+        line
     }
 }
 
@@ -674,6 +703,35 @@ impl Config {
             id: id.to_string(),
             detail,
         };
+
+        if self.privacy.mode() == PrivacyMode::Full && self.privacy.trusted_backends.is_empty() {
+            return Err(Error::ConfigInvalid {
+                path: path.to_path_buf(),
+                id: "privacy".to_string(),
+                detail: format!(
+                    "`mode = \"full\"` restricts routing to backends you name, and \
+                     `trusted_backends` is empty — so nothing could be routed \
+                     anywhere. Name the destinations you accept, for example: \
+                     trusted_backends = [{}]. There is no default: which \
+                     operators you trust with your data is not IronWire's call.",
+                    if self.backends.is_empty() {
+                        "\"nearai\"".to_string()
+                    } else {
+                        self.backends
+                            .iter()
+                            .map(|b| format!("\"{}\"", b.id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+            });
+        }
+        if self.privacy.mode() < PrivacyMode::Full && !self.privacy.trusted_backends.is_empty() {
+            tracing::warn!(
+                "`privacy.trusted_backends` is set but `privacy.mode` is below `full`; \
+                 it restricts nothing at this level"
+            );
+        }
 
         let mut seen: Vec<&str> = Vec::new();
         for backend in &self.backends {

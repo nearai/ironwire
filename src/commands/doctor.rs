@@ -53,6 +53,35 @@ pub(crate) async fn run(port: Option<u16>) -> Result<()> {
     }
 
     println!();
+    // Said before any probe: under `full` a healthy backend that is not
+    // trusted is not an answer, and a user staring at green probe lines
+    // should not have to work that out.
+    let privacy = super::paths()
+        .ok()
+        .and_then(|paths| ironwire_core::config::Config::load(&paths).ok())
+        .map(|config| config.privacy)
+        .unwrap_or_default();
+    if privacy.mode() == ironwire_core::config::PrivacyMode::Full {
+        let registered: Vec<&str> = status
+            .backends
+            .iter()
+            .filter(|b| b.authenticated && privacy.trusted_backends.contains(&b.id))
+            .map(|b| b.id.as_str())
+            .collect();
+        if registered.is_empty() {
+            println!(
+                "privacy      mode is `full`, and none of the trusted backends ({}) \n\
+                 \x20            is connected — every request will be refused",
+                privacy.trusted_backends.join(", ")
+            );
+        } else {
+            println!(
+                "privacy      mode is `full` — routing restricted to {}",
+                registered.join(", ")
+            );
+        }
+        println!();
+    }
     println!("Probing backends…");
     let mut failures = 0;
     for probe in client.probe().await? {

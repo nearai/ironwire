@@ -21,6 +21,9 @@ use crate::privacy::PrivacyFilter;
 #[derive(Clone, Default)]
 pub struct BackendRegistry {
     backends: Vec<Arc<dyn Backend>>,
+    /// The privacy config, for the trusted-backend constraint. `None` until
+    /// state is built, which is only the case in tests that never route.
+    privacy_policy: Option<Arc<ironwire_core::config::PrivacyConfig>>,
 }
 
 impl BackendRegistry {
@@ -33,6 +36,29 @@ impl BackendRegistry {
     /// Add a backend. Order is the tie-break for equally-preferred candidates.
     pub fn push(&mut self, backend: Arc<dyn Backend>) {
         self.backends.push(backend);
+    }
+
+    /// Install the privacy config, so `candidates` can mark what may be routed
+    /// to under `privacy.mode = "full"`.
+    pub fn set_privacy(&mut self, privacy: Arc<ironwire_core::config::PrivacyConfig>) {
+        self.privacy_policy = Some(privacy);
+    }
+
+    /// Trusted ids named in config that no registered backend answers to.
+    #[must_use]
+    pub fn missing_trusted(&self) -> Vec<String> {
+        self.privacy_policy
+            .as_ref()
+            .filter(|privacy| privacy.mode() == ironwire_core::config::PrivacyMode::Full)
+            .map(|privacy| {
+                privacy
+                    .trusted_backends
+                    .iter()
+                    .filter(|id| !self.backends.iter().any(|b| b.id().as_str() == id.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Look up by id.
@@ -101,6 +127,13 @@ impl BackendRegistry {
                     healthy: status.is_none_or(|s| s.authenticated),
                     consented: !backend.kind().requires_consent()
                         || consent.is_granted(backend.id().as_str()),
+                    // Beside `consented` because it is the same shape of fact:
+                    // a user instruction, read from config, that the router
+                    // must obey without knowing where it came from.
+                    trusted: self
+                        .privacy_policy
+                        .as_ref()
+                        .is_none_or(|privacy| privacy.trusts(backend.id().as_str())),
                     requires_client_identity: backend.requires_client_identity(),
                     models: backend.models(),
                     catalogue_from_provider: backend.catalogue_from_provider(),
@@ -206,6 +239,11 @@ impl AppState {
         consent: ConsentLedger,
         control_token: String,
     ) -> Self {
+        // The registry has to know the privacy policy before it can say which
+        // backends may be routed to, and this is the one place both are in
+        // scope.
+        let mut backends = backends;
+        backends.set_privacy(Arc::new(config.privacy.clone()));
         Self {
             backends,
             policy: Arc::new(Mutex::new(Policy::new())),

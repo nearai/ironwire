@@ -207,7 +207,7 @@ python3 - "${IRONWIRE_HOME}/config.toml" <<'EDIT'
 import re, sys
 path = sys.argv[1]
 text = open(path).read()
-text = text.replace("enabled = false", "enabled = true")
+text = text.replace('mode = "off"', 'mode = "credentials"')
 text = text.replace('named_values = []', 'named_values = ["Acme Holdings"]')
 open(path, "w").write(text)
 EDIT

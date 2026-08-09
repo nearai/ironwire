@@ -144,6 +144,15 @@ pub enum Ineligible {
     StructuredOutputUnsupported,
     /// Prompt does not fit.
     ContextTooSmall,
+    /// `privacy.mode = "full"` and this backend is not in `trusted_backends`.
+    ///
+    /// The one variant here that is not a statement about what the *wire* can
+    /// carry. Everything else in this gate answers "would the agent break";
+    /// this answers "did the user forbid it", and it belongs here for the same
+    /// reason: eligibility is the only place a constraint cannot be sorted
+    /// around. Expressed as a preference it would be one exhausted backend away
+    /// from being silently ignored.
+    NotTrustedUnderFullPrivacy,
     /// The backend speaks a different wire, and this build has no translation
     /// between the two. Not a quality loss — the request would arrive in a
     /// shape the backend cannot read at all.

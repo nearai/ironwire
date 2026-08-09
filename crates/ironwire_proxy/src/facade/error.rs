@@ -175,6 +175,41 @@ impl FacadeError {
                      `on_breach = \"descend\"`, or wait for the window to reset."
                 ),
             ),
+            // The cause is named first and plainly: a user who forgot the
+            // setting has to be able to connect the symptom to it in one read.
+            // It says what IronWire is *doing* — restricting routing to a named
+            // set — and never that anything is safe (`docs/TRUST.md` I7).
+            NoRoute::NoTrustedBackendAvailable { tried, missing } => {
+                let mut detail = String::new();
+                if !tried.is_empty() {
+                    detail.push_str(&format!(
+                        " Trusted backends were tried: {}.",
+                        tried
+                            .iter()
+                            .map(|(id, why)| format!("{id} ({why})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !missing.is_empty() {
+                    detail.push_str(&format!(
+                        " These ids are in `trusted_backends` but are not \
+                         connected backends: {}.",
+                        missing.join(", ")
+                    ));
+                }
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "api_error",
+                    format!(
+                        "Refused because `privacy.mode = \"full\"` restricts routing \
+                         to the backends in `privacy.trusted_backends`, and none of \
+                         them can serve this request.{detail} IronWire will not fall \
+                         back to a backend you excluded. Run `ironwire status` to \
+                         see the trusted set, or change the mode in config.toml."
+                    ),
+                )
+            }
             NoRoute::RequiresClientIdentity => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",

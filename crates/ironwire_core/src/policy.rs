@@ -101,6 +101,11 @@ pub struct Candidate {
     pub requires_client_identity: bool,
     /// Models this backend offers, best-first, with the tier each satisfies.
     pub models: Vec<(String, ModelTier)>,
+    /// Whether the user's privacy mode permits routing here.
+    ///
+    /// Computed where the config lives, beside `consented`, so this crate stays
+    /// free of config knowledge. Always true below `privacy.mode = "full"`.
+    pub trusted: bool,
     /// Whether [`Self::models`] came from the provider rather than from a list
     /// compiled into this binary.
     ///
@@ -147,6 +152,20 @@ pub enum NoRoute {
     /// The only backends that could serve this need a client identity the
     /// request does not carry.
     RequiresClientIdentity,
+    /// `privacy.mode = "full"` is on and no trusted backend could serve this.
+    ///
+    /// A refusal, never a fallback. Everywhere else IronWire's job is to keep
+    /// the agent alive; this is the one place that is subordinate, because a
+    /// user who set `full` said that not sending the data matters more than
+    /// finishing the turn.
+    NoTrustedBackendAvailable {
+        /// Trusted backends that exist, and why each could not serve this.
+        tried: Vec<(BackendId, String)>,
+        /// Ids named in `trusted_backends` that are not registered at all — a
+        /// typo here refuses everything, and saying only "no trusted backend"
+        /// sends the user hunting in the wrong place.
+        missing: Vec<String>,
+    },
     /// Every backend that could have served this is stopped by a spend cap the
     /// user set.
     ///
@@ -391,6 +410,21 @@ impl Policy {
         if let Some((pinned, model)) = forced
             && let Some(candidate) = candidates.iter().find(|c| c.id == pinned)
         {
+            // A pin overrides *preference*. It cannot override the privacy
+            // mode: a per-request header that could relax a constraint set in
+            // the user's own config would make the setting decorative for
+            // anything able to set a header.
+            if !candidate.trusted {
+                return Err(NoRoute::NoTrustedBackendAvailable {
+                    tried: vec![(
+                        candidate.id.clone(),
+                        "named by a pin or X-IronWire-Route, but not in \
+                         privacy.trusted_backends"
+                            .to_string(),
+                    )],
+                    missing: Vec::new(),
+                });
+            }
             let cross = candidate.caps.protocol.family() != inbound.family();
             eligible(&peek.requirements, &candidate.caps, cross).map_err(|why| {
                 NoRoute::AllIneligible {
@@ -761,6 +795,22 @@ impl Policy {
                 cap_usd,
             });
         }
+        // Reported ahead of everything else: when the mode is what stopped the
+        // request, any other reason is incidental to a backend the user had
+        // already excluded.
+        if ineligible
+            .iter()
+            .any(|(_, why)| *why == Ineligible::NotTrustedUnderFullPrivacy)
+        {
+            return Err(NoRoute::NoTrustedBackendAvailable {
+                tried: ineligible
+                    .iter()
+                    .filter(|(_, why)| *why != Ineligible::NotTrustedUnderFullPrivacy)
+                    .map(|(id, why)| (id.clone(), format!("{why:?}")))
+                    .collect(),
+                missing: Vec::new(),
+            });
+        }
         if !ineligible.is_empty() {
             return Err(NoRoute::AllIneligible {
                 reasons: ineligible,
@@ -820,6 +870,12 @@ fn usable(
     // and we never synthesize that client's identity to unlock it.
     if candidate.requires_client_identity && !peek.carries_client_identity {
         return Err(Unusable::NeedsClientIdentity);
+    }
+    // Checked before the capability gate on purpose: a user who forbade this
+    // destination should be told that, not handed an incidental capability
+    // mismatch on a backend they were never going to reach.
+    if !candidate.trusted {
+        return Err(Unusable::Ineligible(Ineligible::NotTrustedUnderFullPrivacy));
     }
     // "Needs translation" is a question about the wire, not about the family:
     // Responses and Chat Completions share a family and are different wires.
@@ -909,6 +965,7 @@ mod tests {
                 ("claude-sonnet-4-6".to_string(), ModelTier::Balanced),
             ],
             catalogue_from_provider: true,
+            trusted: true,
         }
     }
 
@@ -1161,6 +1218,128 @@ mod tests {
             );
             assert_eq!(later.reason, "sticky affinity");
             assert_eq!(later.backend.as_str(), "claude-sub");
+        }
+    }
+
+    /// `privacy.mode = "full"` names the destinations that may receive a
+    /// request, and nothing may route around it.
+    mod full_privacy {
+        use super::*;
+
+        fn ladder() -> Vec<Candidate> {
+            let mut trusted =
+                candidate("nearai", BackendKind::Credits, Protocol::AnthropicMessages);
+            trusted.trusted = true;
+            let mut untrusted = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            untrusted.trusted = false;
+            // Untrusted first, so a test cannot pass by accident of ordering.
+            vec![untrusted, trusted]
+        }
+
+        #[test]
+        fn only_a_trusted_backend_is_routed_to() {
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &ladder(),
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(
+                decision.backend.as_str(),
+                "nearai",
+                "routed to a backend the user excluded"
+            );
+        }
+
+        /// The refusal is the feature. Everywhere else IronWire keeps the agent
+        /// alive; here the user said not sending the data matters more.
+        #[test]
+        fn nothing_trusted_means_refused_not_redirected() {
+            let mut candidates = ladder();
+            candidates.retain(|c| !c.trusted);
+            let mut policy = Policy::new();
+            let error = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &candidates,
+                    t(0),
+                )
+                .expect_err("must refuse");
+            assert!(
+                matches!(error, NoRoute::NoTrustedBackendAvailable { .. }),
+                "got {error:?}"
+            );
+        }
+
+        /// A header a client can set must not relax a constraint the user put
+        /// in their own config, or the setting is decorative.
+        #[test]
+        fn a_pin_cannot_reach_an_untrusted_backend() {
+            let mut policy = Policy::new();
+            let error = policy
+                .decide_with_override(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &ladder(),
+                    t(0),
+                    Some((BackendId::from("claude-sub"), None)),
+                )
+                .expect_err("must refuse");
+            assert!(
+                matches!(error, NoRoute::NoTrustedBackendAvailable { .. }),
+                "a pin routed around the privacy mode: {error:?}"
+            );
+        }
+
+        /// The silent-leak case: an affinity established before the config
+        /// changed must not survive it. The sticky path runs `usable`, and this
+        /// pins that it does.
+        #[test]
+        fn an_existing_affinity_to_a_now_untrusted_backend_is_dropped() {
+            let mut policy = Policy::new();
+            // First, with everything trusted, settle on claude-sub.
+            let mut open = ladder();
+            for candidate in &mut open {
+                candidate.trusted = true;
+            }
+            let first = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &open,
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(first.backend.as_str(), "claude-sub");
+
+            // The user then restricts the trusted set. The very next request
+            // must leave, not continue on the affinity.
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &ladder(),
+                    t(60),
+                )
+                .expect("routes");
+            assert_eq!(
+                decision.backend.as_str(),
+                "nearai",
+                "a sticky affinity kept sending to a backend the user excluded"
+            );
         }
     }
 
@@ -1699,6 +1878,7 @@ mod compaction_tests {
             // These fixtures state what a backend really offers, so they stand
             // for a catalogue the provider gave us, not one we guessed.
             catalogue_from_provider: true,
+            trusted: true,
         }
     }
 

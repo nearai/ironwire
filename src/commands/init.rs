@@ -303,8 +303,14 @@ check = true
 # pii         — credentials, plus emails, IP addresses and phone numbers.
 #               Deterministic classes only: names need a classifier that has
 #               to publish its precision and recall before it ships.
-# full        — pii, and only trusted backends are routed to.
+# full        — pii, and requests are routed only to the backends named in
+#               trusted_backends below. Nothing else is tried: when none of
+#               them can serve a request, IronWire refuses it rather than
+#               falling back. There is no default set — which operators you
+#               trust with your data is not IronWire's call to make.
 mode = "off"
+# Required when mode = "full"; ignored otherwise.
+# trusted_backends = ["nearai", "ollama"]
 # API keys, tokens and private keys, by shape.
 secrets = true
 # Exact strings to substitute — your employer, a customer's domain. Note that

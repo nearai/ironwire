@@ -126,6 +126,26 @@ Three consequences worth stating plainly:
 
 ---
 
+### `full`: a constraint on the destination, not on the content
+
+Substitution has a false-negative rate nobody can measure on someone else's
+data, so it cannot answer "this must not reach Anthropic". `mode = "full"` does,
+by making the trusted set a routing *eligibility* rule: a backend the user did
+not name stops being a candidate, and when none of the named ones can serve a
+request IronWire refuses it and says so. A pin and an `X-IronWire-Route` header
+cannot relax it — a per-request header able to override a config-level privacy
+constraint would make the setting decorative.
+
+What it does **not** do: the trusted backend still receives the request in full.
+`full` means "only these destinations". It does not mean encrypted, anonymous,
+or safe, and no string this feature prints says otherwise (`docs/TRUST.md` I7).
+Substitution at the `pii` level still runs on the way there — trusted is not the
+same as unfiltered.
+
+There is no default trusted set. Shipping one would be IronWire asserting that
+some operator is trustworthy for someone else's data; the daemon refuses to
+start under `full` with an empty list instead.
+
 ### Measured cost
 
 `credentials` costs ~1.5 ms per turn on a 333 KB history; `pii` costs ~8 ms —

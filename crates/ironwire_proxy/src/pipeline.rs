@@ -193,6 +193,18 @@ pub async fn dispatch(
     // returns early from inside the failover loop too, and a channel that
     // reports only some failures is worse than one that reports none — a user
     // would learn to read silence as success.
+    let result = result.map_err(|error| match error {
+        // The router knows a trusted backend could not serve this; only the
+        // registry knows which trusted ids do not exist at all. A typo there
+        // refuses everything, so it has to reach the message.
+        PipelineError::NoRoute(NoRoute::NoTrustedBackendAvailable { tried, .. }) => {
+            PipelineError::NoRoute(NoRoute::NoTrustedBackendAvailable {
+                tried,
+                missing: state.backends.missing_trusted(),
+            })
+        }
+        other => other,
+    });
     if let Err(error) = &result {
         state.events.publish(crate::events::Event::Failed {
             at: Utc::now(),
