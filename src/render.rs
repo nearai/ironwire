@@ -4,20 +4,31 @@
 //! `unknown` (`docs/CRITIQUE.md` §4). A plausible fabricated percentage costs
 //! us belief in the numbers that *are* real, which is most of the value of this
 //! screen.
+//!
+//! The session section is the one place that shows a figure the provider did
+//! not state, and it is not an exception to that rule: it measures IronWire's
+//! own traffic and labels every derived number with where it came from. See
+//! [`ironwire_usage`] for why that is a different claim from quota.
 
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_proxy::control::{
     BackendView, BalanceView, HeadroomView, HealthView, LogView, StatusView,
 };
 use ironwire_update::UpdateStatus;
+use ironwire_usage::{Basis, SessionUsage, UsageReport};
+
+use crate::style::Style;
 
 /// Render `ironwire log`.
 #[must_use]
-pub(crate) fn log(view: &LogView) -> String {
+pub(crate) fn log(view: &LogView, style: Style) -> String {
     let mut out = String::new();
     if !view.enabled {
         out.push_str("Local trace capture is off.\n\n");
-        out.push_str("  Turn it on with `capture.enabled = true` in\n");
+        out.push_str(&format!(
+            "  Turn it on with {} in\n",
+            style.action("capture.enabled = true")
+        ));
         out.push_str("  $IRONWIRE_HOME/config.toml, then restart the daemon.\n");
         return out;
     }
@@ -26,19 +37,19 @@ pub(crate) fn log(view: &LogView) -> String {
         return out;
     }
 
-    out.push_str(&format!(
+    out.push_str(&style.dim(format!(
         "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}\n",
         "when", "backend", "model", "in/cached", "out", "took"
-    ));
+    )));
     for exchange in &view.exchanges {
-        out.push_str(&exchange_row(exchange));
+        out.push_str(&exchange_row(exchange, style));
     }
     out.push('\n');
-    out.push_str(&summary_block(&view.last_24h));
+    out.push_str(&summary_block(&view.last_24h, style));
     out
 }
 
-fn exchange_row(exchange: &Exchange) -> String {
+fn exchange_row(exchange: &Exchange, style: Style) -> String {
     let model = exchange
         .served_model
         .as_deref()
@@ -57,19 +68,19 @@ fn exchange_row(exchange: &Exchange) -> String {
     let status = if exchange.status == 200 {
         String::new()
     } else {
-        format!("  [{}]", exchange.status)
+        style.bad(format!("  [{}]", exchange.status))
     };
     // Shown only when the filter was on. Zero substitutions on a turn the user
     // believed was being filtered is exactly the signal they need, so it is
     // printed rather than suppressed as uninteresting (`docs/PRIVACY.md` §7).
     let filtered = exchange
         .substitutions
-        .map_or_else(String::new, |n| format!("  🔒{n}"));
+        .map_or_else(String::new, |n| style.dim(format!("  🔒{n}")));
 
     format!(
         "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}{status}{filtered}\n",
-        exchange.started_at.format("%Y-%m-%d %H:%M:%S"),
-        truncate(&exchange.backend, 15),
+        style.dim(exchange.started_at.format("%Y-%m-%d %H:%M:%S")),
+        style.name(format!("{:<15}", truncate(&exchange.backend, 15))),
         truncate(model, 18),
         format!("{}{}", tokens(exchange.input_tokens), cached),
         tokens(exchange.output_tokens),
@@ -77,9 +88,13 @@ fn exchange_row(exchange: &Exchange) -> String {
     )
 }
 
-fn summary_block(summary: &Summary) -> String {
+fn summary_block(summary: &Summary, style: Style) -> String {
     let mut out = String::new();
-    out.push_str(&format!("last 24h: {} exchanges", summary.exchanges));
+    out.push_str(&format!(
+        "{} {} exchanges",
+        style.dim("last 24h:"),
+        style.value(summary.exchanges)
+    ));
     if summary.without_usage > 0 {
         out.push_str(&format!(
             " ({} with no usage reported)",
@@ -88,7 +103,8 @@ fn summary_block(summary: &Summary) -> String {
     }
     out.push('\n');
     out.push_str(&format!(
-        "  tokens: {} in · {} cached · {} out\n",
+        "  {} {} in · {} cached · {} out\n",
+        style.dim("tokens:"),
         compact(summary.input_tokens),
         compact(summary.cache_read_tokens),
         compact(summary.output_tokens),
@@ -97,10 +113,10 @@ fn summary_block(summary: &Summary) -> String {
         let split = summary
             .by_backend
             .iter()
-            .map(|(backend, count)| format!("{backend} {count}"))
+            .map(|(backend, count)| format!("{} {count}", style.name(backend)))
             .collect::<Vec<_>>()
             .join(" · ");
-        out.push_str(&format!("  routed: {split}\n"));
+        out.push_str(&format!("  {} {split}\n", style.dim("routed:")));
     }
     out
 }
@@ -112,6 +128,19 @@ fn compact(value: i64) -> String {
         format!("{:.1}k", value as f64 / 1_000.0)
     } else {
         value.to_string()
+    }
+}
+
+/// The same scale for a rate, which is rarely a whole number.
+fn compact_rate(value: f64) -> String {
+    if value >= 1_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else if value >= 10.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
     }
 }
 
@@ -127,33 +156,48 @@ fn truncate(text: &str, width: usize) -> String {
 
 /// Render the full status screen.
 #[must_use]
-pub(crate) fn status(status: &StatusView) -> String {
+pub(crate) fn status(status: &StatusView, style: Style) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "IronWire {} — http://127.0.0.1:{}\n\n",
-        status.version, status.port
+        "{} {} — {}\n\n",
+        style.heading("IronWire"),
+        status.version,
+        style.action(format!("http://127.0.0.1:{}", status.port))
     ));
 
     if status.backends.is_empty() {
         out.push_str("No backends configured.\n\n");
-        out.push_str("  Run `ironwire connect claude --subscription`, or set\n");
+        out.push_str(&format!(
+            "  Run {}, or set\n",
+            style.action("`ironwire connect claude --subscription`")
+        ));
         out.push_str("  ANTHROPIC_API_KEY and restart the daemon.\n");
         return out;
     }
 
     for backend in &status.backends {
-        out.push_str(&backend_block(backend));
+        out.push_str(&backend_block(backend, style));
         out.push('\n');
     }
 
-    let balance = balance_block(&status.balance);
+    let balance = balance_block(&status.balance, style);
     if !balance.is_empty() {
         out.push_str(&balance);
         out.push('\n');
     }
 
+    let usage = usage_block(&status.usage, style);
+    if !usage.is_empty() {
+        out.push_str(&usage);
+        out.push('\n');
+    }
+
     if let Some(pin) = &status.pin {
-        out.push_str(&format!("Pinned to {pin} (clear with `ironwire pin`)\n"));
+        out.push_str(&format!(
+            "Pinned to {} (clear with {})\n",
+            style.name(pin),
+            style.action("`ironwire pin`")
+        ));
     }
     out.push_str(&format!(
         "{} conversation(s) with a sticky route\n",
@@ -172,20 +216,26 @@ pub(crate) fn status(status: &StatusView) -> String {
             status.quirks_serial
         ));
     }
-    out.push_str(&update_line(&status.update));
+    out.push_str(&update_line(&status.update, style));
     out
 }
 
 /// Notify-only: say a newer release exists and how to get it. Never act.
-fn update_line(update: &UpdateStatus) -> String {
+fn update_line(update: &UpdateStatus, style: Style) -> String {
     match update {
         UpdateStatus::Available {
             latest,
             upgrade_command,
             ..
         } => match upgrade_command {
-            Some(command) => format!("\nironwire {latest} is available — {command}\n"),
-            None => format!("\nironwire {latest} is available\n"),
+            Some(command) => format!(
+                "\n{}\n",
+                style.warn(format!("ironwire {latest} is available — {command}"))
+            ),
+            None => format!(
+                "\n{}\n",
+                style.warn(format!("ironwire {latest} is available"))
+            ),
         },
         UpdateStatus::Unsupported {
             latest,
@@ -196,36 +246,48 @@ fn update_line(update: &UpdateStatus) -> String {
                 .as_deref()
                 .map_or_else(String::new, |c| format!(" — {c}"));
             format!(
-                "\nThis build is below the supported floor ({minimum_supported}); providers may \n\
-                 have changed in ways it does not handle. {latest} is available{how}\n"
+                "\n{}\n",
+                style.bad(format!(
+                    "This build is below the supported floor ({minimum_supported}); providers may \n\
+                     have changed in ways it does not handle. {latest} is available{how}"
+                ))
             )
         }
         UpdateStatus::UpToDate | UpdateStatus::Unknown => String::new(),
     }
 }
 
-fn backend_block(backend: &BackendView) -> String {
+fn backend_block(backend: &BackendView, style: Style) -> String {
     let mut out = String::new();
-    out.push_str(&format!("{}\n", backend.name));
+    out.push_str(&format!("{}\n", style.name(&backend.name)));
 
     if !backend.authenticated {
         let detail = backend.detail.as_deref().unwrap_or("not authenticated");
-        out.push_str(&format!("  not connected — {detail}\n"));
+        out.push_str(&format!("  {} — {detail}\n", style.bad("not connected")));
         return out;
     }
     if !backend.consented {
-        out.push_str("  awaiting consent — run `ironwire connect claude --subscription`\n");
+        out.push_str(&format!(
+            "  {} — run {}\n",
+            style.warn("awaiting consent"),
+            style.action("`ironwire connect claude --subscription`")
+        ));
         return out;
     }
 
     out.push_str(&format!(
-        "  connected · {}\n",
+        "  {} · {}\n",
+        style.good("connected"),
         backend.kind.replace('_', " ")
     ));
-    out.push_str(&format!("  capacity: {}\n", headroom(&backend.headroom)));
+    out.push_str(&format!(
+        "  {} {}\n",
+        style.dim("capacity:"),
+        headroom(&backend.headroom, style)
+    ));
     // Only when it is not the boring answer. A "circuit: closed" line on every
     // healthy backend is noise that trains people to stop reading the block.
-    if let Some(line) = health_line(&backend.health) {
+    if let Some(line) = health_line(&backend.health, style) {
         out.push_str(&format!("  {line}\n"));
     }
     if !backend.models.is_empty() {
@@ -242,20 +304,24 @@ fn backend_block(backend: &BackendView) -> String {
             .collect::<Vec<_>>();
         let rest = backend.models.len().saturating_sub(shown.len());
         let more = if rest > 0 {
-            format!(" (+{rest} more)")
+            style.dim(format!(" (+{rest} more)"))
         } else {
             String::new()
         };
-        out.push_str(&format!("  models: {}{more}\n", shown.join(", ")));
+        out.push_str(&format!(
+            "  {} {}{more}\n",
+            style.dim("models:"),
+            shown.join(", ")
+        ));
     }
     out
 }
 
 /// Say a backend is being skipped, and why — a silently-skipped backend looks
 /// like one that is simply not being chosen.
-fn health_line(health: &HealthView) -> Option<String> {
+fn health_line(health: &HealthView, style: Style) -> Option<String> {
     match health.circuit.as_str() {
-        "open" => Some(match health.retry_in_secs {
+        "open" => Some(style.bad(match health.retry_in_secs {
             Some(secs) if secs > 0 => format!(
                 "skipping after {} consecutive failures · next try in {}",
                 health.consecutive_failures,
@@ -265,22 +331,22 @@ fn health_line(health: &HealthView) -> Option<String> {
                 "skipping after {} consecutive failures",
                 health.consecutive_failures
             ),
-        }),
-        "halfopen" | "half_open" => Some("recovering — trying it again now".to_string()),
-        _ if health.consecutive_failures > 0 => Some(format!(
+        })),
+        "halfopen" | "half_open" => Some(style.warn("recovering — trying it again now")),
+        _ if health.consecutive_failures > 0 => Some(style.warn(format!(
             "{} recent failure(s), still in use",
             health.consecutive_failures
-        )),
+        ))),
         _ => None,
     }
 }
 
 /// Every pool as one balance — see `BalanceView` for why this counts pools
 /// rather than merging them into a single number.
-fn balance_block(balance: &BalanceView) -> String {
+fn balance_block(balance: &BalanceView, style: Style) -> String {
     let mut parts = Vec::new();
     if balance.available > 0 {
-        parts.push(match balance.free_available {
+        parts.push(style.good(match balance.free_available {
             0 => format!("{} pool(s) available", balance.available),
             free if free == balance.available => {
                 format!("{} pool(s) available, all already paid for", free)
@@ -289,16 +355,16 @@ fn balance_block(balance: &BalanceView) -> String {
                 "{} pool(s) available ({free} already paid for)",
                 balance.available
             ),
-        });
+        }));
     }
     if balance.unknown > 0 {
         // Not folded into "available": the provider has told us nothing, and
         // reporting that as headroom is exactly the fabrication this screen
         // exists to avoid.
-        parts.push(format!("{} not yet reporting", balance.unknown));
+        parts.push(style.dim(format!("{} not yet reporting", balance.unknown)));
     }
     if balance.unavailable > 0 {
-        parts.push(match balance.next_available_at {
+        parts.push(style.bad(match balance.next_available_at {
             Some(at) => {
                 let secs = (at - chrono::Utc::now()).num_seconds().max(0);
                 format!(
@@ -308,13 +374,13 @@ fn balance_block(balance: &BalanceView) -> String {
                 )
             }
             None => format!("{} unavailable", balance.unavailable),
-        });
+        }));
     }
 
     if parts.is_empty() {
         return String::new();
     }
-    let mut out = format!("Balance: {}\n", parts.join(" · "));
+    let mut out = format!("{} {}\n", style.heading("Balance:"), parts.join(" · "));
 
     // Two different currencies, so two lines rather than one number. A
     // subscription is spent in percent of a window you have already bought; an
@@ -326,62 +392,219 @@ fn balance_block(balance: &BalanceView) -> String {
         .iter()
         .filter(|s| s.exchanges > 0 || s.used_pct.is_some())
         .map(|s| match s.used_pct {
-            Some(pct) => format!("{} {pct:.0}% used", s.name),
-            None => format!("{} not yet reported", s.name),
+            Some(pct) => format!(
+                "{} {}",
+                style.name(&s.name),
+                style.by_usage(f64::from(pct), format!("{pct:.0}% used"))
+            ),
+            None => format!("{} {}", style.name(&s.name), style.dim("not yet reported")),
         })
         .collect();
     if !used.is_empty() {
-        out.push_str(&format!("  subscriptions: {}\n", used.join(" · ")));
+        out.push_str(&format!(
+            "  {} {}\n",
+            style.dim("subscriptions:"),
+            used.join(" · ")
+        ));
     }
     match balance.spend_today_usd {
         // Zero is a result, not an absence: it is the sentence "nothing was
         // billed today", which is the whole point of routing to a subscription.
         // `+ 0.0` because summing no dollars at all gives `-0.0` in IEEE 754,
         // and "$-0.00" reads like a refund.
-        Some(spend) => out.push_str(&format!("  metered spend, last 24h: ${:.2}\n", spend + 0.0)),
-        None => out.push_str("  metered spend, last 24h: not recorded (ledger off)\n"),
+        Some(spend) => out.push_str(&format!(
+            "  {} {}\n",
+            style.dim("metered spend, last 24h:"),
+            style.value(format!("${:.2}", spend + 0.0))
+        )),
+        None => out.push_str(&format!(
+            "  {} {}\n",
+            style.dim("metered spend, last 24h:"),
+            style.dim("not recorded (ledger off)")
+        )),
     }
     out
 }
 
-fn headroom(headroom: &HeadroomView) -> String {
+fn headroom(headroom: &HeadroomView, style: Style) -> String {
     match headroom {
         HeadroomView::Observed {
             used_pct,
             observed_secs_ago,
             resets_in_secs,
         } => {
-            let bar = meter(*used_pct);
-            let age = duration(*observed_secs_ago);
+            let pct = f64::from(*used_pct);
+            let bar = meter(pct, style);
+            let age = style.dim(format!("observed {} ago", duration(*observed_secs_ago)));
+            let used = style.by_usage(pct, format!("{used_pct:.0}% used"));
             match resets_in_secs {
                 Some(reset) if *reset > 0 => format!(
-                    "{bar} {used_pct:.0}% used · resets in {} · observed {age} ago",
-                    duration(*reset)
+                    "{bar} {used} · resets in {} · {age}",
+                    style.value(duration(*reset))
                 ),
-                _ => format!("{bar} {used_pct:.0}% used · observed {age} ago"),
+                _ => format!("{bar} {used} · {age}"),
             }
         }
         HeadroomView::Exhausted { retry_in_secs } => {
-            format!("exhausted · retry in {}", duration(*retry_in_secs))
+            style.bad(format!("exhausted · retry in {}", duration(*retry_in_secs)))
         }
         // Not "0%", not "healthy" — we genuinely do not know, and saying so is
         // what makes the other rows worth believing.
-        HeadroomView::Unknown => "unknown (the provider has not reported yet)".to_string(),
+        HeadroomView::Unknown => style.dim("unknown (the provider has not reported yet)"),
     }
 }
 
-fn meter(used_pct: f32) -> String {
+/// The session section: how fast this is going, measured from our own ledger.
+///
+/// Kept visibly separate from `capacity:` above, and worded so the difference
+/// cannot be missed. That line is the provider's word; this one is ours, and a
+/// reader who conflates them ends up trusting an extrapolation the way they
+/// would trust a rate-limit header.
+fn usage_block(report: &UsageReport, style: Style) -> String {
+    if report.sessions.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "{} {}\n",
+        style.heading(format!("Session ({}h window)", report.session_hours)),
+        style.dim("— measured from IronWire's own ledger, not reported by the provider")
+    );
+    for session in &report.sessions {
+        out.push_str(&session_block(session, style));
+    }
+    out
+}
+
+fn session_block(session: &SessionUsage, style: Style) -> String {
+    let mut out = format!(
+        "  {} {}\n",
+        style.name(&session.backend),
+        style.dim(format!(
+            "opened {} ago · closes in {}",
+            duration_minutes(session.elapsed_minutes),
+            duration_minutes(session.remaining_minutes)
+        ))
+    );
+
+    // The bar exists only when there is something to be a fraction *of*.
+    // Drawing an empty one against no ceiling would imply a limit we do not
+    // have.
+    if let (Some(ceiling), Some(pct)) = (session.ceiling.as_ref(), session.used_pct) {
+        let caveat = if ceiling.unverified {
+            style.dim(" (unverified figures)")
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "    {} {} of {}{caveat}\n",
+            meter(pct, style),
+            style.by_usage(pct, format!("{pct:.0}%")),
+            ceiling.description
+        ));
+    }
+
+    let mut used = format!(
+        "{} tokens · {} exchange(s)",
+        style.value(compact(session.tokens.total())),
+        session.exchanges
+    );
+    if session.without_usage > 0 {
+        // The total below is missing these, so it is an undercount and the
+        // reader has to be told by how much.
+        used.push_str(&style.dim(format!(
+            " ({} with no usage reported)",
+            session.without_usage
+        )));
+    }
+    if session.cost_usd > 0.0 {
+        used.push_str(&style.dim(format!(" · ${:.2} at metered rates", session.cost_usd)));
+    }
+    out.push_str(&format!("    {} {used}\n", style.dim("used:")));
+
+    match session.burn {
+        Some(burn) => {
+            let mut line = format!(
+                "{} {}",
+                style.value(compact_rate(burn.tokens_per_minute)),
+                style.dim("tokens/min")
+            );
+            if burn.cost_per_hour > 0.0 {
+                line.push_str(&style.dim(format!(" · ${:.2}/hour", burn.cost_per_hour)));
+            }
+            if let Some(hourly) = session.hourly_tokens_per_minute {
+                line.push_str(&style.dim(format!(" · {}/min last hour", compact_rate(hourly))));
+            }
+            out.push_str(&format!("    {} {line}\n", style.dim("burn:")));
+        }
+        // Not "0 tokens/min": that reads as "you have stopped", which is a
+        // different claim from "one request is not an interval".
+        None => out.push_str(&format!(
+            "    {} {}\n",
+            style.dim("burn:"),
+            style.dim("not enough traffic in this window to measure a rate")
+        )),
+    }
+
+    if let Some(projection) = session.projection {
+        let mut line = format!(
+            "{} tokens by the time it closes",
+            style.value(compact(projection.total_tokens))
+        );
+        if projection.total_cost_usd > 0.0 {
+            line.push_str(&style.dim(format!(" · ${:.2}", projection.total_cost_usd)));
+        }
+        out.push_str(&format!("    {} {line}\n", style.dim("at this rate:")));
+    }
+
+    // The one sentence this whole section exists to be able to say.
+    if let Some(minutes) = session.exhausts_in_minutes {
+        let ceiling = session.ceiling.as_ref().map_or("that ceiling", |c| {
+            if c.basis == Basis::Declared {
+                "your declared limit"
+            } else {
+                "your usual ceiling"
+            }
+        });
+        if session.exhausts_before_close() {
+            out.push_str(&format!(
+                "    {}\n",
+                style.bad(format!(
+                    "you reach {ceiling} in {} — {} before the window closes",
+                    duration_minutes(minutes),
+                    duration_minutes(session.remaining_minutes - minutes)
+                ))
+            ));
+        } else {
+            out.push_str(&format!(
+                "    {}\n",
+                style.good(format!("the window closes before you reach {ceiling}"))
+            ));
+        }
+    } else if session.ceiling.is_none() {
+        out.push_str(&format!(
+            "    {}\n",
+            style.dim(
+                "nothing to compare against yet — needs one completed session, \
+                 or `usage.plan` in config.toml"
+            )
+        ));
+    }
+    out
+}
+
+fn meter(used_pct: f64, style: Style) -> String {
     const WIDTH: usize = 10;
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "used_pct is clamped to 0..=100 at observation time"
+        reason = "the value is clamped to 0..=100 before the cast"
     )]
-    let filled = ((used_pct.clamp(0.0, 100.0) / 100.0) * WIDTH as f32).round() as usize;
+    let filled = ((used_pct.clamp(0.0, 100.0) / 100.0) * WIDTH as f64).round() as usize;
+    let filled = filled.min(WIDTH);
     format!(
         "[{}{}]",
-        "█".repeat(filled.min(WIDTH)),
-        "░".repeat(WIDTH.saturating_sub(filled))
+        style.by_usage(used_pct, "█".repeat(filled)),
+        style.dim("░".repeat(WIDTH.saturating_sub(filled)))
     )
 }
 
@@ -400,6 +623,16 @@ fn duration(secs: i64) -> String {
     } else {
         format!("{hours}h{minutes}m")
     }
+}
+
+/// The same scale, from the minutes the usage estimates are computed in.
+fn duration_minutes(minutes: f64) -> String {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "minutes come from a bounded window, far inside i64"
+    )]
+    let secs = (minutes.max(0.0) * 60.0) as i64;
+    duration(secs)
 }
 
 #[cfg(test)]
@@ -446,7 +679,7 @@ mod log_tests {
         unknown.input_tokens = None;
         unknown.output_tokens = None;
         unknown.cache_read_tokens = None;
-        let row = exchange_row(&unknown);
+        let row = exchange_row(&unknown, Style::plain());
         assert!(row.contains('—'));
         assert!(
             !row.contains(" 0 "),
@@ -459,29 +692,32 @@ mod log_tests {
         let mut substituted = exchange();
         substituted.requested_model = Some("claude-opus-4-6".into());
         substituted.served_model = Some("claude-sonnet-4-6".into());
-        assert!(exchange_row(&substituted).contains("claude-sonnet-4-6"));
+        assert!(exchange_row(&substituted, Style::plain()).contains("claude-sonnet-4-6"));
     }
 
     #[test]
     fn a_non_200_exchange_shows_its_status() {
         let mut failed = exchange();
         failed.status = 429;
-        assert!(exchange_row(&failed).contains("[429]"));
-        assert!(!exchange_row(&exchange()).contains('['));
+        assert!(exchange_row(&failed, Style::plain()).contains("[429]"));
+        assert!(!exchange_row(&exchange(), Style::plain()).contains('['));
     }
 
     #[test]
     fn the_summary_names_how_many_had_no_usage() {
-        let rendered = summary_block(&Summary {
-            exchanges: 10,
-            without_usage: 3,
-            input_tokens: 1_200,
-            cache_read_tokens: 2_400_000,
-            output_tokens: 900,
-            cost_usd: 1.25,
-            by_backend: vec![("claude-sub".into(), 7), ("anthropic-key".into(), 3)],
-            cost_by_backend: vec![("claude-sub".into(), 0.0), ("anthropic-key".into(), 1.25)],
-        });
+        let rendered = summary_block(
+            &Summary {
+                exchanges: 10,
+                without_usage: 3,
+                input_tokens: 1_200,
+                cache_read_tokens: 2_400_000,
+                output_tokens: 900,
+                cost_usd: 1.25,
+                by_backend: vec![("claude-sub".into(), 7), ("anthropic-key".into(), 3)],
+                cost_by_backend: vec![("claude-sub".into(), 0.0), ("anthropic-key".into(), 1.25)],
+            },
+            Style::plain(),
+        );
         assert!(rendered.contains("10 exchanges"));
         assert!(rendered.contains("3 with no usage reported"));
         assert!(rendered.contains("2.4M cached"));
@@ -490,17 +726,20 @@ mod log_tests {
 
     #[test]
     fn capture_being_off_explains_how_to_turn_it_on() {
-        let rendered = log(&LogView {
-            enabled: false,
-            exchanges: vec![],
-            last_24h: Summary::default(),
-        });
+        let rendered = log(
+            &LogView {
+                enabled: false,
+                exchanges: vec![],
+                last_24h: Summary::default(),
+            },
+            Style::plain(),
+        );
         assert!(rendered.contains("capture.enabled = true"));
     }
 
     #[test]
     fn an_empty_ledger_says_so_rather_than_printing_an_empty_table() {
-        let rendered = log(&view(vec![], Summary::default()));
+        let rendered = log(&view(vec![], Summary::default()), Style::plain());
         assert!(rendered.contains("No exchanges recorded yet"));
     }
 
@@ -509,6 +748,9 @@ mod log_tests {
         assert_eq!(compact(42), "42");
         assert_eq!(compact(1_500), "1.5k");
         assert_eq!(compact(2_400_000), "2.4M");
+        assert_eq!(compact_rate(1.25), "1.2");
+        assert_eq!(compact_rate(42.4), "42");
+        assert_eq!(compact_rate(1_500.0), "1.5k");
     }
 
     #[test]
@@ -537,9 +779,25 @@ mod tests {
         }
     }
 
+    pub(super) fn status_view(backends: Vec<BackendView>) -> StatusView {
+        StatusView {
+            version: "0.1.0".into(),
+            port: 8463,
+            tracked_conversations: 0,
+            pin: None,
+            backends,
+            balance: BalanceView::default(),
+            privacy: None,
+            quirks_serial: 0,
+            update: UpdateStatus::Unknown,
+            last_route: None,
+            usage: UsageReport::default(),
+        }
+    }
+
     #[test]
     fn unknown_capacity_says_unknown_and_shows_no_number() {
-        let rendered = backend_block(&view(HeadroomView::Unknown));
+        let rendered = backend_block(&view(HeadroomView::Unknown), Style::plain());
         assert!(rendered.contains("unknown"));
         assert!(!rendered.contains('%'), "we must not imply a measurement");
         assert!(!rendered.contains('█'));
@@ -547,11 +805,14 @@ mod tests {
 
     #[test]
     fn an_observation_is_shown_with_its_age() {
-        let rendered = backend_block(&view(HeadroomView::Observed {
-            used_pct: 82.0,
-            observed_secs_ago: 40,
-            resets_in_secs: Some(8040),
-        }));
+        let rendered = backend_block(
+            &view(HeadroomView::Observed {
+                used_pct: 82.0,
+                observed_secs_ago: 40,
+                resets_in_secs: Some(8040),
+            }),
+            Style::plain(),
+        );
         assert!(rendered.contains("82% used"));
         assert!(rendered.contains("observed 40s ago"));
         assert!(rendered.contains("resets in 2h14m"));
@@ -562,7 +823,7 @@ mod tests {
         let mut backend = view(HeadroomView::Unknown);
         backend.authenticated = false;
         backend.detail = Some("Claude Code is not logged in on this machine".into());
-        let rendered = backend_block(&backend);
+        let rendered = backend_block(&backend, Style::plain());
         assert!(rendered.contains("not connected"));
         assert!(rendered.contains("not logged in"));
         assert!(!rendered.contains("capacity"));
@@ -572,17 +833,21 @@ mod tests {
     fn an_unconsented_subscription_points_at_the_command_that_fixes_it() {
         let mut backend = view(HeadroomView::Unknown);
         backend.consented = false;
-        assert!(backend_block(&backend).contains("ironwire connect claude --subscription"));
+        assert!(
+            backend_block(&backend, Style::plain())
+                .contains("ironwire connect claude --subscription")
+        );
     }
 
     #[test]
     fn the_meter_tracks_the_percentage() {
-        assert_eq!(meter(0.0), "[░░░░░░░░░░]");
-        assert_eq!(meter(100.0), "[██████████]");
-        assert_eq!(meter(50.0), "[█████░░░░░]");
+        let plain = Style::plain();
+        assert_eq!(meter(0.0, plain), "[░░░░░░░░░░]");
+        assert_eq!(meter(100.0, plain), "[██████████]");
+        assert_eq!(meter(50.0, plain), "[█████░░░░░]");
         // Out-of-range input must not panic or overflow the bar.
-        assert_eq!(meter(-5.0), "[░░░░░░░░░░]");
-        assert_eq!(meter(150.0), "[██████████]");
+        assert_eq!(meter(-5.0, plain), "[░░░░░░░░░░]");
+        assert_eq!(meter(150.0, plain), "[██████████]");
     }
 
     #[test]
@@ -592,22 +857,13 @@ mod tests {
         assert_eq!(duration(7200), "2h");
         assert_eq!(duration(8040), "2h14m");
         assert_eq!(duration(-10), "0s");
+        assert_eq!(duration_minutes(134.0), "2h14m");
+        assert_eq!(duration_minutes(-3.0), "0s");
     }
 
     #[test]
     fn an_empty_daemon_tells_you_what_to_run() {
-        let rendered = status(&StatusView {
-            version: "0.1.0".into(),
-            port: 8463,
-            tracked_conversations: 0,
-            pin: None,
-            backends: vec![],
-            balance: BalanceView::default(),
-            privacy: None,
-            quirks_serial: 0,
-            update: UpdateStatus::Unknown,
-            last_route: None,
-        });
+        let rendered = status(&status_view(vec![]), Style::plain());
         assert!(rendered.contains("ironwire connect claude"));
     }
 
@@ -615,7 +871,7 @@ mod tests {
     fn a_healthy_backend_says_nothing_about_its_circuit() {
         // A "circuit: closed" line on every healthy backend is noise that
         // trains people to stop reading the block.
-        let rendered = backend_block(&view(HeadroomView::Unknown));
+        let rendered = backend_block(&view(HeadroomView::Unknown), Style::plain());
         assert!(!rendered.contains("circuit"));
         assert!(!rendered.contains("skipping"));
     }
@@ -631,22 +887,25 @@ mod tests {
             consecutive_failures: 5,
             retry_in_secs: Some(90),
         };
-        let rendered = backend_block(&backend);
+        let rendered = backend_block(&backend, Style::plain());
         assert!(rendered.contains("skipping after 5 consecutive failures"));
         assert!(rendered.contains("1m"), "got: {rendered}");
     }
 
     #[test]
     fn the_balance_counts_pools_and_says_which_are_free() {
-        let rendered = balance_block(&BalanceView {
-            available: 3,
-            free_available: 2,
-            unknown: 1,
-            unavailable: 0,
-            next_available_at: None,
-            spend_today_usd: Some(1.234),
-            subscription_used: Vec::new(),
-        });
+        let rendered = balance_block(
+            &BalanceView {
+                available: 3,
+                free_available: 2,
+                unknown: 1,
+                unavailable: 0,
+                next_available_at: None,
+                spend_today_usd: Some(1.234),
+                subscription_used: Vec::new(),
+            },
+            Style::plain(),
+        );
         assert!(rendered.contains("3 pool(s) available (2 already paid for)"));
         assert!(rendered.contains("1 not yet reporting"));
         assert!(rendered.contains("$1.23"));
@@ -657,12 +916,15 @@ mod tests {
         // The whole reason `unknown` is a separate field. Folding it into
         // `available` would be the same fabrication the headroom column exists
         // to avoid.
-        let rendered = balance_block(&BalanceView {
-            available: 0,
-            free_available: 0,
-            unknown: 2,
-            ..BalanceView::default()
-        });
+        let rendered = balance_block(
+            &BalanceView {
+                available: 0,
+                free_available: 0,
+                unknown: 2,
+                ..BalanceView::default()
+            },
+            Style::plain(),
+        );
         assert!(rendered.contains("2 not yet reporting"));
         assert!(!rendered.contains("available"), "got: {rendered}");
     }
@@ -671,12 +933,295 @@ mod tests {
     fn an_unmeasured_spend_shows_no_figure_at_all() {
         // `None` means the ledger is off — which is not the same as zero, and
         // printing "$0.00" would tell the user something we do not know.
-        let rendered = balance_block(&BalanceView {
-            available: 1,
-            free_available: 1,
-            spend_today_usd: None,
-            ..BalanceView::default()
-        });
+        let rendered = balance_block(
+            &BalanceView {
+                available: 1,
+                free_available: 1,
+                spend_today_usd: None,
+                ..BalanceView::default()
+            },
+            Style::plain(),
+        );
         assert!(!rendered.contains('$'), "got: {rendered}");
+    }
+
+    #[test]
+    fn colour_never_changes_which_words_are_printed() {
+        // Colour has to be findability, never information: piped to a file or
+        // read by someone who cannot distinguish red from green, the screen
+        // has to say the same things.
+        let strip = |text: &str| {
+            let mut out = String::new();
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for c in chars.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let mut backend = view(HeadroomView::Observed {
+            used_pct: 95.0,
+            observed_secs_ago: 10,
+            resets_in_secs: Some(600),
+        });
+        backend.health = HealthView {
+            circuit: "open".into(),
+            consecutive_failures: 3,
+            retry_in_secs: Some(30),
+        };
+        let mut view = status_view(vec![backend]);
+        view.usage = usage_fixture();
+        view.update = UpdateStatus::Available {
+            latest: "9.9.9".into(),
+            summary: None,
+            upgrade_command: Some("brew upgrade ironwire".into()),
+        };
+
+        let coloured = status(&view, Style::resolve(crate::style::ColorChoice::Always));
+        assert!(
+            coloured.contains('\x1b'),
+            "the fixture must exercise colour"
+        );
+        assert_eq!(strip(&coloured), status(&view, Style::plain()));
+    }
+}
+
+#[cfg(test)]
+fn usage_fixture() -> UsageReport {
+    use ironwire_usage::{BurnRate, Ceiling, Projection, TokenCounts};
+
+    UsageReport {
+        sessions: vec![SessionUsage {
+            backend: "claude-sub".into(),
+            started_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            closes_at: chrono::Utc::now() + chrono::Duration::hours(4),
+            elapsed_minutes: 60.0,
+            remaining_minutes: 240.0,
+            exchanges: 12,
+            without_usage: 1,
+            tokens: TokenCounts {
+                input: 1_000,
+                output: 4_000,
+                cache_read: 95_000,
+                cache_write: 0,
+            },
+            cost_usd: 2.0,
+            models: vec!["claude-opus-4-6".into()],
+            burn: Some(BurnRate {
+                tokens_per_minute: 10_000.0,
+                cost_per_hour: 12.0,
+            }),
+            hourly_tokens_per_minute: Some(1_666.0),
+            projection: Some(Projection {
+                total_tokens: 2_500_000,
+                total_cost_usd: 50.0,
+                remaining_minutes: 240.0,
+            }),
+            ceiling: Some(Ceiling {
+                tokens: 200_000,
+                basis: Basis::SelfCalibrated,
+                description: "your own p90 over 14 past session(s)".into(),
+                unverified: false,
+            }),
+            used_pct: Some(50.0),
+            exhausts_in_minutes: Some(10.0),
+        }],
+        completed_sessions: 14,
+        p90: None,
+        history_hours: 192,
+        session_hours: 5,
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use ironwire_usage::{BurnRate, Ceiling, SessionUsage, TokenCounts};
+
+    fn session() -> SessionUsage {
+        usage_fixture().sessions.remove(0)
+    }
+
+    fn render(session: SessionUsage) -> String {
+        usage_block(
+            &UsageReport {
+                sessions: vec![session],
+                ..usage_fixture()
+            },
+            Style::plain(),
+        )
+    }
+
+    #[test]
+    fn the_section_says_the_numbers_are_ours_and_not_the_providers() {
+        // The line above it is a rate-limit header. This one is arithmetic on
+        // our own traffic, and a reader who conflates the two ends up trusting
+        // an extrapolation the way they would trust the provider.
+        let rendered = render(session());
+        assert!(rendered.contains("measured from IronWire's own ledger"));
+        assert!(rendered.contains("not reported by the provider"));
+    }
+
+    #[test]
+    fn a_window_on_course_to_run_out_early_says_when() {
+        let rendered = render(session());
+        assert!(rendered.contains("you reach your usual ceiling in 10m"));
+        assert!(
+            rendered.contains("3h50m before the window closes"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_window_that_will_outlast_the_burn_says_the_reassuring_thing() {
+        let mut session = session();
+        session.exhausts_in_minutes = Some(600.0);
+        let rendered = render(session);
+        assert!(rendered.contains("the window closes before you reach"));
+        assert!(!rendered.contains("before the window closes"), "{rendered}");
+    }
+
+    #[test]
+    fn with_no_ceiling_there_is_no_bar_and_no_percentage() {
+        // Drawing an empty bar against nothing implies a limit we do not have.
+        let mut session = session();
+        session.ceiling = None;
+        session.used_pct = None;
+        session.exhausts_in_minutes = None;
+        let rendered = render(session);
+        assert!(!rendered.contains('%'), "{rendered}");
+        assert!(!rendered.contains('█'), "{rendered}");
+        assert!(rendered.contains("nothing to compare against yet"));
+        assert!(rendered.contains("usage.plan"));
+    }
+
+    #[test]
+    fn a_declared_limit_is_named_as_the_users_own_claim() {
+        let mut session = session();
+        session.ceiling = Some(Ceiling {
+            tokens: 88_000,
+            basis: Basis::Declared,
+            description: "the Max 5× limit you declared".into(),
+            unverified: false,
+        });
+        let rendered = render(session);
+        assert!(rendered.contains("the Max 5× limit you declared"));
+        assert!(rendered.contains("you reach your declared limit"));
+    }
+
+    #[test]
+    fn a_ceiling_its_own_source_calls_a_guess_is_flagged() {
+        let mut session = session();
+        session.ceiling = Some(Ceiling {
+            tokens: 19_000,
+            basis: Basis::Declared,
+            description: "the Team limit you declared".into(),
+            unverified: true,
+        });
+        assert!(render(session).contains("unverified"));
+    }
+
+    #[test]
+    fn a_window_with_too_little_traffic_says_so_rather_than_showing_zero() {
+        // "0 tokens/min" reads as "you have stopped", which is a different
+        // claim from "one request is not an interval".
+        let mut session = session();
+        session.burn = None;
+        session.projection = None;
+        session.exhausts_in_minutes = None;
+        let rendered = render(session);
+        assert!(rendered.contains("not enough traffic in this window"));
+        assert!(!rendered.contains("0.0 tokens/min"), "{rendered}");
+    }
+
+    #[test]
+    fn exchanges_the_provider_said_nothing_about_are_declared_as_missing() {
+        // Otherwise the token total silently undercounts and reads as complete.
+        assert!(render(session()).contains("1 with no usage reported"));
+    }
+
+    #[test]
+    fn an_empty_report_renders_nothing_at_all() {
+        // With capture off there is no section, not an empty one.
+        assert_eq!(usage_block(&UsageReport::default(), Style::plain()), "");
+    }
+
+    #[test]
+    fn the_rate_and_the_projection_are_both_shown() {
+        let rendered = render(session());
+        assert!(rendered.contains("10.0k tokens/min"));
+        assert!(rendered.contains("$12.00/hour"));
+        assert!(rendered.contains("1.7k/min last hour"));
+        assert!(rendered.contains("2.5M tokens by the time it closes"));
+    }
+
+    #[test]
+    fn the_used_line_counts_every_kind_of_token() {
+        // Cache reads are most of what a coding agent sends; leaving them out
+        // would understate a long session by an order of magnitude.
+        let mut session = session();
+        session.tokens = TokenCounts {
+            input: 1_000,
+            output: 4_000,
+            cache_read: 95_000,
+            cache_write: 100_000,
+        };
+        session.burn = Some(BurnRate {
+            tokens_per_minute: 1.0,
+            cost_per_hour: 0.0,
+        });
+        assert!(render(session).contains("200.0k tokens"));
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+
+    /// Not an assertion — a way to look at the screen. `cargo test -p ironwire
+    /// preview -- --nocapture --ignored`.
+    #[test]
+    #[ignore = "prints the status screen for a human to look at"]
+    fn the_status_screen() {
+        let mut view = tests::status_view(vec![BackendView {
+            id: "claude-sub".into(),
+            name: "Claude subscription".into(),
+            kind: "subscription".into(),
+            authenticated: true,
+            consented: true,
+            detail: None,
+            headroom: HeadroomView::Observed {
+                used_pct: 74.0,
+                observed_secs_ago: 40,
+                resets_in_secs: Some(8_040),
+            },
+            health: HealthView::default(),
+            models: vec!["claude-opus-4-6".into(), "claude-sonnet-4-6".into()],
+        }]);
+        view.balance = BalanceView {
+            available: 2,
+            free_available: 1,
+            unknown: 1,
+            unavailable: 0,
+            next_available_at: None,
+            spend_today_usd: Some(0.0),
+            subscription_used: vec![ironwire_proxy::control::SubscriptionUse {
+                name: "Claude subscription".into(),
+                used_pct: Some(74.0),
+                exchanges: 128,
+            }],
+        };
+        view.usage = usage_fixture();
+        println!(
+            "{}",
+            status(&view, Style::resolve(crate::style::ColorChoice::Always))
+        );
     }
 }

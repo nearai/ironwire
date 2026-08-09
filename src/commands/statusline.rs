@@ -221,6 +221,7 @@ mod tests {
             quirks_serial: 0,
             update: UpdateStatus::UpToDate,
             last_route,
+            usage: ironwire_usage::UsageReport::default(),
         }
     }
 

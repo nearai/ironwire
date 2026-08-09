@@ -1332,6 +1332,7 @@ dependencies = [
  "ironwire_quirks",
  "ironwire_update",
  "ironwire_upstream",
+ "ironwire_usage",
  "reqwest 0.12.28",
  "secrecy",
  "serde",
@@ -1427,6 +1428,7 @@ dependencies = [
  "ironwire_translate",
  "ironwire_update",
  "ironwire_upstream",
+ "ironwire_usage",
  "secrecy",
  "serde",
  "serde_json",
@@ -1497,6 +1499,15 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ironwire_usage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ironwire_ledger",
+ "serde",
 ]
 
 [[package]]
