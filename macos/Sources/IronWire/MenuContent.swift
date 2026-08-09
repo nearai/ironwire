@@ -22,6 +22,16 @@ struct MenuContent: View {
     @ObservedObject var notifier: Notifier
     @ObservedObject var loginItem: LoginItem
     @State private var pinError: String?
+    @State private var pane: Pane = .status
+
+    /// The two halves of the menu. Settings is a separate pane rather than more
+    /// rows: the status pane is read at a glance under pressure, and burying
+    /// what it says under a consent question would be the wrong trade.
+    enum Pane: String, CaseIterable, Identifiable {
+        case status = "Status"
+        case settings = "Settings"
+        var id: String { rawValue }
+    }
 
     private var iconState: IconState { IconState.from(client.status) }
 
@@ -29,17 +39,31 @@ struct MenuContent: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            if client.status != nil {
+                Picker("", selection: $pane) {
+                    ForEach(Pane.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+            }
             if let status = client.status {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        backendSection(status)
-                        balanceSection(status.balance)
-                        routeSection(status)
-                        pinSection(status)
-                        privacySection(status)
-                        updateSection(status.update)
+                    switch pane {
+                    case .status:
+                        VStack(alignment: .leading, spacing: 14) {
+                            backendSection(status)
+                            balanceSection(status.balance)
+                            routeSection(status)
+                            pinSection(status)
+                            privacySection(status)
+                            updateSection(status.update)
+                        }
+                        .padding(12)
+                    case .settings:
+                        SettingsContent(client: client)
                     }
-                    .padding(12)
                 }
                 .frame(maxHeight: 420)
             } else {

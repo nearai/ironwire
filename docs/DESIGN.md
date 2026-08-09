@@ -326,13 +326,29 @@ One daemon per machine, lockfile at `$IRONWIRE_HOME/daemon.lock`, listening on
 GET  /_ironwire/status          full state snapshot (JSON)
 GET  /_ironwire/events          SSE: route decisions, quota changes, errors
 GET  /_ironwire/backends
+GET  /_ironwire/settings        what can be changed, and what is selectable
 POST /_ironwire/pin             { model | backend | clear }
+POST /_ironwire/privacy         { mode }
+POST /_ironwire/consent         { backend, granted, prompt_version }
 GET  /_ironwire/log?limit=      recent exchanges from the local ledger
 POST /_ironwire/shutdown
 ```
 
 `ironwire status` and the macOS menu bar app are both **clients of this API**.
 No routing logic lives in the CLI or in Swift; otherwise they diverge.
+
+That rule is why `/settings` reports which privacy modes are *selectable* rather
+than only which exist. `full` routes solely to backends the user has named, so
+with none named it would take every backend out of service — a rule that lives
+in `Config::validate`. A client that worked it out for itself would be a second
+implementation of it, in a language that cannot see the config.
+
+The two writes follow from the same principle. `POST /privacy` changes the
+running daemon *and* `config.toml`, because a change that only applied at the
+next restart is a switch that appears to do nothing, and one that only lived in
+memory would quietly revert the user onto a weaker filter. `POST /consent`
+carries the prompt version the user was actually shown and refuses anything
+else: an answer belongs to the wording it answered (`docs/TRUST.md` §2).
 
 ---
 

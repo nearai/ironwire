@@ -40,6 +40,13 @@ public final class ControlClient: ObservableObject {
     @Published public private(set) var status: StatusView?
     @Published public private(set) var connection: Connection = .connecting
 
+    /// What can be changed, once it has been asked for.
+    ///
+    /// Fetched when the settings pane opens rather than on every poll: it costs
+    /// another `statuses()` sweep on the daemon, and nothing in it changes
+    /// unless this app changed it.
+    @Published public private(set) var settings: SettingsView?
+
     /// Raised while the dropdown is on screen, which is the only time the fast
     /// poll is worth its Keychain reads.
     @Published public var menuIsOpen = false {
@@ -92,10 +99,13 @@ public final class ControlClient: ObservableObject {
     /// backend — are ones a real daemon will not produce on demand, and the one
     /// that matters most (no bar for an unknown headroom) is the one the issue
     /// warns is most likely to be quietly wrong.
-    public static func fixture(status: StatusView?, connection: Connection = .connected) -> ControlClient {
+    public static func fixture(
+        status: StatusView?, connection: Connection = .connected, settings: SettingsView? = nil
+    ) -> ControlClient {
         let client = ControlClient(home: URL(fileURLWithPath: "/nonexistent"))
         client.status = status
         client.connection = connection
+        client.settings = settings
         return client
     }
 
@@ -260,6 +270,87 @@ public final class ControlClient: ObservableObject {
         } catch {
             // A dropped stream is the normal end of a daemon restart.
             return false
+        }
+    }
+
+    // MARK: - Settings
+
+    /// Fetch what can be changed.
+    @discardableResult
+    public func refreshSettings() async -> Bool {
+        guard let request = authorised(path: "/settings") else { return false }
+        guard case .success(let data) = await send(request, retryingUnauthorised: true),
+              let decoded = try? decoder.decode(SettingsView.self, from: data)
+        else { return false }
+        settings = decoded
+        return true
+    }
+
+    /// What a settings write reported back.
+    public struct WriteOutcome: Sendable, Equatable {
+        /// A warning the daemon attached to an otherwise successful change —
+        /// the privacy mode applied but could not be saved, say. Not an error:
+        /// the change is in force, and the user is told what did not happen.
+        public let warning: String?
+    }
+
+    /// Change the privacy mode.
+    ///
+    /// The app does not decide whether the mode is allowed — it offers what the
+    /// daemon marked selectable, and the daemon refuses anything else with a
+    /// sentence worth showing.
+    public func setPrivacyMode(_ mode: String) async -> Result<WriteOutcome, PinError> {
+        guard var request = authorised(path: "/privacy") else {
+            return .failure(PinError(message: "IronWire is not running"))
+        }
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["mode": mode])
+
+        switch await send(request, retryingUnauthorised: true) {
+        case .success(let data):
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            await refreshSettings()
+            await refresh()
+            return .success(WriteOutcome(warning: body?["warning"] as? String))
+        case .unauthorised:
+            connection = .unauthorised
+            return .failure(PinError(message: "the control token was rejected"))
+        case .failure(let message):
+            return .failure(PinError(message: message ?? "could not reach the IronWire daemon"))
+        }
+    }
+
+    /// Record or withdraw consent for a subscription backend.
+    ///
+    /// `promptVersion` is the version of the question the user was actually
+    /// shown, and the daemon checks it. This app must never send a version it
+    /// merely knows about — the whole point is that an answer belongs to the
+    /// wording it answered.
+    public func setConsent(
+        backend: String, granted: Bool, promptVersion: Int
+    ) async -> Result<Void, PinError> {
+        guard var request = authorised(path: "/consent") else {
+            return .failure(PinError(message: "IronWire is not running"))
+        }
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "backend": backend,
+            "granted": granted,
+            "prompt_version": promptVersion,
+        ])
+
+        switch await send(request, retryingUnauthorised: true) {
+        case .success:
+            await refreshSettings()
+            await refresh()
+            return .success(())
+        case .unauthorised:
+            connection = .unauthorised
+            return .failure(PinError(message: "the control token was rejected"))
+        case .failure(let message):
+            return .failure(PinError(message: message ?? "could not reach the IronWire daemon"))
         }
     }
 

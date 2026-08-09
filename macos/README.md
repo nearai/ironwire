@@ -1,9 +1,9 @@
 # IronWire menu bar app
 
-A macOS `MenuBarExtra` that shows what the daemon is doing, and lets you pin
-where traffic goes. It is a **pure client** of the control API
-(`docs/DESIGN.md` §6): it renders `/_ironwire/status` and posts to
-`/_ironwire/pin`, and it decides nothing.
+A macOS `MenuBarExtra` that shows what the daemon is doing and lets you change
+the few things worth changing from a menu. It is a **pure client** of the control
+API (`docs/DESIGN.md` §6): it renders what the daemon reports and posts back what
+you picked, and it decides nothing.
 
 ```
         ┌──────────────────────┐
@@ -14,7 +14,10 @@ where traffic goes. It is a **pure client** of the control API
                    ▼
         GET  /_ironwire/status     ── StatusView
         GET  /_ironwire/events     ── Event stream
-        POST /_ironwire/pin        ── the only write
+        GET  /_ironwire/settings   ── what is changeable, and what is selectable
+        POST /_ironwire/pin        ── where traffic goes
+        POST /_ironwire/privacy    ── the filter mode
+        POST /_ironwire/consent    ── enable or disable a subscription
                    │  Bearer $IRONWIRE_HOME/control.token
                    ▼
         ┌──────────────────────┐
@@ -29,6 +32,7 @@ make -C macos test     # the Swift suite
 make -C macos app      # build/IronWire.app — universal, ad-hoc signed
 make -C macos run      # build it and launch it
 make -C macos dist     # build/IronWire-macos.zip, the release artifact
+make -C macos install  # into /Applications (PREFIX=~/Applications for one user)
 ```
 
 Needs Xcode's toolchain (`xcodebuild -version` ≥ 15) and macOS 13 or newer.
@@ -39,6 +43,34 @@ make -C macos app ARCHS=
 ```
 
 Xcode opens `Package.swift` directly if you would rather work there.
+
+## What it shows, and what it can change
+
+**Status** is the pane you read at a glance: every backend with its capacity,
+the current route, spend, and a pin control. **Settings** is a separate pane, so
+a consent question never buries what the status pane is trying to say.
+
+From Settings you can change the privacy mode and enable or disable a
+subscription backend. Both take effect immediately — the daemon swaps the filter
+and the routing constraint without a restart — and both are written down, so
+they survive one.
+
+Three things it deliberately will not do:
+
+- **Offer a privacy mode the daemon says is unselectable.** `full` routes only
+  to backends you have named as acceptable, so with none named it would take
+  every backend out of service. The daemon reports that, and the option is
+  greyed out with its reason beside it, rather than the app working the rule out
+  for itself.
+- **Enable a subscription in one click.** `docs/TRUST.md` §2 says a subscription
+  stays off until you answer a specific question in plain language, and that the
+  answer is recorded against the version of the question you were asked. So the
+  app shows the daemon's own wording in full — every point, in its order — and
+  sends back the version that was on screen. There is no abridged version: a
+  shortened consent question is a different question.
+- **Log you in.** A credential comes from you logging into Claude Code or Codex,
+  or exporting an API key. A menu cannot conjure one, so a service without a
+  credential says so and names the command that would fix it.
 
 ## The rule
 
@@ -68,7 +100,8 @@ Makefile                       app / dist / run / test / clean
 Resources/Info.plist           LSUIElement, bundle id, version
 Sources/IronWireKit/           everything decidable without a window
   Models.swift                 Codable mirrors of StatusView / Event
-  ControlClient.swift          token + port discovery, polling, SSE, pin
+  Settings.swift               Codable mirrors of SettingsView / ConsentPrompt
+  ControlClient.swift          discovery, polling, SSE, and the three writes
   Discovery.swift              $IRONWIRE_HOME, control.token, config.toml
   Format.swift                 the bar, the meter, the wording
   IconState.swift              what the icon says
@@ -76,8 +109,10 @@ Sources/IronWireKit/           everything decidable without a window
   NotificationPolicy.swift     which events are worth interrupting someone for
 Sources/IronWire/              views and wiring only
   IronWireApp.swift            the MenuBarExtra scene
-  MenuContent.swift            the dropdown
+  MenuContent.swift            the status pane
+  SettingsContent.swift        the settings pane, including the consent question
   MenuBarIcon.swift            drawing the four icon states
+  LoginItem.swift              the "Open at login" toggle, over SMAppService
   Notifications.swift          opt-in UNUserNotificationCenter
 Tests/
 ```

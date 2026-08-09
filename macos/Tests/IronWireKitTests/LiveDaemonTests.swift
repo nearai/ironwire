@@ -152,6 +152,114 @@ final class LiveDaemonTests: XCTestCase {
         XCTAssertTrue(error.message.contains("not-a-real-backend"), error.message)
     }
 
+    // MARK: - Settings
+
+    /// The settings contract, against the real thing. A field renamed on the
+    /// Rust side shows up here and nowhere else.
+    func test_the_running_daemon_returns_settings_this_app_can_read() async throws {
+        let client = ControlClient()
+        let fetched = await client.refreshSettings()
+        XCTAssertTrue(fetched, "is `ironwire serve` running?")
+
+        let settings = try XCTUnwrap(client.settings)
+        XCTAssertEqual(
+            settings.privacy.options.map(\.id),
+            ["off", "credentials", "pii", "full"],
+            "the ladder, in order")
+        XCTAssertFalse(settings.privacy.summary.isEmpty)
+    }
+
+    /// The rule this app must never re-derive: `full` needs somewhere to route.
+    /// On a machine with nothing trusted the daemon says so, and says why.
+    func test_full_is_reported_as_unselectable_when_nothing_is_trusted() async throws {
+        let client = ControlClient()
+        _ = await client.refreshSettings()
+        let settings = try XCTUnwrap(client.settings)
+        let full = try XCTUnwrap(settings.privacy.options.first { $0.id == "full" })
+
+        if settings.privacy.trustedBackends.isEmpty {
+            XCTAssertFalse(full.selectable)
+            XCTAssertNotNil(full.unavailableBecause, "a greyed-out option has to say why")
+        } else {
+            XCTAssertTrue(full.selectable)
+        }
+    }
+
+    /// The round trip that matters: switch, observe it in force, put it back.
+    func test_a_privacy_mode_change_takes_effect_and_can_be_undone() async throws {
+        let client = ControlClient()
+        _ = await client.refreshSettings()
+        let original = try XCTUnwrap(client.settings?.privacy.mode)
+
+        let target = original == "off" ? "credentials" : "off"
+        guard case .success = await client.setPrivacyMode(target) else {
+            return XCTFail("the daemon refused a mode it listed as selectable")
+        }
+        XCTAssertEqual(client.settings?.privacy.mode, target, "not in force after the write")
+        // The status surface has to agree — it is what the menu draws from.
+        XCTAssertNotNil(client.status)
+
+        guard case .success = await client.setPrivacyMode(original) else {
+            return XCTFail("could not restore the original mode")
+        }
+        XCTAssertEqual(client.settings?.privacy.mode, original)
+    }
+
+    func test_a_mode_that_does_not_exist_is_refused_in_words() async throws {
+        let client = ControlClient()
+        let outcome = await client.setPrivacyMode("maximum")
+        guard case .failure(let error) = outcome else {
+            return XCTFail("the daemon accepted a mode that does not exist")
+        }
+        XCTAssertTrue(error.message.contains("maximum"), error.message)
+    }
+
+    /// Consent, end to end, at the version the daemon is currently asking at —
+    /// and then withdrawn again, because this test must not leave a subscription
+    /// enabled on somebody's machine.
+    func test_consent_can_be_granted_and_withdrawn_at_the_current_prompt_version() async throws {
+        let client = ControlClient()
+        _ = await client.refreshSettings()
+        let settings = try XCTUnwrap(client.settings)
+        guard let service = settings.services.first(where: { $0.canToggle && !$0.consented }),
+              let prompt = service.consentPrompt
+        else {
+            throw XCTSkip("no subscription backend is awaiting consent on this machine")
+        }
+        XCTAssertTrue(prompt.isComplete, "the prompt has to be presentable before it is answered")
+
+        guard case .success = await client.setConsent(
+            backend: service.id, granted: true, promptVersion: prompt.version)
+        else { return XCTFail("the daemon refused consent at its own current version") }
+
+        let after = try XCTUnwrap(client.settings?.services.first { $0.id == service.id })
+        XCTAssertTrue(after.consented)
+
+        guard case .success = await client.setConsent(
+            backend: service.id, granted: false, promptVersion: prompt.version)
+        else { return XCTFail("could not withdraw consent again") }
+        let restored = try XCTUnwrap(client.settings?.services.first { $0.id == service.id })
+        XCTAssertFalse(restored.consented, "this test must not leave a subscription enabled")
+    }
+
+    /// The whole point of sending the version: an answer belongs to the wording
+    /// it answered, and a stale client must not be able to grant on the strength
+    /// of a question nobody read.
+    func test_consent_at_a_version_the_daemon_is_no_longer_asking_is_refused() async throws {
+        let client = ControlClient()
+        _ = await client.refreshSettings()
+        let settings = try XCTUnwrap(client.settings)
+        guard let service = settings.services.first(where: { $0.canToggle }) else {
+            throw XCTSkip("no subscription backend on this machine")
+        }
+
+        let outcome = await client.setConsent(backend: service.id, granted: true, promptVersion: 0)
+        guard case .failure(let error) = outcome else {
+            return XCTFail("the daemon accepted consent to a version it is not asking")
+        }
+        XCTAssertTrue(error.message.contains("different question"), error.message)
+    }
+
     private func temporaryHome(token: String? = nil, port: Int? = nil) throws -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ironwire-live-\(UUID().uuidString)")
