@@ -776,12 +776,23 @@ impl Policy {
             // candidates that could actually have served this request count, so
             // a cheaper backend skipped for tier reasons does not make every
             // route look degraded.
-            let passed_over_a_cheaper_credential = candidates
+            // Preference is cost first and registration order second — the
+            // same two signals, in the same order, that `sort_key` and
+            // `BackendRegistry::push` already use. Cost alone was not enough:
+            // two API keys rank equal, so falling from one to the other read as
+            // `Preferred`, which is the same invisible-and-permanent fallback
+            // rung 2 exists to prevent, one class narrower.
+            let position = |id: &BackendId| candidates.iter().position(|c| &c.id == id);
+            let passed_over_a_preferred_credential = candidates
                 .iter()
                 .filter(|c| c.caps.protocol == inbound && c.id != best.id)
                 .filter(|c| serves_tier(c, tier))
-                .any(|c| c.kind.marginal_cost_rank() < best.kind.marginal_cost_rank());
-            let rung = match (served_tier < tier, passed_over_a_cheaper_credential) {
+                .any(|c| {
+                    let (theirs, ours) =
+                        (c.kind.marginal_cost_rank(), best.kind.marginal_cost_rank());
+                    theirs < ours || (theirs == ours && position(&c.id) < position(&best.id))
+                });
+            let rung = match (served_tier < tier, passed_over_a_preferred_credential) {
                 (_, true) => Rung::AlternateCredential,
                 (true, false) => Rung::SmallerModel,
                 (false, false) => Rung::Preferred,
@@ -1346,6 +1357,51 @@ mod tests {
                 )
                 .expect("routes");
             assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// Two API keys rank equal on cost, so only registration order says
+        /// which the user preferred — and a fallback between them is still a
+        /// different credential.
+        #[test]
+        fn falling_between_equal_cost_credentials_is_still_rung_two() {
+            let mut first = candidate("primary", BackendKind::ApiKey, Protocol::AnthropicMessages);
+            first.quota.primary = Headroom::Exhausted { until: t(600) };
+            let second = candidate("backup", BackendKind::ApiKey, Protocol::AnthropicMessages);
+
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &[first, second],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "backup");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// And the first-choice backend, when it is available, is rung 0 — the
+        /// rule must not mark every route degraded merely for having a
+        /// second backend registered.
+        #[test]
+        fn the_first_choice_backend_is_still_rung_zero() {
+            let mut policy = Policy::new();
+            let decision = policy
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &[
+                        candidate("primary", BackendKind::ApiKey, Protocol::AnthropicMessages),
+                        candidate("backup", BackendKind::ApiKey, Protocol::AnthropicMessages),
+                    ],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "primary");
+            assert_eq!(decision.rung, Rung::Preferred);
         }
 
         /// Unchanged: descending a model tier on the *same* backend is rung 1.

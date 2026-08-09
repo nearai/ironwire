@@ -289,10 +289,22 @@ async fn dispatch_inner(
     let mut same_backend_attempts = 0usize;
 
     while attempts < max_attempts {
+        // Marked unhealthy rather than removed. `usable()` refuses an unhealthy
+        // candidate exactly as it refused an absent one, so routing is
+        // unchanged — but the rung calculation can still see that a preferred
+        // backend was passed over. Dropping them from the list made a live
+        // failover record `Preferred` while the same fall, predicted from
+        // quota, recorded rung 2: the same event, two different answers,
+        // depending only on whether we knew in advance.
         let available: Vec<_> = candidates
             .iter()
-            .filter(|c| !excluded.contains(&c.id))
             .cloned()
+            .map(|mut candidate| {
+                if excluded.contains(&candidate.id) {
+                    candidate.healthy = false;
+                }
+                candidate
+            })
             .collect();
 
         let decision = {
