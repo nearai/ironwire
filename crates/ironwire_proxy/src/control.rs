@@ -226,6 +226,15 @@ pub struct BalanceView {
     /// summing all of it produced a "spend" figure for a day on which nothing
     /// was billed — the opposite of what this proxy exists to tell you.
     pub spend_today_usd: Option<f64>,
+    /// Cache reads as a fraction of every prompt token in the window, when
+    /// anything reported usage. The prompt cache is the largest cost lever in a
+    /// coding session and the thing this router's whole design protects; it was
+    /// the one number nobody could see.
+    #[serde(default)]
+    pub cache_hit_rate: Option<f64>,
+    /// Exchanges summarised for that rate, so the figure carries its basis.
+    #[serde(default)]
+    pub cache_exchanges: i64,
     /// The configured daily spend cap and what has gone against it, when the
     /// user set one. A permanent line rather than a startup message, following
     /// the privacy filter's precedent: a limit you cannot see is one you cannot
@@ -550,6 +559,8 @@ fn balance(
                 .map(|(_, cost)| cost)
                 .sum()
         }),
+        cache_hit_rate: summary.as_ref().and_then(|s| s.cache_hit_rate),
+        cache_exchanges: summary.as_ref().map_or(0, |s| s.exchanges),
         spend_cap: limits
             .daily_spend_usd
             .filter(|cap| *cap > 0.0)

@@ -61,6 +61,11 @@ fn exchange_row(exchange: &Exchange, style: Style) -> String {
     let cached = exchange
         .cache_read_tokens
         .map_or_else(String::new, |v| format!("/{}", compact(v)));
+    // Only when there is one, so the common warm row does not get noisier.
+    let written = exchange
+        .cache_write_tokens
+        .filter(|v| *v > 0)
+        .map_or_else(String::new, |v| format!("+{}", compact(v)));
     let took = exchange.total_ms.map_or_else(
         || "—".to_string(),
         |ms| format!("{:.1}s", ms as f64 / 1000.0),
@@ -82,7 +87,7 @@ fn exchange_row(exchange: &Exchange, style: Style) -> String {
         style.dim(exchange.started_at.format("%Y-%m-%d %H:%M:%S")),
         style.name(format!("{:<15}", truncate(&exchange.backend, 15))),
         truncate(model, 18),
-        format!("{}{}", tokens(exchange.input_tokens), cached),
+        format!("{}{cached}{written}", tokens(exchange.input_tokens)),
         tokens(exchange.output_tokens),
         took,
     )
@@ -102,13 +107,34 @@ fn summary_block(summary: &Summary, style: Style) -> String {
         ));
     }
     out.push('\n');
+    // Writes named separately because they are billed above base input rate:
+    // a breakdown that folds them into "in" cannot explain a bill that moved.
+    let written = if summary.cache_write_tokens > 0 {
+        format!(" · {} written", compact(summary.cache_write_tokens))
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "  {} {} in · {} cached · {} out\n",
+        "  {} {} in · {} cached{written} · {} out\n",
         style.dim("tokens:"),
         compact(summary.input_tokens),
         compact(summary.cache_read_tokens),
         compact(summary.output_tokens),
     ));
+    // Omitted entirely rather than shown as "unknown" when nothing reported:
+    // absence is quieter and equally honest.
+    if let Some(rate) = summary.cache_hit_rate {
+        let cold = if summary.cold_starts > 0 {
+            format!(" · {} cold starts", style.value(summary.cold_starts))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "  {} {:.0}% hit rate{cold}\n",
+            style.dim("cache: "),
+            rate * 100.0
+        ));
+    }
     if !summary.by_backend.is_empty() {
         let split = summary
             .by_backend
@@ -407,6 +433,18 @@ fn balance_block(balance: &BalanceView, style: Style) -> String {
             used.join(" · ")
         ));
     }
+    if let Some(rate) = balance.cache_hit_rate {
+        out.push_str(&format!(
+            "  cache: {:.0}% hit rate over {} exchange{} today\n",
+            rate * 100.0,
+            balance.cache_exchanges,
+            if balance.cache_exchanges == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
     // Permanent, like the privacy-filter line: a limit the user cannot see is
     // one they cannot trust, and this is the number they set it against.
     if let Some(cap) = &balance.spend_cap {
@@ -423,12 +461,12 @@ fn balance_block(balance: &BalanceView, style: Style) -> String {
         // and "$-0.00" reads like a refund.
         Some(spend) => out.push_str(&format!(
             "  {} {}\n",
-            style.dim("metered spend, last 24h:"),
+            style.dim("metered spend today:"),
             style.value(format!("${:.2}", spend + 0.0))
         )),
         None => out.push_str(&format!(
             "  {} {}\n",
-            style.dim("metered spend, last 24h:"),
+            style.dim("metered spend today:"),
             style.dim("not recorded (ledger off)")
         )),
     }
@@ -724,6 +762,57 @@ mod log_tests {
     }
 
     #[test]
+    fn a_window_with_no_reported_usage_shows_no_cache_line() {
+        // Absence rather than "cache: unknown": quieter, and equally honest.
+        let rendered = summary_block(
+            &Summary {
+                exchanges: 3,
+                without_usage: 3,
+                cache_hit_rate: None,
+                ..Summary::default()
+            },
+            Style::plain(),
+        );
+        assert!(!rendered.contains("hit rate"), "got: {rendered}");
+        assert!(!rendered.contains("cold start"), "got: {rendered}");
+        // The token line still lists what was summed; it is the *rate* that is
+        // withheld, because a rate over nothing is a fabrication.
+        assert!(rendered.contains("0 cached"), "got: {rendered}");
+    }
+
+    /// Distinct from the above and it must read that way: this cache really is
+    /// doing nothing.
+    #[test]
+    fn an_all_cold_window_says_zero_percent() {
+        let rendered = summary_block(
+            &Summary {
+                exchanges: 4,
+                cache_write_tokens: 50_000,
+                cache_hit_rate: Some(0.0),
+                cold_starts: 4,
+                ..Summary::default()
+            },
+            Style::plain(),
+        );
+        assert!(rendered.contains("0% hit rate"), "got: {rendered}");
+        assert!(rendered.contains("4 cold starts"), "got: {rendered}");
+        assert!(rendered.contains("50.0k written"), "got: {rendered}");
+    }
+
+    /// The common warm row must not get noisier for a number that is usually
+    /// zero.
+    #[test]
+    fn a_row_shows_cache_writes_only_when_there_are_some() {
+        let mut warm = exchange();
+        warm.cache_write_tokens = Some(0);
+        assert!(!exchange_row(&warm, Style::plain()).contains('+'));
+
+        let mut cold = exchange();
+        cold.cache_write_tokens = Some(2_048);
+        assert!(exchange_row(&cold, Style::plain()).contains("+2.0k"));
+    }
+
+    #[test]
     fn the_summary_names_how_many_had_no_usage() {
         let rendered = summary_block(
             &Summary {
@@ -735,6 +824,10 @@ mod log_tests {
                 cost_usd: 1.25,
                 by_backend: vec![("claude-sub".into(), 7), ("anthropic-key".into(), 3)],
                 cost_by_backend: vec![("claude-sub".into(), 0.0), ("anthropic-key".into(), 1.25)],
+                cache_write_tokens: 4_096,
+                cache_hit_rate: Some(0.97),
+                cold_starts: 2,
+                cache_by_backend: vec![("claude-sub".into(), 2_400_000, 4_096)],
             },
             Style::plain(),
         );
@@ -922,6 +1015,8 @@ mod tests {
                 unavailable: 0,
                 next_available_at: None,
                 spend_today_usd: Some(1.234),
+                cache_hit_rate: None,
+                cache_exchanges: 0,
                 spend_cap: None,
                 subscription_used: Vec::new(),
             },
@@ -1233,6 +1328,8 @@ mod preview {
             unavailable: 0,
             next_available_at: None,
             spend_today_usd: Some(0.0),
+            cache_hit_rate: Some(0.97),
+            cache_exchanges: 412,
             spend_cap: None,
             subscription_used: vec![ironwire_proxy::control::SubscriptionUse {
                 name: "Claude subscription".into(),

@@ -122,12 +122,39 @@ pub struct Summary {
     pub input_tokens: i64,
     /// Summed cache reads.
     pub cache_read_tokens: i64,
+    /// Summed cache writes.
+    ///
+    /// Anthropic bills these above the base input rate, so a breakdown that
+    /// omits them cannot explain why a bill moved — which is exactly the
+    /// question someone reads this to answer.
+    pub cache_write_tokens: i64,
     /// Summed output tokens.
     pub output_tokens: i64,
     /// Summed USD across the window, priced from observed usage.
     pub cost_usd: f64,
     /// Per-backend exchange counts, descending.
     pub by_backend: Vec<(String, i64)>,
+    /// Cache reads as a fraction of every prompt token — reads, writes and
+    /// uncached input alike.
+    ///
+    /// Writes belong in the denominator: a turn that wrote 100k tokens and read
+    /// none had a 0% hit rate, and leaving writes out would report it as
+    /// perfect or as undefined.
+    ///
+    /// `None`, never `0.0`, when nothing in the window reported usage. A
+    /// fabricated zero reads as "your cache is broken" when the truth is "the
+    /// provider told us nothing" — the same rule as everywhere else here.
+    pub cache_hit_rate: Option<f64>,
+    /// Exchanges that wrote to the cache and read nothing: a fresh prefix with
+    /// nothing reused. The number that actually diagnoses a thrashing route.
+    pub cold_starts: i64,
+    /// Cache reads and writes per backend, in the same order as
+    /// [`Self::by_backend`].
+    ///
+    /// A cross-family exchange never reports a write — the translator has no
+    /// field to map — so a hit rate over a mixed window compares unlike things.
+    /// The per-backend split is what makes the cost of a descent visible.
+    pub cache_by_backend: Vec<(String, i64, i64)>,
     /// Per-backend priced cost, in the same order.
     ///
     /// Kept per backend rather than only as a total because the total answers
@@ -324,8 +351,12 @@ impl Ledger {
                              AND cache_read_tokens IS NULL THEN 1 ELSE 0 END),
                     COALESCE(SUM(input_tokens), 0),
                     COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0),
                     COALESCE(SUM(output_tokens), 0),
-                    COALESCE(SUM(cost_usd), 0.0)
+                    COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(CASE WHEN COALESCE(cache_write_tokens, 0) > 0
+                                       AND COALESCE(cache_read_tokens, 0) = 0
+                                      THEN 1 ELSE 0 END), 0)
              FROM exchanges WHERE started_at >= ?1",
             [&cutoff],
             |row| {
@@ -334,16 +365,25 @@ impl Ledger {
                     without_usage: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
                     input_tokens: row.get(2)?,
                     cache_read_tokens: row.get(3)?,
-                    output_tokens: row.get(4)?,
-                    cost_usd: row.get(5)?,
+                    cache_write_tokens: row.get(4)?,
+                    output_tokens: row.get(5)?,
+                    cost_usd: row.get(6)?,
+                    cold_starts: row.get(7)?,
+                    // Filled in below, once we know whether anything reported.
+                    cache_hit_rate: None,
                     by_backend: Vec::new(),
                     cost_by_backend: Vec::new(),
+                    cache_by_backend: Vec::new(),
                 })
             },
         )?;
 
+        // One `GROUP BY`, not three: `status` runs this on every render and the
+        // menu bar app will poll it.
         let mut statement = conn.prepare(
-            "SELECT backend, COUNT(*), COALESCE(SUM(cost_usd), 0.0)
+            "SELECT backend, COUNT(*), COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_write_tokens), 0)
              FROM exchanges WHERE started_at >= ?1
              GROUP BY backend ORDER BY COUNT(*) DESC",
         )?;
@@ -353,17 +393,40 @@ impl Ledger {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, f64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         summary.by_backend = rows
             .iter()
-            .map(|(backend, count, _)| (backend.clone(), *count))
+            .map(|(backend, count, ..)| (backend.clone(), *count))
             .collect();
         summary.cost_by_backend = rows
-            .into_iter()
-            .map(|(backend, _, cost)| (backend, cost))
+            .iter()
+            .map(|(backend, _, cost, ..)| (backend.clone(), *cost))
             .collect();
+        summary.cache_by_backend = rows
+            .into_iter()
+            .map(|(backend, _, _, reads, writes)| (backend, reads, writes))
+            .collect();
+
+        // A rate is shown only when something was actually reported. The sums
+        // above coalesce NULL to zero, which is right for a total and wrong for
+        // deciding whether there is anything to describe — so the decision uses
+        // the counter that distinguishes the two.
+        let prompt_tokens =
+            summary.input_tokens + summary.cache_read_tokens + summary.cache_write_tokens;
+        summary.cache_hit_rate = (summary.exchanges > summary.without_usage && prompt_tokens > 0)
+            .then(|| {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "token counts are far below f64's exact-integer range"
+                )]
+                {
+                    summary.cache_read_tokens as f64 / prompt_tokens as f64
+                }
+            });
         Ok(summary)
     }
 
@@ -457,6 +520,88 @@ mod tests {
             status: 200,
             error: None,
         }
+    }
+
+    /// The cache is the largest cost lever in a session and the thing the whole
+    /// router protects; the aggregate silently dropped the most expensive token
+    /// class entirely.
+    #[test]
+    fn the_summary_accounts_for_cache_writes() {
+        let ledger = Ledger::in_memory().expect("opens");
+        ledger.record(&exchange("claude-sub", 0)).expect("records");
+        let summary = ledger.summary(at(-60)).expect("summarises");
+        assert_eq!(summary.cache_write_tokens, 2_048);
+        // 98000 / (12 + 98000 + 2048)
+        let rate = summary.cache_hit_rate.expect("usage was reported");
+        assert!((rate - 0.9795).abs() < 0.001, "got {rate}");
+    }
+
+    /// A fabricated 0% reads as "your cache is broken" when the truth is "the
+    /// provider told us nothing".
+    #[test]
+    fn a_window_with_no_reported_usage_has_no_hit_rate() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut silent = exchange("claude-sub", 0);
+        silent.input_tokens = None;
+        silent.cache_read_tokens = None;
+        silent.cache_write_tokens = None;
+        silent.output_tokens = None;
+        ledger.record(&silent).expect("records");
+
+        let summary = ledger.summary(at(-60)).expect("summarises");
+        assert_eq!(summary.cache_hit_rate, None);
+        assert_eq!(summary.without_usage, 1);
+    }
+
+    /// Distinct from the above, and the distinction is the point: this cache
+    /// really is doing nothing, and the user should see that.
+    #[test]
+    fn an_all_cold_window_reports_zero_rather_than_nothing() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut cold = exchange("claude-sub", 0);
+        cold.cache_read_tokens = Some(0);
+        cold.cache_write_tokens = Some(50_000);
+        ledger.record(&cold).expect("records");
+
+        let summary = ledger.summary(at(-60)).expect("summarises");
+        assert_eq!(summary.cache_hit_rate, Some(0.0));
+        assert_eq!(summary.cold_starts, 1, "a fresh prefix reusing nothing");
+    }
+
+    #[test]
+    fn cache_is_reported_per_backend() {
+        let ledger = Ledger::in_memory().expect("opens");
+        ledger.record(&exchange("claude-sub", 0)).expect("records");
+        let mut translated = exchange("nearai", 1);
+        // The translator has no field to map, so a cross-family exchange
+        // reports reads and never writes.
+        translated.cache_write_tokens = Some(0);
+        translated.cache_read_tokens = Some(0);
+        ledger.record(&translated).expect("records");
+
+        let summary = ledger.summary(at(-60)).expect("summarises");
+        let near = summary
+            .cache_by_backend
+            .iter()
+            .find(|(backend, ..)| backend == "nearai")
+            .expect("present");
+        assert_eq!((near.1, near.2), (0, 0));
+    }
+
+    /// An exchange with no prompt tokens at all must contribute to neither side
+    /// of the ratio rather than dividing by zero.
+    #[test]
+    fn an_exchange_with_no_prompt_tokens_cannot_divide_by_zero() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut empty = exchange("claude-sub", 0);
+        empty.input_tokens = Some(0);
+        empty.cache_read_tokens = Some(0);
+        empty.cache_write_tokens = Some(0);
+        ledger.record(&empty).expect("records");
+        assert_eq!(
+            ledger.summary(at(-60)).expect("summarises").cache_hit_rate,
+            None
+        );
     }
 
     #[test]
