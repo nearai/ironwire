@@ -39,7 +39,7 @@ final class MenuContentTests: XCTestCase {
     private func render(_ status: StatusView?, connection: ControlClient.Connection = .connected) -> NSImage? {
         let view = MenuContent(
             client: .fixture(status: status, connection: connection),
-            notifier: Notifier())
+            notifier: Notifier(), loginItem: LoginItem())
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
         return renderer.nsImage

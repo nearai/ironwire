@@ -16,7 +16,7 @@ use chrono::Utc;
 use ironwire_core::DEFAULT_PORT;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::CodexCredentials;
-use ironwire_creds::consent::ConsentLedger;
+use ironwire_creds::consent::{ConsentLedger, ConsentPrompt};
 
 use crate::claude_settings;
 use crate::codex_config;
@@ -165,12 +165,7 @@ fn connect_claude(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
         return Ok(());
     }
 
-    if !ask_subscription_consent(
-        "Claude",
-        "api.anthropic.com",
-        "Anthropic",
-        "an Anthropic API key",
-    )? {
+    if !ask_subscription_consent("claude-sub")? {
         println!("Left disabled. IronWire will use API keys only.");
         return Ok(());
     }
@@ -266,7 +261,7 @@ fn connect_codex(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
         return Ok(());
     }
 
-    if !ask_subscription_consent("Codex", "chatgpt.com", "OpenAI", "an OpenAI API key")? {
+    if !ask_subscription_consent("codex-sub")? {
         println!("Left disabled. IronWire will use API keys only.");
         return Ok(());
     }
@@ -498,27 +493,32 @@ fn connect_api_key(vendor: &str, env: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
-/// The consent prompt. `docs/TRUST.md` §2 fixes its content; changing what it
-/// *means* requires bumping `CONSENT_PROMPT_VERSION`, which invalidates
-/// consent given to the old wording.
-fn ask_subscription_consent(
-    product: &str,
-    host: &str,
-    vendor: &str,
-    alternative: &str,
-) -> Result<bool> {
+/// Ask the consent question and read the answer.
+///
+/// The wording is [`ConsentPrompt`], not this function: the menu bar app has to
+/// ask the same question, and two hand-maintained copies of a consent prompt are
+/// two prompts — while the recorded version goes on claiming both users answered
+/// the same one. This renders it for a terminal and does nothing else.
+fn ask_subscription_consent(backend_id: &str) -> Result<bool> {
+    let prompt = ConsentPrompt::for_backend(backend_id)
+        .with_context(|| format!("no consent prompt is defined for `{backend_id}`"))?;
+
     println!();
-    println!("  IronWire will read the OAuth token that {product} Code stores on this");
-    println!("  machine and send requests to {host} with it, from this computer only.");
+    for line in wrap(&prompt.summary, 72) {
+        println!("  {line}");
+    }
     println!();
-    println!("  · This uses a private authentication path. {vendor} does not document");
-    println!("    it and may change or block it at any time.");
-    println!("  · Using it from a third-party proxy may fall outside your subscription's");
-    println!("    intended use. If {vendor} objects, it is your account that is affected.");
-    println!("  · Your token is never sent anywhere except {host}.");
-    println!("  · You can use {alternative} instead — fully supported, no ambiguity.");
+    for point in &prompt.points {
+        let mut lines = wrap(point, 70).into_iter();
+        if let Some(first) = lines.next() {
+            println!("  · {first}");
+        }
+        for rest in lines {
+            println!("    {rest}");
+        }
+    }
     println!();
-    print!("  Enable the {product} subscription backend? [y/N] ");
+    print!("  {} [y/N] ", prompt.question);
     std::io::stdout().flush().ok();
 
     let mut answer = String::new();
@@ -529,4 +529,26 @@ fn ask_subscription_consent(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Break a sentence onto lines of at most `width`, on word boundaries.
+///
+/// The prompt is stored as sentences rather than pre-broken lines so that a GUI
+/// can lay it out for its own width; a terminal has to do the breaking itself.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }

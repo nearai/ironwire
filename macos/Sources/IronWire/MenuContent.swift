@@ -20,6 +20,7 @@ import SwiftUI
 struct MenuContent: View {
     @ObservedObject var client: ControlClient
     @ObservedObject var notifier: Notifier
+    @ObservedObject var loginItem: LoginItem
     @State private var pinError: String?
 
     private var iconState: IconState { IconState.from(client.status) }
@@ -51,7 +52,12 @@ struct MenuContent: View {
         // The only place the poll rate changes. `/_ironwire/status` re-reads a
         // credential per backend, so one second is for when someone is actually
         // watching and five is for the rest of the time.
-        .onAppear { client.menuIsOpen = true }
+        .onAppear {
+            client.menuIsOpen = true
+            // The system is the authority on this, and the user can change it in
+            // System Settings while we are not looking.
+            loginItem.refresh()
+        }
         .onDisappear { client.menuIsOpen = false }
     }
 
@@ -411,6 +417,18 @@ struct MenuContent: View {
             Toggle("Notify on family changes and failures", isOn: $notifier.enabled)
                 .font(.caption)
                 .toggleStyle(.checkbox)
+
+            Toggle("Open at login", isOn: Binding(
+                get: { loginItem.isOn },
+                set: { loginItem.set($0) }
+            ))
+            .font(.caption)
+            .toggleStyle(.checkbox)
+            if let detail = loginItem.detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 12) {
                 if let status = client.status {

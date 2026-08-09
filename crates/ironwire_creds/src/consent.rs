@@ -18,6 +18,75 @@ use serde::{Deserialize, Serialize};
 /// to v1 has not agreed to v2.
 pub const CONSENT_PROMPT_VERSION: u32 = 1;
 
+/// The question a user must answer before a subscription backend is used.
+///
+/// Data rather than `println!` calls, because there is now more than one surface
+/// that has to ask it: `ironwire connect` in a terminal, and the menu bar app.
+/// Two hand-written copies of a consent prompt is two prompts, and the one that
+/// gets edited is never the one someone read — while `CONSENT_PROMPT_VERSION`
+/// goes on claiming they answered the same question.
+///
+/// `docs/TRUST.md` §2 fixes the content. Changing what it *means* requires
+/// bumping the version, which invalidates consent given to the old wording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentPrompt {
+    /// The version this wording is. Recorded with the answer.
+    pub version: u32,
+    /// Backend this grants, e.g. `claude-sub`.
+    pub backend_id: String,
+    /// What the user calls it, e.g. `Claude`.
+    pub product: String,
+    /// What IronWire will do, in one sentence.
+    pub summary: String,
+    /// What the user is taking on, one point at a time. Never softened, and
+    /// never reordered so the cost reads last.
+    pub points: Vec<String>,
+    /// The question itself.
+    pub question: String,
+}
+
+impl ConsentPrompt {
+    /// The prompt for a backend, or `None` where consent is not the gate.
+    ///
+    /// An unknown id yields `None` rather than a generic prompt: a consent
+    /// screen that cannot name what it is about is not consent.
+    #[must_use]
+    pub fn for_backend(backend_id: &str) -> Option<Self> {
+        let (product, host, vendor, alternative) = match backend_id {
+            "claude-sub" => (
+                "Claude",
+                "api.anthropic.com",
+                "Anthropic",
+                "an Anthropic API key",
+            ),
+            "codex-sub" => ("Codex", "chatgpt.com", "OpenAI", "an OpenAI API key"),
+            _ => return None,
+        };
+        Some(Self {
+            version: CONSENT_PROMPT_VERSION,
+            backend_id: backend_id.to_string(),
+            product: product.to_string(),
+            summary: format!(
+                "IronWire will read the OAuth token that {product} Code stores on this \
+                 machine and send requests to {host} with it, from this computer only."
+            ),
+            points: vec![
+                format!(
+                    "This uses a private authentication path. {vendor} does not document \
+                     it and may change or block it at any time."
+                ),
+                format!(
+                    "Using it from a third-party proxy may fall outside your subscription's \
+                     intended use. If {vendor} objects, it is your account that is affected."
+                ),
+                format!("Your token is never sent anywhere except {host}."),
+                format!("You can use {alternative} instead — fully supported, no ambiguity."),
+            ],
+            question: format!("Enable the {product} subscription backend?"),
+        })
+    }
+}
+
 /// One recorded consent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsentRecord {
@@ -207,5 +276,86 @@ mod durability_tests {
         ConsentLedger::default().save(&path).expect("saves");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o077, 0, "group or other can access it: {mode:o}");
+    }
+
+    /// Both surfaces that ask for consent read the same wording from here. A
+    /// second copy would drift, and the recorded version would go on claiming
+    /// both users answered the same question.
+    #[test]
+    fn every_backend_that_requires_consent_has_a_prompt() {
+        for backend in ["claude-sub", "codex-sub"] {
+            let prompt = ConsentPrompt::for_backend(backend).expect("has a prompt");
+            assert_eq!(prompt.backend_id, backend);
+            assert_eq!(prompt.version, CONSENT_PROMPT_VERSION);
+            assert!(!prompt.summary.is_empty());
+            assert!(!prompt.question.is_empty());
+        }
+    }
+
+    /// A consent screen that cannot name what it is about is not consent, so an
+    /// unknown backend gets nothing rather than a generic form of words.
+    #[test]
+    fn an_unknown_backend_has_no_prompt_rather_than_a_generic_one() {
+        assert!(ConsentPrompt::for_backend("nearai").is_none());
+        assert!(ConsentPrompt::for_backend("").is_none());
+    }
+
+    /// `docs/TRUST.md` §2 fixes what has to be said. These are the four things a
+    /// user is agreeing to, and none of them may quietly go missing.
+    #[test]
+    fn the_prompt_states_the_cost_and_not_only_the_benefit() {
+        let prompt = ConsentPrompt::for_backend("claude-sub").expect("has a prompt");
+        let all = prompt.points.join(" ");
+        assert!(
+            all.contains("does not document"),
+            "the path being private: {all}"
+        );
+        assert!(
+            all.contains("your account that is affected"),
+            "who bears the risk: {all}"
+        );
+        assert!(
+            all.contains("never sent anywhere except"),
+            "where the token goes: {all}"
+        );
+        assert!(all.contains("instead"), "the alternative: {all}");
+        assert!(
+            prompt.summary.contains("this computer only"),
+            "the scope: {}",
+            prompt.summary
+        );
+    }
+
+    /// The prompt names the product and the host it will talk to, because
+    /// "enable the subscription backend" on its own does not say what happens.
+    #[test]
+    fn the_prompt_names_the_product_and_the_host() {
+        let claude = ConsentPrompt::for_backend("claude-sub").expect("has a prompt");
+        assert!(
+            claude.summary.contains("api.anthropic.com"),
+            "{}",
+            claude.summary
+        );
+        assert!(claude.question.contains("Claude"), "{}", claude.question);
+
+        let codex = ConsentPrompt::for_backend("codex-sub").expect("has a prompt");
+        assert!(codex.summary.contains("chatgpt.com"), "{}", codex.summary);
+        assert!(codex.question.contains("Codex"), "{}", codex.question);
+    }
+
+    /// The prompt is stored as sentences, not pre-broken lines: a terminal wraps
+    /// it to its width and a menu lays it out in a view. Embedded newlines would
+    /// make one of those two look wrong.
+    #[test]
+    fn the_prompt_carries_no_layout_of_its_own() {
+        let prompt = ConsentPrompt::for_backend("claude-sub").expect("has a prompt");
+        assert!(!prompt.summary.contains('\n'));
+        for point in &prompt.points {
+            assert!(!point.contains('\n'), "{point}");
+            assert!(
+                !point.contains("  "),
+                "double spaces suggest hand-wrapping: {point}"
+            );
+        }
     }
 }

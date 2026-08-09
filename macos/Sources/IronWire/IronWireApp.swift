@@ -23,7 +23,7 @@ struct IronWireApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuContent(client: model.client, notifier: model.notifier)
+            MenuContent(client: model.client, notifier: model.notifier, loginItem: model.loginItem)
         } label: {
             MenuBarLabel(client: model.client)
         }
@@ -54,6 +54,7 @@ private struct MenuBarLabel: View {
 final class AppModel: ObservableObject {
     let client = ControlClient()
     let notifier = Notifier()
+    let loginItem = LoginItem()
 
     init() {
         client.onEvent = { [weak self] event in
