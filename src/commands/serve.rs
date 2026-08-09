@@ -80,6 +80,7 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
 
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
+        .with_paths(paths.clone())
         .with_ledger(ledger)
         .with_quirks(quirks);
     // Resume today's spending rather than restarting it: a cap that could be

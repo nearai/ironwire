@@ -15,6 +15,7 @@
 pub mod atomic;
 pub mod capability;
 pub mod config;
+pub mod config_edit;
 pub mod error;
 pub mod peek;
 pub mod policy;

@@ -308,7 +308,7 @@ async fn enabling_the_filter_with_nothing_to_match_leaves_it_off() {
             ..PrivacyConfig::default()
         },
     );
-    assert!(state.privacy.is_none());
+    assert!(state.privacy().is_none());
 
     let (status, _) = send(state, body.clone()).await;
     assert_eq!(status, StatusCode::OK);

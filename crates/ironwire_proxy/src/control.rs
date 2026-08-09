@@ -14,9 +14,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
+use ironwire_core::config::PrivacyMode;
 use ironwire_core::protocol::BackendId;
 use ironwire_core::quota::Headroom;
 use ironwire_creds::ConsentLedger;
+use ironwire_creds::consent::ConsentPrompt;
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_update::UpdateStatus;
 use ironwire_usage::UsageReport;
@@ -282,6 +284,106 @@ pub struct SubscriptionUse {
     pub exchanges: i64,
 }
 
+/// The settings a client may change, and everything it needs to render them
+/// without deciding anything itself.
+///
+/// The menu bar app is the reason this exists. It could read `privacy` off
+/// [`StatusView`] and offer four buttons — and it would be wrong, because
+/// whether `full` is even selectable depends on `trusted_backends`, which is a
+/// rule that lives in [`Config::validate`] and would then have a second,
+/// drifting implementation in Swift. So the daemon says which options exist,
+/// which are selectable, and why not (`docs/DESIGN.md` §6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingsView {
+    /// The privacy filter, and the modes it could be switched to.
+    pub privacy: PrivacySettingsView,
+    /// Everything a user can log into, and what it would take.
+    pub services: Vec<ServiceView>,
+}
+
+/// The privacy filter as a settings screen sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacySettingsView {
+    /// The mode in force, as it serialises: `off` / `credentials` / `pii` /
+    /// `full`.
+    pub mode: String,
+    /// What the filter is *doing*, in the daemon's own words. Rendered
+    /// verbatim or not at all — never restated as what the user is safe from
+    /// (`docs/TRUST.md` I7).
+    pub summary: String,
+    /// Every mode, in ladder order.
+    pub options: Vec<PrivacyOptionView>,
+    /// Backends the user named as acceptable destinations under `full`.
+    pub trusted_backends: Vec<String>,
+}
+
+/// One rung of the privacy ladder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyOptionView {
+    /// The value to send back to `POST /_ironwire/privacy`.
+    pub id: String,
+    /// What this level substitutes, in one clause.
+    pub describes: String,
+    /// Whether switching to it right now would work.
+    pub selectable: bool,
+    /// Why it would not, when it would not. Present so a greyed-out option can
+    /// say what to do about itself instead of just being greyed out.
+    pub unavailable_because: Option<String>,
+}
+
+/// One thing a user can log into.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceView {
+    /// Backend id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// `subscription` / `api_key` / `credits` / `local`.
+    pub kind: String,
+    /// Whether a credential was found.
+    pub authenticated: bool,
+    /// Why not, when it was not.
+    pub detail: Option<String>,
+    /// Whether this backend is gated behind recorded consent.
+    pub requires_consent: bool,
+    /// Whether that consent is currently recorded, at the current prompt
+    /// version.
+    pub consented: bool,
+    /// The exact question that has to be answered to enable it.
+    ///
+    /// Carried rather than written into the client, because a second copy of a
+    /// consent prompt is a second prompt — and the recorded version would go on
+    /// claiming both users answered the same one (`docs/TRUST.md` §2).
+    pub consent_prompt: Option<ConsentPrompt>,
+    /// What to run for the part a GUI cannot do: pointing a coding agent at
+    /// IronWire means editing the user's shell profile or their agent's config,
+    /// which is theirs to own.
+    pub connect_command: Option<String>,
+}
+
+/// Body of `POST /_ironwire/privacy`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrivacyRequest {
+    /// The mode to switch to.
+    pub mode: String,
+}
+
+/// Body of `POST /_ironwire/consent`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsentRequest {
+    /// Backend to grant or withdraw consent for.
+    pub backend: String,
+    /// `true` to record consent, `false` to withdraw it.
+    pub granted: bool,
+    /// The prompt version the user actually answered.
+    ///
+    /// Required, and checked against the current one. A client that has been
+    /// running since before the wording changed would otherwise record consent
+    /// to the new question on the strength of the old one having been shown —
+    /// which is exactly what versioning the prompt exists to prevent.
+    pub prompt_version: u32,
+}
+
 /// Body of `POST /_ironwire/pin`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PinRequest {
@@ -335,10 +437,280 @@ pub fn router() -> Router<AppState> {
         .route("/status", get(status))
         .route("/backends", get(status))
         .route("/pin", post(pin))
+        .route("/settings", get(settings))
+        .route("/privacy", post(privacy))
+        .route("/consent", post(consent))
         .route("/probe", post(probe))
         .route("/log", get(log))
         .route("/events", get(events))
         .route("/health", get(health))
+}
+
+/// What can be changed, and what it would take.
+async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let statuses = state.backends.statuses().await;
+    let consent = state.consent_snapshot();
+    axum::Json(settings_view(&state, &statuses, &consent)).into_response()
+}
+
+fn settings_view(
+    state: &AppState,
+    statuses: &[ironwire_upstream::backend::BackendStatus],
+    consent: &ConsentLedger,
+) -> SettingsView {
+    let privacy = state.privacy_config();
+
+    let options = [
+        PrivacyMode::Off,
+        PrivacyMode::Credentials,
+        PrivacyMode::Pii,
+        PrivacyMode::Full,
+    ]
+    .into_iter()
+    .map(|mode| {
+        // The same rule `Config::validate` applies at startup, asked here so a
+        // client can grey the option out instead of offering a switch that
+        // would take every backend out of service.
+        let blocked =
+            (mode == PrivacyMode::Full && privacy.trusted_backends.is_empty()).then(|| {
+                "`full` routes only to backends you have named as acceptable, and none are named. \
+             Add `trusted_backends` under `[privacy]` in config.toml first — which operators \
+             you trust with your data is not IronWire's call."
+                    .to_string()
+            });
+        PrivacyOptionView {
+            id: mode_name(mode).to_string(),
+            describes: mode.describe().to_string(),
+            selectable: blocked.is_none(),
+            unavailable_because: blocked,
+        }
+    })
+    .collect();
+
+    let services = statuses
+        .iter()
+        .map(|status| {
+            let requires_consent = status.kind.requires_consent();
+            ServiceView {
+                id: status.id.to_string(),
+                name: status.name.clone(),
+                kind: kind_name(status.kind),
+                authenticated: status.authenticated,
+                detail: status.detail.clone(),
+                requires_consent,
+                consented: !requires_consent || consent.is_granted(status.id.as_str()),
+                consent_prompt: ConsentPrompt::for_backend(status.id.as_str()),
+                connect_command: connect_command(status.id.as_str()),
+            }
+        })
+        .collect();
+
+    SettingsView {
+        privacy: PrivacySettingsView {
+            mode: mode_name(privacy.mode()).to_string(),
+            summary: privacy.summary(),
+            options,
+            trusted_backends: privacy.trusted_backends.clone(),
+        },
+        services,
+    }
+}
+
+/// What to run for the parts a GUI has no business doing.
+///
+/// Pointing Claude Code at IronWire means an environment variable in the user's
+/// shell profile; pointing Codex at it means editing their `config.toml`. Both
+/// are files the user owns, and `ironwire connect` already shows the change
+/// before making it (`docs/TRUST.md`). A menu offering to do it silently would
+/// be the wrong end of that trade.
+fn connect_command(backend_id: &str) -> Option<String> {
+    match backend_id {
+        "claude-sub" => Some("ironwire connect claude".to_string()),
+        "codex-sub" => Some("ironwire connect codex".to_string()),
+        "nearai" => Some("ironwire connect near".to_string()),
+        _ => None,
+    }
+}
+
+/// The value a mode serialises as, matching `PrivacyMode`'s snake_case.
+fn mode_name(mode: PrivacyMode) -> &'static str {
+    match mode {
+        PrivacyMode::Off => "off",
+        PrivacyMode::Credentials => "credentials",
+        PrivacyMode::Pii => "pii",
+        PrivacyMode::Full => "full",
+    }
+}
+
+fn kind_name(kind: ironwire_core::protocol::BackendKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+}
+
+/// Change the privacy mode: in the running daemon, and in `config.toml`.
+///
+/// Both, and in that order. A change that only took effect at the next restart
+/// would be a switch that appears to do nothing, and a change that only lived
+/// in memory would silently revert the next time the daemon started — the user
+/// would be back on a weaker filter without ever being told.
+async fn privacy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<PrivacyRequest>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+
+    let Some(mode) = parse_mode(&request.mode) else {
+        return bad_request(format!(
+            "unknown privacy mode `{}` (try: off, credentials, pii, full)",
+            request.mode
+        ));
+    };
+
+    // The same refusal `Config::validate` makes at startup. Switching to `full`
+    // with nothing trusted would take every backend out of service, and a
+    // settings screen that can do that is worse than one that cannot.
+    let current = state.privacy_config();
+    if mode == PrivacyMode::Full && current.trusted_backends.is_empty() {
+        return bad_request(
+            "`mode = \"full\"` routes only to backends you have named as acceptable, and \
+             none are named — so nothing could be routed anywhere. Add `trusted_backends` \
+             under `[privacy]` in config.toml first. There is no default: which operators \
+             you trust with your data is not IronWire's call."
+                .to_string(),
+        );
+    }
+
+    state.set_privacy_mode(mode);
+
+    // Persisted after the switch, and reported separately: the running daemon
+    // is already filtering the way the user asked, and a config file we could
+    // not write is a smaller problem than pretending nothing happened.
+    let persisted = persist_privacy_mode(&state, mode);
+    let summary = state.privacy_config().summary();
+    match persisted {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "mode": mode_name(mode),
+                "summary": summary,
+                "persisted": true,
+            })),
+        )
+            .into_response(),
+        Err(detail) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "mode": mode_name(mode),
+                "summary": summary,
+                "persisted": false,
+                "warning": format!(
+                    "This is in force now, but could not be saved, so it will revert when the \
+                     daemon restarts: {detail}"
+                ),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Write the mode into `config.toml`, preserving everything else in it.
+fn persist_privacy_mode(state: &AppState, mode: PrivacyMode) -> Result<(), String> {
+    let Some(path) = state.config_path() else {
+        return Err("this daemon was not started from a config file".to_string());
+    };
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let edited = ironwire_core::config_edit::set_privacy_mode(&existing, mode)
+        .map_err(|error| error.to_string())?;
+    ironwire_core::atomic::write(&path, &edited)
+        .map_err(|error| format!("writing {}: {error}", path.display()))
+}
+
+/// Record or withdraw consent for a subscription backend.
+///
+/// The daemon reads the consent ledger on every routing decision, so this takes
+/// effect on the next request rather than the next restart — unlike
+/// `ironwire disconnect --subscription`, which edits the file underneath a
+/// running daemon and has to say so.
+async fn consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ConsentRequest>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+
+    let Some(prompt) = ConsentPrompt::for_backend(&request.backend) else {
+        return bad_request(format!(
+            "`{}` is not a backend that consent applies to",
+            request.backend
+        ));
+    };
+
+    // Granting is the direction that needs the check. Withdrawing consent is
+    // always allowed: a user who wants to stop should never be told that the
+    // version of the question they answered was too old to stop with.
+    if request.granted && request.prompt_version != prompt.version {
+        return bad_request(format!(
+            "this asked version {} of the consent question, but the current one is version {}. \
+             Re-read it and answer again — a newer question is a different question.",
+            request.prompt_version, prompt.version
+        ));
+    }
+
+    let recorded = state.set_consent(&request.backend, request.granted);
+    match recorded {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "backend": request.backend,
+                "consented": request.granted,
+            })),
+        )
+            .into_response(),
+        Err(detail) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                // Deliberately not "ok with a warning" like the privacy write.
+                // A consent we failed to record must not be treated as granted.
+                "error": format!("could not record that: {detail}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_mode(name: &str) -> Option<PrivacyMode> {
+    match name {
+        "off" => Some(PrivacyMode::Off),
+        "credentials" => Some(PrivacyMode::Credentials),
+        "pii" => Some(PrivacyMode::Pii),
+        "full" => Some(PrivacyMode::Full),
+        _ => None,
+    }
+}
+
+fn bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 /// Unauthenticated: it reveals nothing and is what a service manager probes.
@@ -462,10 +834,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         pin,
         backends,
         balance,
-        privacy: state
-            .privacy
-            .as_ref()
-            .map(|filter| filter.summary().to_string()),
+        privacy: state.privacy().map(|filter| filter.summary().to_string()),
         quirks_serial: state.quirks().serial(),
         update: state.update_status(),
         last_route: state.last_route().map(|route| LastRouteView {

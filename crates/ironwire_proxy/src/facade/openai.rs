@@ -164,10 +164,7 @@ async fn forward(
     // The privacy filter is the one documented exception to byte-identical
     // forwarding (`docs/PROTOCOL.md` §2), and it is opt-in. With it off,
     // `body` below is still exactly the bytes the client sent.
-    let applied = state
-        .privacy
-        .as_ref()
-        .map(|filter| filter.apply(&key, &parsed));
+    let applied = state.privacy().map(|filter| filter.apply(&key, &parsed));
     let body = match &applied {
         Some(applied) => {
             bytes::Bytes::from(serde_json::to_vec(&applied.body).unwrap_or_else(|_| body.to_vec()))

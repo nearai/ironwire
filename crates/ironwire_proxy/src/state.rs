@@ -17,13 +17,30 @@ use ironwire_usage::UsageReport;
 use crate::events::EventBus;
 use crate::privacy::PrivacyFilter;
 
+/// Take a lock, recovering from poisoning.
+///
+/// Every mutex in this module guards plain data. A thread that panicked while
+/// holding one has not corrupted anything a reader cannot cope with, and
+/// refusing to route because of it would turn one panic into an outage.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// The set of backends this daemon can route to.
 #[derive(Clone, Default)]
 pub struct BackendRegistry {
     backends: Vec<Arc<dyn Backend>>,
     /// The privacy config, for the trusted-backend constraint. `None` until
     /// state is built, which is only the case in tests that never route.
-    privacy_policy: Option<Arc<ironwire_core::config::PrivacyConfig>>,
+    ///
+    /// Shared and swappable, because the mode is a routing constraint the user
+    /// can now change while the daemon is running: under `full`, `trusts`
+    /// decides which backends are eligible at all. A copy taken at startup
+    /// would keep routing to a backend the user has since untrusted.
+    privacy_policy: Arc<Mutex<Option<Arc<ironwire_core::config::PrivacyConfig>>>>,
 }
 
 impl BackendRegistry {
@@ -40,15 +57,22 @@ impl BackendRegistry {
 
     /// Install the privacy config, so `candidates` can mark what may be routed
     /// to under `privacy.mode = "full"`.
-    pub fn set_privacy(&mut self, privacy: Arc<ironwire_core::config::PrivacyConfig>) {
-        self.privacy_policy = Some(privacy);
+    ///
+    /// Takes `&self`: this is called again whenever the mode changes, from a
+    /// control-API handler that only has a shared reference to the state.
+    pub fn set_privacy(&self, privacy: Arc<ironwire_core::config::PrivacyConfig>) {
+        *lock(&self.privacy_policy) = Some(privacy);
+    }
+
+    /// The privacy config currently in force, if one has been installed.
+    fn privacy_policy(&self) -> Option<Arc<ironwire_core::config::PrivacyConfig>> {
+        lock(&self.privacy_policy).clone()
     }
 
     /// Trusted ids named in config that no registered backend answers to.
     #[must_use]
     pub fn missing_trusted(&self) -> Vec<String> {
-        self.privacy_policy
-            .as_ref()
+        self.privacy_policy()
             .filter(|privacy| privacy.mode() == ironwire_core::config::PrivacyMode::Full)
             .map(|privacy| {
                 privacy
@@ -115,6 +139,10 @@ impl BackendRegistry {
             ironwire_core::quota::QuotaSnapshot,
         ) -> ironwire_core::quota::QuotaSnapshot,
     ) -> Vec<Candidate> {
+        // Read once, so every candidate in one routing decision is judged
+        // against the same policy — a mode changed mid-scan would otherwise
+        // produce a candidate set that never existed.
+        let privacy_policy = self.privacy_policy();
         self.backends
             .iter()
             .map(|backend| {
@@ -130,8 +158,7 @@ impl BackendRegistry {
                     // Beside `consented` because it is the same shape of fact:
                     // a user instruction, read from config, that the router
                     // must obey without knowing where it came from.
-                    trusted: self
-                        .privacy_policy
+                    trusted: privacy_policy
                         .as_ref()
                         .is_none_or(|privacy| privacy.trusts(backend.id().as_str())),
                     requires_client_identity: backend.requires_client_identity(),
@@ -180,7 +207,20 @@ pub struct AppState {
     pub events: EventBus,
     /// The optional privacy filter. `None` unless the user turned it on and
     /// configured something for it to match (`docs/PRIVACY.md`).
-    pub privacy: Option<Arc<PrivacyFilter>>,
+    ///
+    /// Swappable, because the mode is a setting the user can change without
+    /// restarting. Read through [`AppState::privacy`], which hands back an
+    /// `Arc` so an in-flight request keeps the filter it started with rather
+    /// than changing behaviour halfway down a response stream.
+    privacy: Arc<Mutex<Option<Arc<PrivacyFilter>>>>,
+    /// The privacy settings the filter above was built from.
+    privacy_config: Arc<Mutex<Arc<ironwire_core::config::PrivacyConfig>>>,
+    /// Where this daemon's files live, when it was started from a real home.
+    ///
+    /// `None` in tests, which never persist anything. A settings change that
+    /// cannot be written down is refused rather than applied silently, so this
+    /// being absent is a reason to say no — see [`AppState::set_consent`].
+    paths: Option<Arc<ironwire_core::config::PathsConfig>>,
     /// Port actually bound. Distinct from `config.server.port`, which is only
     /// a request: a `--port` override or a config reload would otherwise make
     /// `status` report a number nothing is listening on.
@@ -244,7 +284,6 @@ impl AppState {
         // The registry has to know the privacy policy before it can say which
         // backends may be routed to, and this is the one place both are in
         // scope.
-        let mut backends = backends;
         backends.set_privacy(Arc::new(config.privacy.clone()));
         Self {
             backends,
@@ -257,7 +296,11 @@ impl AppState {
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             breakers: Arc::new(BreakerBoard::default()),
             events: EventBus::new(),
-            privacy: PrivacyFilter::from_config(&config.privacy).map(Arc::new),
+            privacy: Arc::new(Mutex::new(
+                PrivacyFilter::from_config(&config.privacy).map(Arc::new),
+            )),
+            privacy_config: Arc::new(Mutex::new(Arc::new(config.privacy.clone()))),
+            paths: None,
             port: config.server.port,
             config: Arc::new(config),
             control_token: Arc::new(control_token),
@@ -265,6 +308,46 @@ impl AppState {
             spend: Arc::new(Mutex::new(crate::spend::SpendTracker::default())),
             usage: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The privacy filter currently in force.
+    ///
+    /// Handed out as an `Arc` rather than borrowed, so a request that started
+    /// under one mode finishes under it. A filter swapped out from under an
+    /// in-flight exchange would substitute in the request and then fail to
+    /// reverse the substitution in the response — the one failure mode that
+    /// turns the filter into corruption rather than protection.
+    #[must_use]
+    pub fn privacy(&self) -> Option<Arc<PrivacyFilter>> {
+        lock(&self.privacy).clone()
+    }
+
+    /// The privacy settings currently in force.
+    #[must_use]
+    pub fn privacy_config(&self) -> Arc<ironwire_core::config::PrivacyConfig> {
+        Arc::clone(&lock(&self.privacy_config))
+    }
+
+    /// Change the privacy mode, everywhere it is read from.
+    ///
+    /// Two things have to move together, and the ordering matters. The filter
+    /// decides what gets substituted; the registry's copy decides which
+    /// backends are eligible at all under `full`. Installing the routing
+    /// constraint *first* means there is no instant at which requests could be
+    /// substituted-for-`full` while still eligible to reach an untrusted
+    /// backend — the direction that would leak.
+    ///
+    /// Persistence is the caller's job: this is the running daemon's state, and
+    /// a change that could not be written to `config.toml` is still a change
+    /// the user asked for and can see.
+    pub fn set_privacy_mode(&self, mode: ironwire_core::config::PrivacyMode) {
+        let mut updated = (*self.privacy_config()).clone();
+        updated.mode = Some(mode);
+        let updated = Arc::new(updated);
+
+        self.backends.set_privacy(Arc::clone(&updated));
+        *lock(&self.privacy) = PrivacyFilter::from_config(&updated).map(Arc::new);
+        *lock(&self.privacy_config) = updated;
     }
 
     /// A usage report, reusing the last one only if nothing has changed.
@@ -387,6 +470,55 @@ impl AppState {
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
+    }
+
+    /// Record where this daemon's files live, so settings changes can be saved.
+    #[must_use]
+    pub fn with_paths(mut self, paths: ironwire_core::config::PathsConfig) -> Self {
+        self.paths = Some(Arc::new(paths));
+        self
+    }
+
+    /// `config.toml`, when there is one to write.
+    #[must_use]
+    pub fn config_path(&self) -> Option<std::path::PathBuf> {
+        self.paths.as_ref().map(|paths| paths.config_file())
+    }
+
+    /// Record or withdraw consent for a backend, and write it down.
+    ///
+    /// In that order, and both or neither. The router reads the in-memory
+    /// ledger on every decision, so a grant takes effect on the next request —
+    /// but a grant that only lived in memory would vanish at the next restart,
+    /// and `docs/TRUST.md` §2 is that consent is *recorded*. So a failed write
+    /// rolls the in-memory change back and reports the failure: consent we
+    /// could not record must never be treated as granted.
+    ///
+    /// # Errors
+    ///
+    /// A message naming what could not be written.
+    pub fn set_consent(&self, backend_id: &str, granted: bool) -> Result<(), String> {
+        let Some(paths) = self.paths.as_ref() else {
+            return Err("this daemon was not started from a home directory".to_string());
+        };
+        let path = paths.consent_file();
+
+        let previous = self.consent_snapshot();
+        {
+            let mut ledger = lock(&self.consent);
+            if granted {
+                ledger.grant(backend_id, chrono::Utc::now());
+            } else {
+                ledger.revoke(backend_id);
+            }
+        }
+
+        let updated = self.consent_snapshot();
+        if let Err(error) = updated.save(&path) {
+            *lock(&self.consent) = previous;
+            return Err(format!("writing {}: {error}", path.display()));
+        }
+        Ok(())
     }
 
     /// Read the consent ledger.
