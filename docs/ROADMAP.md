@@ -262,6 +262,16 @@ Thin SwiftUI client over `/_ironwire/status` and `/_ironwire/events`. Shows the
 capacity bars, current route, live spend, and a pin control. **No routing logic
 in Swift** — the daemon is the only brain (DESIGN §6).
 
+Built, in [`macos/`](../macos/README.md). The icon carries four states, the
+dropdown mirrors `ironwire status`, and an unobserved backend renders the word
+`unknown` with no bar — a bar drawn at zero would be a number nobody measured, in
+the one surface a user takes in without reading.
+
+It ships as `IronWire-macos.zip` and installs through the Homebrew formula. What
+is outstanding is **signing and notarisation**: the bundle is ad-hoc signed,
+which is enough for `brew` and for a local build but not for a direct download.
+That needs the Apple Developer certificate in the table below.
+
 ---
 
 ## M6 — Trace contribution
@@ -451,7 +461,7 @@ listing them here keeps them from looking finished when they are not.
 | Hosted apt repo | hosting, plus a signing key for the `Release` file | M4 |
 | Real quirks signing key | same. The compiled-in key is a placeholder that verifies nothing, so the channel is inert — which is the correct failure mode, but it *is* inert | M4 |
 | npm / PyPI / tap publication | `NPM_TOKEN`, PyPI trusted publishing, `TAP_TOKEN` | M4 |
-| macOS menu bar app | Xcode, and a Mac to build on | M5 |
+| Menu bar app signing | an Apple Developer certificate. The app is built and ad-hoc signed, which is enough for `brew` and for a local build; a *downloaded* bundle is blocked by Gatekeeper until it is notarised | M5 |
 | Tier-3 PII classifier | a local model, and a labelled corpus to state its precision and recall against | M7 |
 
 The code paths for these exist and are tested against mocks and fixtures. What

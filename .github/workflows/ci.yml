@@ -30,6 +30,19 @@ jobs:
       # ignored test nobody runs is a deleted test, so it runs here.
       - run: cargo test --release -p ironwire_privacy --test cost -- --include-ignored
 
+      # The menu bar app (macos/), on the macOS leg only: Linux runners cannot
+      # build Swift, and a red matrix on every push would be worse than no
+      # coverage. The alternative is finding a Swift compile break during a tag
+      # build, after the tag is pushed — which is the failure this whole job
+      # exists to avoid.
+      #
+      # `app` as well as `test`, because the bundle assembly and the Info.plist
+      # are what the release job runs, and a typo there is only otherwise
+      # discovered by a release.
+      - name: Menu bar app
+        if: matrix.os == 'macos-latest'
+        run: make -C macos test app
+
   # The packaging scripts only otherwise run inside a tag build, which is the
   # worst place to find a typo: the tag is already pushed and a fix needs
   # another one. So they run here, against fake release artifacts.

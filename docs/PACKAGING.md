@@ -136,16 +136,57 @@ installer tells you to run, and it is what `doctor` assumes.
 
 ## The macOS menu bar app
 
-Not built. `docs/ROADMAP.md` M5 and issue #8 specify a SwiftUI `MenuBarExtra`
-app in a `macos/` directory, and the daemon side it needs is finished:
-`/_ironwire/status` returns a complete `StatusView`, `/_ironwire/events` is a
-live SSE stream (emitting `: connected` and `: lagged N` comment frames a client
-must parse and ignore), and `/_ironwire/pin` is the only write it needs.
-`LastRouteView` now carries `rung`, so the app can tell a degraded route from a
-preferred one without inferring it from backend names — which would be a second
-implementation of a routing question, in a language that cannot see the policy.
+Built, in [`macos/`](../macos/README.md): a SwiftUI `MenuBarExtra` that is a pure
+client of the control API. It renders `/_ironwire/status`, holds
+`/_ironwire/events` open, and posts to `/_ironwire/pin` — and decides nothing, because
+the daemon is the only brain (`docs/DESIGN.md` §6).
 
-When it is written it must not enter any CI workflow: Linux runners cannot build
-an Xcode project, and a red matrix on every push is worse than no CI. Signing,
-notarisation and a `.dmg` need an Apple Developer certificate and are a separate
-problem from a build that runs locally.
+It is a Swift package rather than an `.xcodeproj`, so the same `make -C macos
+dist` produces the bundle locally and in the release job. `macos/README.md` has
+the reasoning and the other decisions worth knowing about (the App Sandbox is
+off, so the app can read `control.token`).
+
+### How it ships
+
+**As its own artifact, not inside the binary tarballs.** The archive layout above
+is the installer's contract — a single `ironwire` at the root — and
+`scripts/install.sh` finds the binary by searching the unpacked tree. A second
+executable in there would be a hazard for no gain.
+
+| Where | What |
+|---|---|
+| Release | `IronWire-macos.zip`, universal, built on the `aarch64-apple-darwin` runner |
+| Homebrew | a `resource` in the formula, staged into `prefix` inside `on_macos` |
+| npm / pip / apt | not carried — see below |
+
+The formula omits the app entirely when the artifact is missing, so a release
+that skipped the macOS runner still installs the binary. Formulae do not link
+`.app` bundles into `/Applications` the way casks do, so the caveats say where
+it landed.
+
+npm and pip *could* carry it — `@ironwire/cli-darwin-arm64` and the macOS wheels
+are the only packages a Mac pulls, so it would cost Linux and Windows users
+nothing — but neither has any business copying an app into `/Applications`, and
+`build_npm.mjs` refuses install scripts on purpose. That would need an
+`ironwire menubar install` command, which does not exist.
+
+### What is still missing: signing and notarisation
+
+The bundle is **ad-hoc signed**. That is enough to execute on Apple Silicon and
+enough to run a locally built copy, and it is enough for the Homebrew path today
+because `brew` unpacks the resource itself rather than handing the user a
+download. It is **not** enough for a bundle a user downloads directly:
+un-notarised apps are blocked by Gatekeeper on first launch, and clearing the
+quarantine attribute by hand is not a thing to ask of anyone.
+
+Proper signing, notarisation and a `.dmg` need an Apple Developer certificate,
+which this project does not have (`docs/ROADMAP.md`). Everything else is in
+place: the remaining step is a credential, not a redesign.
+
+### CI
+
+`make -C macos test app` runs on the **macOS leg of `ci.yml` only**. Linux
+runners cannot build Swift, and a red matrix on every push would be worse than
+no coverage — but the alternative, finding a Swift compile break during a tag
+build after the tag is pushed, is the failure the packaging job exists to
+prevent. The guard is `if: matrix.os == 'macos-latest'`.

@@ -102,6 +102,22 @@ jobs:
           done
           ls -la
 
+      # The menu bar app (macos/), built once on the arm64 macOS runner as a
+      # universal bundle rather than per-target: it is one artifact for both
+      # Macs, and only a macOS runner can build Swift at all.
+      #
+      # A separate zip, not a passenger inside the binary tarball — that archive
+      # has a documented shape, a single `ironwire` at the root, and
+      # scripts/install.sh finds the binary by searching the unpacked tree.
+      - name: Build the menu bar app
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          make -C macos test
+          make -C macos dist
+          cp macos/build/IronWire-macos.zip dist/
+          cd dist
+          shasum -a 256 IronWire-macos.zip > IronWire-macos.zip.sha256
+
       # Size is reported, never gated. A capability worth its bytes should not
       # be blocked by a number picked in advance (docs/PACKAGING.md).
       - name: Report size

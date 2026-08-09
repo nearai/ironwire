@@ -171,6 +171,80 @@ for row in csv.reader(io.StringIO(z.read(record).decode())):
     fi
 fi
 
+# ------------------------------------------------------------------ brew
+
+echo
+echo "build_brew.py"
+mkdir -p "${work}/brewdist"
+cp "${work}"/artifacts/ironwire-*apple-darwin.tar.gz \
+   "${work}"/artifacts/ironwire-*linux-gnu.tar.gz "${work}/brewdist/" 2>/dev/null || true
+
+# Without the menu bar app: a release that skipped the macOS runner must still
+# produce a formula that installs the binary, because the binary is the product.
+if out=$(python3 packaging/build_brew.py --version "$VERSION" \
+        --dist "${work}/brewdist" --out "${work}/no-app.rb" 2>&1); then
+    ok "runs without the menu bar artifact"
+else
+    bad "runs without the menu bar artifact" "$out"
+fi
+if [ -f "${work}/no-app.rb" ]; then
+    if grep -q "IronWire.app" "${work}/no-app.rb"; then
+        bad "omits the app when there is no artifact" "formula references an app it cannot download"
+    else
+        ok "omits the app when there is no artifact"
+    fi
+fi
+
+# With it: the app ships as a `resource`, because the formula's one URL per
+# platform is already spent on the binary.
+mkdir -p "${work}/appstage/IronWire.app/Contents/MacOS"
+printf 'placeholder' >"${work}/appstage/IronWire.app/Contents/MacOS/IronWire"
+if command -v ditto >/dev/null 2>&1; then
+    (cd "${work}/appstage" && ditto -c -k --keepParent IronWire.app "${work}/brewdist/IronWire-macos.zip")
+elif command -v zip >/dev/null 2>&1; then
+    (cd "${work}/appstage" && zip -qr "${work}/brewdist/IronWire-macos.zip" IronWire.app)
+fi
+
+if [ -f "${work}/brewdist/IronWire-macos.zip" ]; then
+    if out=$(python3 packaging/build_brew.py --version "$VERSION" \
+            --dist "${work}/brewdist" --out "${work}/with-app.rb" 2>&1); then
+        ok "runs with the menu bar artifact"
+    else
+        bad "runs with the menu bar artifact" "$out"
+    fi
+
+    if grep -q 'resource "menubar"' "${work}/with-app.rb" &&
+       grep -q 'prefix.install "IronWire.app"' "${work}/with-app.rb"; then
+        ok "ships the app as a macOS-only resource"
+    else
+        bad "ships the app as a macOS-only resource" "resource or install stanza missing"
+    fi
+
+    # A formula whose caveats print `#{{opt_prefix}}` tells the user to open a
+    # path that does not exist. It happened; hence the test.
+    if grep -q '#{{' "${work}/with-app.rb"; then
+        bad "interpolations are single-braced" "found '#{{' — a format-escape leaked into the formula"
+    else
+        ok "interpolations are single-braced"
+    fi
+
+    # The formula is Ruby, and a syntax error in it is only otherwise discovered
+    # by a user running `brew install`.
+    if command -v ruby >/dev/null 2>&1; then
+        for formula in "${work}/no-app.rb" "${work}/with-app.rb"; do
+            if ruby -c "$formula" >/dev/null 2>&1; then
+                ok "$(basename "$formula") is valid Ruby"
+            else
+                bad "$(basename "$formula") is valid Ruby" "$(ruby -c "$formula" 2>&1 | head -n1)"
+            fi
+        done
+    else
+        skip "formula syntax check (ruby not installed)"
+    fi
+else
+    skip "menu bar resource (no zip tool available)"
+fi
+
 # --------------------------------------------------------------- manifest
 
 echo

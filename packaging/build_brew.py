@@ -21,6 +21,12 @@ from pathlib import Path
 
 REPO = "nearai/ironwire"
 
+# The menu bar app rides as its own artifact rather than inside the binary
+# tarballs. Those have a documented shape — a single `ironwire` at the root
+# (docs/PACKAGING.md) — and `scripts/install.sh` finds the binary by searching
+# the unpacked tree, so a second executable in there is a hazard for no gain.
+MENUBAR_ARCHIVE = "IronWire-macos.zip"
+
 PLATFORMS = [
     ("aarch64-apple-darwin", "on_macos", "Hardware::CPU.arm?"),
     ("x86_64-apple-darwin", "on_macos", "Hardware::CPU.intel?"),
@@ -35,11 +41,11 @@ class Ironwire < Formula
   version "{version}"
   license any_of: ["MIT", "Apache-2.0"]
 
-{blocks}
+{blocks}{menubar}
   def install
     bin.install "ironwire"
     generate_completions_from_executable(bin/"ironwire", "completions", shells: [:bash, :zsh, :fish])
-  end
+{menubar_install}  end
 
   # A user agent, not a system daemon. IronWire reads the OAuth tokens Claude
   # Code and Codex stored in this user's home directory and binds 127.0.0.1
@@ -64,7 +70,7 @@ class Ironwire < Formula
       Run it:
         ironwire serve                  in the foreground
         brew services start ironwire    in the background
-    EOS
+{menubar_caveat}    EOS
   end
 
   test do
@@ -111,10 +117,67 @@ def main() -> int:
     if not blocks:
         raise SystemExit("no artifacts found — refusing to write an empty formula")
 
+    menubar, menubar_install, menubar_caveat = menu_bar_app(args.dist, base)
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(TEMPLATE.format(repo=REPO, version=args.version, blocks=blocks))
+    args.out.write_text(
+        TEMPLATE.format(
+            repo=REPO,
+            version=args.version,
+            blocks=blocks,
+            menubar=menubar,
+            menubar_install=menubar_install,
+            menubar_caveat=menubar_caveat,
+        )
+    )
     print(f"wrote {args.out}")
     return 0
+
+
+def menu_bar_app(dist: Path, base: str) -> tuple[str, str, str]:
+    """The macOS menu bar app, as a Homebrew `resource`.
+
+    A resource rather than a second `url`: a formula gets one URL per platform
+    block and that one is spent on the binary, which is the thing every platform
+    needs. The app is extra, and only on macOS.
+
+    Absent from the formula entirely when the artifact is missing, so a release
+    that skipped the macOS runner still produces a formula that installs — the
+    binary is the product and the app is not worth failing a release over.
+    """
+    archive = dist / MENUBAR_ARCHIVE
+    if not archive.exists():
+        print(f"warning: no {MENUBAR_ARCHIVE}; the formula will not carry the menu bar app")
+        return "", "", ""
+
+    resource = (
+        "  # The menu bar app (macos/). Ad-hoc signed, not notarised: Homebrew\n"
+        "  # unpacks it itself rather than handing it to the user as a download,\n"
+        "  # which is what keeps Gatekeeper out of the way for now.\n"
+        "  on_macos do\n"
+        '    resource "menubar" do\n'
+        f'      url "{base}/{MENUBAR_ARCHIVE}"\n'
+        f'      sha256 "{sha256(archive)}"\n'
+        "    end\n"
+        "  end\n"
+    )
+    install = (
+        "\n    on_macos do\n"
+        '      resource("menubar").stage { prefix.install "IronWire.app" }\n'
+        "    end\n"
+    )
+    # Formulae do not link .app bundles into /Applications the way casks do, so
+    # the caveat has to say where it went — otherwise it is installed and
+    # invisible, which is the same as not installed.
+    # Single braces: this string is substituted into the template, not formatted
+    # again, so `#{opt_prefix}` has to arrive already spelled the way Ruby wants
+    # it.
+    caveat = (
+        "\n      The menu bar app is installed but not linked into /Applications:\n"
+        '        open "#{opt_prefix}/IronWire.app"\n'
+        '        ln -s "#{opt_prefix}/IronWire.app" /Applications   # to keep it\n'
+    )
+    return resource, install, caveat
 
 
 if __name__ == "__main__":
