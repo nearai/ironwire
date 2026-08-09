@@ -187,6 +187,15 @@ pub struct LastRouteView {
     /// the field a status line exists for: a fallback that nobody notices is
     /// one the user cannot act on.
     pub from: Option<String>,
+    /// How far down the ladder this route sits.
+    ///
+    /// Carried rather than left to the caller, because the alternative is a
+    /// client inferring "is this degraded" from backend *names* — a second
+    /// implementation of a routing question, in a language that cannot see the
+    /// policy, drifting the moment the ladder changes. Defaulted on the way in
+    /// so an older daemon still parses.
+    #[serde(default)]
+    pub rung: ironwire_core::policy::Rung,
     /// When it happened.
     pub at: DateTime<Utc>,
 }
@@ -463,6 +472,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             backend: route.backend,
             model: route.model,
             from: route.from,
+            rung: route.rung,
             at: route.at,
         }),
         usage: usage(&state, now),

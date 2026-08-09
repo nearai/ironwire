@@ -367,6 +367,7 @@ async fn dispatch_inner(
                 state.set_last_route(crate::state::LastRoute {
                     backend: decision.backend.to_string(),
                     model: decision.model.clone(),
+                    rung: decision.rung,
                     from: previous
                         .as_ref()
                         .filter(|p| *p != &decision.backend)

@@ -230,6 +230,7 @@ mod tests {
             backend: "nearai".into(),
             model: None,
             from: from.map(ToString::to_string),
+            rung: ironwire_core::policy::Rung::CrossFamily,
             at: chrono::Utc::now() - ago,
         }
     }

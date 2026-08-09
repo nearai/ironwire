@@ -22,10 +22,14 @@ use crate::quota::QuotaSnapshot;
 /// Rungs 0–2 are silent because nothing the user can observe changes. Rung 3
 /// changes how their agent behaves, so it is announced — pretending otherwise
 /// is how we lose their trust the first time it matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rung {
     /// Preferred backend, preferred model. Cache warm, reasoning intact.
+    ///
+    /// The default, so a client reading an older daemon's status assumes the
+    /// undegraded case rather than inventing a fallback that never happened.
+    #[default]
     Preferred,
     /// Same account, smaller model. Cache mostly warm, reasoning intact.
     SmallerModel,

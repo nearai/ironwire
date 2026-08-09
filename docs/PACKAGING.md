@@ -131,3 +131,21 @@ installer tells you to run, and it is what `doctor` assumes.
 5. `ironwire update` **notifies only** — it never downloads or applies anything,
    and it prints the command belonging to the user's install. See
    [`UPDATES.md`](./UPDATES.md).
+
+---
+
+## The macOS menu bar app
+
+Not built. `docs/ROADMAP.md` M5 and issue #8 specify a SwiftUI `MenuBarExtra`
+app in a `macos/` directory, and the daemon side it needs is finished:
+`/_ironwire/status` returns a complete `StatusView`, `/_ironwire/events` is a
+live SSE stream (emitting `: connected` and `: lagged N` comment frames a client
+must parse and ignore), and `/_ironwire/pin` is the only write it needs.
+`LastRouteView` now carries `rung`, so the app can tell a degraded route from a
+preferred one without inferring it from backend names — which would be a second
+implementation of a routing question, in a language that cannot see the policy.
+
+When it is written it must not enter any CI workflow: Linux runners cannot build
+an Xcode project, and a red matrix on every push is worse than no CI. Signing,
+notarisation and a `.dmg` need an Apple Developer certificate and are a separate
+problem from a build that runs locally.

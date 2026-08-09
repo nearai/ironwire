@@ -226,6 +226,8 @@ pub struct LastRoute {
     pub model: Option<String>,
     /// Backend this conversation was on before, when this was a change.
     pub from: Option<String>,
+    /// How far down the ladder it sits.
+    pub rung: ironwire_core::policy::Rung,
     /// When.
     pub at: chrono::DateTime<chrono::Utc>,
 }
