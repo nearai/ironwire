@@ -62,7 +62,7 @@ pub struct ResilienceConfig {
 
 impl From<&ironwire_core::config::ResilienceConfig> for ResilienceConfig {
     fn from(config: &ironwire_core::config::ResilienceConfig) -> Self {
-        Self::for_turn(config, false)
+        Self::for_turn(config, false, false)
     }
 }
 
@@ -71,16 +71,23 @@ impl ResilienceConfig {
     ///
     /// A compaction turn sends the whole conversation and thinks for far longer
     /// before its first token, so it gets a longer stall timeout
-    /// (`docs/PROTOCOL.md` §8). Everything else is unchanged: the keepalive
-    /// cadence is about the *client's* patience, which does not vary by turn.
+    /// (`docs/PROTOCOL.md` §8), and so does a turn served by a local model,
+    /// which is the slowest thing IronWire routes to. Everything else is
+    /// unchanged: the keepalive cadence is about the *client's* patience, which
+    /// does not vary by turn.
     #[must_use]
     pub fn for_turn(
         config: &ironwire_core::config::ResilienceConfig,
         likely_compaction: bool,
+        is_local: bool,
     ) -> Self {
         Self {
             keepalive: Duration::from_secs(config.keepalive_secs.max(1)),
-            stall_timeout: Duration::from_secs(config.stall_timeout_for(likely_compaction).max(1)),
+            stall_timeout: Duration::from_secs(
+                config
+                    .stall_timeout_for_backend(likely_compaction, is_local)
+                    .max(1),
+            ),
             max_reconnects: config.max_reconnects,
         }
     }

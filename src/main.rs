@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { write } => commands::init::run(cli.port, write),
+        Command::Init { write } => commands::init::run(cli.port, write).await,
         Command::Serve => commands::serve::run(cli.port).await,
         Command::Status { json } => commands::status::run(cli.port, json).await,
         Command::Statusline => commands::statusline::run(cli.port).await,

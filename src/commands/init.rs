@@ -59,7 +59,7 @@ fn has_env(name: &str) -> bool {
 }
 
 /// Say what was found, and what each thing is worth.
-fn report(found: &Found) {
+fn report(found: &Found, local: &[(u16, &'static str)]) {
     let line = |present: bool, what: &str, note: &str| {
         if present {
             println!("  found    {what:<28}{note}");
@@ -84,13 +84,57 @@ fn report(found: &Found) {
         "credits; cross-family fallback",
     );
 
-    if !found.anything() {
+    for (port, name) in local {
+        println!(
+            "  found    {:<28}free, private, and yours",
+            format!("{name} on :{port}")
+        );
+    }
+
+    if !found.anything() && local.is_empty() {
         println!("  nothing yet");
     }
 }
 
+/// Local model servers worth looking for, on the ports they ship with.
+///
+/// Reported, never written: `init` without `--write` changes nothing, and a
+/// discovered endpoint is the user's decision to make (`docs/DESIGN.md`).
+const LOCAL_SERVERS: &[(u16, &str)] = &[(11434, "Ollama"), (1234, "LM Studio"), (8000, "vLLM")];
+
+/// Ask each loopback port whether an OpenAI-compatible server is there.
+///
+/// Short timeout and total silence when nothing answers: this runs on every
+/// `init`, including on machines that will never run a local model, and a
+/// second of latency or a line of "not found" noise would be a tax on everyone
+/// for a feature most people do not use.
+async fn find_local_servers() -> Vec<(u16, &'static str)> {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Vec::new(),
+    };
+    let probes = LOCAL_SERVERS.iter().map(|(port, name)| {
+        let client = client.clone();
+        async move {
+            let url = format!("http://127.0.0.1:{port}/v1/models");
+            match client.get(url).send().await {
+                Ok(response) if response.status().is_success() => Some((*port, *name)),
+                _ => None,
+            }
+        }
+    });
+    futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 /// Run `ironwire init`.
-pub(crate) fn run(port: Option<u16>, write: bool) -> Result<()> {
+pub(crate) async fn run(port: Option<u16>, write: bool) -> Result<()> {
     let paths = paths()?;
     let port = port
         .or_else(|| Config::load(&paths).ok().map(|c| c.server.port))
@@ -102,9 +146,10 @@ pub(crate) fn run(port: Option<u16>, write: bool) -> Result<()> {
     println!();
 
     let found = Found::detect();
-    report(&found);
+    let local = find_local_servers().await;
+    report(&found, &local);
 
-    if !found.anything() {
+    if !found.anything() && local.is_empty() {
         println!();
         println!("Nothing found yet. Any one of these is enough to start:");
         println!();
@@ -264,11 +309,23 @@ scan_tool_results = false
 # api_key_env = "ANTHROPIC_API_KEY_WORK"   # which variable holds the key
 #
 # [[backends]]
-# id = "local"                  # an id discovery does not produce: adds one
-# kind = "openai-compatible"
-# base_url = "http://127.0.0.1:11434/v1"   # required for this kind
+# id = "local"
+# kind = "openai-compatible"    # a hosted endpoint speaking OpenAI chat
+# base_url = "https://example.internal/v1" # required for this kind
 # api_key_env = "LOCAL_API_KEY"            # required; no secrets in this file
-# models = ["qwen3-coder"]                 # best first
+#
+# [[backends]]
+# id = "ollama"                 # an id discovery does not produce: adds one
+# kind = "local"                # a model on this machine: free, private, and
+#                               # the cheapest capacity there is
+# base_url = "http://127.0.0.1:11434/v1"   # required, and must include /v1 —
+#                               # Ollama's native /api/* is a different protocol
+# api_key_env = "LOCAL_API_KEY" # optional here; most local servers take no auth
+# # A bare slug on a local backend counts as `fast`, whatever its name suggests,
+# # because local capacity sorts cheapest and a model that reads as frontier-tier
+# # would take work you asked a frontier model for. Say so explicitly to opt one
+# # up the ladder:
+# models = ["qwen3-coder:30b", {{ name = "llama3.3:70b", tier = "balanced" }}]
 "#
     )
 }

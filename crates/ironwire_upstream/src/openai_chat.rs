@@ -46,7 +46,9 @@ pub struct ChatCompletionsBackend {
     id: BackendId,
     name: String,
     kind: BackendKind,
-    api_key: SecretString,
+    /// `None` for a local server that takes no auth, which is most of them.
+    /// Absent means no `Authorization` header at all — not an empty one.
+    api_key: Option<SecretString>,
     issuer_host: String,
     base_url: String,
     client: reqwest::Client,
@@ -78,8 +80,44 @@ impl ChatCompletionsBackend {
             BackendId::from("nearai"),
             "NEAR AI",
             BackendKind::Credits,
-            api_key,
+            Some(api_key),
             base_url.unwrap_or_else(|| NEARAI_DEFAULT_BASE_URL.to_string()),
+            models,
+            timeout_secs,
+        )
+    }
+
+    /// Build an arbitrary OpenAI-compatible backend.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a reqwest client build failure.
+    /// Build a backend for a model running on this machine or LAN.
+    ///
+    /// `BackendKind::Local` rather than `Credits`: free at the margin, not
+    /// metered, and no consent gate. `api_key` is optional because most local
+    /// servers take no auth — and `None` means no header, not an empty one.
+    ///
+    /// The base URL must include the OpenAI-compatible prefix, usually `/v1`.
+    /// Ollama's native `/api/*` is a different protocol and is not supported.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a reqwest client build failure.
+    pub fn local(
+        id: BackendId,
+        name: &str,
+        base_url: String,
+        api_key: Option<SecretString>,
+        models: Vec<(String, ModelTier)>,
+        timeout_secs: u64,
+    ) -> reqwest::Result<Self> {
+        Self::new(
+            id,
+            name,
+            BackendKind::Local,
+            api_key,
+            base_url,
             models,
             timeout_secs,
         )
@@ -94,7 +132,7 @@ impl ChatCompletionsBackend {
         id: BackendId,
         name: &str,
         kind: BackendKind,
-        api_key: SecretString,
+        api_key: Option<SecretString>,
         base_url: String,
         models: Vec<(String, ModelTier)>,
         timeout_secs: u64,
@@ -130,14 +168,26 @@ impl ChatCompletionsBackend {
         self
     }
 
-    fn bearer(&self) -> Bearer {
-        Bearer {
-            token: self.api_key.clone(),
+    fn bearer(&self) -> Option<Bearer> {
+        Some(Bearer {
+            token: self.api_key.clone()?,
             // Leaked to a `&'static str` because `Bearer` binds a credential to
             // a compile-time host for the first-party backends; a user-supplied
             // endpoint is configured once at startup, so this leaks once per
             // backend rather than per request.
             issuer_host: Box::leak(self.issuer_host.clone().into_boxed_str()),
+        })
+    }
+
+    /// Attach the credential, if there is one.
+    ///
+    /// A local server usually takes none, and sending `Authorization: Bearer `
+    /// with nothing after it is not the same as sending no header — some
+    /// servers reject it outright.
+    fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.bearer() {
+            Some(bearer) => builder.bearer_auth(bearer.token.expose_secret()),
+            None => builder,
         }
     }
 }
@@ -185,7 +235,13 @@ impl Backend for ChatCompletionsBackend {
     }
 
     async fn status(&self) -> BackendStatus {
-        let authenticated = !self.api_key.expose_secret().is_empty();
+        // Local capacity needs no credential, so "no key" is its ordinary
+        // state rather than a fault to report.
+        let authenticated = self.kind == BackendKind::Local
+            || self
+                .api_key
+                .as_ref()
+                .is_some_and(|key| !key.expose_secret().is_empty());
         BackendStatus {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -200,9 +256,7 @@ impl Backend for ChatCompletionsBackend {
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
         let url = crate::endpoint_url(&self.base_url, &request.path);
         let mut builder = self
-            .client
-            .post(&url)
-            .bearer_auth(self.bearer().token.expose_secret())
+            .authorize(self.client.post(&url))
             .header("content-type", "application/json");
         for (name, value) in &request.headers {
             // The translated lane rebuilds the body, so inbound provider
@@ -325,9 +379,7 @@ impl Backend for ChatCompletionsBackend {
 
     async fn probe(&self) -> Result<(), UpstreamError> {
         let response = self
-            .client
-            .get(format!("{}/models", self.base_url))
-            .bearer_auth(self.api_key.expose_secret())
+            .authorize(self.client.get(format!("{}/models", self.base_url)))
             .timeout(std::time::Duration::from_secs(15))
             .send()
             .await
@@ -343,6 +395,21 @@ impl Backend for ChatCompletionsBackend {
                 && let Some(models) = crate::openai_responses::parse_model_list(&body)
                 && !models.is_empty()
             {
+                // A discovered local model is `Fast`, whatever its name
+                // suggests. `from_model_hint` resolves an unrecognised slug to
+                // `Frontier` — right for a hosted catalogue, catastrophic here,
+                // because local capacity also sorts cheapest and a
+                // `qwen3-coder:30b` reading as frontier-tier would take work
+                // meant for Opus. The user opts a local model up the ladder by
+                // declaring a tier in config; discovery never does.
+                let models: crate::Catalogue = if self.kind == BackendKind::Local {
+                    models
+                        .into_iter()
+                        .map(|(name, _)| (name, ModelTier::Fast))
+                        .collect()
+                } else {
+                    models
+                };
                 tracing::info!(
                     backend = %self.id,
                     count = models.len(),
@@ -388,9 +455,9 @@ mod tests {
     fn the_credential_is_bound_to_the_configured_endpoint() {
         // TRUST.md I2 for a user-supplied host: derived, not hardcoded.
         let b = backend("https://api.near.ai/v1");
-        assert_eq!(b.bearer().issuer_host, "api.near.ai");
+        assert_eq!(b.bearer().expect("a key").issuer_host, "api.near.ai");
         let b = backend("http://127.0.0.1:9000/v1");
-        assert_eq!(b.bearer().issuer_host, "127.0.0.1:9000");
+        assert_eq!(b.bearer().expect("a key").issuer_host, "127.0.0.1:9000");
     }
 
     #[test]
@@ -425,5 +492,67 @@ mod tests {
             ..Observation::default()
         });
         assert!(!b.quota().is_available(Utc::now()));
+    }
+}
+
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    fn local(models: Vec<(String, ModelTier)>) -> ChatCompletionsBackend {
+        ChatCompletionsBackend::local(
+            BackendId::from("ollama"),
+            "ollama",
+            "http://127.0.0.1:11434/v1".to_string(),
+            None,
+            models,
+            60,
+        )
+        .expect("client builds")
+    }
+
+    /// Most local servers take no auth, and `Authorization: Bearer ` with
+    /// nothing after it is not the same as sending no header — some reject it.
+    #[test]
+    fn a_local_backend_without_a_key_carries_no_credential() {
+        assert!(local(Vec::new()).bearer().is_none());
+    }
+
+    #[test]
+    fn a_local_backend_with_a_key_is_bound_to_its_own_host() {
+        let backend = ChatCompletionsBackend::local(
+            BackendId::from("ollama"),
+            "ollama",
+            "http://127.0.0.1:11434/v1".to_string(),
+            Some(SecretString::from("sk-local")),
+            Vec::new(),
+            60,
+        )
+        .expect("client builds");
+        let bearer = backend.bearer().expect("a key was configured");
+        assert_eq!(bearer.issuer_host, "127.0.0.1:11434");
+    }
+
+    /// Free at the margin, not metered, and no consent gate — the three things
+    /// that make `Local` a different capacity class rather than a label.
+    #[test]
+    fn local_capacity_is_free_and_ungated() {
+        let backend = local(Vec::new());
+        assert_eq!(backend.kind(), BackendKind::Local);
+        assert!(!backend.kind().is_metered());
+        assert!(!backend.kind().requires_consent());
+        assert!(!backend.requires_client_identity());
+    }
+
+    /// A local server that is not running is a backend `status` can explain,
+    /// not a startup failure.
+    #[tokio::test]
+    async fn an_unreachable_local_server_still_reports_itself() {
+        let status = local(Vec::new()).status().await;
+        assert!(
+            status.authenticated,
+            "a local backend needs no credential, so it is never 'not logged in'"
+        );
+        assert_eq!(status.kind, BackendKind::Local);
     }
 }

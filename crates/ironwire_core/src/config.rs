@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::DEFAULT_PORT;
 use crate::error::{Error, Result};
+use crate::protocol::{BackendKind, ModelTier};
 
 /// Resolved filesystem locations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +184,13 @@ pub struct ResilienceConfig {
     /// one turn whose output becomes permanent — and it would do so most often
     /// in exactly the longest sessions, where compaction matters most.
     pub compaction_stall_timeout_secs: u64,
+    /// Stall timeout for a turn served by local capacity.
+    ///
+    /// A 70B model on a laptop CPU can take minutes to its first token, which
+    /// the ordinary timeout reads as a dead upstream. Defaults to the ordinary
+    /// one and is floored at it, so this can lengthen IronWire's patience with
+    /// a slow local model and never shorten it.
+    pub local_stall_timeout_secs: u64,
 }
 
 impl Default for ResilienceConfig {
@@ -192,6 +200,7 @@ impl Default for ResilienceConfig {
             stall_timeout_secs: 180,
             max_reconnects: 2,
             compaction_stall_timeout_secs: 600,
+            local_stall_timeout_secs: 180,
         }
     }
 }
@@ -208,6 +217,23 @@ impl ResilienceConfig {
                 .max(self.stall_timeout_secs)
         } else {
             self.stall_timeout_secs
+        }
+    }
+
+    /// The stall timeout for a turn, given whether local capacity is serving it.
+    ///
+    /// Same floor rule, same reason: a local model is the slowest thing
+    /// IronWire routes to, so a configured value below the ordinary timeout
+    /// would make the one backend that needs the most patience the least
+    /// patiently treated.
+    #[must_use]
+    pub fn stall_timeout_for_backend(&self, likely_compaction: bool, is_local: bool) -> u64 {
+        let base = self.stall_timeout_for(likely_compaction);
+        if is_local {
+            base.max(self.local_stall_timeout_secs)
+                .max(self.stall_timeout_secs)
+        } else {
+            base
         }
     }
 }
@@ -307,8 +333,64 @@ pub struct BackendConfig {
     pub api_key_env: Option<String>,
     /// Model slugs this backend should offer, best first. Configurable because
     /// third-party catalogues move faster than our release cadence.
+    ///
+    /// A bare string takes the tier IronWire infers from its name — except on
+    /// a local backend, where it is [`ModelTier::Fast`] (see
+    /// [`ModelEntry::tier_on`]). `{ name = "...", tier = "..." }` states one
+    /// outright.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub models: Option<Vec<String>>,
+    pub models: Option<Vec<ModelEntry>>,
+}
+
+/// A configured model: a slug, and optionally the tier it should count as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelEntry {
+    /// Just the slug.
+    Name(String),
+    /// The slug and the tier the user says it belongs to.
+    Tiered {
+        /// Model slug, as the provider spells it.
+        name: String,
+        /// `fast`, `balanced` or `frontier`.
+        tier: ModelTier,
+    },
+}
+
+impl ModelEntry {
+    /// The slug.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) | Self::Tiered { name, .. } => name,
+        }
+    }
+
+    /// The tier this entry counts as on a backend of `kind`.
+    ///
+    /// A declared tier always wins. Otherwise the name decides — except on
+    /// local capacity, where the name must not.
+    ///
+    /// `ModelTier::from_model_hint` resolves anything it does not recognise to
+    /// `Frontier`, deliberately: for a hosted catalogue, guessing low silently
+    /// downgrades a user's work. For a local catalogue the same default is
+    /// catastrophic, because local capacity also sorts cheapest — `qwen3-coder:30b`
+    /// would read as frontier-tier and take work meant for Opus. So a local
+    /// model is `Fast` until the user says otherwise. They opt it up the
+    /// ladder; IronWire never does it on their behalf.
+    #[must_use]
+    pub fn tier_on(&self, kind: BackendKind) -> ModelTier {
+        match self {
+            Self::Tiered { tier, .. } => *tier,
+            Self::Name(name) => {
+                if kind == BackendKind::Local {
+                    ModelTier::Fast
+                } else {
+                    ModelTier::from_model_hint(name)
+                }
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -403,31 +485,56 @@ impl Config {
             }
             seen.push(&backend.id);
 
-            let Some(kind) = BackendKind::parse(&backend.kind) else {
+            let Some(kind) = BackendImpl::parse(&backend.kind) else {
                 return Err(invalid(
                     &backend.id,
                     format!(
                         "`kind = \"{}\"` is not a backend IronWire can build. \
                          Valid kinds: {}.",
                         backend.kind,
-                        BackendKind::ALL.join(", ")
+                        BackendImpl::ALL.join(", ")
                     ),
                 ));
             };
 
-            // The one kind with no defaults to fall back on: there is no
-            // canonical host for "some OpenAI-compatible server", and building
-            // it against nothing yields a backend that fails every request.
-            if kind == BackendKind::OpenAiCompatible {
+            // The id travels into ledger rows, event payloads and
+            // `X-IronWire-Route`, so it is not free-form text.
+            if !backend
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                || backend.id.is_empty()
+            {
+                return Err(invalid(
+                    &backend.id,
+                    "ids may contain only letters, digits, `-` and `_`: this one \
+                     ends up in ledger rows, event payloads and the \
+                     `X-IronWire-Route` header."
+                        .to_string(),
+                ));
+            }
+
+            // Neither kind has a host to fall back on: there is no canonical
+            // address for "some OpenAI-compatible server", and building one
+            // against nothing yields a backend that fails every request.
+            if matches!(kind, BackendImpl::OpenAiCompatible | BackendImpl::Local) {
                 if backend.base_url.is_none() {
                     return Err(invalid(
                         &backend.id,
-                        "`kind = \"openai-compatible\"` needs a `base_url`; there \
-                         is no default host to assume."
-                            .to_string(),
+                        format!(
+                            "`kind = \"{}\"` needs a `base_url`; there is no \
+                             default host to assume. For a local server it must \
+                             include the OpenAI-compatible prefix, usually \
+                             `/v1` — Ollama's native `/api/*` is a different \
+                             protocol and is not supported.",
+                            backend.kind
+                        ),
                     ));
                 }
-                if backend.api_key_env.is_none() {
+                // A key is required for a hosted endpoint and optional for a
+                // local one: most local servers take no auth at all, and
+                // demanding a variable that holds nothing would be ceremony.
+                if kind == BackendImpl::OpenAiCompatible && backend.api_key_env.is_none() {
                     return Err(invalid(
                         &backend.id,
                         "`kind = \"openai-compatible\"` needs an `api_key_env` \
@@ -443,8 +550,12 @@ impl Config {
 }
 
 /// The backend implementations a `[[backends]]` entry can name.
+///
+/// Distinct from [`crate::protocol::BackendKind`], which is the *capacity*
+/// class a backend draws on — subscription, key, credits, local. Several impls
+/// here map to one capacity class and vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
+pub enum BackendImpl {
     /// Claude Code's stored subscription credential.
     ClaudeSubscription,
     /// The metered Anthropic API.
@@ -457,9 +568,12 @@ pub enum BackendKind {
     NearAi,
     /// Any other endpoint speaking OpenAI Chat Completions.
     OpenAiCompatible,
+    /// A model server on this machine or LAN. Free at the margin, and usually
+    /// unauthenticated, which is what separates it from `openai-compatible`.
+    Local,
 }
 
-impl BackendKind {
+impl BackendImpl {
     /// Every accepted spelling, for the error message that lists them.
     pub const ALL: &'static [&'static str] = &[
         "claude-subscription",
@@ -468,6 +582,7 @@ impl BackendKind {
         "openai-api",
         "nearai",
         "openai-compatible",
+        "local",
     ];
 
     /// Parse the `kind` field. `None` for anything not in [`Self::ALL`].
@@ -480,6 +595,7 @@ impl BackendKind {
             "openai-api" => Some(Self::OpenAiApi),
             "nearai" => Some(Self::NearAi),
             "openai-compatible" => Some(Self::OpenAiCompatible),
+            "local" => Some(Self::Local),
             _ => None,
         }
     }
@@ -591,15 +707,102 @@ mod tests {
         assert!(load("[server]\nport = 8463\n").is_ok());
     }
 
+    /// The rule the whole local-backend feature rests on. `from_model_hint`
+    /// resolves an unrecognised slug to `Frontier`, and local capacity sorts
+    /// cheapest, so a bare name on a local backend must not inherit that.
+    #[test]
+    fn a_bare_slug_on_local_capacity_is_fast_not_frontier() {
+        let entry = ModelEntry::Name("qwen3-coder:30b".to_string());
+        assert_eq!(entry.tier_on(BackendKind::Local), ModelTier::Fast);
+        // The same slug on hosted capacity keeps the cautious default.
+        assert_eq!(entry.tier_on(BackendKind::Credits), ModelTier::Frontier);
+    }
+
+    /// The user opts a local model up the ladder; IronWire never does.
+    #[test]
+    fn a_declared_tier_wins_everywhere() {
+        let entry = ModelEntry::Tiered {
+            name: "llama3.3:70b".to_string(),
+            tier: ModelTier::Balanced,
+        };
+        assert_eq!(entry.tier_on(BackendKind::Local), ModelTier::Balanced);
+        assert_eq!(entry.tier_on(BackendKind::ApiKey), ModelTier::Balanced);
+    }
+
+    #[test]
+    fn a_models_list_accepts_both_spellings() {
+        let config = load(
+            r#"
+            [[backends]]
+            id = "ollama"
+            kind = "local"
+            base_url = "http://127.0.0.1:11434/v1"
+            models = ["qwen3-coder:30b", { name = "llama3.3:70b", tier = "balanced" }]
+            "#,
+        )
+        .expect("valid");
+        let models = config.backends[0].models.as_ref().expect("declared");
+        assert_eq!(models[0].name(), "qwen3-coder:30b");
+        assert_eq!(models[1].tier_on(BackendKind::Local), ModelTier::Balanced);
+    }
+
+    /// Local servers usually take no auth, so requiring a key variable would be
+    /// ceremony — but a host is still required, and the message says why.
+    #[test]
+    fn a_local_backend_needs_a_base_url_but_not_a_key() {
+        assert!(
+            load(
+                r#"
+                [[backends]]
+                id = "ollama"
+                kind = "local"
+                base_url = "http://127.0.0.1:11434/v1"
+                "#,
+            )
+            .is_ok()
+        );
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "ollama"
+            kind = "local"
+            "#,
+        );
+        assert!(message.contains("base_url"), "{message}");
+        assert!(
+            message.contains("/v1"),
+            "the fix must be spelled out: {message}"
+        );
+    }
+
+    /// The id reaches ledger rows, event payloads and `X-IronWire-Route`.
+    #[test]
+    fn an_id_is_restricted_to_a_conservative_character_set() {
+        for bad in ["has space", "quote\"d", "semi;colon", ""] {
+            let toml = format!("[[backends]]\nid = \"{bad}\"\nkind = \"nearai\"\n");
+            assert!(
+                Config::load_from(&{
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let path = dir.path().join("config.toml");
+                    std::fs::write(&path, &toml).expect("write");
+                    std::mem::forget(dir);
+                    path
+                })
+                .is_err(),
+                "accepted id {bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_advertised_kind_parses() {
-        for kind in BackendKind::ALL {
+        for kind in BackendImpl::ALL {
             assert!(
-                BackendKind::parse(kind).is_some(),
+                BackendImpl::parse(kind).is_some(),
                 "`{kind}` is advertised but not accepted"
             );
         }
-        assert!(BackendKind::parse("not-a-kind").is_none());
+        assert!(BackendImpl::parse("not-a-kind").is_none());
     }
 
     #[test]
@@ -687,5 +890,47 @@ mod resilience_tests {
             ..ResilienceConfig::default()
         };
         assert_eq!(config.stall_timeout_for(true), 180);
+    }
+
+    #[test]
+    fn a_local_turn_can_be_given_more_patience() {
+        let config = ResilienceConfig {
+            stall_timeout_secs: 180,
+            local_stall_timeout_secs: 900,
+            ..ResilienceConfig::default()
+        };
+        assert_eq!(config.stall_timeout_for_backend(false, true), 900);
+        assert_eq!(
+            config.stall_timeout_for_backend(false, false),
+            180,
+            "a hosted turn keeps the ordinary timeout"
+        );
+    }
+
+    /// The same trap as the compaction floor: a local model is the slowest
+    /// thing IronWire routes to, so a value below the ordinary timeout would
+    /// make the backend that needs the most patience the least patiently
+    /// treated.
+    #[test]
+    fn a_misconfigured_local_timeout_never_makes_a_local_turn_more_fragile() {
+        let config = ResilienceConfig {
+            stall_timeout_secs: 180,
+            local_stall_timeout_secs: 10,
+            ..ResilienceConfig::default()
+        };
+        assert_eq!(config.stall_timeout_for_backend(false, true), 180);
+    }
+
+    /// A compaction turn on local capacity gets the longer of the two, not
+    /// whichever rule was consulted last.
+    #[test]
+    fn a_local_compaction_turn_gets_the_longest_patience() {
+        let config = ResilienceConfig {
+            stall_timeout_secs: 180,
+            compaction_stall_timeout_secs: 600,
+            local_stall_timeout_secs: 300,
+            ..ResilienceConfig::default()
+        };
+        assert_eq!(config.stall_timeout_for_backend(true, true), 600);
     }
 }

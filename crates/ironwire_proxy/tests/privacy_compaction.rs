@@ -206,7 +206,7 @@ fn state_for(harness: Harness, base_url: &str) -> AppState {
                 ironwire_core::protocol::BackendId::from("openai-chat"),
                 "OpenAI-compatible",
                 ironwire_core::protocol::BackendKind::ApiKey,
-                SecretString::from("sk-test"),
+                Some(SecretString::from("sk-test")),
                 base_url.to_string(),
                 Vec::new(),
                 10,

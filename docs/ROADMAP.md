@@ -404,11 +404,26 @@ compaction, runs end to end with tiers 1+2 on; the provider receives no
 nominated value; the client's transcript contains no placeholder; and
 `tests/passthrough.rs` still passes with the filter off.
 
+### ✅ Local backends (Ollama, vLLM, LM Studio)
+
+`kind = "local"` in `config.toml`, over the OpenAI-compatible surface only —
+Ollama's native `/api/*` is a different protocol. No auth by default, because
+most local servers take none; `BackendKind::Local`, so it is free at the margin,
+not consent-gated, and never priced (a local slug hitting the cloud price table
+would report money nobody spent).
+
+The rule that makes it safe: **a local model counts as `fast` unless the user
+says otherwise**, and a local backend never outranks one that can actually serve
+the tier asked for. Local capacity sorts cheapest of all, and
+`ModelTier::from_model_hint` resolves an unrecognised slug to `frontier` — so
+without both of those, `qwen3-coder:30b` would quietly take every request meant
+for Opus. `ironwire init` reports a server on the standard ports and writes
+nothing.
+
 ---
 
 ## Later
 
-- Local backends (Ollama, vLLM, LM Studio) as a rung-3 target
 - GitHub Copilot subscription backend (`ironclaw_llm::github_copilot_auth`)
 - Bedrock / Vertex as rung-2 targets for the Anthropic family (same wire format,
   different credential — high-fidelity fallback)

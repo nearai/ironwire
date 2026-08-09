@@ -218,6 +218,9 @@ async fn forward(
         .get(&routed.decision.backend)
         .cloned()
         .expect("dispatch returned a registered backend");
+    // Read before the `Arc` moves into the observation closure below. Local
+    // capacity gets a longer stall timeout and no price.
+    let backend_is_local = backend.kind() == ironwire_core::protocol::BackendKind::Local;
 
     let ledger = state.ledger.clone();
     let entry = pipeline::LedgerContext {
@@ -227,6 +230,7 @@ async fn forward(
         path: path.to_string(),
         conversation: conversation.to_string(),
         backend: routed.decision.backend.to_string(),
+        backend_is_local,
         requested_model: peek.requested_model.clone(),
         rung: format!("{:?}", routed.decision.rung).to_lowercase(),
         attempts: routed.attempts,
@@ -267,6 +271,7 @@ async fn forward(
         let settings = resilience::ResilienceConfig::for_turn(
             &state.config.resilience,
             peek.likely_compaction,
+            backend_is_local,
         );
         let reconnect: resilience::Reconnect = Box::new(move || {
             let state = reconnect_state.clone();

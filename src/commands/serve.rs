@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ironwire_core::config::ModelEntry;
 use ironwire_core::config::{Config, PathsConfig};
-use ironwire_core::protocol::{BackendId, ModelTier};
+use ironwire_core::protocol::{BackendId, BackendKind, ModelTier};
 use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
@@ -347,7 +348,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
             ChatCompletionsBackend::nearai(
                 key,
                 base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
-                models_for(config, "nearai").unwrap_or_default(),
+                models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
                 timeout,
             )
             .context("building the NEAR AI backend")?,
@@ -397,12 +398,12 @@ fn backend_from_config(
     timeout: u64,
     env: EnvLookup<'_>,
 ) -> Result<Option<Arc<dyn ironwire_upstream::backend::Backend>>> {
-    use ironwire_core::config::BackendKind;
+    use ironwire_core::config::BackendImpl;
 
     let key = |default: &str| entry_key(entry, default, env);
     let backend: Option<Arc<dyn ironwire_upstream::backend::Backend>> =
-        match BackendKind::parse(&entry.kind) {
-            Some(BackendKind::ClaudeSubscription) => ClaudeCodeCredentials::discover()
+        match BackendImpl::parse(&entry.kind) {
+            Some(BackendImpl::ClaudeSubscription) => ClaudeCodeCredentials::discover()
                 .is_ok()
                 .then(|| {
                     AnthropicBackend::subscription(entry.base_url.clone(), timeout)
@@ -410,14 +411,14 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendKind::AnthropicApi) => key("ANTHROPIC_API_KEY")
+            Some(BackendImpl::AnthropicApi) => key("ANTHROPIC_API_KEY")
                 .map(|key| {
                     AnthropicBackend::api_key(key, entry.base_url.clone(), timeout)
                         .context("building a configured Anthropic API backend")
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendKind::CodexSubscription) => CodexCredentials::discover()
+            Some(BackendImpl::CodexSubscription) => CodexCredentials::discover()
                 .is_ok_and(|c| c.mode == CodexMode::ChatGpt)
                 .then(|| {
                     ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout)
@@ -425,7 +426,7 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendKind::OpenAiApi) => key("OPENAI_API_KEY")
+            Some(BackendImpl::OpenAiApi) => key("OPENAI_API_KEY")
                 .or_else(codex_stored_key)
                 .map(|key| {
                     ResponsesBackend::openai_api_key(key, entry.base_url.clone(), timeout)
@@ -433,7 +434,7 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendKind::NearAi) => key("NEARAI_API_KEY")
+            Some(BackendImpl::NearAi) => key("NEARAI_API_KEY")
                 .map(|key| {
                     ChatCompletionsBackend::nearai(
                         key,
@@ -441,7 +442,7 @@ fn backend_from_config(
                         entry
                             .models
                             .as_ref()
-                            .map(|models| models_from(models))
+                            .map(|models| models_from(models, BackendKind::Credits))
                             .unwrap_or_default(),
                         timeout,
                     )
@@ -449,7 +450,35 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendKind::OpenAiCompatible) => {
+            Some(BackendImpl::Local) => {
+                // `validate` has already established the base URL. The key is
+                // genuinely optional here: most local servers take no auth, and
+                // `None` sends no `Authorization` header at all.
+                let Some(base_url) = entry.base_url.clone() else {
+                    return Ok(None);
+                };
+                Some(Arc::new(
+                    ChatCompletionsBackend::local(
+                        BackendId::from(entry.id.as_str()),
+                        &entry.id,
+                        base_url,
+                        entry.api_key_env.as_deref().and_then(|name| {
+                            env(name)
+                                .filter(|key| !key.is_empty())
+                                .map(SecretString::from)
+                        }),
+                        entry
+                            .models
+                            .as_ref()
+                            .map(|models| models_from(models, BackendKind::Local))
+                            .unwrap_or_default(),
+                        timeout,
+                    )
+                    .context("building a configured local backend")?,
+                )
+                    as Arc<dyn ironwire_upstream::backend::Backend>)
+            }
+            Some(BackendImpl::OpenAiCompatible) => {
                 // `validate` has already established that both are present.
                 let (Some(base_url), Some(key)) = (entry.base_url.clone(), key("")) else {
                     return Ok(None);
@@ -458,13 +487,13 @@ fn backend_from_config(
                     ChatCompletionsBackend::new(
                         BackendId::from(entry.id.as_str()),
                         &entry.id,
-                        ironwire_core::protocol::BackendKind::ApiKey,
-                        key,
+                        BackendKind::ApiKey,
+                        Some(key),
                         base_url,
                         entry
                             .models
                             .as_ref()
-                            .map(|models| models_from(models))
+                            .map(|models| models_from(models, BackendKind::ApiKey))
                             .unwrap_or_default(),
                         timeout,
                     )
@@ -548,20 +577,24 @@ fn codex_stored_key() -> Option<SecretString> {
 /// configured list was previously read for one id and silently ignored for
 /// every other. `None` means "nothing configured", which is different from an
 /// empty list and leaves the provider's own catalogue in charge.
-fn models_for(config: &Config, id: &str) -> Option<Vec<(String, ModelTier)>> {
+fn models_for(config: &Config, id: &str, kind: BackendKind) -> Option<Vec<(String, ModelTier)>> {
     config
         .backends
         .iter()
         .find(|entry| entry.id == id)
         .and_then(|entry| entry.models.as_ref())
-        .map(|models| models_from(models))
+        .map(|models| models_from(models, kind))
 }
 
-/// Tier each configured slug by the same rule the rest of the router uses.
-fn models_from(models: &[String]) -> Vec<(String, ModelTier)> {
+/// Tier each configured slug for a backend of `kind`.
+///
+/// The tier is not a property of the name alone: the same slug means something
+/// different on local capacity, which sorts cheapest and must not inherit a
+/// frontier tier from a name nobody recognises (`ModelEntry::tier_on`).
+fn models_from(models: &[ModelEntry], kind: BackendKind) -> Vec<(String, ModelTier)> {
     models
         .iter()
-        .map(|model| (model.clone(), ModelTier::from_model_hint(model)))
+        .map(|entry| (entry.name().to_string(), entry.tier_on(kind)))
         .collect()
 }
 
@@ -684,7 +717,7 @@ mod tests {
         let mut declared = entry("local", "openai-compatible");
         declared.base_url = Some("http://127.0.0.1:11434/v1".to_string());
         declared.api_key_env = Some("LOCAL_KEY".to_string());
-        declared.models = Some(vec!["qwen3-coder".to_string()]);
+        declared.models = Some(vec![ModelEntry::Name("qwen3-coder".to_string())]);
 
         let built = backend_from_config(&declared, 60, &env_with(&[("LOCAL_KEY", "sk-local")]))
             .expect("builds")
@@ -733,15 +766,15 @@ mod tests {
     fn a_configured_catalogue_is_read_for_any_backend_not_just_nearai() {
         let mut config = Config::default();
         let mut declared = entry("anthropic-key", "anthropic-api");
-        declared.models = Some(vec!["claude-haiku-4-5".to_string()]);
+        declared.models = Some(vec![ModelEntry::Name("claude-haiku-4-5".to_string())]);
         config.backends.push(declared);
 
         assert_eq!(
-            models_for(&config, "anthropic-key"),
+            models_for(&config, "anthropic-key", BackendKind::ApiKey),
             Some(vec![("claude-haiku-4-5".to_string(), ModelTier::Fast)])
         );
         assert_eq!(
-            models_for(&config, "nearai"),
+            models_for(&config, "nearai", BackendKind::Credits),
             None,
             "nothing configured is not the same as an empty catalogue"
         );

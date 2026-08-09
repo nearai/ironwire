@@ -668,6 +668,12 @@ pub struct LedgerContext {
     pub conversation: String,
     /// Backend that served it.
     pub backend: String,
+    /// Whether that backend is local capacity.
+    ///
+    /// Carried rather than inferred from the id, because the id is
+    /// user-supplied. It decides one thing: whether this exchange gets a price
+    /// at all (see [`Self::write`]).
+    pub backend_is_local: bool,
     /// Model the client asked for.
     pub requested_model: Option<String>,
     /// Fidelity rung, lowercased.
@@ -691,23 +697,34 @@ impl LedgerContext {
     /// delivered anyway.
     pub fn write(self, ledger: &Ledger, observation: &Observation) {
         let usage = observation.usage;
-        // Priced against whichever model actually served it, so a fallback to a
-        // cheaper model shows up as a cheaper turn.
-        let cost_usd = ironwire_ledger::price(
-            observation
-                .served_model
-                .as_deref()
-                .or(self.requested_model.as_deref())
-                .unwrap_or("unknown"),
-            usage.and_then(|u| {
-                Some((
-                    u32::try_from(u.input_tokens).ok()?,
-                    u32::try_from(u.output_tokens).ok()?,
-                    u32::try_from(u.cache_read_tokens).ok()?,
-                    u32::try_from(u.cache_creation_tokens).ok()?,
-                ))
-            }),
-        );
+        // A local model has no price, and must not be given one. The price
+        // table matches on the slug, so a local `llama3.3:70b` — or any slug
+        // colliding with a hosted name — would be costed against a cloud rate
+        // and reported as money the user did not spend. `None`, not `Some(0.0)`:
+        // a measured zero sums into `Summary::cost_usd` as though it were an
+        // observation, and the ledger's rule throughout is that an absent
+        // number beats a fabricated one.
+        let cost_usd = if self.backend_is_local {
+            None
+        } else {
+            // Priced against whichever model actually served it, so a fallback
+            // to a cheaper model shows up as a cheaper turn.
+            ironwire_ledger::price(
+                observation
+                    .served_model
+                    .as_deref()
+                    .or(self.requested_model.as_deref())
+                    .unwrap_or("unknown"),
+                usage.and_then(|u| {
+                    Some((
+                        u32::try_from(u.input_tokens).ok()?,
+                        u32::try_from(u.output_tokens).ok()?,
+                        u32::try_from(u.cache_read_tokens).ok()?,
+                        u32::try_from(u.cache_creation_tokens).ok()?,
+                    ))
+                }),
+            )
+        };
         let exchange = Exchange {
             started_at: self.started_at,
             ttfb_ms: None,

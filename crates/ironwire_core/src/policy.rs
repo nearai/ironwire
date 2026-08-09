@@ -495,14 +495,33 @@ impl Policy {
         let sort_key = |c: &&Candidate| {
             let pressured = u8::from(c.quota.is_pressured(now));
             let cost = c.kind.marginal_cost_rank();
+            // Local capacity is the cheapest there is — rank 0, ahead of a
+            // subscription — and descending a rung is normally fine, because
+            // rung 1 means "same account, smaller model". A local backend
+            // breaks that assumption: descending onto it means a 30B model on
+            // the user's laptop taking work they asked Opus for, silently,
+            // because it sorted cheapest. So a local backend that cannot serve
+            // the requested tier yields to anything that can. It is still
+            // tried when it is all there is — being last is not being refused.
+            let beyond_its_tier = u8::from(c.kind == BackendKind::Local && !serves_tier(c, tier));
             if peek.likely_compaction {
                 // `pick_model` falls back to a lesser tier rather than refusing,
                 // so "has no model at all" is the wrong question here — what
                 // matters is whether this backend can serve the tier the client
                 // actually asked for, without descending.
-                (pressured, u8::from(!serves_tier(c, tier)), cost)
+                (
+                    pressured,
+                    beyond_its_tier,
+                    u8::from(!serves_tier(c, tier)),
+                    cost,
+                )
             } else {
-                (pressured, cost, u8::from(pick_model(c, tier).is_none()))
+                (
+                    pressured,
+                    beyond_its_tier,
+                    cost,
+                    u8::from(pick_model(c, tier).is_none()),
+                )
             }
         };
         same_wire.sort_by_key(sort_key);
@@ -705,6 +724,68 @@ mod tests {
             "You are Claude Code",
             &["Read"],
         )
+    }
+
+    /// The test the local-backend feature exists under, written before it.
+    ///
+    /// `BackendKind::Local` has `marginal_cost_rank() == 0` — cheaper than a
+    /// subscription — so the *only* thing keeping a 30B model on someone's
+    /// laptop from taking every frontier request is the tier its slugs carry.
+    /// `from_model_hint` resolves anything it does not recognise to `Frontier`,
+    /// which is right for a hosted catalogue and catastrophic for a local one.
+    /// Local models are therefore `Fast` unless the user says otherwise, and
+    /// this asserts the consequence rather than the mechanism.
+    #[test]
+    fn a_frontier_request_does_not_land_on_a_local_model() {
+        let mut local = candidate("ollama", BackendKind::Local, Protocol::AnthropicMessages);
+        local.models = vec![("qwen3-coder:30b".to_string(), ModelTier::Fast)];
+        let subscription = candidate(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+        );
+
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &[local, subscription],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(
+            decision.backend.as_str(),
+            "claude-sub",
+            "a frontier request went to a local model because it sorted cheapest"
+        );
+    }
+
+    /// The other half: a local backend is not decoration. Asked for something
+    /// it can serve, it wins on cost exactly as intended.
+    #[test]
+    fn a_fast_request_does_land_on_a_local_model() {
+        let mut local = candidate("ollama", BackendKind::Local, Protocol::AnthropicMessages);
+        local.models = vec![("qwen3-coder:30b".to_string(), ModelTier::Fast)];
+        let mut subscription = candidate(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+        );
+        subscription.models = vec![("claude-haiku-4-5".to_string(), ModelTier::Fast)];
+
+        let mut policy = Policy::new();
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-haiku-4-5"),
+                &[local, subscription],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.backend.as_str(), "ollama");
     }
 
     /// A distinct conversation per index, so a test can fill the map.
