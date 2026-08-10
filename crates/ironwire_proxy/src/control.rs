@@ -151,9 +151,9 @@ pub struct StatusView {
     /// What the privacy filter is *doing*, never what the user is safe from
     /// (`docs/TRUST.md` I7). `None` when it is off.
     pub privacy: Option<String>,
-    /// Serial of the signed quirks document in force; `0` means the values this
+    /// Serial of the signed catalog document in force; `0` means the values this
     /// binary shipped with (`docs/UPDATES.md`).
-    pub quirks_serial: u64,
+    pub catalog_serial: u64,
     /// What the last update check concluded. IronWire never applies an update
     /// itself — this is notification, not action.
     pub update: UpdateStatus,
@@ -446,6 +446,45 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health))
 }
 
+/// Why `full` cannot be switched on right now, or `None` when it can.
+///
+/// **One rule, one place.** `GET /settings` greys the option out with this and
+/// `POST /privacy` refuses with this; when they were written separately they
+/// drifted immediately — the settings screen greyed `full` out while the
+/// endpoint behind it accepted the very same change.
+///
+/// Naming a destination is not the same as having one. `trusted_backends`
+/// defaults to `["nearai"]`, and that backend registers whether or not a key was
+/// found, so "named" is true on machines where `full` can route nowhere.
+/// Selecting it there fails every request as "rate limited", which is both wrong
+/// and unactionable.
+fn full_is_blocked(
+    privacy: &ironwire_core::config::PrivacyConfig,
+    statuses: &[ironwire_upstream::backend::BackendStatus],
+) -> Option<String> {
+    if privacy.trusted_backends.is_empty() {
+        return Some(
+            "`full` routes only to backends you have named as acceptable, and none are named. \
+             Add `trusted_backends` under `[privacy]` in config.toml first — which operators \
+             you trust with your data is not IronWire's call."
+                .to_string(),
+        );
+    }
+    let usable = privacy.trusted_backends.iter().any(|id| {
+        statuses
+            .iter()
+            .any(|status| status.id.as_str() == id && status.authenticated)
+    });
+    (!usable).then(|| {
+        format!(
+            "`full` would route only to {}, and none of those has a credential yet — every \
+             request would be refused. Connect one first, or name a backend you do have under \
+             `trusted_backends` in config.toml.",
+            privacy.trusted_backends.join(", ")
+        )
+    })
+}
+
 /// What can be changed, and what it would take.
 async fn settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize(&state, &headers) {
@@ -482,29 +521,7 @@ fn settings_view(
         // request as "rate limited", which is both wrong and unactionable, so
         // the usable check is part of the same question.
         let blocked = (mode == PrivacyMode::Full)
-            .then(|| {
-                if privacy.trusted_backends.is_empty() {
-                    return Some(
-                        "`full` routes only to backends you have named as acceptable, and none \
-                         are named. Add `trusted_backends` under `[privacy]` in config.toml \
-                         first — which operators you trust with your data is not IronWire's call."
-                            .to_string(),
-                    );
-                }
-                let usable = privacy.trusted_backends.iter().any(|id| {
-                    statuses
-                        .iter()
-                        .any(|status| status.id.as_str() == id && status.authenticated)
-                });
-                (!usable).then(|| {
-                    format!(
-                        "`full` would route only to {}, and none of those has a credential yet — \
-                         every request would be refused. Connect one first, or name a backend \
-                         you do have under `trusted_backends` in config.toml.",
-                        privacy.trusted_backends.join(", ")
-                    )
-                })
-            })
+            .then(|| full_is_blocked(&privacy, statuses))
             .flatten();
         PrivacyOptionView {
             id: mode_name(mode).to_string(),
@@ -599,18 +616,16 @@ async fn privacy(
         ));
     };
 
-    // The same refusal `Config::validate` makes at startup. Switching to `full`
-    // with nothing trusted would take every backend out of service, and a
-    // settings screen that can do that is worse than one that cannot.
+    // The same refusal `Config::validate` makes at startup, and the same one
+    // `GET /settings` greys the option out with — literally the same function,
+    // because a settings screen that greys an option out while the endpoint
+    // behind it accepts the change is worse than either behaviour alone.
     let current = state.privacy_config();
-    if mode == PrivacyMode::Full && current.trusted_backends.is_empty() {
-        return bad_request(
-            "`mode = \"full\"` routes only to backends you have named as acceptable, and \
-             none are named — so nothing could be routed anywhere. Add `trusted_backends` \
-             under `[privacy]` in config.toml first. There is no default: which operators \
-             you trust with your data is not IronWire's call."
-                .to_string(),
-        );
+    if mode == PrivacyMode::Full {
+        let statuses = state.backends.statuses().await;
+        if let Some(reason) = full_is_blocked(&current, &statuses) {
+            return bad_request(reason);
+        }
     }
 
     state.set_privacy_mode(mode);
@@ -860,7 +875,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
         backends,
         balance,
         privacy: state.privacy().map(|filter| filter.summary().to_string()),
-        quirks_serial: state.quirks().serial(),
+        catalog_serial: state.catalog().serial(),
         update: state.update_status(),
         last_route: state.last_route().map(|route| LastRouteView {
             backend: route.backend,

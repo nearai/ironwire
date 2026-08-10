@@ -5,9 +5,9 @@ Two independent channels, deliberately:
 | Channel | Carries | Cadence | Applied by |
 |---|---|---|---|
 | **Release** | The binary | Whenever we ship | The user, or their package manager |
-| **Quirks** | Provider values that break us when they change | Same day if needed | The daemon, automatically |
+| **Catalog** | Provider values that break us when they change | Same day if needed | The daemon, automatically |
 
-IronWire **never updates its own binary.** The quirks channel exists so that it
+IronWire **never updates its own binary.** The catalog channel exists so that it
 does not need to.
 
 ---
@@ -59,7 +59,7 @@ mattered.
 
 ---
 
-## 2. The quirks channel
+## 2. The catalog channel
 
 IronWire depends on values it does not control and cannot predict: an
 `anthropic-beta` flag, an API version string, the prefix that identifies Claude
@@ -79,7 +79,7 @@ The obvious objection is that a remotely-updatable document controlling a
 credential-holding proxy is a supply-chain hole. The design answers it
 structurally rather than with validation:
 
-> **No type in the quirks schema can express a host, a URL, or a filesystem
+> **No type in the catalog schema can express a host, a URL, or a filesystem
 > path.**
 
 Base URLs, credential file locations, and the credential→host binding stay
@@ -89,7 +89,7 @@ even against a compromised signing key.
 
 Validation was the alternative and it is weaker: a check is one refactor away
 from being wrong, while an unrepresentable field stays unrepresentable. A test
-in `ironwire_quirks::schema` walks the serialized document and fails on any
+in `ironwire_catalog::schema` walks the serialized document and fails on any
 field name that looks like a location, so adding one is a deliberate act that
 lands in review as a `TRUST.md` change.
 
@@ -120,7 +120,7 @@ Unknown fields are tolerated so an older binary survives a newer document.
 
 ### Signing
 
-The public key is compiled in (`ironwire_quirks::QUIRKS_PUBLIC_KEY`); a key
+The public key is compiled in (`ironwire_catalog::CATALOG_PUBLIC_KEY`); a key
 fetched at runtime is not a root of trust. The private half lives in release
 signing infrastructure, not in this repository.
 
@@ -140,6 +140,6 @@ the channel is inert rather than dangerous before it is real.
   see `TRUST.md` §6.
 - **Auto-apply at idle.** A reasonable opt-in later. Not a default: a proxy that
   changes its own behaviour unprompted is hard to trust and harder to debug.
-- **A quirks field that names a host or path.** See §2. This is a `TRUST.md`
+- **A catalog field that names a host or path.** See §2. This is a `TRUST.md`
   change, not a schema change.
 - **Telemetry beyond the version check.** There is none, and none is planned.

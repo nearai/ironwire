@@ -40,8 +40,8 @@ public struct StatusView: Decodable, Sendable, Equatable {
     /// What the privacy filter is *doing*. Rendered verbatim or not at all
     /// (`docs/TRUST.md` I7).
     public let privacy: String?
-    /// Serial of the signed quirks document in force.
-    public let quirksSerial: UInt64
+    /// Serial of the signed catalog document in force.
+    public let catalogSerial: UInt64
     /// What the last update check concluded. Notification, never action.
     public let update: UpdateStatus
     /// The most recent route this daemon took.
@@ -51,7 +51,7 @@ public struct StatusView: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case version, port, trackedConversations, pin, backends, balance
-        case privacy, quirksSerial, update, lastRoute, usage
+        case privacy, catalogSerial, update, lastRoute, usage
     }
 
     public init(from decoder: Decoder) throws {
@@ -63,7 +63,7 @@ public struct StatusView: Decodable, Sendable, Equatable {
         backends = try c.decodeIfPresent([BackendView].self, forKey: .backends) ?? []
         balance = try c.decodeIfPresent(BalanceView.self, forKey: .balance) ?? BalanceView()
         privacy = try c.decodeIfPresent(String.self, forKey: .privacy)
-        quirksSerial = try c.decodeIfPresent(UInt64.self, forKey: .quirksSerial) ?? 0
+        catalogSerial = try c.decodeIfPresent(UInt64.self, forKey: .catalogSerial) ?? 0
         update = try c.decodeIfPresent(UpdateStatus.self, forKey: .update) ?? .unknown
         lastRoute = try c.decodeIfPresent(LastRouteView.self, forKey: .lastRoute)
         usage = try c.decodeIfPresent(UsageView.self, forKey: .usage) ?? UsageView()
@@ -74,7 +74,7 @@ public struct StatusView: Decodable, Sendable, Equatable {
     public init(
         version: String, port: Int, trackedConversations: Int = 0, pin: String? = nil,
         backends: [BackendView] = [], balance: BalanceView = BalanceView(),
-        privacy: String? = nil, quirksSerial: UInt64 = 0, update: UpdateStatus = .upToDate,
+        privacy: String? = nil, catalogSerial: UInt64 = 0, update: UpdateStatus = .upToDate,
         lastRoute: LastRouteView? = nil, usage: UsageView = UsageView()
     ) {
         self.usage = usage
@@ -85,7 +85,7 @@ public struct StatusView: Decodable, Sendable, Equatable {
         self.backends = backends
         self.balance = balance
         self.privacy = privacy
-        self.quirksSerial = quirksSerial
+        self.catalogSerial = catalogSerial
         self.update = update
         self.lastRoute = lastRoute
     }

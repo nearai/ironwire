@@ -2,7 +2,7 @@
 //!
 //! This used to be a hand-rolled reader for `~/.codex/auth.json`. It is not any
 //! more: `ironclaw_llm::auth` already does exactly this, in production, with
-//! the auth-mode quirks and the ChatGPT-vs-API-key base-URL split handled. A
+//! the auth-mode catalog and the ChatGPT-vs-API-key base-URL split handled. A
 //! second implementation of credential discovery is a second thing to keep
 //! correct as Codex changes its file format, and the failure mode is a user
 //! silently losing their subscription.

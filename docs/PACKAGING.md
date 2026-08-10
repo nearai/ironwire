@@ -97,7 +97,7 @@ $IRONWIRE_HOME              default ~/.ironwire   (0700)
 ├── control.token           control-API token (0600)
 ├── daemon.lock             single-daemon lockfile
 ├── ledger.sqlite           local trace ledger
-├── quirks.json             signed provider quirks (docs/UPDATES.md)
+├── catalog.json             signed provider catalog (docs/UPDATES.md)
 ├── quota.json              observed capacity, carried across restarts (0600)
 ├── update.json             cached update check, at most one a day
 └── bodies/                 captured bodies, only if capture.bodies = true

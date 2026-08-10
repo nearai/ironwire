@@ -207,7 +207,7 @@ the middle of a streamed response (`docs/UPDATES.md` §1).
 - [x] `ironwire update`; `ironwire status` surfaces it
 - [ ] Publish `manifest.json` at the pinned URL (needs the release job)
 
-### Provider-quirks channel ✅ built
+### Provider-catalog channel ✅ built
 
 Signed data, refreshed independently of the binary, so a changed
 `anthropic-beta` flag is a minutes-long fix rather than a five-ecosystem release
@@ -306,12 +306,12 @@ save money buys one cheaper request and pays for it for the rest of the session.
       at all, which ends the session
 - [x] `compaction_stall_timeout_secs` (600s), floored at the ordinary timeout so
       a misconfiguration cannot make compaction *more* fragile than a normal turn
-- [x] Recognition lives in the quirks channel and is advisory: a miss costs a
+- [x] Recognition lives in the catalog channel and is advisory: a miss costs a
       slightly worse routing decision on one turn, never a wrong answer. An
       empty marker list disables it
 - [ ] **The marker set is a conservative guess, not a verified fingerprint.** No
       harness documents its compaction prompt; the real strings need observing
-      per harness and shipping through the quirks channel
+      per harness and shipping through the catalog channel
 
 ---
 
@@ -379,7 +379,7 @@ history. An unreversed placeholder there is self-perpetuating corruption
 - [x] Compaction does not change the conversation key, so the salt and the
       route survive it. If it did, every compaction would silently re-roll both
       at the worst possible moment
-- [ ] Optional compaction fingerprints in the **quirks channel**, as an
+- [ ] Optional compaction fingerprints in the **catalog channel**, as an
       optimization only — a client-shape fingerprint is exactly the thing that
       breaks silently on a client update
 - [x] Detection cost **measured rather than assumed**: tiers 1 and 2 cost ~1.5 ms
@@ -463,7 +463,7 @@ listing them here keeps them from looking finished when they are not.
 | Signed releases | a real signing key, held somewhere that is not a repo | M4 |
 | Publish `manifest.json` | a pinned URL to serve it from | M4 |
 | Hosted apt repo | hosting, plus a signing key for the `Release` file | M4 |
-| Real quirks signing key | same. The compiled-in key is a placeholder that verifies nothing, so the channel is inert — which is the correct failure mode, but it *is* inert | M4 |
+| Real catalog signing key | same. The compiled-in key is a placeholder that verifies nothing, so the channel is inert — which is the correct failure mode, but it *is* inert | M4 |
 | npm / PyPI / tap publication | `NPM_TOKEN`, PyPI trusted publishing, `TAP_TOKEN` | M4 |
 | Menu bar app signing | an Apple Developer certificate. The app is built and ad-hoc signed, which is enough for `brew` and for a local build; a *downloaded* bundle is blocked by Gatekeeper until it is notarised | M5 |
 | Tier-3 PII classifier | a local model, and a labelled corpus to state its precision and recall against | M7 |

@@ -2,13 +2,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use ironwire_catalog::CatalogStore;
 use ironwire_core::config::Config;
 use ironwire_core::peek::IdentityMarkers;
 use ironwire_core::policy::{Candidate, Policy};
 use ironwire_core::protocol::BackendId;
 use ironwire_creds::ConsentLedger;
 use ironwire_ledger::Ledger;
-use ironwire_quirks::QuirksStore;
 use ironwire_update::UpdateStatus;
 use ironwire_upstream::backend::{Backend, BackendStatus};
 use ironwire_upstream::breaker::BreakerBoard;
@@ -188,14 +188,14 @@ pub struct AppState {
     /// ledger could not be opened — a ledger problem must never stop the proxy
     /// from doing its actual job.
     pub ledger: Option<Ledger>,
-    /// Provider values refreshed through the signed quirks channel
+    /// Provider values refreshed through the signed catalog channel
     /// (`docs/UPDATES.md`).
     ///
     /// Behind a lock because a running daemon can install a newer document —
     /// which is the whole point of the channel: one that needed a restart to
     /// take effect would have the same latency as a release. The lock is held
     /// only long enough to clone an `Arc`, so the read path is a pointer copy.
-    quirks: Arc<Mutex<Arc<QuirksStore>>>,
+    catalog: Arc<Mutex<Arc<CatalogStore>>>,
     /// What the last update check concluded. Notify-only — IronWire never
     /// applies an update itself.
     pub update: Arc<Mutex<UpdateStatus>>,
@@ -290,8 +290,8 @@ impl AppState {
             policy: Arc::new(Mutex::new(Policy::new())),
             consent: Arc::new(Mutex::new(consent)),
             ledger: None,
-            quirks: Arc::new(Mutex::new(Arc::new(QuirksStore::new(
-                ironwire_quirks::QUIRKS_PUBLIC_KEY,
+            catalog: Arc::new(Mutex::new(Arc::new(CatalogStore::new(
+                ironwire_catalog::CATALOG_PUBLIC_KEY,
             )))),
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             breakers: Arc::new(BreakerBoard::default()),
@@ -407,27 +407,27 @@ impl AppState {
         }
     }
 
-    /// Install a quirks store loaded at startup.
+    /// Install a catalog store loaded at startup.
     #[must_use]
-    pub fn with_quirks(self, quirks: QuirksStore) -> Self {
-        self.set_quirks(Arc::new(quirks));
+    pub fn with_catalog(self, catalog: CatalogStore) -> Self {
+        self.set_catalog(Arc::new(catalog));
         self
     }
 
-    /// The quirks in force. A pointer copy, not a deep clone.
+    /// The catalog in force. A pointer copy, not a deep clone.
     #[must_use]
-    pub fn quirks(&self) -> Arc<QuirksStore> {
-        match self.quirks.lock() {
+    pub fn catalog(&self) -> Arc<CatalogStore> {
+        match self.catalog.lock() {
             Ok(guard) => Arc::clone(&guard),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
         }
     }
 
-    /// Install a newer quirks document, for the background refresh.
-    pub fn set_quirks(&self, quirks: Arc<QuirksStore>) {
-        match self.quirks.lock() {
-            Ok(mut guard) => *guard = quirks,
-            Err(poisoned) => *poisoned.into_inner() = quirks,
+    /// Install a newer catalog document, for the background refresh.
+    pub fn set_catalog(&self, catalog: Arc<CatalogStore>) {
+        match self.catalog.lock() {
+            Ok(mut guard) => *guard = catalog,
+            Err(poisoned) => *poisoned.into_inner() = catalog,
         }
     }
 
@@ -451,17 +451,17 @@ impl AppState {
     /// Identity markers currently in force.
     #[must_use]
     pub fn identity_markers(&self) -> IdentityMarkers {
-        let store = self.quirks();
-        let quirks = store.current();
+        let store = self.catalog();
+        let catalog = store.current();
         IdentityMarkers {
-            claude_code_system_prefix: quirks.client_identity.claude_code_system_prefix.clone(),
-            claude_code_user_agent_prefix: quirks
+            claude_code_system_prefix: catalog.client_identity.claude_code_system_prefix.clone(),
+            claude_code_user_agent_prefix: catalog
                 .client_identity
                 .claude_code_user_agent_prefix
                 .clone(),
-            codex_instructions_marker: quirks.client_identity.codex_instructions_marker.clone(),
-            codex_originator_prefix: quirks.client_identity.codex_originator_prefix.clone(),
-            compaction_markers: quirks.client_identity.compaction_markers.clone(),
+            codex_instructions_marker: catalog.client_identity.codex_instructions_marker.clone(),
+            codex_originator_prefix: catalog.client_identity.codex_originator_prefix.clone(),
+            compaction_markers: catalog.client_identity.compaction_markers.clone(),
         }
     }
 
@@ -603,7 +603,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod quirks_tests {
+mod catalog_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use ironwire_core::config::Config;
@@ -622,7 +622,7 @@ mod quirks_tests {
     fn a_fresh_daemon_runs_on_the_compiled_in_values() {
         let state = state();
         assert_eq!(
-            state.quirks().serial(),
+            state.catalog().serial(),
             0,
             "0 means built-ins, not a document"
         );
@@ -654,21 +654,21 @@ mod quirks_tests {
             },
         })
         .to_string();
-        let signed = ironwire_quirks::SignedQuirks {
+        let signed = ironwire_catalog::SignedCatalog {
             signature: hex::encode(signing.sign(document.as_bytes()).to_bytes()),
             document,
         };
 
-        let mut store = QuirksStore::new(verifying);
+        let mut store = CatalogStore::new(verifying);
         store
             .apply(&signed)
             .expect("a correctly signed document applies");
 
         let state = state();
-        assert_eq!(state.quirks().serial(), 0);
-        state.set_quirks(Arc::new(store));
+        assert_eq!(state.catalog().serial(), 0);
+        state.set_catalog(Arc::new(store));
 
-        assert_eq!(state.quirks().serial(), 42);
+        assert_eq!(state.catalog().serial(), 42);
         assert_eq!(
             state.identity_markers().claude_code_system_prefix,
             "You are Something Else"
@@ -689,12 +689,12 @@ mod quirks_tests {
             "client_identity": {"claude_code_system_prefix": "You are Evil"},
         })
         .to_string();
-        let signed = ironwire_quirks::SignedQuirks {
+        let signed = ironwire_catalog::SignedCatalog {
             signature: hex::encode(attacker.sign(document.as_bytes()).to_bytes()),
             document,
         };
 
-        let mut store = QuirksStore::new(ours);
+        let mut store = CatalogStore::new(ours);
         assert!(
             store.apply(&signed).is_err(),
             "a document signed by the wrong key was accepted"
@@ -703,12 +703,12 @@ mod quirks_tests {
     }
 
     #[test]
-    fn reading_the_quirks_is_a_pointer_copy_not_a_deep_clone() {
+    fn reading_the_catalog_is_a_pointer_copy_not_a_deep_clone() {
         // It happens on every request; a deep clone of the model catalogue per
         // request would be a real cost for no reason.
         let state = state();
-        let a = state.quirks();
-        let b = state.quirks();
+        let a = state.catalog();
+        let b = state.catalog();
         assert!(Arc::ptr_eq(&a, &b));
     }
 }

@@ -271,7 +271,7 @@ pass. That position comes with hard commitments, not defaults
 - **Traces stay local by default.** Upload is a separate, explicit decision.
 - **IronWire never updates itself.** `ironwire update` tells you a release
   exists and prints your package manager's command. The only thing it refreshes
-  on its own is a signed provider-quirks document — which, by construction,
+  on its own is a signed provider-catalog document — which, by construction,
   cannot name a host, so it can never redirect where a credential goes.
 
 ## Documentation
@@ -285,7 +285,7 @@ pass. That position comes with hard commitments, not defaults
 | [`docs/PRIVACY.md`](docs/PRIVACY.md) | The optional privacy filter, and where it stops |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Milestones |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | brew / npx / apt / pip |
-| [`docs/UPDATES.md`](docs/UPDATES.md) | notify-only updates, and the signed quirks channel |
+| [`docs/UPDATES.md`](docs/UPDATES.md) | notify-only updates, and the signed catalog channel |
 
 ## Layout
 
@@ -295,7 +295,7 @@ crates/
   ironwire_creds      credential discovery + consent
   ironwire_ledger     the local trace ledger
   ironwire_usage      session windows, burn rate, projections (from the ledger)
-  ironwire_quirks     the signed provider-quirks channel
+  ironwire_catalog     the signed provider-catalog channel
   ironwire_update     notify-only update checking
   ironwire_privacy    reversible substitution (the optional filter)
   ironwire_translate  cross-family translation (the fallback lane)

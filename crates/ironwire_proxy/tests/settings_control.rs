@@ -13,6 +13,8 @@ use ironwire_creds::ConsentLedger;
 use ironwire_creds::consent::CONSENT_PROMPT_VERSION;
 use ironwire_proxy::server::app;
 use ironwire_proxy::state::{AppState, BackendRegistry};
+use ironwire_upstream::openai_chat::ChatCompletionsBackend;
+use secrecy::SecretString;
 use tower::ServiceExt;
 
 const TOKEN: &str = "test-token";
@@ -57,6 +59,24 @@ fn home() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
+/// A registered, authenticated backend. The base URL is a closed loopback port:
+/// nothing here ever sends a request, and `status()` only reads the key.
+fn chat_backend(
+    id: &str,
+    name: &str,
+) -> Result<ChatCompletionsBackend, Box<dyn std::error::Error>> {
+    ChatCompletionsBackend::new(
+        ironwire_core::protocol::BackendId::from(id),
+        name,
+        ironwire_core::protocol::BackendKind::Credits,
+        Some(SecretString::from("a-key")),
+        "http://127.0.0.1:9/v1".to_string(),
+        Vec::new(),
+        5,
+    )
+    .map_err(Into::into)
+}
+
 // ---------------------------------------------------------------- settings
 
 #[tokio::test]
@@ -81,7 +101,16 @@ async fn the_settings_endpoint_needs_the_control_token() {
 #[tokio::test]
 async fn full_is_not_selectable_until_the_user_has_named_somewhere_to_route() {
     let dir = home();
-    let state = state_in(dir.path(), PrivacyConfig::default());
+    // Explicitly empty, not `default()`: the default names `nearai` now, so
+    // taking the default here would quietly test the has-no-credential case
+    // below instead of the nothing-named case this one is about.
+    let state = state_in(
+        dir.path(),
+        PrivacyConfig {
+            trusted_backends: Vec::new(),
+            ..PrivacyConfig::default()
+        },
+    );
     let (status, body) = call(&state, "GET", "/settings", None).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -97,22 +126,72 @@ async fn full_is_not_selectable_until_the_user_has_named_somewhere_to_route() {
     );
 }
 
+/// Naming a destination is not the same as having one.
+///
+/// `trusted_backends` defaults to `["nearai"]` and that backend registers with
+/// or without a key, so "named" is true on a machine where `full` can route
+/// nowhere at all. Selecting it there refuses every request, so the option stays
+/// greyed out and says which credential is missing.
 #[tokio::test]
-async fn full_becomes_selectable_once_a_destination_is_named() {
+async fn full_is_not_selectable_while_the_named_destination_has_no_credential() {
     let dir = home();
     let state = state_in(
         dir.path(),
         PrivacyConfig {
             trusted_backends: vec!["nearai".to_string()],
-            mode: Some(PrivacyMode::Full),
             ..PrivacyConfig::default()
         },
     );
     let (_, body) = call(&state, "GET", "/settings", None).await;
     let options = body["privacy"]["options"].as_array().expect("options");
     let full = options.iter().find(|o| o["id"] == "full").expect("full");
-    assert_eq!(full["selectable"], true);
+    assert_eq!(full["selectable"], false);
+    assert!(
+        full["unavailable_because"]
+            .as_str()
+            .is_some_and(|why| why.contains("credential")),
+        "the reason has to name what is missing, not just that it is unavailable: {full}"
+    );
     assert_eq!(body["privacy"]["trusted_backends"][0], "nearai");
+}
+
+/// And it does become selectable once that destination can actually serve.
+#[tokio::test]
+async fn full_becomes_selectable_once_a_named_destination_is_usable() {
+    let dir = home();
+    let mut registry = BackendRegistry::new();
+    registry.push(std::sync::Arc::new(
+        ChatCompletionsBackend::nearai(
+            Some(SecretString::from("near-key")),
+            Some("http://127.0.0.1:9/v1".to_string()),
+            Vec::new(),
+            5,
+        )
+        .expect("build the NEAR AI backend"),
+    ));
+    let state = AppState::new(
+        registry,
+        Config {
+            privacy: PrivacyConfig {
+                trusted_backends: vec!["nearai".to_string()],
+                ..PrivacyConfig::default()
+            },
+            ..Config::default()
+        },
+        ConsentLedger::default(),
+        TOKEN.to_string(),
+    )
+    .with_paths(PathsConfig::rooted_at(dir.path()));
+
+    let (_, body) = call(&state, "GET", "/settings", None).await;
+    let options = body["privacy"]["options"].as_array().expect("options");
+    let full = options.iter().find(|o| o["id"] == "full").expect("full");
+    assert_eq!(full["selectable"], true);
+
+    // And the endpoint behind the option agrees. These two were written
+    // separately once and disagreed immediately.
+    let (status, _) = call(&state, "POST", "/privacy", Some(r#"{"mode":"full"}"#)).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // ---------------------------------------------------------------- privacy
@@ -150,23 +229,52 @@ async fn setting_a_mode_takes_effect_immediately_and_is_written_down() {
 #[tokio::test]
 async fn switching_to_full_also_moves_the_routing_constraint() {
     let dir = home();
-    let state = state_in(
-        dir.path(),
-        PrivacyConfig {
-            trusted_backends: vec!["nearai".to_string()],
-            ..PrivacyConfig::default()
+    // Two usable backends, one trusted and one not. The empty registry this
+    // used to run against could only assert that nothing was eligible, which
+    // was equally true before the switch — it proved nothing about the
+    // constraint moving.
+    let mut registry = BackendRegistry::new();
+    registry.push(std::sync::Arc::new(
+        chat_backend("nearai", "NEAR AI").expect("build nearai"),
+    ));
+    registry.push(std::sync::Arc::new(
+        chat_backend("openai-key", "OpenAI").expect("build openai"),
+    ));
+    let state = AppState::new(
+        registry,
+        Config {
+            privacy: PrivacyConfig {
+                trusted_backends: vec!["nearai".to_string()],
+                ..PrivacyConfig::default()
+            },
+            ..Config::default()
         },
-    );
+        ConsentLedger::default(),
+        TOKEN.to_string(),
+    )
+    .with_paths(PathsConfig::rooted_at(dir.path()));
 
     let (status, _) = call(&state, "POST", "/privacy", Some(r#"{"mode":"full"}"#)).await;
     assert_eq!(status, StatusCode::OK);
 
+    // `candidates` lists every registered backend and marks each one; the
+    // filtering itself is `policy::eligible`'s job. So the assertion is on the
+    // mark, not on the length of the list.
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
     let candidates = state.backends.candidates(&statuses, &consent);
-    // No backends are registered in this fixture, so the assertion that matters
-    // is that the registry is now judging against `full` at all.
-    assert!(candidates.is_empty());
+    let trusted = |id: &str| {
+        candidates
+            .iter()
+            .find(|c| c.id.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} is registered"))
+            .trusted
+    };
+    assert!(trusted("nearai"), "the named backend is not marked trusted");
+    assert!(
+        !trusted("openai-key"),
+        "a backend the user did not name is still marked trusted under `full`"
+    );
     assert_eq!(state.privacy_config().mode(), PrivacyMode::Full);
     assert!(state.privacy_config().trusts("nearai"));
     assert!(!state.privacy_config().trusts("openai"));
@@ -298,7 +406,7 @@ async fn consent_for_a_backend_it_does_not_apply_to_is_refused() {
         &state,
         "POST",
         "/consent",
-        Some(r#"{"backend":"nearai","granted":true,"prompt_version":1}"#),
+        Some(r#"{"backend":"nearai","granted":true,"prompt_version":2}"#),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -324,7 +432,7 @@ async fn consent_that_cannot_be_written_is_not_granted() {
         &state,
         "POST",
         "/consent",
-        Some(r#"{"backend":"claude-sub","granted":true,"prompt_version":1}"#),
+        Some(r#"{"backend":"claude-sub","granted":true,"prompt_version":2}"#),
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

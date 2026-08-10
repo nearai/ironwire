@@ -124,8 +124,8 @@ final class DecodingTests: XCTestCase {
     }
 
     func test_an_event_type_from_a_newer_daemon_is_ignored_rather_than_fatal() throws {
-        let event = try decode(Event.self, #"{"type":"quirks_updated","at":"2026-08-08T12:00:00Z","serial":7}"#)
-        XCTAssertEqual(event, .unrecognised("quirks_updated"))
+        let event = try decode(Event.self, #"{"type":"catalog_updated","at":"2026-08-08T12:00:00Z","serial":7}"#)
+        XCTAssertEqual(event, .unrecognised("catalog_updated"))
         XCTAssertNil(NotificationPolicy.notification(for: event))
     }
 
@@ -243,7 +243,7 @@ enum Fixtures {
         "subscription_used": [{"name": "Claude subscription", "used_pct": 82.0, "exchanges": 41}]
       },
       "privacy": "redacting emails and API keys",
-      "quirks_serial": 0,
+      "catalog_serial": 0,
       "update": {"state": "up_to_date"},
       "last_route": {
         "backend": "nearai",

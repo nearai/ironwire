@@ -71,10 +71,10 @@ impl PathsConfig {
         self.home.join("ledger.sqlite")
     }
 
-    /// Cached signed provider-quirks document.
+    /// Cached signed provider-catalog document.
     #[must_use]
-    pub fn quirks_file(&self) -> PathBuf {
-        self.home.join("quirks.json")
+    pub fn catalog_file(&self) -> PathBuf {
+        self.home.join("catalog.json")
     }
 
     /// Observed quota from the previous run, mode 0600

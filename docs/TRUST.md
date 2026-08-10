@@ -13,7 +13,7 @@ defaults: changing one is a product decision, not a config change.
 | # | Invariant | Enforcement |
 |---|---|---|
 | I1 | **Loopback only.** IronWire binds `127.0.0.1` and has no remote mode, no `--host`, no tunnel helper. | Hardcoded bind address; test asserts the listener is loopback. |
-| I2 | **Credentials never leave the machine.** No credential, refresh token or derived bearer is written to any network destination other than the credential's own issuer. | Egress allowlist keyed by credential; test asserts a credential is only ever attached to its issuer's host. The signed quirks channel **cannot express a host, URL, or path** (§7), so I2 holds even against a compromised signing key. |
+| I2 | **Credentials never leave the machine.** No credential, refresh token or derived bearer is written to any network destination other than the credential's own issuer. | Egress allowlist keyed by credential; test asserts a credential is only ever attached to its issuer's host. The signed catalog channel **cannot express a host, URL, or path** (§7), so I2 holds even against a compromised signing key. |
 | I3 | **No hosted IronWire holds anyone's subscription token.** There is no server-side product that proxies a user's subscription. | Non-goal, stated in DESIGN.md §11. |
 | I4 | **Single user.** No multi-tenant routing, no shared pools, no capacity resale. | No tenancy concept exists in the type system. |
 | I5 | **No identity forgery.** IronWire never synthesizes another product's client identity to unlock a subscription. | See §3. |
@@ -215,7 +215,7 @@ engineering cannot fix.
 
 ---
 
-## 6. Updates and the quirks channel
+## 6. Updates and the catalog channel
 
 Full design in [`UPDATES.md`](./UPDATES.md); the trust-relevant parts:
 
@@ -255,14 +255,14 @@ work.** It is bounded accordingly:
 - Off with `updates.check = false`, honoured before the first check — switching
   it off means no request is ever made, not one last one.
 
-**The quirks channel refreshes provider values without a release** — an
+**The catalog channel refreshes provider values without a release** — an
 `anthropic-beta` flag, an API version, a client-identity marker. It is signed,
 rollback-protected, and fails closed onto the values compiled into the binary.
 
 The constraint that makes a remotely-updatable document acceptable in a
 credential-holding proxy is structural, not procedural:
 
-> **No type in the quirks schema can express a host, a URL, or a filesystem
+> **No type in the catalog schema can express a host, a URL, or a filesystem
 > path.**
 
 Whoever holds the signing key can change which beta flag we send. They cannot

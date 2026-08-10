@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ironwire_catalog::CatalogStore;
 use ironwire_core::config::ModelEntry;
 use ironwire_core::config::{Config, PathsConfig};
 use ironwire_core::protocol::{BackendId, BackendKind, ModelTier};
@@ -12,7 +13,6 @@ use ironwire_creds::codex::{CodexCredentials, CodexMode};
 use ironwire_ledger::Ledger;
 use ironwire_proxy::server::ServeError;
 use ironwire_proxy::state::{AppState, BackendRegistry};
-use ironwire_quirks::QuirksStore;
 use ironwire_upstream::anthropic::AnthropicBackend;
 use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use ironwire_upstream::openai_responses::ResponsesBackend;
@@ -70,9 +70,9 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let ledger = open_ledger(&paths, &config);
     // Provider values that may have been refreshed since this binary shipped.
     // A missing or untrusted document silently leaves the built-ins in force.
-    let quirks = QuirksStore::load(ironwire_quirks::QUIRKS_PUBLIC_KEY, &paths.quirks_file());
-    if quirks.serial() > 0 {
-        println!("  provider quirks: serial {}", quirks.serial());
+    let catalog = CatalogStore::load(ironwire_catalog::CATALOG_PUBLIC_KEY, &paths.catalog_file());
+    if catalog.serial() > 0 {
+        println!("  provider catalog: serial {}", catalog.serial());
     }
     // Housekeeping the user should never have to remember: capture is on by
     // default, so without this the ledger grows for the life of the install.
@@ -82,16 +82,16 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
         .with_port(port)
         .with_paths(paths.clone())
         .with_ledger(ledger)
-        .with_quirks(quirks);
+        .with_catalog(catalog);
     // Resume today's spending rather than restarting it: a cap that could be
     // reset by restarting the daemon is not a cap.
     seed_spend(&state);
 
     // Notify-only: check rarely, tell the user, never act. See docs/UPDATES.md.
     super::update::spawn_check(state.clone(), &paths, config_updates_enabled);
-    // Provider quirks refresh while running, so a changed `anthropic-beta`
+    // Provider catalog refresh while running, so a changed `anthropic-beta`
     // flag is a minutes-long fix rather than a restart (docs/UPDATES.md §2).
-    super::quirks::spawn_refresh(state.clone(), &paths, config_updates_enabled);
+    super::catalog::spawn_refresh(state.clone(), &paths, config_updates_enabled);
     // Ask each backend what it serves, once, in the background. Without this
     // the catalogue was only ever learned by `ironwire doctor`, so a daemon
     // nobody ran doctor against routed on compiled-in guesses for its whole

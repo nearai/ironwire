@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use futures_util::StreamExt;
+use ironwire_catalog::AnthropicCatalog;
 use ironwire_core::capability::Capabilities;
 use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::claude::{ANTHROPIC_HOST, ClaudeCodeCredentials};
 use ironwire_creds::{Bearer, CredentialError};
-use ironwire_quirks::AnthropicQuirks;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};
@@ -77,16 +77,16 @@ pub struct AnthropicBackend {
     discovered: Arc<Mutex<Option<crate::Catalogue>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
     /// Protocol constants. These are the values most likely to change under us,
-    /// so they come from the signed quirks channel rather than a release
+    /// so they come from the signed catalog channel rather than a release
     /// (`docs/UPDATES.md`). The *host* deliberately does not.
-    quirks: AnthropicQuirks,
+    catalog: AnthropicCatalog,
 }
 
 impl AnthropicBackend {
     /// Replace the protocol constants with a newer signed set.
     #[must_use]
-    pub fn with_quirks(mut self, quirks: AnthropicQuirks) -> Self {
-        self.quirks = quirks;
+    pub fn with_catalog(mut self, catalog: AnthropicCatalog) -> Self {
+        self.catalog = catalog;
         self
     }
 
@@ -107,7 +107,7 @@ impl AnthropicBackend {
             models: anthropic_models(),
             discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
-            quirks: AnthropicQuirks::default(),
+            catalog: AnthropicCatalog::default(),
         })
     }
 
@@ -132,7 +132,7 @@ impl AnthropicBackend {
             models: anthropic_models(),
             discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
-            quirks: AnthropicQuirks::default(),
+            catalog: AnthropicCatalog::default(),
         })
     }
 
@@ -325,7 +325,7 @@ impl Backend for AnthropicBackend {
         let mut builder = self
             .client
             .get(format!("{}/v1/models", self.base_url))
-            .header("anthropic-version", &self.quirks.api_version)
+            .header("anthropic-version", &self.catalog.api_version)
             .timeout(std::time::Duration::from_secs(15));
         builder = match &self.auth {
             AnthropicAuth::Subscription => builder
@@ -333,7 +333,7 @@ impl Backend for AnthropicBackend {
                     reqwest::header::AUTHORIZATION,
                     format!("Bearer {}", bearer.token.expose_secret()),
                 )
-                .header("anthropic-beta", &self.quirks.oauth_beta),
+                .header("anthropic-beta", &self.catalog.oauth_beta),
             AnthropicAuth::ApiKey(_) => builder.header("x-api-key", bearer.token.expose_secret()),
         };
 
@@ -417,13 +417,13 @@ impl AnthropicBackend {
                 // the API answers 401. Append rather than replace so the
                 // client's own beta flags survive.
                 let beta = match saw_beta {
-                    Some(existing) if existing.contains(&self.quirks.oauth_beta) => existing,
-                    Some(existing) => format!("{existing},{}", self.quirks.oauth_beta),
-                    None => self.quirks.oauth_beta.to_string(),
+                    Some(existing) if existing.contains(&self.catalog.oauth_beta) => existing,
+                    Some(existing) => format!("{existing},{}", self.catalog.oauth_beta),
+                    None => self.catalog.oauth_beta.to_string(),
                 };
                 builder = builder.header("anthropic-beta", beta);
                 if !saw_version {
-                    builder = builder.header("anthropic-version", &self.quirks.api_version);
+                    builder = builder.header("anthropic-version", &self.catalog.api_version);
                 }
             }
             AnthropicAuth::ApiKey(_) => {
@@ -432,7 +432,7 @@ impl AnthropicBackend {
                     builder = builder.header("anthropic-beta", beta);
                 }
                 if !saw_version {
-                    builder = builder.header("anthropic-version", &self.quirks.api_version);
+                    builder = builder.header("anthropic-version", &self.catalog.api_version);
                 }
             }
         }

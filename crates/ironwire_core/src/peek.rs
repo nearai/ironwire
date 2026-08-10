@@ -23,7 +23,7 @@ const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 /// never writes it.
 ///
 /// Compiled-in default. The live value can be refreshed through the signed
-/// quirks channel (`docs/UPDATES.md`), because a marker string is exactly the
+/// catalog channel (`docs/UPDATES.md`), because a marker string is exactly the
 /// kind of thing that changes without notice.
 pub const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code";
 
@@ -33,7 +33,7 @@ pub const CLAUDE_CODE_SYSTEM_PREFIX: &str = "You are Claude Code";
 /// **These are a conservative starting guess, not a verified fingerprint.**
 /// Each harness words its compaction prompt differently and none of them
 /// document it, so the real set has to be established by observation and then
-/// shipped through the quirks channel — which is precisely what that channel is
+/// shipped through the catalog channel — which is precisely what that channel is
 /// for. Nothing here is load-bearing: a miss costs a slightly worse routing
 /// decision on one turn, never a wrong answer (see [`RequestPeek::
 /// likely_compaction`]).
@@ -84,7 +84,7 @@ pub fn originator_names_codex(originator: Option<&str>, prefix: &str) -> bool {
 }
 
 /// Markers used to recognise a client's own identity, so the caller can supply
-/// refreshed ones without this crate depending on the quirks channel.
+/// refreshed ones without this crate depending on the catalog channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityMarkers {
     /// Prefix of one of Claude Code's system blocks.
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn an_empty_marker_set_disables_detection_entirely() {
-        // The quirks channel can turn this off by shipping no markers, which is
+        // The catalog channel can turn this off by shipping no markers, which is
         // the escape hatch if the heuristic turns out to misfire in the field.
         let mut messages: Vec<serde_json::Value> = (0..12)
             .map(|i| json!({"role": "user", "content": format!("m{i}")}))

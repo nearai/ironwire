@@ -396,7 +396,7 @@ here (is a switch *wise*).
 2. **Recognition must stay optional.** Fingerprinting each harness's compaction
    request is the obvious approach and is exactly the kind of client-shape
    detail that breaks silently on a client update. Any fingerprint belongs in
-   the signed quirks channel (`docs/UPDATES.md`), and nothing may depend on it
+   the signed catalog channel (`docs/UPDATES.md`), and nothing may depend on it
    being right — behaviour without recognition must be correct, just less
    tuned.
 3. **`count_tokens` must keep working and must be routed like the turn it
@@ -436,5 +436,5 @@ a different HTTP stack — so it is not known whether the app reaches the ChatGP
 subscription through IronWire or is refused as an unrecognised client. That
 needs a capture from a running app, and until there is one this section states
 the uncertainty rather than implying coverage. The markers live in the signed
-quirks channel precisely so the answer can ship in minutes rather than a
+catalog channel precisely so the answer can ship in minutes rather than a
 release.

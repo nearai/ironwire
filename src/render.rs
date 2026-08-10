@@ -236,10 +236,10 @@ pub(crate) fn status(status: &StatusView, style: Style) -> String {
     if let Some(privacy) = &status.privacy {
         out.push_str(&format!("privacy filter: {privacy}\n"));
     }
-    if status.quirks_serial > 0 {
+    if status.catalog_serial > 0 {
         out.push_str(&format!(
-            "provider quirks: serial {}\n",
-            status.quirks_serial
+            "provider catalog: serial {}\n",
+            status.catalog_serial
         ));
     }
     out.push_str(&update_line(&status.update, style));
@@ -901,7 +901,7 @@ mod tests {
             backends,
             balance: BalanceView::default(),
             privacy: None,
-            quirks_serial: 0,
+            catalog_serial: 0,
             update: UpdateStatus::Unknown,
             last_route: None,
             usage: UsageReport::default(),

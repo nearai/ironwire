@@ -1,4 +1,4 @@
-//! The signed provider-quirks channel.
+//! The signed provider-catalog channel.
 //!
 //! IronWire depends on values it does not control: a `anthropic-beta` flag, an
 //! API version string, a model catalogue, the prefix that identifies a client.
@@ -21,10 +21,10 @@
 pub mod schema;
 pub mod store;
 
-pub use schema::{AnthropicQuirks, ClientIdentityQuirks, ModelEntry, Quirks, SCHEMA_VERSION};
-pub use store::{QuirksError, QuirksStore, SignedQuirks};
+pub use schema::{AnthropicCatalog, Catalog, ClientIdentityCatalog, ModelEntry, SCHEMA_VERSION};
+pub use store::{CatalogError, CatalogStore, SignedCatalog};
 
-/// Public key this build trusts for quirks documents.
+/// Public key this build trusts for catalog documents.
 ///
 /// Baked in on purpose: a key fetched at runtime is not a root of trust. Its
 /// private half lives in the release signing infrastructure, not in this
@@ -33,4 +33,4 @@ pub use store::{QuirksError, QuirksStore, SignedQuirks};
 /// The placeholder below is deliberately **not** a usable key. Until release
 /// signing exists, every document fails verification and the daemon runs on the
 /// compiled-in defaults, which is the correct failure direction.
-pub const QUIRKS_PUBLIC_KEY: [u8; 32] = [0u8; 32];
+pub const CATALOG_PUBLIC_KEY: [u8; 32] = [0u8; 32];

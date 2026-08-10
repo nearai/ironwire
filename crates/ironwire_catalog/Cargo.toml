@@ -1,6 +1,6 @@
 [package]
-name = "ironwire_quirks"
-description = "Signed provider-quirks channel: the values that change when a provider changes"
+name = "ironwire_catalog"
+description = "Signed provider-catalog channel: the values that change when a provider changes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

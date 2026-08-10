@@ -218,7 +218,7 @@ mod tests {
             backends: vec![],
             balance: ironwire_proxy::control::BalanceView::default(),
             privacy: None,
-            quirks_serial: 0,
+            catalog_serial: 0,
             update: UpdateStatus::UpToDate,
             last_route,
             usage: ironwire_usage::UsageReport::default(),

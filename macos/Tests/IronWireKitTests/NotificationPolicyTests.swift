@@ -63,6 +63,6 @@ final class NotificationPolicyTests: XCTestCase {
     }
 
     func test_an_event_from_a_newer_daemon_is_never_announced() {
-        XCTAssertNil(NotificationPolicy.notification(for: .unrecognised("quirks_updated")))
+        XCTAssertNil(NotificationPolicy.notification(for: .unrecognised("catalog_updated")))
     }
 }

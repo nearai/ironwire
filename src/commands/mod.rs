@@ -4,6 +4,7 @@
 //! control API rather than reading state off disk, so the CLI and the menu bar
 //! app can never disagree about what is happening (`docs/DESIGN.md` §6).
 
+pub(crate) mod catalog;
 pub(crate) mod connect;
 pub(crate) mod control_client;
 pub(crate) mod doctor;
@@ -13,7 +14,6 @@ pub(crate) mod log;
 pub(crate) mod pin;
 pub(crate) mod privacy;
 pub(crate) mod prune;
-pub(crate) mod quirks;
 pub(crate) mod serve;
 pub(crate) mod service;
 pub(crate) mod status;

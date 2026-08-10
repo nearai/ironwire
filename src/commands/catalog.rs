@@ -1,6 +1,6 @@
-//! Refreshing the signed provider-quirks document while the daemon runs.
+//! Refreshing the signed provider-catalog document while the daemon runs.
 //!
-//! `docs/UPDATES.md` §2: quirks exist so that a changed `anthropic-beta` flag
+//! `docs/UPDATES.md` §2: catalog exist so that a changed `anthropic-beta` flag
 //! is a minutes-long fix rather than a five-ecosystem release. That only holds
 //! if a *running* daemon picks it up — a document that requires a restart to
 //! take effect has the same latency as a release, which is the problem it was
@@ -8,7 +8,7 @@
 //!
 //! Two properties this must keep, both from `docs/TRUST.md` I2:
 //!
-//! - The URL is **pinned**, not configurable. A redirectable quirks source
+//! - The URL is **pinned**, not configurable. A redirectable catalog source
 //!   would be a supply-chain hole, and the schema deliberately cannot express a
 //!   host so that a compromised *signing key* still cannot move traffic.
 //! - Verification happens before parse, and a failure leaves the previous
@@ -17,13 +17,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use ironwire_catalog::{CatalogStore, SignedCatalog};
 use ironwire_core::config::PathsConfig;
 use ironwire_proxy::state::AppState;
-use ironwire_quirks::{QuirksStore, SignedQuirks};
 
 /// Where the signed document lives. Pinned for the same reason the release
 /// manifest is.
-const QUIRKS_URL: &str = "https://ironwire.dev/releases/quirks.json";
+const CATALOG_URL: &str = "https://ironwire.dev/releases/catalog.json";
 
 /// How often a running daemon looks for a newer document.
 ///
@@ -45,18 +45,18 @@ pub(crate) fn spawn_refresh(state: AppState, paths: &PathsConfig, enabled: bool)
     if !enabled {
         return;
     }
-    let path = paths.quirks_file();
+    let path = paths.catalog_file();
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_CHECK_DELAY).await;
         loop {
             match fetch_and_apply(&state, &path).await {
                 Ok(Some(serial)) => {
-                    tracing::info!(serial, "applied a newer provider-quirks document");
+                    tracing::info!(serial, "applied a newer provider-catalog document");
                 }
-                Ok(None) => tracing::debug!("provider quirks unchanged"),
+                Ok(None) => tracing::debug!("provider catalog unchanged"),
                 // Never fatal: the compiled-in defaults, or the document
                 // already loaded, stay in force.
-                Err(error) => tracing::debug!(%error, "provider-quirks refresh skipped"),
+                Err(error) => tracing::debug!(%error, "provider-catalog refresh skipped"),
             }
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
@@ -72,18 +72,18 @@ async fn fetch_and_apply(
         .timeout(Duration::from_secs(15))
         .build()?;
     let body = client
-        .get(QUIRKS_URL)
+        .get(CATALOG_URL)
         .send()
         .await?
         .error_for_status()?
         .bytes()
         .await?;
-    let signed: SignedQuirks = serde_json::from_slice(&body)?;
+    let signed: SignedCatalog = serde_json::from_slice(&body)?;
 
     // Start from the store in force, so the rollback guard on `serial` applies
     // and a replayed older document is refused. There is deliberately no way to
     // read the serial before verifying: an unverified number is not evidence.
-    let mut next = (*state.quirks()).clone();
+    let mut next = (*state.catalog()).clone();
     let before = next.serial();
     next.apply(&signed)?;
     let serial = next.serial();
@@ -93,9 +93,9 @@ async fn fetch_and_apply(
 
     // Persist only after it verified, so a bad document cannot poison the
     // cache that the next startup reads.
-    if let Err(error) = QuirksStore::persist(&signed, path) {
-        tracing::warn!(%error, "could not cache the quirks document");
+    if let Err(error) = CatalogStore::persist(&signed, path) {
+        tracing::warn!(%error, "could not cache the catalog document");
     }
-    state.set_quirks(Arc::new(next));
+    state.set_catalog(Arc::new(next));
     Ok(Some(serial))
 }

@@ -193,7 +193,7 @@ conversation" than from "fix this test".
 
 The tempting move is to fingerprint each harness's compaction request and
 handle it specially. That fingerprint is precisely the kind of thing that
-breaks silently on a client update — which is what the signed quirks channel
+breaks silently on a client update — which is what the signed catalog channel
 exists for (`docs/UPDATES.md`), and it is where any such fingerprint will live.
 
 But recognition must be an **optimization, not a dependency**. Correctness comes
@@ -410,6 +410,6 @@ substitution *count* so the log is not silently misleading about what was sent.
   it and saying so would be the most harmful thing on this page.
 - **Filter by default.** A mutation of the request path is opt-in, always.
 - **Send anything to a remote classifier.** Tier 3 is local-only, and I2 already
-  makes the network shape of this unavailable to the quirks channel.
+  makes the network shape of this unavailable to the catalog channel.
 - **Persist the map.** §4.
 - **Silently pass a partially-reversed response.** §5.

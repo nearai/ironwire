@@ -1,4 +1,4 @@
-//! The quirks schema — and, more importantly, what it deliberately cannot say.
+//! The catalog schema — and, more importantly, what it deliberately cannot say.
 //!
 //! # The security property
 //!
@@ -36,7 +36,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Provider values that move faster than our release cadence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Quirks {
+pub struct Catalog {
     /// Schema this document targets.
     pub schema_version: u32,
     /// Monotonic counter. A document with a serial at or below the one already
@@ -48,10 +48,10 @@ pub struct Quirks {
     pub issued_at: DateTime<Utc>,
     /// Anthropic protocol constants.
     #[serde(default)]
-    pub anthropic: AnthropicQuirks,
+    pub anthropic: AnthropicCatalog,
     /// How a client's own identity is recognised (`docs/TRUST.md` §3).
     #[serde(default)]
-    pub client_identity: ClientIdentityQuirks,
+    pub client_identity: ClientIdentityCatalog,
     /// Model catalogues, keyed by backend id.
     #[serde(default)]
     pub models: BTreeMap<String, Vec<ModelEntry>>,
@@ -60,7 +60,7 @@ pub struct Quirks {
 /// Anthropic wire constants. Strings the API validates, not places we send to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AnthropicQuirks {
+pub struct AnthropicCatalog {
     /// `anthropic-version` header value.
     pub api_version: String,
     /// Beta flag that enables OAuth bearer auth. This is the value most likely
@@ -68,7 +68,7 @@ pub struct AnthropicQuirks {
     pub oauth_beta: String,
 }
 
-impl Default for AnthropicQuirks {
+impl Default for AnthropicCatalog {
     fn default() -> Self {
         Self {
             api_version: "2023-06-01".to_string(),
@@ -80,7 +80,7 @@ impl Default for AnthropicQuirks {
 /// Markers that identify which product a request came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ClientIdentityQuirks {
+pub struct ClientIdentityCatalog {
     /// Prefix of one of Claude Code's system blocks.
     pub claude_code_system_prefix: String,
     /// Prefix of the `user-agent` Claude Code sends. Refreshable for the same
@@ -121,7 +121,7 @@ fn default_compaction_markers() -> Vec<String> {
         .collect()
 }
 
-impl Default for ClientIdentityQuirks {
+impl Default for ClientIdentityCatalog {
     fn default() -> Self {
         Self {
             claude_code_system_prefix: "You are Claude Code".to_string(),
@@ -144,7 +144,7 @@ pub struct ModelEntry {
     pub tier: String,
 }
 
-impl Default for Quirks {
+impl Default for Catalog {
     /// The compiled-in baseline: what this binary knows without a network.
     ///
     /// A fresh install with no connectivity must work, so the defaults are the
@@ -154,14 +154,14 @@ impl Default for Quirks {
             schema_version: SCHEMA_VERSION,
             serial: 0,
             issued_at: DateTime::UNIX_EPOCH,
-            anthropic: AnthropicQuirks::default(),
-            client_identity: ClientIdentityQuirks::default(),
+            anthropic: AnthropicCatalog::default(),
+            client_identity: ClientIdentityCatalog::default(),
             models: BTreeMap::new(),
         }
     }
 }
 
-impl Quirks {
+impl Catalog {
     /// Models for a backend, or an empty slice when the document says nothing —
     /// in which case the backend keeps its compiled-in catalogue.
     #[must_use]
@@ -179,7 +179,7 @@ mod tests {
     /// module docs.
     #[test]
     fn the_schema_cannot_express_a_host_a_url_or_a_path() {
-        let serialised = serde_json::to_string(&Quirks::default()).expect("serialises");
+        let serialised = serde_json::to_string(&Catalog::default()).expect("serialises");
         let document: serde_json::Value = serde_json::from_str(&serialised).expect("parses");
 
         fn walk(value: &serde_json::Value, path: &str) {
@@ -206,16 +206,16 @@ mod tests {
                 _ => {}
             }
         }
-        walk(&document, "quirks");
+        walk(&document, "catalog");
     }
 
     #[test]
     fn the_compiled_in_default_is_usable_offline() {
         // A fresh install with no network must still talk to Anthropic.
-        let quirks = Quirks::default();
-        assert!(!quirks.anthropic.api_version.is_empty());
-        assert!(!quirks.anthropic.oauth_beta.is_empty());
-        assert!(!quirks.client_identity.claude_code_system_prefix.is_empty());
+        let catalog = Catalog::default();
+        assert!(!catalog.anthropic.api_version.is_empty());
+        assert!(!catalog.anthropic.oauth_beta.is_empty());
+        assert!(!catalog.client_identity.claude_code_system_prefix.is_empty());
     }
 
     #[test]
@@ -230,8 +230,8 @@ mod tests {
                           "some_future_knob": true},
             "a_whole_new_section": {"x": 1},
         });
-        let quirks: Quirks = serde_json::from_value(document).expect("tolerates unknown fields");
-        assert_eq!(quirks.anthropic.oauth_beta, "oauth-2026-01-01");
+        let catalog: Catalog = serde_json::from_value(document).expect("tolerates unknown fields");
+        assert_eq!(catalog.anthropic.oauth_beta, "oauth-2026-01-01");
     }
 
     #[test]
@@ -239,13 +239,13 @@ mod tests {
         let document = serde_json::json!({
             "schema_version": 1, "serial": 1, "issued_at": "2026-08-08T00:00:00Z",
         });
-        let quirks: Quirks = serde_json::from_value(document).expect("parses");
-        assert_eq!(quirks.anthropic, AnthropicQuirks::default());
-        assert_eq!(quirks.client_identity, ClientIdentityQuirks::default());
+        let catalog: Catalog = serde_json::from_value(document).expect("parses");
+        assert_eq!(catalog.anthropic, AnthropicCatalog::default());
+        assert_eq!(catalog.client_identity, ClientIdentityCatalog::default());
     }
 
     #[test]
     fn a_backend_with_no_catalogue_keeps_its_own() {
-        assert!(Quirks::default().models_for("nearai").is_empty());
+        assert!(Catalog::default().models_for("nearai").is_empty());
     }
 }

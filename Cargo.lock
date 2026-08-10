@@ -1324,12 +1324,12 @@ dependencies = [
  "clap_complete",
  "dirs",
  "futures-util",
+ "ironwire_catalog",
  "ironwire_core",
  "ironwire_creds",
  "ironwire_ledger",
  "ironwire_privacy",
  "ironwire_proxy",
- "ironwire_quirks",
  "ironwire_update",
  "ironwire_upstream",
  "ironwire_usage",
@@ -1342,6 +1342,22 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ironwire_catalog"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "hex",
+ "ironwire_core",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
 ]
 
 [[package]]
@@ -1420,11 +1436,11 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "ironwire_catalog",
  "ironwire_core",
  "ironwire_creds",
  "ironwire_ledger",
  "ironwire_privacy",
- "ironwire_quirks",
  "ironwire_translate",
  "ironwire_update",
  "ironwire_upstream",
@@ -1436,22 +1452,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tower",
- "tracing",
-]
-
-[[package]]
-name = "ironwire_quirks"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "ed25519-dalek",
- "hex",
- "ironwire_core",
- "rand 0.8.7",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -1490,9 +1490,9 @@ dependencies = [
  "futures-util",
  "http",
  "ironclaw_llm",
+ "ironwire_catalog",
  "ironwire_core",
  "ironwire_creds",
- "ironwire_quirks",
  "reqwest 0.12.28",
  "secrecy",
  "serde",
