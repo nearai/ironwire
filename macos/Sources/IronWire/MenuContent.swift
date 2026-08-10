@@ -34,6 +34,8 @@ struct MenuContent: View {
     /// Backends whose consent costs the user has expanded. Not persisted: a
     /// reading aid, not a setting.
     @State private var expanded: Set<String> = []
+    /// What the last wiring of each tool reported, keyed by tool id.
+    @State private var toolReports: [String: [String]] = [:]
 
     private var iconState: IconState { IconState.from(client.status) }
 
@@ -389,23 +391,63 @@ struct MenuContent: View {
                         HStack(spacing: 6) {
                             Text(tool.name).font(.caption)
                             Spacer()
-                            Text(tool.wired ? "routed here" : "not routed here")
-                                .font(.caption2)
-                                .foregroundStyle(tool.wired ? Color.green : Color.orange)
+                            Toggle("", isOn: Binding(
+                                get: { tool.wired },
+                                set: { wanted in setTool(tool, connect: wanted) }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                            .disabled(busy)
+                            .accessibilityLabel(Text("Route \(tool.name) through IronWire"))
+                            .accessibilityHint(Text(tool.configPath ?? tool.connectCommand))
                         }
-                        // Named, never offered as a button. Editing an agent's
-                        // config needs the file printed before it is touched,
-                        // and a dropdown cannot give it that.
-                        if !tool.wired, !tool.connectCommand.isEmpty {
-                            Text(tool.connectCommand)
-                                .font(.caption2.monospaced())
-                                .textSelection(.enabled)
-                                .foregroundStyle(.secondary)
+                        if !tool.wired {
+                            Text("not routed here")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                        // What the last edit did, and to which file. This is
+                        // the one write that changes something outside
+                        // `$IRONWIRE_HOME`, and every other surface in this
+                        // product names the file before touching it.
+                        if let report = toolReports[tool.id] {
+                            ForEach(Array(report.enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
                     .help(tool.configPath ?? "")
                 }
             }
+        }
+    }
+
+    /// Wire a tool, and keep what the daemon said it did.
+    ///
+    /// The report is shown rather than discarded because a slot the user was
+    /// already using is left alone — a switch that flicks back with no
+    /// explanation is the worst version of that, and the daemon has the
+    /// sentence that explains it.
+    private func setTool(_ tool: ToolView, connect: Bool) {
+        busy = true
+        Task {
+            settingsError = nil
+            switch await client.setTool(id: tool.id, connect: connect) {
+            case .success(let outcome):
+                var lines = outcome.changes
+                lines.append(contentsOf: outcome.occupied)
+                if let path = outcome.path, !lines.isEmpty {
+                    lines.append(path)
+                }
+                toolReports[tool.id] = lines
+            case .failure(let failure):
+                settingsError = failure.message
+            }
+            busy = false
         }
     }
 

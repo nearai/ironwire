@@ -307,7 +307,7 @@ final class MenuContentTests: XCTestCase {
     /// The state this section exists for: everything healthy, nothing routing.
     /// An unwired tool has to occupy space, or the pane goes on implying that a
     /// green backend means traffic is arriving.
-    func test_an_unwired_tool_says_so_and_names_the_command() throws {
+    func test_an_unwired_tool_says_so() throws {
         let listed = try height(
             status(backends: []),
             settings: withTools([
@@ -320,8 +320,10 @@ final class MenuContentTests: XCTestCase {
             listed, nothing, "an unwired tool is not being drawn at all")
     }
 
-    /// A wired tool is one line; an unwired one also carries the command. So
-    /// the unwired case is the taller of the two, which is the right way round.
+    /// A wired tool is a name and a switch; an unwired one also says "not
+    /// routed here". So the unwired case is the taller of the two, which is the
+    /// right way round — the state that needs explaining is the one that gets
+    /// the words.
     func test_an_unwired_tool_is_taller_than_a_wired_one() throws {
         let wired = try height(
             status(backends: []),
