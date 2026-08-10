@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 ironwire_catalog.workspace = true
 serde_json.workspace = true
+dirs.workspace = true
 toml.workspace = true
 
 [dev-dependencies]

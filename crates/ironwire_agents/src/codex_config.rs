@@ -231,6 +231,30 @@ fn joined(lines: &[String]) -> String {
     out
 }
 
+/// Where Codex keeps its config. `CODEX_HOME` wins, as it does for Codex.
+#[must_use]
+pub fn path() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("CODEX_HOME")
+        && !home.is_empty()
+    {
+        return Some(std::path::PathBuf::from(home).join("config.toml"));
+    }
+    Some(dirs::home_dir()?.join(".codex").join("config.toml"))
+}
+
+/// Whether this config currently routes Codex through IronWire.
+///
+/// The provider block alone is not enough: it can sit there unselected. What
+/// decides where traffic goes is the top-level `model_provider`.
+#[must_use]
+pub fn is_wired(existing: &str) -> bool {
+    existing
+        .parse::<toml::Table>()
+        .ok()
+        .and_then(|table| Some(table.get("model_provider")?.as_str()? == "ironwire"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1349,6 +1349,7 @@ dependencies = [
 name = "ironwire_agents"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "ironwire_catalog",
  "serde_json",
  "tempfile",
@@ -1447,6 +1448,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "ironwire_agents",
  "ironwire_catalog",
  "ironwire_core",
  "ironwire_creds",

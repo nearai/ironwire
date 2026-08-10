@@ -128,6 +128,41 @@ pub fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool)
     agent.detect.iter().any(|name| on_path(name))
 }
 
+/// Whether this tool's config already points at IronWire.
+///
+/// Every setting has to be ours. A tool with the base URL set but a second key
+/// still the user's is half-wired, and reporting it as connected would explain
+/// away the very symptom someone opened the menu to understand.
+#[must_use]
+pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
+    let Ok(format) = usable(agent) else {
+        return false;
+    };
+    if agent.settings.is_empty() {
+        return false;
+    }
+    match format {
+        ConfigFormat::Json => {
+            let Ok(root) = json_parse(existing) else {
+                return false;
+            };
+            agent.settings.iter().all(|setting| {
+                let path: Vec<&str> = setting.key.split('.').collect();
+                matches!(json_slot(&root, &path), Slot::Ours(_))
+            })
+        }
+        ConfigFormat::Toml => {
+            let Ok(table) = toml_parse(existing) else {
+                return false;
+            };
+            agent
+                .settings
+                .iter()
+                .all(|setting| matches!(toml_slot(&table, &setting.key), Slot::Ours(_)))
+        }
+    }
+}
+
 /// The entry's format, once it has passed the schema's own validation.
 ///
 /// Checked here as well as at load, because an entry reaching a file writer is

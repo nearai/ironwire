@@ -299,6 +299,34 @@ pub struct SettingsView {
     pub privacy: PrivacySettingsView,
     /// Everything a user can log into, and what it would take.
     pub services: Vec<ServiceView>,
+    /// Every coding agent IronWire knows about, and whether it is pointed here.
+    ///
+    /// Separate from `services` because they answer different questions: a
+    /// service is capacity IronWire can spend, a tool is something on this
+    /// machine that may or may not be sending its traffic through us. A user
+    /// with a working subscription and an unwired agent has everything
+    /// configured and nothing routing, and only this list explains it.
+    #[serde(default)]
+    pub tools: Vec<ToolView>,
+}
+
+/// One coding agent, as a settings screen needs to describe it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolView {
+    /// Stable id — what `ironwire disconnect <id>` accepts.
+    pub id: String,
+    /// What the user calls it.
+    pub name: String,
+    /// The file IronWire would edit, when one can be located.
+    pub config_path: Option<String>,
+    /// Whether the tool looks present on this machine.
+    pub installed: bool,
+    /// Whether its config currently routes through IronWire.
+    pub wired: bool,
+    /// What to run to point it here. A GUI cannot edit somebody's agent config
+    /// on their behalf without the same "name the file first" ceremony the CLI
+    /// does, so it names the command instead (`docs/TRUST.md` §5).
+    pub connect_command: String,
 }
 
 /// The privacy filter as a settings screen sees it.
@@ -550,7 +578,20 @@ fn settings_view(
         })
         .collect();
 
+    let tools = ironwire_agents::tools::all(state.catalog().current())
+        .into_iter()
+        .map(|tool| ToolView {
+            id: tool.id,
+            name: tool.name,
+            config_path: tool.config_path.map(|path| path.display().to_string()),
+            installed: tool.installed,
+            wired: tool.wired,
+            connect_command: tool.connect_command,
+        })
+        .collect();
+
     SettingsView {
+        tools,
         privacy: PrivacySettingsView {
             mode: mode_name(privacy.mode()).to_string(),
             summary: privacy.summary(),

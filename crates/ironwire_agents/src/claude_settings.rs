@@ -250,6 +250,30 @@ fn render(root: &Map<String, Value>) -> String {
     out
 }
 
+/// Where Claude Code keeps its settings.
+///
+/// `CLAUDE_CONFIG_DIR` wins, because it wins for Claude Code itself — reading a
+/// different file from the one the agent reads would make every answer here
+/// wrong in the one case someone deliberately moved it.
+#[must_use]
+pub fn path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir).join("settings.json"));
+    }
+    Some(dirs::home_dir()?.join(".claude").join("settings.json"))
+}
+
+/// Whether these settings currently route Claude Code through IronWire.
+#[must_use]
+pub fn is_wired(existing: &str) -> bool {
+    serde_json::from_str::<Value>(existing)
+        .ok()
+        .and_then(|root| root.get("env")?.get(BASE_URL)?.as_str().map(points_at_us))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,3 +21,4 @@
 pub mod catalog;
 pub mod claude_settings;
 pub mod codex_config;
+pub mod tools;

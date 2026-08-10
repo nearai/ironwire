@@ -42,6 +42,8 @@ ironwire_usage ← burn rate and projections, over ironwire_ledger's rows
      ↑
 ironwire_upstream ← HTTP to providers
      ↑
+ironwire_agents ← where a coding agent keeps its config, and how to edit it
+     ↑
 ironwire_proxy ← axum, façades, pipeline
      ↑
 src/ (the `ironwire` binary, at the workspace root)
