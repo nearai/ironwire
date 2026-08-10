@@ -56,8 +56,6 @@ pub(crate) enum Error {
     Unparseable(String),
     /// The entry did not survive validation, so we will not act on it.
     Unusable(String),
-    /// A format we do not have a safe editor for yet.
-    UnsupportedFormat(ConfigFormat),
 }
 
 impl std::fmt::Display for Error {
@@ -69,11 +67,6 @@ impl std::fmt::Display for Error {
                  rewrite a file it cannot read: {detail}"
             ),
             Self::Unusable(detail) => write!(f, "the catalog entry is not usable: {detail}"),
-            Self::UnsupportedFormat(format) => write!(
-                f,
-                "IronWire cannot safely edit {format:?} for a catalog-described tool yet; \
-                 set the key by hand"
-            ),
         }
     }
 }
@@ -85,17 +78,12 @@ impl std::error::Error for Error {}
 /// # Errors
 ///
 /// [`Error::Unparseable`] when the file is not valid, [`Error::Unusable`] when
-/// the catalog entry fails validation, [`Error::UnsupportedFormat`] for a
-/// format with no safe editor.
+/// the catalog entry fails validation. A shape this module will not edit by
+/// hand is reported as an occupied slot rather than raised as an error.
 pub(crate) fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
-    let format = usable(agent)?;
-    match format {
+    match usable(agent)? {
         ConfigFormat::Json => json_connect(agent, existing, port),
-        // Codex's config proves why: round-tripping TOML through a serializer
-        // deletes the user's comments and ordering. A text editor for arbitrary
-        // key paths is its own piece of work, and doing it badly is worse than
-        // saying so.
-        ConfigFormat::Toml => Err(Error::UnsupportedFormat(format)),
+        ConfigFormat::Toml => toml_connect(agent, existing, port),
     }
 }
 
@@ -105,10 +93,9 @@ pub(crate) fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<E
 ///
 /// As [`connect`].
 pub(crate) fn disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
-    let format = usable(agent)?;
-    match format {
+    match usable(agent)? {
         ConfigFormat::Json => json_disconnect(agent, existing),
-        ConfigFormat::Toml => Err(Error::UnsupportedFormat(format)),
+        ConfigFormat::Toml => toml_disconnect(agent, existing),
     }
 }
 
@@ -317,6 +304,308 @@ fn json_render(root: &Map<String, Value>) -> String {
     out
 }
 
+// ---------------------------------------------------------------------- TOML
+//
+// Edited as *text*, for the reason `codex_config` gives: round-tripping a TOML
+// file through a serializer deletes the user's comments, their ordering, and
+// anything our types do not model. Parsing happens twice — once to refuse a
+// file we cannot read, once on the result to refuse an edit we cannot stand
+// behind — and the value is read back out of that second parse to prove it
+// landed where we meant it to.
+//
+// The shapes this handles are the ones a tool's config actually uses: a
+// top-level key, and a key inside a `[table]` or `[table.sub]` header. Anything
+// else — a table written inline, a key already spelled as a dotted path, an
+// array of tables — is reported rather than guessed at. Refusing is a worse
+// user experience than succeeding and a much better one than corrupting a file.
+
+fn toml_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
+    toml_parse(existing)?;
+
+    let mut out = existing.to_string();
+    let mut changes = Vec::new();
+    let mut occupied = Vec::new();
+    let mut written: Vec<(String, String)> = Vec::new();
+
+    for setting in &agent.settings {
+        let url = setting.facade.url(port);
+        let table = toml_parse(&out)?;
+        match toml_slot(&table, &setting.key) {
+            Slot::Blocked(current) => {
+                occupied.push(Occupied {
+                    slot: setting.key.clone(),
+                    current,
+                });
+                continue;
+            }
+            Slot::Ours(current) if current == url => continue,
+            Slot::Ours(_) => match toml_replace(&out, &setting.key, &url) {
+                Some(next) => {
+                    out = next;
+                    changes.push(format!("{}: updated to `{url}`", setting.key));
+                    written.push((setting.key.clone(), url));
+                }
+                None => occupied.push(Occupied {
+                    slot: setting.key.clone(),
+                    current: "a shape IronWire will not edit by hand".to_string(),
+                }),
+            },
+            Slot::Empty => match toml_insert(&out, &setting.key, &url) {
+                Some(next) => {
+                    out = next;
+                    changes.push(format!("{}: `{url}` (added)", setting.key));
+                    written.push((setting.key.clone(), url));
+                }
+                None => occupied.push(Occupied {
+                    slot: setting.key.clone(),
+                    current: "a table IronWire cannot safely extend".to_string(),
+                }),
+            },
+        }
+    }
+
+    verify_written(&out, &written)?;
+    Ok(Edit {
+        contents: out,
+        changes,
+        occupied,
+    })
+}
+
+fn toml_disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
+    toml_parse(existing)?;
+
+    let mut out = existing.to_string();
+    let mut changes = Vec::new();
+
+    for setting in &agent.settings {
+        let table = toml_parse(&out)?;
+        if let Slot::Ours(_) = toml_slot(&table, &setting.key)
+            && let Some(next) = toml_remove_line(&out, &setting.key)
+        {
+            out = next;
+            changes.push(format!("{}: removed", setting.key));
+        }
+    }
+
+    toml_parse(&out)?;
+    Ok(Edit {
+        contents: out,
+        changes,
+        occupied: Vec::new(),
+    })
+}
+
+/// The result must still parse, and every key we *wrote* must read back as the
+/// value we wrote.
+///
+/// The read-back is the half that matters: a textual edit which produced valid
+/// TOML with the value in the wrong table would otherwise look like a success.
+/// Only written keys are checked — a slot we deliberately left alone is
+/// supposed to be unchanged, and asserting on it would fail the very refusals
+/// this module exists to make.
+fn verify_written(contents: &str, written: &[(String, String)]) -> Result<(), Error> {
+    let table = toml_parse(contents)?;
+    for (key, url) in written {
+        match toml_slot(&table, key) {
+            Slot::Ours(current) if &current == url => {}
+            _ => {
+                return Err(Error::Unparseable(format!(
+                    "after editing, `{key}` is not the value IronWire wrote — refusing to save"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn toml_parse(contents: &str) -> Result<toml::Table, Error> {
+    contents
+        .parse::<toml::Table>()
+        .map_err(|error| Error::Unparseable(error.to_string()))
+}
+
+fn toml_slot(table: &toml::Table, key: &str) -> Slot {
+    let mut path = key.split('.').peekable();
+    let mut current = table;
+    while let Some(segment) = path.next() {
+        if path.peek().is_none() {
+            return match current.get(segment) {
+                None => Slot::Empty,
+                Some(toml::Value::String(value)) if points_at_us(value) => {
+                    Slot::Ours(value.clone())
+                }
+                Some(toml::Value::String(value)) => Slot::Blocked(value.clone()),
+                Some(other) => Slot::Blocked(other.to_string()),
+            };
+        }
+        match current.get(segment) {
+            Some(toml::Value::Table(next)) => current = next,
+            Some(_) => return Slot::Blocked(format!("`{segment}` is not a table")),
+            None => return Slot::Empty,
+        }
+    }
+    Slot::Empty
+}
+
+/// The `[header]` line for a table path, if the file spells it that way.
+///
+/// `None` covers both "not there" and "there, but written inline or as a dotted
+/// key" — neither of which this module will edit.
+fn toml_header_line(contents: &str, table_path: &[&str]) -> Option<usize> {
+    let wanted = format!("[{}]", table_path.join("."));
+    contents.lines().position(|line| line.trim() == wanted)
+}
+
+/// Where a table's block ends: the next header, or end of file.
+fn toml_block_end(lines: &[&str], header: usize) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .skip(header + 1)
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map_or(lines.len(), |(index, _)| index)
+}
+
+/// The line index of `key = ...` within a range, ignoring comments.
+fn toml_key_line(lines: &[&str], range: std::ops::Range<usize>, key: &str) -> Option<usize> {
+    lines[range.clone()]
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#')
+                && trimmed
+                    .strip_prefix(key)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+        })
+        .map(|offset| range.start + offset)
+}
+
+fn toml_insert(contents: &str, key: &str, value: &str) -> Option<String> {
+    let mut segments: Vec<&str> = key.split('.').collect();
+    let leaf = segments.pop()?;
+    let assignment = format!("{leaf} = \"{value}\"");
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+
+    if segments.is_empty() {
+        // A top-level key has to come before the first table header, or TOML
+        // reads it as belonging to that table.
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .unwrap_or(lines.len());
+        lines.insert(at, assignment);
+        return Some(joined(&lines));
+    }
+
+    match toml_header_line(contents, &segments) {
+        Some(header) => {
+            lines.insert(header + 1, assignment);
+            Some(joined(&lines))
+        }
+        None => {
+            // No header for it. Only safe to add one when nothing of that path
+            // exists yet — otherwise it is spelled inline or dotted somewhere,
+            // and a second definition is a parse error at best.
+            let table = contents.parse::<toml::Table>().ok()?;
+            if !matches!(toml_slot(&table, key), Slot::Empty) {
+                return None;
+            }
+            let mut walked = &table;
+            for segment in &segments {
+                match walked.get(*segment) {
+                    Some(toml::Value::Table(next)) => walked = next,
+                    Some(_) => return None,
+                    None => {
+                        // Nothing of this path exists: a fresh header is safe.
+                        let mut out = joined(&lines);
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(&format!("\n[{}]\n{assignment}\n", segments.join(".")));
+                        return Some(out);
+                    }
+                }
+            }
+            // The table exists but has no header line, so it is inline.
+            None
+        }
+    }
+}
+
+fn toml_replace(contents: &str, key: &str, value: &str) -> Option<String> {
+    let mut segments: Vec<&str> = key.split('.').collect();
+    let leaf = segments.pop()?;
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+    let range = if segments.is_empty() {
+        0..borrowed
+            .iter()
+            .position(|line| line.trim_start().starts_with('['))
+            .unwrap_or(borrowed.len())
+    } else {
+        let header = toml_header_line(contents, &segments)?;
+        (header + 1)..toml_block_end(&borrowed, header)
+    };
+
+    let at = toml_key_line(&borrowed, range, leaf)?;
+    let indent: String = lines[at]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    lines[at] = format!("{indent}{leaf} = \"{value}\"");
+    Some(joined(&lines))
+}
+
+fn toml_remove_line(contents: &str, key: &str) -> Option<String> {
+    let mut segments: Vec<&str> = key.split('.').collect();
+    let leaf = segments.pop()?;
+    let mut lines: Vec<String> = contents.lines().map(str::to_string).collect();
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+    let (range, header) = if segments.is_empty() {
+        (
+            0..borrowed
+                .iter()
+                .position(|line| line.trim_start().starts_with('['))
+                .unwrap_or(borrowed.len()),
+            None,
+        )
+    } else {
+        let header = toml_header_line(contents, &segments)?;
+        (
+            (header + 1)..toml_block_end(&borrowed, header),
+            Some(header),
+        )
+    };
+
+    let at = toml_key_line(&borrowed, range.clone(), leaf)?;
+    lines.remove(at);
+
+    // A header whose block we just emptied is one we added. Anything the user
+    // put in it keeps it, same as the JSON side.
+    if let Some(header) = header {
+        let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let end = toml_block_end(&borrowed, header);
+        let empty = borrowed[(header + 1)..end]
+            .iter()
+            .all(|line| line.trim().is_empty());
+        if empty {
+            lines.drain(header..end);
+        }
+    }
+    Some(joined(&lines))
+}
+
+fn joined(lines: &[String]) -> String {
+    let mut out = lines.join("\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,14 +715,122 @@ mod tests {
     }
 
     #[test]
-    fn a_toml_tool_is_refused_rather_than_round_tripped() {
-        let mut toml_agent = agent("model_providers.ironwire.base_url");
-        toml_agent.config.file = "config.toml".to_string();
-        let error = connect(&toml_agent, "", 8463).expect_err("refuses");
-        assert!(matches!(
-            error,
-            Error::UnsupportedFormat(ConfigFormat::Toml)
-        ));
+    fn a_toml_table_is_created_when_nothing_of_it_exists() {
+        let edit = connect(&toml_agent("providers.ironwire.base_url"), "", 8463).expect("edits");
+        assert!(edit.contents.contains("[providers.ironwire]"));
+        assert!(
+            edit.contents
+                .contains("base_url = \"http://127.0.0.1:8463/anthropic\"")
+        );
+        assert!(edit.contents.parse::<toml::Table>().is_ok());
+    }
+
+    fn toml_agent(key: &str) -> AgentEntry {
+        let mut entry = agent(key);
+        entry.config.file = "config.toml".to_string();
+        entry
+    }
+
+    #[test]
+    fn a_key_goes_into_a_table_that_already_has_a_header() {
+        let existing = "# mine\n[providers.ironwire]\nwire_api = \"responses\"\n";
+        let edit = connect(&toml_agent("providers.ironwire.base_url"), existing, 8463).expect("e");
+        assert!(edit.contents.contains("# mine"), "{}", edit.contents);
+        assert!(edit.contents.contains("wire_api = \"responses\""));
+        let parsed: toml::Table = edit.contents.parse().expect("valid");
+        assert_eq!(
+            parsed["providers"]["ironwire"]["base_url"].as_str(),
+            Some("http://127.0.0.1:8463/anthropic")
+        );
+    }
+
+    /// The whole reason this is a text edit and not a round trip.
+    #[test]
+    fn comments_and_ordering_survive() {
+        let existing = "# a comment the user wrote\nmodel = \"x\"\n\n[other]\nkeep = 1\n";
+        let edit = connect(&toml_agent("providers.p.base_url"), existing, 8463).expect("edits");
+        assert!(edit.contents.contains("# a comment the user wrote"));
+        assert!(edit.contents.contains("model = \"x\""));
+        assert!(edit.contents.contains("[other]"));
+        assert!(edit.contents.contains("keep = 1"));
+    }
+
+    #[test]
+    fn a_toml_slot_someone_else_is_using_is_left_alone() {
+        let existing = "[providers.ironwire]\nbase_url = \"https://their-proxy.example\"\n";
+        let edit = connect(&toml_agent("providers.ironwire.base_url"), existing, 8463).expect("e");
+        assert!(edit.is_noop());
+        assert_eq!(edit.occupied.len(), 1);
+        assert!(edit.contents.contains("their-proxy.example"));
+    }
+
+    #[test]
+    fn our_own_toml_value_is_followed_to_a_new_port() {
+        let existing = "[providers.ironwire]\nbase_url = \"http://127.0.0.1:1111/anthropic\"\n";
+        let edit = connect(&toml_agent("providers.ironwire.base_url"), existing, 8463).expect("e");
+        assert_eq!(edit.changes.len(), 1);
+        let parsed: toml::Table = edit.contents.parse().expect("valid");
+        assert_eq!(
+            parsed["providers"]["ironwire"]["base_url"].as_str(),
+            Some("http://127.0.0.1:8463/anthropic")
+        );
+    }
+
+    /// A table written inline cannot be extended by adding a header — that
+    /// would be a second definition and a parse error. Reported, not attempted.
+    #[test]
+    fn an_inline_table_is_reported_rather_than_given_a_second_definition() {
+        let existing = "providers = { ironwire = { wire_api = \"responses\" } }\n";
+        let edit = connect(&toml_agent("providers.ironwire.base_url"), existing, 8463).expect("e");
+        assert!(edit.is_noop(), "{:?}", edit.changes);
+        assert_eq!(edit.occupied.len(), 1);
+        assert_eq!(edit.contents, existing);
+    }
+
+    #[test]
+    fn a_top_level_key_lands_before_the_first_table_header() {
+        let existing = "[other]\nkeep = 1\n";
+        let edit = connect(&toml_agent("base_url"), existing, 8463).expect("edits");
+        let parsed: toml::Table = edit.contents.parse().expect("valid");
+        // If it landed after the header it would belong to `other`.
+        assert!(parsed.get("base_url").is_some(), "{}", edit.contents);
+        assert_eq!(parsed["other"]["keep"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn a_toml_file_we_cannot_read_is_never_rewritten() {
+        let error = connect(&toml_agent("a.b"), "not = = toml", 8463).expect_err("refuses");
+        assert!(matches!(error, Error::Unparseable(_)));
+    }
+
+    #[test]
+    fn toml_disconnect_removes_ours_and_the_header_it_emptied() {
+        let existing = "[providers.ironwire]\nbase_url = \"http://127.0.0.1:8463/anthropic\"\n";
+        let edit = disconnect(&toml_agent("providers.ironwire.base_url"), existing).expect("e");
+        assert_eq!(edit.changes.len(), 1);
+        assert!(!edit.contents.contains("base_url"));
+        assert!(
+            !edit.contents.contains("[providers.ironwire]"),
+            "{}",
+            edit.contents
+        );
+    }
+
+    #[test]
+    fn toml_disconnect_keeps_a_table_the_user_is_also_using() {
+        let existing = "[providers.ironwire]\nbase_url = \"http://127.0.0.1:8463/anthropic\"\nwire_api = \"responses\"\n";
+        let edit = disconnect(&toml_agent("providers.ironwire.base_url"), existing).expect("e");
+        assert!(edit.contents.contains("[providers.ironwire]"));
+        assert!(edit.contents.contains("wire_api"));
+        assert!(!edit.contents.contains("base_url"));
+    }
+
+    #[test]
+    fn toml_disconnect_leaves_a_value_that_was_never_ours() {
+        let existing = "[providers.ironwire]\nbase_url = \"https://their-proxy.example\"\n";
+        let edit = disconnect(&toml_agent("providers.ironwire.base_url"), existing).expect("e");
+        assert!(edit.is_noop());
+        assert!(edit.contents.contains("their-proxy.example"));
     }
 
     /// A catalog entry that failed validation must not reach a file at all.
