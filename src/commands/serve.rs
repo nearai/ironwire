@@ -396,17 +396,21 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
 
     // NEAR AI is a different API family, so it is only ever reached through the
     // translated lane — and only at a turn boundary (`docs/PROTOCOL.md` §6).
-    if let Some(key) = api_key_for(config, "nearai", "NEARAI_API_KEY", &real_env) {
-        push(Arc::new(
-            ChatCompletionsBackend::nearai(
-                key,
-                base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
-                models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
-                timeout,
-            )
-            .context("building the NEAR AI backend")?,
-        ));
-    }
+    //
+    // Registered whether or not a key was found, unlike the backends above. It
+    // is the destination `privacy.mode = "full"` names by default, and a
+    // trusted destination the user cannot see is one they cannot act on: with
+    // no entry at all, `full` reads as broken rather than as needing a key.
+    // Without one it reports `authenticated: false` and names what to set.
+    push(Arc::new(
+        ChatCompletionsBackend::nearai(
+            api_key_for(config, "nearai", "NEARAI_API_KEY", &real_env),
+            base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
+            models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
+            timeout,
+        )
+        .context("building the NEAR AI backend")?,
+    ));
 
     // Anything the user declared that discovery does not produce. Appended
     // rather than prepended: registration order is the tie-break in
@@ -490,7 +494,7 @@ fn backend_from_config(
             Some(BackendImpl::NearAi) => key("NEARAI_API_KEY")
                 .map(|key| {
                     ChatCompletionsBackend::nearai(
-                        key,
+                        Some(key),
                         entry.base_url.clone(),
                         entry
                             .models

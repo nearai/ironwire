@@ -474,13 +474,38 @@ fn settings_view(
         // The same rule `Config::validate` applies at startup, asked here so a
         // client can grey the option out instead of offering a switch that
         // would take every backend out of service.
-        let blocked =
-            (mode == PrivacyMode::Full && privacy.trusted_backends.is_empty()).then(|| {
-                "`full` routes only to backends you have named as acceptable, and none are named. \
-             Add `trusted_backends` under `[privacy]` in config.toml first — which operators \
-             you trust with your data is not IronWire's call."
-                    .to_string()
-            });
+        //
+        // Naming a destination is not the same as having one. `trusted_backends`
+        // defaults to `["nearai"]`, which is a backend that registers whether or
+        // not a key was found — so "named" would be true on a machine where
+        // `full` can route precisely nowhere. Selecting it there fails every
+        // request as "rate limited", which is both wrong and unactionable, so
+        // the usable check is part of the same question.
+        let blocked = (mode == PrivacyMode::Full)
+            .then(|| {
+                if privacy.trusted_backends.is_empty() {
+                    return Some(
+                        "`full` routes only to backends you have named as acceptable, and none \
+                         are named. Add `trusted_backends` under `[privacy]` in config.toml \
+                         first — which operators you trust with your data is not IronWire's call."
+                            .to_string(),
+                    );
+                }
+                let usable = privacy.trusted_backends.iter().any(|id| {
+                    statuses
+                        .iter()
+                        .any(|status| status.id.as_str() == id && status.authenticated)
+                });
+                (!usable).then(|| {
+                    format!(
+                        "`full` would route only to {}, and none of those has a credential yet — \
+                         every request would be refused. Connect one first, or name a backend \
+                         you do have under `trusted_backends` in config.toml.",
+                        privacy.trusted_backends.join(", ")
+                    )
+                })
+            })
+            .flatten();
         PrivacyOptionView {
             id: mode_name(mode).to_string(),
             describes: mode.describe().to_string(),

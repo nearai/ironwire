@@ -314,17 +314,37 @@ pub struct PrivacyConfig {
     pub scan_code_blocks: bool,
     /// Backends that may receive requests under `mode = "full"`.
     ///
-    /// No default, deliberately. Not `["nearai"]`, not "anything local": a
-    /// shipped default would be IronWire asserting that some operator is
-    /// trustworthy for someone else's data, which it has no basis to do. The
-    /// user names the destinations, or the daemon does not start.
+    /// Defaults to `["nearai"]`. This was deliberately empty before, on the
+    /// argument that a shipped default is IronWire asserting some operator is
+    /// trustworthy for someone else's data. That argument has not gone away —
+    /// it is now answered rather than avoided: NEAR AI is this project's own
+    /// destination, so the assertion is about ourselves and not about a third
+    /// party, and `full` with nothing named was a mode that could not be
+    /// selected without first editing a file most users never open.
+    ///
+    /// What this does **not** claim is that the destination is safe. `full`
+    /// means "only send to backends named here", which is a routing
+    /// constraint, not a property of the operator (`docs/TRUST.md` I7). The
+    /// user can replace this list; naming their own destinations still
+    /// overrides it entirely.
     ///
     /// Ignored below `full`, with a warning at load.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default = "default_trusted_backends",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub trusted_backends: Vec<String>,
     /// Scan replayed tool results. Off by default — they are output from the
     /// user's own machine that the model needs verbatim to reason about.
     pub scan_tool_results: bool,
+}
+
+/// The destination `full` names when the user has named none.
+///
+/// A function rather than a constant because `serde(default = ...)` needs one,
+/// and it is the single place the shipped answer to "trusted by whom" lives.
+fn default_trusted_backends() -> Vec<String> {
+    vec!["nearai".to_string()]
 }
 
 fn is_false(value: &bool) -> bool {
@@ -391,7 +411,7 @@ impl Default for PrivacyConfig {
             enabled: false,
             secrets: true,
             named_values: Vec::new(),
-            trusted_backends: Vec::new(),
+            trusted_backends: default_trusted_backends(),
             scan_code_blocks: false,
             scan_tool_results: false,
         }
@@ -710,10 +730,12 @@ impl Config {
                 id: "privacy".to_string(),
                 detail: format!(
                     "`mode = \"full\"` restricts routing to backends you name, and \
-                     `trusted_backends` is empty — so nothing could be routed \
-                     anywhere. Name the destinations you accept, for example: \
-                     trusted_backends = [{}]. There is no default: which \
-                     operators you trust with your data is not IronWire's call.",
+                     `trusted_backends` was set to an empty list — so nothing \
+                     could be routed anywhere. Name the destinations you accept, \
+                     for example: trusted_backends = [{}]. Removing the key \
+                     entirely restores the default, [\"nearai\"]; an empty list \
+                     is read as a deliberate choice and refused rather than \
+                     quietly replaced.",
                     if self.backends.is_empty() {
                         "\"nearai\"".to_string()
                     } else {

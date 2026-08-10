@@ -253,17 +253,27 @@ final class MenuContentTests: XCTestCase {
 
     // MARK: - The privacy ladder
 
-    /// A greyed-out option that does not say why is worse than one that is not
-    /// there. The reason has to occupy space on screen.
-    func test_the_reason_a_mode_is_unavailable_takes_up_room() throws {
+    /// The reason a mode cannot be picked is carried, not drawn: it is the
+    /// segment's tooltip and VoiceOver hint, so the control stays one row high
+    /// however much the daemon has to say about it.
+    ///
+    /// Deliberately the inverse of what this test asserted before. Drawing the
+    /// reason is the stronger behaviour and the dropdown could not afford it;
+    /// the assertion that matters now is that the text never reaches layout.
+    func test_an_unavailable_mode_carries_its_reason_without_drawing_it() throws {
         let base = status(backends: [])
+        let unselectable = PrivacyOptionView(
+            id: "full", describes: "only trusted backends", selectable: false,
+            unavailableBecause: String(repeating: "A long reason nobody has room for. ", count: 8))
+        // The model still carries it — this is what the tooltip and the
+        // accessibility hint read from.
+        XCTAssertNotNil(unselectable.unavailableBecause)
+
         let withReason = try height(
             base,
             settings: settings(options: [
                 PrivacyOptionView(id: "off", describes: "requests are forwarded unchanged"),
-                PrivacyOptionView(
-                    id: "full", describes: "only trusted backends", selectable: false,
-                    unavailableBecause: "`full` routes only to backends you have named, and none are named."),
+                unselectable,
             ]))
         let withoutReason = try height(
             base,
@@ -271,9 +281,9 @@ final class MenuContentTests: XCTestCase {
                 PrivacyOptionView(id: "off", describes: "requests are forwarded unchanged"),
                 PrivacyOptionView(id: "full", describes: "only trusted backends", selectable: false),
             ]))
-        XCTAssertGreaterThan(
+        XCTAssertEqual(
             withReason, withoutReason,
-            "the explanation for an unselectable mode is not being drawn")
+            "the unavailable reason is being drawn, which the dropdown has no room for")
     }
 
     /// With no settings document there is nothing to offer, so the pane falls

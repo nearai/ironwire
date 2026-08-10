@@ -80,7 +80,7 @@ fn state_for(nearai: &str) -> AppState {
     ));
     registry.push(Arc::new(
         ChatCompletionsBackend::nearai(
-            SecretString::from("near-key"),
+            Some(SecretString::from("near-key")),
             Some(nearai.to_string()),
             vec![("near-x".to_string(), ModelTier::Frontier)],
             5,

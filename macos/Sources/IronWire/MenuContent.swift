@@ -506,22 +506,18 @@ struct MenuContent: View {
     private func privacySection(_ status: StatusView) -> some View {
         if let privacy = client.settings?.privacy, !privacy.options.isEmpty {
             section("Privacy filter") {
-                privacyControl(privacy)
-
-                // What each mode substitutes is a tooltip, not a paragraph. A
-                // menu read at a glance cannot afford four lines describing a
-                // setting whose name is already on screen.
+                // Nothing but the control. What each mode substitutes, and why a
+                // dimmed one cannot be picked, are both carried as the segment's
+                // tooltip and its VoiceOver hint — reachable, and not four lines
+                // of prose in a dropdown read at a glance.
                 //
-                // A greyed-out segment cannot carry its reason beside it the way
-                // a list row could, so the reasons go here. These *are* drawn:
-                // an option disabled for unstated reasons is worse than one that
-                // is absent, and it is the only prose in this section.
-                ForEach(privacy.options.filter { !$0.selectable && $0.unavailableBecause != nil }) { option in
-                    Text("\(option.id): \(option.unavailableBecause ?? "")")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                // This is weaker than drawing the reason: a user who never
+                // hovers sees a mode they cannot select and no explanation. The
+                // stronger version is one `ForEach` in `privacySection`. It is
+                // also mostly moot once a trusted backend ships by default,
+                // because then `full` is selectable and there is no reason to
+                // show.
+                privacyControl(privacy)
             }
         } else if let privacy = status.privacy {
             section("Privacy filter") {

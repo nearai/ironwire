@@ -192,7 +192,7 @@ fn state_with(nearai_base: &str, anthropic_base: &str) -> AppState {
 
     registry.push(Arc::new(
         ChatCompletionsBackend::nearai(
-            SecretString::from("near-key"),
+            Some(SecretString::from("near-key")),
             Some(nearai_base.to_string()),
             vec![("near-x".to_string(), ModelTier::Frontier)],
             30,

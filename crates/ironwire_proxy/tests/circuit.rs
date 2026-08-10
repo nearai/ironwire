@@ -96,7 +96,7 @@ fn state_for(dead: &str, healthy: &str, threshold: u32) -> AppState {
     ));
     registry.push(Arc::new(
         ChatCompletionsBackend::nearai(
-            SecretString::from("near-key"),
+            Some(SecretString::from("near-key")),
             Some(healthy.to_string()),
             vec![("near-x".to_string(), ModelTier::Frontier)],
             5,

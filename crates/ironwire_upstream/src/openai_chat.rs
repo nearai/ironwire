@@ -70,8 +70,13 @@ impl ChatCompletionsBackend {
     /// # Errors
     ///
     /// Propagates a reqwest client build failure.
+    /// The key is optional so the backend can be registered without one. A
+    /// credits backend with no key reports `authenticated: false` and shows up
+    /// in `status` as something to connect, which is the contract
+    /// `build_registry` states: a backend nobody has a credential for is still
+    /// a backend the user should be able to see IronWire knows about.
     pub fn nearai(
-        api_key: SecretString,
+        api_key: Option<SecretString>,
         base_url: Option<String>,
         models: Vec<(String, ModelTier)>,
         timeout_secs: u64,
@@ -80,7 +85,7 @@ impl ChatCompletionsBackend {
             BackendId::from("nearai"),
             "NEAR AI",
             BackendKind::Credits,
-            Some(api_key),
+            api_key,
             base_url.unwrap_or_else(|| NEARAI_DEFAULT_BASE_URL.to_string()),
             models,
             timeout_secs,
@@ -443,7 +448,7 @@ mod tests {
 
     fn backend(base: &str) -> ChatCompletionsBackend {
         ChatCompletionsBackend::nearai(
-            SecretString::from("near-key"),
+            Some(SecretString::from("near-key")),
             Some(base.to_string()),
             vec![("near-x".to_string(), ModelTier::Balanced)],
             60,
