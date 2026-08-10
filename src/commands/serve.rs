@@ -102,8 +102,8 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     quota_writer.spawn(state.clone());
 
     println!("IronWire listening on http://127.0.0.1:{port}");
-    println!("  Claude Code: export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
-    println!("  Codex:       ironwire connect codex");
+    println!("  Point your agents at it:  ironwire init");
+    println!("  Confirm they are:         ironwire doctor");
     println!();
 
     let result = ironwire_proxy::server::serve_on(listener, state.clone(), shutdown_signal())
@@ -318,8 +318,8 @@ async fn port_in_use(port: u16) -> anyhow::Error {
     } else {
         anyhow::anyhow!(
             "Port {port} is in use by something that is not IronWire.\n\
-             Pick another with `ironwire serve --port <n>`, and point your \
-             clients at it with `ironwire env --port <n>`."
+             Pick another with `ironwire serve --port <n>`, and re-point your \
+             clients at it with `ironwire init --port <n>`."
         )
     }
 }

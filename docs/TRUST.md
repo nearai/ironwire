@@ -43,23 +43,43 @@ before the first request, not buried.
 ### Consent gate
 
 Each subscription backend is **off until explicitly enabled**, once, in plain
-language:
+language. `ironwire init` asks for every subscription it found, in one question
+(prompt v2):
 
 ```
-$ ironwire connect claude --subscription
+$ ironwire init
 
-  IronWire will read the OAuth token that Claude Code stores on this machine
-  and send requests to api.anthropic.com with it, from this computer only.
+  IronWire can use the Claude and ChatGPT subscriptions above, by replaying
+  the OAuth tokens Claude Code and Codex have already stored on this machine.
+  Each token goes only to its own provider (api.anthropic.com and chatgpt.com),
+  from this computer.
 
-  · This uses a private authentication path. Anthropic does not document it
-    and may change or block it at any time.
-  · Using it from a third-party proxy may fall outside your subscription's
-    intended use. If Anthropic objects, it is your account that is affected.
-  · Your token is never sent anywhere except api.anthropic.com.
-  · You can use an Anthropic API key instead — fully supported, no ambiguity.
+  · Anthropic and OpenAI do not document this authentication path and may
+    change or block it at any time.
+  · Using it from a third-party proxy may fall outside your
+    subscription's intended use. If they object, it is your account
+    that is affected.
+  · You can use an Anthropic API key or an OpenAI API key instead —
+    fully supported, no ambiguity.
 
-  Enable the Claude subscription backend? [y/N]
+  Use the Claude and ChatGPT subscriptions? [Y/n]
 ```
+
+`ironwire connect <target> --subscription` asks the same question for one
+backend, and remains the way to enable one later or to change your mind.
+
+**Why one question, and why the default is yes.** The facts a user needs are
+identical for both subscriptions, and asking twice teaches them that the second
+prompt is a formality — which is the opposite of what a gate is for. The
+default is yes because this is the only question `ironwire init` asks, it is
+asked immediately after listing what was found, and declining is a complete
+answer: the metered keys and local models found alongside still work, which is
+what keeps "no" cheap enough to mean something. **This is a weaker default than
+v1's `[y/N]`, and it is why `CONSENT_PROMPT_VERSION` is 2** — consent recorded
+against v1 does not carry over, and every existing user is asked again.
+
+The prompt is never shown when stdin is not a terminal. A script that cannot
+answer gets nothing enabled, rather than a default that grants a credential.
 
 The answer is recorded with a timestamp and the exact prompt version in
 `$IRONWIRE_HOME/consent.json`. `ironwire status` always shows which backends are

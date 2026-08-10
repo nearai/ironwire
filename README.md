@@ -77,20 +77,29 @@ Or from source: `cargo install --git https://github.com/nearai/ironwire`.
 ## Quick start
 
 ```bash
-ironwire init       # what capacity this machine has, and what to run next
+ironwire init       # then run `claude`
 ```
 
-`init` reads the room — a Claude Code login, a Codex login, API keys in your
-environment — and prints the steps in order. Roughly:
+That is the whole setup. `init` reads the room — a Claude Code login, a Codex
+login, API keys in your environment, a model server on a local port — asks one
+question, and does the rest:
+
+- **Finds your capacity**, including keys your agents are already configured
+  with, and says which of them IronWire will actually be able to see.
+- **Asks once** whether it may use the subscriptions it found, stating the risk
+  before it asks. Say no and everything else still works.
+- **Points every agent it finds** at IronWire, in that agent's own config file —
+  `~/.claude/settings.json`, `~/.codex/config.toml` — so the setup survives a
+  new terminal. It never takes a setting you were already using; it says so and
+  leaves it.
+- **Leaves the daemon running** as a user service, so it comes back after a
+  reboot. No supervisor available (a container, a bare SSH session)? It says so
+  and tells you to run `ironwire serve`.
+
+`ironwire init --dry-run` shows every change without making one.
 
 ```bash
-ironwire connect claude --subscription   # explains the tradeoffs, then asks
-ironwire serve                           # leave this running
-
-# in another terminal
-eval "$(ironwire env)"                   # points Claude Code here
-ironwire doctor                          # confirms it actually is
-claude
+ironwire doctor     # confirm it end to end, with a real request per backend
 ```
 
 `doctor` checks the *clients*, not just the backends. Every backend can be

@@ -16,7 +16,11 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the consent prompt's *meaning* changes. A user who agreed
 /// to v1 has not agreed to v2.
-pub const CONSENT_PROMPT_VERSION: u32 = 1;
+///
+/// v2: `ironwire init` asks once for every subscription it found, rather than
+/// once per backend, and the default moved from no to yes. Both change what a
+/// keypress means, so consent given to v1 does not carry over.
+pub const CONSENT_PROMPT_VERSION: u32 = 2;
 
 /// The question a user must answer before a subscription backend is used.
 ///

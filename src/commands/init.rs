@@ -1,25 +1,47 @@
-//! `ironwire init` — the first two minutes.
+//! `ironwire init` — set IronWire up, in one command.
 //!
-//! Everything this does can be done with the other commands. What it adds is
-//! *ordering*: a new user should not have to read `--help` to learn that
-//! connect comes before serve, or that a subscription needs a separate consent
-//! step. Discovering that by trial and error is where first impressions go.
+//! It looks at what is on the machine, asks the one question that has to be
+//! asked, wires up every agent it finds, and leaves the daemon running. When it
+//! returns, `claude` works.
 //!
-//! It is deliberately not a wizard that changes things behind your back. It
-//! looks at what is on the machine, says what IronWire could do with it, and
-//! prints the commands — each of which is one the user could have found
-//! themselves. `--write` is the only mode that touches anything, and even then
-//! it never grants a subscription consent: that question has to be asked in its
-//! own words (`docs/TRUST.md` §2).
+//! It used to print the commands instead of running them — five of them, plus
+//! an `export` and a second terminal — on the reasoning that a setup step the
+//! user runs themselves is a setup step they consented to. That reasoning is
+//! right about exactly one thing, subscription credentials (`docs/TRUST.md`
+//! §2), and wrong about the rest: writing a settings file we then name, or
+//! starting a daemon the user just asked for, is not a decision they need to
+//! make twice. So the consent gate stays, as one prompt, and everything else
+//! happens.
+//!
+//! `--dry-run` shows every change without making one.
+
+use std::io::Write as _;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use ironwire_core::DEFAULT_PORT;
 use ironwire_core::config::Config;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
 use ironwire_creds::consent::ConsentLedger;
 
-use super::paths;
+use super::{connect, paths, service};
+
+/// A key an agent on this machine is already configured to use.
+///
+/// Worth finding because it is capacity the user already has, and worth
+/// reporting separately because IronWire reads keys from the *daemon's*
+/// environment: a key that lives only in an agent's config file is one the
+/// daemon cannot see, and that gap is invisible until a request fails.
+struct AgentKey {
+    /// Which agent's config it came out of.
+    agent: &'static str,
+    /// The variable it names. Never the value — `docs/TRUST.md` §5.
+    var: String,
+    /// Whether the daemon will actually be able to read it.
+    in_environment: bool,
+}
 
 /// What IronWire found on this machine.
 struct Found {
@@ -29,6 +51,7 @@ struct Found {
     anthropic_key: bool,
     openai_key: bool,
     nearai_key: bool,
+    agent_keys: Vec<AgentKey>,
 }
 
 impl Found {
@@ -41,6 +64,7 @@ impl Found {
             anthropic_key: has_env("ANTHROPIC_API_KEY"),
             openai_key: has_env("OPENAI_API_KEY"),
             nearai_key: has_env("NEARAI_API_KEY"),
+            agent_keys: detect_agent_keys(),
         }
     }
 
@@ -52,10 +76,166 @@ impl Found {
             || self.openai_key
             || self.nearai_key
     }
+
+    /// Subscriptions that are here but not yet consented to.
+    fn ungranted_subscriptions(&self, consent: &ConsentLedger) -> Vec<Subscription> {
+        SUBSCRIPTIONS
+            .iter()
+            .filter(|s| (s.present)(self) && !consent.is_granted(s.backend_id))
+            .copied()
+            .collect()
+    }
+}
+
+/// One subscription backend, and how to talk about it.
+#[derive(Clone, Copy)]
+struct Subscription {
+    backend_id: &'static str,
+    /// What the user calls the thing they pay for.
+    product: &'static str,
+    /// The app that stored the token we would be replaying.
+    client: &'static str,
+    /// The only host its token is ever sent to.
+    host: &'static str,
+    /// Who would object.
+    vendor: &'static str,
+    /// The unambiguous alternative.
+    alternative: &'static str,
+    present: fn(&Found) -> bool,
+}
+
+const SUBSCRIPTIONS: &[Subscription] = &[
+    Subscription {
+        backend_id: "claude-sub",
+        product: "Claude",
+        client: "Claude Code",
+        host: "api.anthropic.com",
+        vendor: "Anthropic",
+        alternative: "an Anthropic API key",
+        present: |f| f.claude_subscription,
+    },
+    Subscription {
+        backend_id: "codex-sub",
+        product: "ChatGPT",
+        client: "Codex",
+        host: "chatgpt.com",
+        vendor: "OpenAI",
+        alternative: "an OpenAI API key",
+        present: |f| f.codex_subscription,
+    },
+];
+
+/// Join names the way a sentence would: "a", "a and b", "a, b and c".
+///
+/// The prompt reads out loud to someone deciding whether to hand over a
+/// credential, so it has to be a sentence rather than a comma-separated list.
+/// `conjunction` because a list of things we would use and a list of things
+/// they could use instead are not the same kind of list.
+fn join<'a>(items: impl Iterator<Item = &'a str>, conjunction: &str) -> String {
+    let items: Vec<_> = items.collect();
+    match items.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} {conjunction} {last}", rest.join(", ")),
+    }
 }
 
 fn has_env(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+/// Read the keys the installed agents are already configured with.
+///
+/// Detection only. Copying a secret out of one config and into another — or
+/// into a service unit, which is where this would naturally lead — would put
+/// IronWire in the business of storing keys, which it is not (`docs/TRUST.md`
+/// §5).
+fn detect_agent_keys() -> Vec<AgentKey> {
+    let mut keys = Vec::new();
+    if let Some(path) = claude_settings_path() {
+        keys.extend(claude_settings_keys(&path));
+    }
+    if let Some(path) = codex_config_path() {
+        keys.extend(codex_config_keys(&path));
+    }
+    keys.sort_by(|a, b| a.var.cmp(&b.var));
+    keys.dedup_by(|a, b| a.var == b.var);
+    keys
+}
+
+/// Variables named in Claude Code's `env` block.
+fn claude_settings_keys(path: &std::path::Path) -> Vec<AgentKey> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    root.get("env")
+        .and_then(serde_json::Value::as_object)
+        .map(|env| {
+            env.keys()
+                .filter(|name| looks_like_a_key(name))
+                .map(|name| AgentKey {
+                    agent: "Claude Code",
+                    var: name.clone(),
+                    in_environment: has_env(name),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Variables named by `env_key` under Codex's `[model_providers]`.
+fn codex_config_keys(path: &std::path::Path) -> Vec<AgentKey> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    table
+        .get("model_providers")
+        .and_then(toml::Value::as_table)
+        .map(|providers| {
+            providers
+                .values()
+                .filter_map(|provider| provider.get("env_key")?.as_str())
+                .map(|name| AgentKey {
+                    agent: "Codex",
+                    var: name.to_string(),
+                    in_environment: has_env(name),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a variable name is plausibly a credential rather than a setting.
+///
+/// A conservative shape match, because the alternative is listing every
+/// variable in someone's `env` block back at them as though it were capacity.
+fn looks_like_a_key(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name.ends_with("_API_KEY") || name.ends_with("_AUTH_TOKEN") || name.ends_with("_TOKEN")
+}
+
+fn claude_settings_path() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir).join("settings.json"));
+    }
+    Some(dirs::home_dir()?.join(".claude").join("settings.json"))
+}
+
+fn codex_config_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("CODEX_HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home).join("config.toml"));
+    }
+    Some(dirs::home_dir()?.join(".codex").join("config.toml"))
 }
 
 /// Say what was found, and what each thing is worth.
@@ -89,6 +269,17 @@ fn report(found: &Found, local: &[(u16, &'static str)]) {
             "  found    {:<28}free, private, and yours",
             format!("{name} on :{port}")
         );
+    }
+
+    for key in &found.agent_keys {
+        // The unreadable case is the one worth the words: it looks like
+        // capacity, and it is not, until the variable is where the daemon runs.
+        let note = if key.in_environment {
+            format!("used by {}", key.agent)
+        } else {
+            format!("used by {} — not in this environment", key.agent)
+        };
+        println!("  found    {:<28}{note}", key.var);
     }
 
     if !found.anything() && local.is_empty() {
@@ -134,7 +325,12 @@ async fn find_local_servers() -> Vec<(u16, &'static str)> {
 }
 
 /// Run `ironwire init`.
-pub(crate) async fn run(port: Option<u16>, write: bool) -> Result<()> {
+pub(crate) async fn run(
+    port: Option<u16>,
+    write: bool,
+    dry_run: bool,
+    no_service: bool,
+) -> Result<()> {
     let paths = paths()?;
     let port = port
         .or_else(|| Config::load(&paths).ok().map(|c| c.server.port))
@@ -142,6 +338,10 @@ pub(crate) async fn run(port: Option<u16>, write: bool) -> Result<()> {
 
     println!("IronWire — one local endpoint for the AI capacity you already have");
     println!();
+    if dry_run {
+        println!("[dry run] nothing on this machine will be changed.");
+        println!();
+    }
     println!("Looking at this machine…");
     println!();
 
@@ -162,62 +362,274 @@ pub(crate) async fn run(port: Option<u16>, write: bool) -> Result<()> {
         return Ok(());
     }
 
-    let consent = ConsentLedger::load(&paths.consent_file());
-    println!();
-    println!("Next:");
-    println!();
-
-    let mut step = 1;
-    if found.claude_subscription && !consent.is_granted("claude-sub") {
-        // Never done for the user, not even with `--write`. The consent prompt
-        // is the whole mechanism, and a command that grants it silently would
-        // make the prompt decorative (`docs/TRUST.md` §2).
-        println!("  {step}. ironwire connect claude --subscription");
-        println!("     Asks whether IronWire may use your Claude subscription. It");
-        println!("     explains the risk first; you can say no and use a key instead.");
-        println!();
-        step += 1;
-    }
-    if found.codex_subscription && !consent.is_granted("codex-sub") {
-        println!("  {step}. ironwire connect codex --subscription");
-        println!("     The same question for ChatGPT.");
-        println!();
-        step += 1;
-    }
-
-    println!("  {step}. ironwire serve");
-    println!("     Runs in the foreground on 127.0.0.1:{port}. Leave it running.");
-    println!();
-    step += 1;
-
-    println!("  {step}. In another terminal, point your agent at it:");
-    println!();
-    println!("       eval \"$(ironwire env)\"     # Claude Code");
-    println!("       ironwire connect codex       # Codex");
-    println!();
-    step += 1;
-
-    println!("  {step}. ironwire doctor");
-    println!("     Confirms your agents are actually pointed here — the thing");
-    println!("     that is easy to get wrong and hard to notice.");
-    println!();
-
     if write {
-        write_config(&paths, port)?;
+        println!();
+        if dry_run {
+            println!("[dry run] would write {}", paths.config_file().display());
+        } else {
+            write_config(&paths, port)?;
+        }
+    }
+
+    let enabled = ask_for_subscriptions(&paths, &found, dry_run)?;
+    let wired = wire_agents(port, dry_run)?;
+    let daemon = start_daemon(port, no_service, dry_run).await?;
+
+    summarise(port, &found, &enabled, &wired, &daemon);
+    Ok(())
+}
+
+/// Ask once, for everything found.
+///
+/// `docs/TRUST.md` §2 requires that the risk be stated in plain language and
+/// the answer recorded against the wording it answered. It does not require
+/// that the question be asked twice when two subscriptions carry the same risk
+/// — and asking twice makes the second one feel like a formality, which is the
+/// opposite of what a consent gate is for.
+///
+/// Answering no is a complete answer: the metered keys and local models found
+/// above still work, which is what makes saying no cheap enough to mean
+/// something.
+fn ask_for_subscriptions(
+    paths: &ironwire_core::config::PathsConfig,
+    found: &Found,
+    dry_run: bool,
+) -> Result<Vec<&'static str>> {
+    let path = paths.consent_file();
+    let mut ledger = ConsentLedger::load(&path);
+    let pending = found.ungranted_subscriptions(&ledger);
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let products = join(pending.iter().map(|s| s.product), "and");
+    let clients = join(pending.iter().map(|s| s.client), "and");
+    let vendors = join(pending.iter().map(|s| s.vendor), "and");
+    let hosts = join(pending.iter().map(|s| s.host), "and");
+    let many = pending.len() > 1;
+
+    println!();
+    if many {
+        println!("  IronWire can use the {products} subscriptions above, by replaying");
+        println!("  the OAuth tokens {clients} have already stored on this machine.");
+        println!("  Each token goes only to its own provider ({hosts}),");
+        println!("  from this computer.");
     } else {
-        println!("Optional: `ironwire init --write` drops a commented config.toml at");
+        println!("  IronWire can use your {products} subscription, by replaying the");
+        println!("  OAuth token {clients} has already stored on this machine. It goes");
+        println!("  only to {hosts}, from this computer.");
+    }
+    println!();
+    println!(
+        "  · {vendors} {} not document this authentication path and may",
+        if many { "do" } else { "does" }
+    );
+    println!("    change or block it at any time.");
+    println!("  · Using it from a third-party proxy may fall outside your");
+    println!("    subscription's intended use. If they object, it is your account");
+    println!("    that is affected.");
+    println!(
+        "  · You can use {} instead —",
+        join(pending.iter().map(|s| s.alternative), "or")
+    );
+    println!("    fully supported, no ambiguity.");
+    println!();
+
+    let question = if many {
+        format!("  Use the {products} subscriptions? [Y/n] ")
+    } else {
+        format!("  Use the {products} subscription? [Y/n] ")
+    };
+    if !ask(&question)? {
+        println!();
+        println!("  Left disabled. IronWire will use API keys and local models only.");
+        println!("  `ironwire connect claude --subscription` asks again, one at a time.");
+        return Ok(Vec::new());
+    }
+
+    let enabled: Vec<&'static str> = pending.iter().map(|s| s.backend_id).collect();
+    if dry_run {
         println!(
-            "{} so the settings are discoverable.",
-            paths.config_file().display()
+            "  [dry run] would record consent for: {}",
+            enabled.join(", ")
+        );
+        return Ok(enabled);
+    }
+    for id in &enabled {
+        ledger.grant(id, Utc::now());
+    }
+    ledger.save(&path).context("writing the consent ledger")?;
+    println!("  Recorded in {}.", path.display());
+    Ok(enabled)
+}
+
+/// Read a yes/no answer, defaulting to yes.
+///
+/// Not a terminal: no answer is coming, and blocking forever inside a script
+/// would be worse than declining. The safe default when nobody is there to ask
+/// is the one that grants nothing.
+fn ask(question: &str) -> Result<bool> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        println!("{question}");
+        println!("  (not a terminal — leaving subscriptions disabled)");
+        return Ok(false);
+    }
+    print!("{question}");
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading your answer")?;
+    Ok(!matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    ))
+}
+
+/// Point every agent that is installed at IronWire.
+///
+/// Only the ones that are installed: writing a settings file nothing will read
+/// is how a setup step turns into litter in someone's home directory.
+fn wire_agents(port: u16, dry_run: bool) -> Result<Vec<&'static str>> {
+    let mut wired = Vec::new();
+    println!();
+    if connect::claude_installed() {
+        connect::wire_claude(port, dry_run)?;
+        wired.push("Claude Code");
+    }
+    if connect::codex_installed() {
+        connect::wire_codex(port, dry_run)?;
+        wired.push("Codex");
+    }
+    if wired.is_empty() {
+        println!("No coding agent found here yet. Once one is installed, run");
+        println!("`ironwire init` again and it will be pointed at IronWire.");
+    }
+    Ok(wired)
+}
+
+/// Where the daemon ended up.
+enum Daemon {
+    /// Running in the background, and it survives a reboot.
+    Service,
+    /// Already listening before we got here.
+    AlreadyUp,
+    /// Nothing to install to, or the user asked us not to.
+    Foreground,
+}
+
+/// Leave the daemon running.
+async fn start_daemon(port: u16, no_service: bool, dry_run: bool) -> Result<Daemon> {
+    println!();
+    if listening(port).await {
+        println!("IronWire is already listening on 127.0.0.1:{port}.");
+        return Ok(Daemon::AlreadyUp);
+    }
+    if dry_run {
+        println!("[dry run] would install and start the background service.");
+        return Ok(Daemon::Service);
+    }
+    if no_service {
+        return Ok(Daemon::Foreground);
+    }
+
+    match service::install_and_start(Some(port))? {
+        service::Outcome::Running(_) => {
+            // Started is not the same as listening, and the difference is a
+            // port already taken or a unit that dies on start. Waiting a moment
+            // and looking is the only honest way to say "it is running".
+            if wait_until_listening(port).await {
+                Ok(Daemon::Service)
+            } else {
+                println!("The service started but nothing is listening on {port} yet.");
+                println!("Check it with: ironwire service status");
+                Ok(Daemon::Service)
+            }
+        }
+        service::Outcome::Installed { retry } => {
+            println!();
+            println!("The unit is installed but did not start. Finish with:");
+            println!("    {retry}");
+            Ok(Daemon::Foreground)
+        }
+        service::Outcome::Unsupported => {
+            println!("No user-scoped service manager here — common in containers and");
+            println!("over a bare SSH session. Run it in the foreground instead.");
+            Ok(Daemon::Foreground)
+        }
+    }
+}
+
+/// Whether anything is accepting connections on the loopback port.
+async fn listening(port: u16) -> bool {
+    tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+}
+
+/// Give a just-started daemon a moment to bind.
+async fn wait_until_listening(port: u16) -> bool {
+    for _ in 0..20 {
+        if listening(port).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    false
+}
+
+/// Say what is true now, and the one command that comes next.
+fn summarise(
+    port: u16,
+    found: &Found,
+    enabled: &[&'static str],
+    wired: &[&'static str],
+    daemon: &Daemon,
+) {
+    println!();
+    match daemon {
+        Daemon::Service | Daemon::AlreadyUp => {
+            println!("Ready. IronWire is on http://127.0.0.1:{port}.");
+        }
+        Daemon::Foreground => {
+            println!("Almost there. Start the daemon and leave it running:");
+            println!();
+            println!("    ironwire serve");
+        }
+    }
+    println!();
+
+    if !wired.is_empty() {
+        println!("  wired    {}", wired.join(", "));
+    }
+    if !enabled.is_empty() {
+        println!("  enabled  {}", enabled.join(", "));
+    }
+
+    // A key an agent uses that the daemon cannot see is the one failure this
+    // command can predict, so it says so here rather than letting `doctor`
+    // discover it later.
+    for key in found.agent_keys.iter().filter(|k| !k.in_environment) {
+        println!(
+            "  note     {} is set for {}, but not where IronWire runs",
+            key.var, key.agent
         );
     }
 
     println!();
-    println!("Once it is running:");
+    // Only once there is something to talk to. "Run `claude`" while the daemon
+    // is down sends the user at a connection error, which is a worse first
+    // impression than the extra step they still have to take.
+    if matches!(daemon, Daemon::Service | Daemon::AlreadyUp) {
+        if wired.contains(&"Claude Code") {
+            println!("Start a new terminal and run `claude` — it goes through IronWire now.");
+        } else if wired.contains(&"Codex") {
+            println!("Start a new `codex` session — it goes through IronWire now.");
+        }
+    }
+    println!("    ironwire doctor    confirm it end to end, with a real request");
     println!("    ironwire status    what capacity you have, and what is left");
     println!("    ironwire watch     live routing, quiet unless something changes");
-    println!("    ironwire log       what your agents actually sent, and what it cost");
-    Ok(())
 }
 
 /// Write a commented `config.toml`, if there is not one already.

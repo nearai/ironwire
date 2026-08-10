@@ -7,10 +7,15 @@
 //! and there is deliberately no flag to ask for one.
 //!
 //! Nothing here is required. `ironwire serve` in the foreground stays
-//! first-class — it is what the installer tells you to run and what `doctor`
-//! assumes.
+//! first-class, and is the answer wherever there is no user-scoped supervisor.
+//!
+//! Installing *starts*. A command that writes a unit file and then hands back
+//! the one line that would make it true has not done the thing it was asked to
+//! do — the user asked for the daemon to be running in the background, and the
+//! file is a means to that, not the deliverable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -54,17 +59,164 @@ impl Manager {
     }
 }
 
+/// What happened when we asked for the daemon in the background.
+#[derive(Debug)]
+pub(crate) enum Outcome {
+    /// Installed and started. It comes back after a reboot.
+    Running(Manager),
+    /// The unit is on disk but the start failed. `retry` is the command that
+    /// would finish the job, so the caller can print something actionable
+    /// rather than a transport error.
+    Installed { retry: String },
+    /// Nowhere to install to. The foreground is the answer here.
+    Unsupported,
+}
+
 /// Run `ironwire service <action>`.
 pub(crate) fn run(action: &str, port: Option<u16>) -> Result<()> {
-    let Some(manager) = Manager::detect() else {
-        return Err(unsupported());
-    };
     match action {
-        "install" => install(manager, port),
-        "uninstall" => uninstall(manager),
-        "status" => status(manager),
+        "install" => match install_and_start(port)? {
+            Outcome::Running(manager) => {
+                println!("IronWire is running as a {}.", manager.label());
+                println!("{}", linger_note(manager));
+                Ok(())
+            }
+            Outcome::Installed { retry } => {
+                println!();
+                println!("The unit is installed but did not start. Finish with:");
+                println!("    {retry}");
+                Ok(())
+            }
+            Outcome::Unsupported => Err(unsupported()),
+        },
+        "uninstall" => match Manager::detect() {
+            Some(manager) => uninstall(manager),
+            None => Err(unsupported()),
+        },
+        "status" => match Manager::detect() {
+            Some(manager) => status(manager),
+            None => Err(unsupported()),
+        },
         other => bail!("unknown action `{other}` (try: install, uninstall, status)"),
     }
+}
+
+/// Write the unit and start it.
+///
+/// The one entry point `init` uses, so "set up IronWire" and "run IronWire as a
+/// service" cannot drift into meaning different things.
+pub(crate) fn install_and_start(port: Option<u16>) -> Result<Outcome> {
+    let Some(manager) = Manager::detect() else {
+        return Ok(Outcome::Unsupported);
+    };
+    let exe = binary()?;
+    let unit = match manager {
+        Manager::Launchd => Some(install_launchd(&exe, port)?),
+        Manager::SystemdUser => Some(install_systemd(&exe, port)?),
+        Manager::SchTasks => None,
+    };
+
+    match start(manager, unit.as_deref(), &exe, port) {
+        Ok(()) => Ok(Outcome::Running(manager)),
+        Err(error) => {
+            println!("Could not start it: {error}");
+            Ok(Outcome::Installed {
+                retry: start_command(manager, unit.as_deref()),
+            })
+        }
+    }
+}
+
+/// Bring the installed unit up now, so it is running when this returns.
+fn start(manager: Manager, unit: Option<&Path>, exe: &Path, port: Option<u16>) -> Result<()> {
+    match manager {
+        Manager::SystemdUser => {
+            // A unit written but not re-read is the classic "it works after a
+            // reboot" bug, so the reload is not optional.
+            sh("systemctl", &["--user", "daemon-reload"])?;
+            sh("systemctl", &["--user", "enable", "--now", "ironwire"])
+        }
+        Manager::Launchd => {
+            let path = unit
+                .context("a launchd install has a plist")?
+                .display()
+                .to_string();
+            match sh("launchctl", &["load", "-w", &path]) {
+                // Re-running `install` after an upgrade is normal, and launchd
+                // calls that an error. The end state is what we promised.
+                Err(error) if already_running(&error) => Ok(()),
+                other => other,
+            }
+        }
+        Manager::SchTasks => {
+            let port_arg = port.map_or_else(String::new, |p| format!(" --port {p}"));
+            let action = format!("\"{}\"{port_arg} serve", exe.display());
+            sh(
+                "schtasks",
+                &[
+                    "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", &action, "/F",
+                ],
+            )?;
+            // `ONLOGON` means the next logon, and the user asked for it now.
+            sh("schtasks", &["/Run", "/TN", TASK_NAME])
+        }
+    }
+}
+
+/// The command that would finish an install that failed to start.
+fn start_command(manager: Manager, unit: Option<&Path>) -> String {
+    match manager {
+        Manager::SystemdUser => "systemctl --user enable --now ironwire".to_string(),
+        Manager::Launchd => format!(
+            "launchctl load -w {}",
+            unit.map_or_else(|| "<plist>".to_string(), |p| p.display().to_string())
+        ),
+        Manager::SchTasks => format!("schtasks /Run /TN {TASK_NAME}"),
+    }
+}
+
+/// What keeps the daemon alive when nobody is logged in.
+///
+/// Never run for the user: lingering keeps a process of theirs running after
+/// they log out, which is a decision about their machine, not a detail of ours.
+fn linger_note(manager: Manager) -> String {
+    match manager {
+        Manager::SystemdUser => {
+            "To keep it running while you are logged out: loginctl enable-linger $USER".to_string()
+        }
+        Manager::Launchd => "Logs: ~/Library/Logs/ironwire.log".to_string(),
+        Manager::SchTasks => format!("Check it with: schtasks /Query /TN {TASK_NAME}"),
+    }
+}
+
+/// The Windows task name, in one place so create, run, query and delete agree.
+const TASK_NAME: &str = "IronWire";
+
+/// Run a command, and turn a non-zero exit into an error carrying its stderr.
+///
+/// The stderr is the whole point: `systemctl` explains itself well, and
+/// swallowing that in favour of "exit code 1" would make a failure here
+/// undiagnosable.
+fn sh(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running `{program}`"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        bail!("`{program} {}` failed", args.join(" "));
+    }
+    bail!("{detail}");
+}
+
+/// launchd's way of saying it is already up, which is success for our purposes.
+fn already_running(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("already loaded") || text.contains("service already loaded")
 }
 
 fn unsupported() -> anyhow::Error {
@@ -88,16 +240,16 @@ fn binary() -> Result<PathBuf> {
     std::env::current_exe().context("locating the ironwire binary")
 }
 
-fn install(manager: Manager, port: Option<u16>) -> Result<()> {
-    let exe = binary()?;
-    println!("Installing IronWire as a {}.", manager.label());
-    println!();
-
-    match manager {
-        Manager::Launchd => install_launchd(&exe, port),
-        Manager::SystemdUser => install_systemd(&exe, port),
-        Manager::SchTasks => install_schtasks(&exe, port),
-    }
+/// Where each manager keeps the artifact we wrote, if it keeps one.
+///
+/// Task Scheduler has no file: the task *is* the registration, which is why
+/// `install_and_start` passes `None` for it and `status` has to ask `schtasks`.
+pub(crate) fn unit_path(manager: Manager) -> Result<Option<PathBuf>> {
+    Ok(match manager {
+        Manager::Launchd => Some(launchd_plist_path()?),
+        Manager::SystemdUser => Some(systemd_unit_path()?),
+        Manager::SchTasks => None,
+    })
 }
 
 // ---------------------------------------------------------------- launchd
@@ -110,7 +262,7 @@ fn launchd_plist_path() -> Result<PathBuf> {
         .join("dev.ironwire.daemon.plist"))
 }
 
-fn install_launchd(exe: &std::path::Path, port: Option<u16>) -> Result<()> {
+fn install_launchd(exe: &std::path::Path, port: Option<u16>) -> Result<PathBuf> {
     let path = launchd_plist_path()?;
     let home = dirs::home_dir().context("locating your home directory")?;
     let logs = home.join("Library").join("Logs");
@@ -158,12 +310,8 @@ fn install_launchd(exe: &std::path::Path, port: Option<u16>) -> Result<()> {
     announce_write(&path);
     std::fs::write(&path, plist).with_context(|| format!("writing {}", path.display()))?;
 
-    println!();
-    println!("Start it now:");
-    println!("    launchctl load -w {}", path.display());
-    println!();
     println!("Logs: {}", logs.join("ironwire.log").display());
-    Ok(())
+    Ok(path)
 }
 
 fn xml_escape(text: &str) -> String {
@@ -181,7 +329,7 @@ fn systemd_unit_path() -> Result<PathBuf> {
     Ok(base.join("systemd").join("user").join("ironwire.service"))
 }
 
-fn install_systemd(exe: &std::path::Path, port: Option<u16>) -> Result<()> {
+fn install_systemd(exe: &std::path::Path, port: Option<u16>) -> Result<PathBuf> {
     let path = systemd_unit_path()?;
     let port_arg = port.map_or_else(String::new, |p| format!(" --port {p}"));
 
@@ -227,54 +375,48 @@ fn install_systemd(exe: &std::path::Path, port: Option<u16>) -> Result<()> {
     announce_write(&path);
     std::fs::write(&path, unit).with_context(|| format!("writing {}", path.display()))?;
 
-    println!();
-    println!("Start it now:");
-    println!("    systemctl --user daemon-reload");
-    println!("    systemctl --user enable --now ironwire");
-    println!();
-    println!("To keep it running while you are logged out:");
-    println!("    loginctl enable-linger $USER");
-    println!();
     println!("Logs: journalctl --user -u ironwire -f");
-    Ok(())
-}
-
-// ---------------------------------------------------------------- schtasks
-
-fn install_schtasks(exe: &std::path::Path, port: Option<u16>) -> Result<()> {
-    let port_arg = port.map_or_else(String::new, |p| format!(" --port {p}"));
-    println!("Run this to register a logon task:");
-    println!();
-    println!(
-        "    schtasks /Create /TN IronWire /SC ONLOGON /TR \"\\\"{}\\\"{port_arg} serve\" /F",
-        exe.display()
-    );
-    println!();
-    println!("It runs as you, not as SYSTEM — IronWire holds your credentials");
-    println!("and must not run with more privilege than you have.");
-    Ok(())
+    Ok(path)
 }
 
 // ---------------------------------------------------------------- teardown
 
+/// Stop it and take the unit back out.
+///
+/// Symmetric with install: it *stops*, rather than printing the command that
+/// would. A stop that fails is reported and does not block the removal — the
+/// user asked for this gone, and a unit file left behind because `systemctl`
+/// was unhappy is the worse outcome.
 fn uninstall(manager: Manager) -> Result<()> {
     match manager {
         Manager::Launchd => {
             let path = launchd_plist_path()?;
-            println!("    launchctl unload -w {}", path.display());
+            if path.exists() {
+                report(sh(
+                    "launchctl",
+                    &["unload", "-w", &path.display().to_string()],
+                ));
+            }
             remove_if_present(&path)
         }
         Manager::SystemdUser => {
-            let path = systemd_unit_path()?;
-            println!("    systemctl --user disable --now ironwire");
-            remove_if_present(&path)?;
-            println!("    systemctl --user daemon-reload");
+            report(sh("systemctl", &["--user", "disable", "--now", "ironwire"]));
+            remove_if_present(&systemd_unit_path()?)?;
+            report(sh("systemctl", &["--user", "daemon-reload"]));
             Ok(())
         }
         Manager::SchTasks => {
-            println!("    schtasks /Delete /TN IronWire /F");
+            report(sh("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]));
+            println!("Removed the {TASK_NAME} logon task.");
             Ok(())
         }
+    }
+}
+
+/// Say that a teardown step failed, and carry on with the rest.
+fn report(result: Result<()>) {
+    if let Err(error) = result {
+        println!("  (continuing) {error}");
     }
 }
 
@@ -290,19 +432,14 @@ fn remove_if_present(path: &std::path::Path) -> Result<()> {
 
 fn status(manager: Manager) -> Result<()> {
     println!("Service manager: {}", manager.label());
-    let installed = match manager {
-        Manager::Launchd => Some(launchd_plist_path()?),
-        Manager::SystemdUser => Some(systemd_unit_path()?),
-        Manager::SchTasks => None,
-    };
-    match installed {
+    match unit_path(manager)? {
         Some(path) if path.exists() => println!("Installed:       {}", path.display()),
         Some(path) => {
             println!("Installed:       no ({} does not exist)", path.display());
             println!();
             println!("    ironwire service install");
         }
-        None => println!("Check with:      schtasks /Query /TN IronWire"),
+        None => println!("Check with:      schtasks /Query /TN {TASK_NAME}"),
     }
     Ok(())
 }
@@ -324,6 +461,31 @@ mod tests {
             xml_escape("/Users/a&b/<bin>/ironwire"),
             "/Users/a&amp;b/&lt;bin&gt;/ironwire"
         );
+    }
+
+    /// Re-running `install` after an upgrade is the common case, and launchd
+    /// calls an already-loaded agent an error. Treating that as a failure would
+    /// make every upgrade look broken.
+    #[test]
+    fn launchd_saying_it_is_already_loaded_is_not_a_failure() {
+        assert!(already_running(&anyhow::anyhow!(
+            "Load failed: 37: Service already loaded"
+        )));
+        assert!(!already_running(&anyhow::anyhow!(
+            "Load failed: 5: Input/output error"
+        )));
+    }
+
+    /// A start that fails has to leave the user a command that finishes the
+    /// job, or the install is a dead end.
+    #[test]
+    fn a_failed_start_names_the_command_that_would_finish_it() {
+        assert!(start_command(Manager::SystemdUser, None).contains("enable --now"));
+        assert!(
+            start_command(Manager::Launchd, Some(std::path::Path::new("/tmp/a.plist")))
+                .contains("/tmp/a.plist")
+        );
+        assert!(start_command(Manager::SchTasks, None).contains(TASK_NAME));
     }
 
     #[test]
