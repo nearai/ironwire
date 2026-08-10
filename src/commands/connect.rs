@@ -69,16 +69,9 @@ pub(crate) fn disconnect(target: &str, subscription: bool) -> Result<()> {
         return Ok(());
     }
     match target {
-        // Claude Code is pointed here by an environment variable, which is the
-        // user's shell to own — we can only say what to remove.
-        "claude" => {
-            println!("Remove the IronWire setting you added for Claude Code:");
-            println!("  unset ANTHROPIC_BASE_URL");
-            println!("  (and remove it from your shell profile)");
-            // The status line, unlike the variable, is in a file we wrote — so
-            // it is ours to take back out.
-            remove_status_line()
-        }
+        // Both settings are in a file we wrote, so both are ours to take back
+        // out — exactly ours, and nothing the user put there themselves.
+        "claude" => unwire_claude(),
         // Codex is pointed here by a file we wrote, so we can undo it.
         "codex" => disconnect_codex(),
         other => bail!("unknown target `{other}`"),
@@ -118,16 +111,8 @@ pub(crate) fn print_env(port: Option<u16>, shell: Option<String>) -> Result<()> 
 fn connect_claude(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
     println!("Claude Code → IronWire");
     println!();
-    println!("Point Claude Code at IronWire by exporting this in your shell:");
-    println!();
-    println!("    export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}/anthropic");
-    println!();
-    println!("Add it to your shell profile to make it stick, or run:");
-    println!();
-    println!("    eval \"$(ironwire env)\"");
-    println!();
 
-    install_status_line(dry_run)?;
+    wire_claude(port, dry_run)?;
 
     match ClaudeCodeCredentials::discover() {
         Ok(creds) => {
@@ -187,48 +172,8 @@ fn connect_codex(subscription: bool, dry_run: bool, port: u16) -> Result<()> {
     println!("Codex → IronWire");
     println!();
 
-    let path = codex_config_path()?;
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let edit = codex_config::connect(&existing, port).with_context(|| {
-        format!(
-            "{} is not valid TOML — IronWire will not append to a file it cannot read",
-            path.display()
-        )
-    })?;
-
-    // TRUST.md: name the file before touching it, every time.
-    if edit.is_noop() {
-        println!("{} already points at IronWire.", path.display());
-    } else {
-        println!("This will change {}:", path.display());
-        for change in &edit.changes {
-            println!("  · {change}");
-        }
-        println!();
-        // Said before the edit, like every other change in this file. This one
-        // is not IronWire's limitation but IronWire is what makes the user meet
-        // it, and finding out afterwards — with a thread stuck on a model and
-        // no UI to change it — is the worst way to learn.
-        println!("Before you agree, one consequence worth knowing:");
-        println!();
-        println!("  Codex has no UI for changing the model on a custom provider");
-        println!("  (openai/codex#15364). A desktop-app thread keeps whatever model");
-        println!("  it was created with, and the CLI needs `-m` or `model =` in");
-        println!("  config.toml. `ironwire disconnect codex` puts it all back.");
-        println!();
-        if dry_run {
-            println!("[dry run] nothing was written.");
-        } else {
-            write_codex_config(&path, &existing, &edit.contents)?;
-            // One file drives both clients, and "restart" means different
-            // things to each.
-            println!("Written. It applies to every Codex client on this machine:");
-            println!("  CLI:     start a new `codex` session");
-            println!("  desktop: quit the app and relaunch it — reopening a window");
-            println!("           is not enough, it keeps the old config");
-        }
-        println!();
-    }
+    wire_codex(port, dry_run)?;
+    println!();
 
     match CodexCredentials::discover() {
         Ok(creds) => println!(
@@ -298,23 +243,127 @@ fn disconnect_codex() -> Result<()> {
     for change in &edit.changes {
         println!("  · {change}");
     }
-    write_codex_config(&path, &existing, &edit.contents)?;
+    write_with_backup(&path, &existing, &edit.contents, "toml")?;
     println!();
     println!("Written. Restart Codex to pick it up.");
     Ok(())
 }
 
-/// Write the config, keeping a copy of what was there.
+/// Point Claude Code at IronWire, in the file Claude Code already reads.
 ///
-/// The backup is not ceremony: this is a file the user edits by hand, and the
-/// cost of being wrong about their config is an afternoon of theirs.
-fn write_codex_config(path: &std::path::Path, existing: &str, contents: &str) -> Result<()> {
+/// Two slots, one write:
+///
+/// - `env.ANTHROPIC_BASE_URL`, which is what actually routes it here. This used
+///   to be an `export` line we printed for the user to run, which meant the
+///   setup did not survive a new terminal and `doctor` spent its life
+///   explaining that. A setting in the file is the same decision, made once.
+/// - `statusLine`, IronWire's one line of screen space. IronWire will not write
+///   into a response stream, so without this the only place it can say "your
+///   traffic just moved" is a second terminal nobody is looking at.
+///
+/// Neither is taken from a user already using it — see [`crate::claude_settings`].
+pub(crate) fn wire_claude(port: u16, dry_run: bool) -> Result<()> {
+    let path = claude_settings_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let command = format!("{} statusline", our_binary()?);
+    let url = anthropic_url(port);
+    let edit = claude_settings::connect(&existing, &command, Some(&url)).with_context(|| {
+        format!(
+            "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
+            path.display()
+        )
+    })?;
+
+    if !edit.is_noop() {
+        // TRUST.md: name the file before touching it, every time.
+        println!("Writing {}:", path.display());
+        for change in &edit.changes {
+            println!("  · {change}");
+        }
+        if dry_run {
+            println!("  [dry run] nothing was written.");
+        } else {
+            write_with_backup(&path, &existing, &edit.contents, "json")?;
+            println!("  Claude Code picks this up on its next start.");
+        }
+    }
+
+    // A slot of their own is not a failure, but it does mean the thing we
+    // promised did not happen — so say what would make it happen by hand.
+    if let Some(theirs) = edit.occupied_slot("ANTHROPIC_BASE_URL") {
+        println!("  ANTHROPIC_BASE_URL is already set to `{theirs}`, so IronWire left it.");
+        println!("  To route Claude Code here instead, set it to: {url}");
+    }
+    if let Some(theirs) = edit.occupied_slot("statusLine") {
+        println!("  You already have a status line (`{theirs}`), so IronWire left it alone.");
+        println!("  To include IronWire in it, add the output of: {command}");
+    }
+    Ok(())
+}
+
+/// Point Codex at IronWire, in the config file Codex already reads.
+pub(crate) fn wire_codex(port: u16, dry_run: bool) -> Result<()> {
+    let path = codex_config_path()?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let edit = codex_config::connect(&existing, port).with_context(|| {
+        format!(
+            "{} is not valid TOML — IronWire will not append to a file it cannot read",
+            path.display()
+        )
+    })?;
+    if edit.is_noop() {
+        return Ok(());
+    }
+
+    println!("Writing {}:", path.display());
+    for change in &edit.changes {
+        println!("  · {change}");
+    }
+    // Said before the edit, like every other change in this file. This one is
+    // not IronWire's limitation, but IronWire is what makes the user meet it,
+    // and finding out afterwards — with a thread stuck on a model and no UI to
+    // change it — is the worst way to learn.
+    println!();
+    println!("  One consequence worth knowing: Codex has no UI for changing the");
+    println!("  model on a custom provider (openai/codex#15364). A desktop thread");
+    println!("  keeps whatever model it was created with, and the CLI needs `-m`");
+    println!("  or `model =` in config.toml. `ironwire disconnect codex` puts it");
+    println!("  all back.");
+    println!();
+    if dry_run {
+        println!("  [dry run] nothing was written.");
+        return Ok(());
+    }
+    write_with_backup(&path, &existing, &edit.contents, "toml")?;
+    // One file drives both clients, and "restart" means different things to each.
+    println!("  CLI: start a new `codex` session.");
+    println!("  Desktop: quit the app and relaunch it — reopening a window is not");
+    println!("  enough, it keeps the old config.");
+    Ok(())
+}
+
+/// The endpoint an Anthropic-speaking client points at.
+fn anthropic_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/anthropic")
+}
+
+/// Write a file we did not create, keeping a copy of what was there.
+///
+/// The backup is what makes an automatic edit defensible: the user can always
+/// get back exactly what they had, without us having to be right about what
+/// mattered in it.
+fn write_with_backup(
+    path: &std::path::Path,
+    existing: &str,
+    contents: &str,
+    extension: &str,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     if !existing.is_empty() {
-        let backup = path.with_extension("toml.ironwire-backup");
+        let backup = path.with_extension(format!("{extension}.ironwire-backup"));
         std::fs::write(&backup, existing)
             .with_context(|| format!("writing {}", backup.display()))?;
         println!("  (previous contents saved to {})", backup.display());
@@ -322,64 +371,38 @@ fn write_codex_config(path: &std::path::Path, existing: &str, contents: &str) ->
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
 }
 
-/// Offer Claude Code's status line as IronWire's one line of screen space.
+/// Whether Claude Code is on this machine at all.
 ///
-/// IronWire will not write into a response stream, so without this the only
-/// place it can say "your traffic just moved" is a second terminal nobody is
-/// looking at (`ironwire watch`). The status line is the harness's own
-/// furniture, outside the transcript, and it is the honest channel.
-fn install_status_line(dry_run: bool) -> Result<()> {
-    let path = claude_settings_path()?;
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let command = format!("{} statusline", our_binary()?);
-    let edit = claude_settings::connect(&existing, &command).with_context(|| {
-        format!(
-            "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
-            path.display()
-        )
-    })?;
-
-    if let Some(theirs) = &edit.occupied_by {
-        println!("You already have a status line (`{theirs}`), so IronWire left it alone.");
-        println!("To include IronWire in it, add the output of:");
-        println!();
-        println!("    {command}");
-        println!();
-        return Ok(());
-    }
-    if edit.is_noop() {
-        return Ok(());
-    }
-
-    println!("This will change {}:", path.display());
-    for change in &edit.changes {
-        println!("  · {change}");
-    }
-    if dry_run {
-        println!("[dry run] nothing was written.");
-        println!();
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if !existing.is_empty() {
-        let backup = path.with_extension("json.ironwire-backup");
-        std::fs::write(&backup, &existing)
-            .with_context(|| format!("writing {}", backup.display()))?;
-        println!("  (previous contents saved to {})", backup.display());
-    }
-    std::fs::write(&path, &edit.contents).with_context(|| format!("writing {}", path.display()))?;
-    println!("Written. Claude Code picks it up on its next start.");
-    println!();
-    Ok(())
+/// Either signal is enough: the config directory means it has run here, and the
+/// binary means it can. Wiring an agent that is not installed writes settings
+/// nothing will read, which is how a setup step turns into litter.
+pub(crate) fn claude_installed() -> bool {
+    claude_settings_path().is_ok_and(|path| path.parent().is_some_and(std::path::Path::exists))
+        || on_path("claude")
 }
 
-/// Undo [`install_status_line`], removing only what it added.
-fn remove_status_line() -> Result<()> {
+/// Whether Codex is on this machine at all.
+pub(crate) fn codex_installed() -> bool {
+    codex_config_path().is_ok_and(|path| path.parent().is_some_and(std::path::Path::exists))
+        || on_path("codex")
+}
+
+/// Whether an executable of this name is reachable on `PATH`.
+fn on_path(name: &str) -> bool {
+    let Ok(path) = std::env::var("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file() || candidate.with_extension("exe").is_file()
+    })
+}
+
+/// Undo [`wire_claude`], removing only what it added.
+fn unwire_claude() -> Result<()> {
     let path = claude_settings_path()?;
     let Ok(existing) = std::fs::read_to_string(&path) else {
+        println!("{} does not exist — nothing to undo.", path.display());
         return Ok(());
     };
     let edit = claude_settings::disconnect(&existing).with_context(|| {
@@ -389,12 +412,15 @@ fn remove_status_line() -> Result<()> {
         )
     })?;
     if edit.is_noop() {
+        println!("{} has nothing of IronWire's in it.", path.display());
         return Ok(());
     }
-    std::fs::write(&path, &edit.contents).with_context(|| format!("writing {}", path.display()))?;
+    println!("Writing {}:", path.display());
     for change in &edit.changes {
         println!("  · {change}");
     }
+    write_with_backup(&path, &existing, &edit.contents, "json")?;
+    println!("  Claude Code goes back to Anthropic on its next start.");
     Ok(())
 }
 

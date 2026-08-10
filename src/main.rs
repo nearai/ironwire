@@ -30,11 +30,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Set up IronWire: see what capacity this machine has, and what to run.
+    /// Set IronWire up: find your capacity, wire up your agents, start it.
+    ///
+    /// Asks one question — whether IronWire may use the subscriptions it found
+    /// — and does the rest. `--dry-run` shows every change without making one.
     Init {
         /// Also write a commented `config.toml`, if there is not one already.
         #[arg(long)]
         write: bool,
+        /// Show what would change, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not install the background service; run `ironwire serve` yourself.
+        #[arg(long)]
+        no_service: bool,
     },
 
     /// Run the loopback daemon in the foreground.
@@ -170,7 +179,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let style = style::Style::resolve(cli.color);
     match cli.command {
-        Command::Init { write } => commands::init::run(cli.port, write).await,
+        Command::Init {
+            write,
+            dry_run,
+            no_service,
+        } => commands::init::run(cli.port, write, dry_run, no_service).await,
         Command::Serve => commands::serve::run(cli.port).await,
         Command::Status { json } => commands::status::run(cli.port, json, style).await,
         Command::Statusline => commands::statusline::run(cli.port).await,

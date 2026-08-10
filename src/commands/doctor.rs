@@ -116,23 +116,44 @@ pub(crate) async fn run(port: Option<u16>) -> Result<()> {
 /// Whether the coding agents on this machine are actually pointed at us.
 fn check_clients(port: u16) {
     let expected = format!("http://127.0.0.1:{port}/anthropic");
-    match std::env::var("ANTHROPIC_BASE_URL") {
-        Ok(value) if value.trim_end_matches('/') == expected.trim_end_matches('/') => {
-            println!("claude code   pointed here");
+    let same = |value: &str| value.trim_end_matches('/') == expected.trim_end_matches('/');
+
+    // Two places can point Claude Code here, and `doctor` has to look at both.
+    // The settings file is where `ironwire init` writes it, and it is *not* in
+    // this process's environment — checking only the variable would report a
+    // correctly configured machine as broken, which is the exact failure this
+    // command exists to catch.
+    let settings = claude_settings_base_url();
+    let variable = std::env::var("ANTHROPIC_BASE_URL").ok();
+
+    match (settings.as_deref(), variable.as_deref()) {
+        (Some(s), _) if same(s) => {
+            println!("claude code   pointed here (~/.claude/settings.json)");
+            // A shell variable disagreeing with the file is worth saying out
+            // loud: which one wins is Claude Code's business, not ours, and a
+            // machine where the two disagree will behave differently depending
+            // on how the agent was started.
+            if let Some(v) = variable.as_deref().filter(|v| !same(v)) {
+                println!("              note: ANTHROPIC_BASE_URL is also set, to {v}");
+                println!(
+                    "              unset it so there is one answer:  unset ANTHROPIC_BASE_URL"
+                );
+            }
         }
-        Ok(value) if value.contains("127.0.0.1") || value.contains("localhost") => {
-            // The commonest near-miss: an old port, or a `--port` override the
-            // shell profile never learned about.
-            println!("claude code   pointed at {value} — that is not this daemon");
-            println!("              fix:  export ANTHROPIC_BASE_URL={expected}");
+        (_, Some(v)) if same(v) => println!("claude code   pointed here (ANTHROPIC_BASE_URL)"),
+        (Some(s), _) => {
+            println!("claude code   settings.json points at {s} — bypassing IronWire");
+            println!("              fix:  ironwire connect claude");
         }
-        Ok(value) => {
-            println!("claude code   pointed at {value} — bypassing IronWire");
-            println!("              fix:  export ANTHROPIC_BASE_URL={expected}");
+        // The commonest near-miss: an old port, or a `--port` override that a
+        // shell profile never learned about.
+        (None, Some(v)) => {
+            println!("claude code   pointed at {v} — bypassing IronWire");
+            println!("              fix:  unset ANTHROPIC_BASE_URL && ironwire connect claude");
         }
-        Err(_) => {
-            println!("claude code   not pointed here (ANTHROPIC_BASE_URL is unset)");
-            println!("              fix:  eval \"$(ironwire env)\"");
+        (None, None) => {
+            println!("claude code   not pointed here");
+            println!("              fix:  ironwire init");
         }
     }
 
@@ -212,6 +233,31 @@ fn codex_config_path() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(home).join("config.toml"));
     }
     Some(dirs::home_dir()?.join(".codex").join("config.toml"))
+}
+
+/// What Claude Code's settings file says its base URL is, if anything.
+///
+/// An unreadable or unparseable file is treated as saying nothing: `doctor`
+/// reports on the user's setup and must not fail because of a syntax error in
+/// a file it does not own.
+fn claude_settings_base_url() -> Option<String> {
+    let text = std::fs::read_to_string(claude_settings_path()?).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(
+        root.get("env")?
+            .get("ANTHROPIC_BASE_URL")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
+fn claude_settings_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return Some(std::path::PathBuf::from(dir).join("settings.json"));
+    }
+    Some(dirs::home_dir()?.join(".claude").join("settings.json"))
 }
 
 #[cfg(test)]

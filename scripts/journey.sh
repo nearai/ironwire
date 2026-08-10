@@ -29,9 +29,13 @@ trap cleanup EXIT INT TERM
 
 export IRONWIRE_HOME="${work}/home"
 export CODEX_HOME="${work}/codex"
+# `init` now writes to the agents' own config files and installs a service.
+# Every path it can touch has to land inside $work, or running this script
+# would reconfigure the machine it is testing on.
+export CLAUDE_CONFIG_DIR="${work}/claude"
 export ANTHROPIC_API_KEY="sk-ant-journey-test"
 export IRONWIRE_ANTHROPIC_BASE_URL="http://127.0.0.1:${mock_port}"
-mkdir -p "$IRONWIRE_HOME" "$CODEX_HOME"
+mkdir -p "$IRONWIRE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
 
 pass=0
 fail=0
@@ -122,10 +126,12 @@ wait_for() {
 [ -x "$bin" ] || { echo "build first: cargo build"; exit 1; }
 
 step "1. A new user runs init"
-says "init names capacity it found" "ANTHROPIC_API_KEY" "$bin" init
-says "init says what to run next" "ironwire serve" "$bin" init
-says "init writes a config on request" "Wrote" "$bin" init --write
-says "init does not clobber an existing config" "leaving it alone" "$bin" init --write
+# `--dry-run` throughout this step: the daemon is not up yet, and the point
+# here is what `init` *would* do. It does it for real in step 4.
+says "init names capacity it found" "ANTHROPIC_API_KEY" "$bin" init --dry-run
+says "init would point Claude Code here" "ANTHROPIC_BASE_URL" "$bin" init --dry-run
+says "init would leave the daemon running" "background service" "$bin" init --dry-run
+says "init changes nothing in a dry run" "nothing was written" "$bin" init --dry-run
 
 step "2. They start the daemon"
 start_mock
@@ -138,17 +144,26 @@ else
     bad "the daemon comes up and answers health" "$(cat "${work}/serve.log")"
     exit 1
 fi
-grep -q "Claude Code: export ANTHROPIC_BASE_URL" "${work}/serve.log" \
+grep -q "Point your agents at it" "${work}/serve.log" \
     && ok "startup tells you how to point a client at it" \
     || bad "startup tells you how to point a client at it" "$(cat "${work}/serve.log")"
 
 step "3. doctor, before anything is pointed here"
 says "doctor notices no client is pointed here" "not pointed here" "$bin" doctor --port "$port"
-says "doctor gives the fix" 'eval "$(ironwire env)"' "$bin" doctor --port "$port"
+says "doctor gives the fix" "ironwire init" "$bin" doctor --port "$port"
 
-step "4. They point a client at it"
-export ANTHROPIC_BASE_URL="http://127.0.0.1:${port}/anthropic"
+step "4. init points the agents at it, for real"
+says "init writes a config on request" "Wrote" \
+    "$bin" init --port "$port" --write --no-service
+says "init does not clobber an existing config" "leaving it alone" \
+    "$bin" init --port "$port" --write --no-service
+[ -f "${CLAUDE_CONFIG_DIR}/settings.json" ] \
+    && grep -q "127.0.0.1:${port}/anthropic" "${CLAUDE_CONFIG_DIR}/settings.json" \
+    && ok "the setting survives in the file, not just in this shell" \
+    || bad "the setting survives in the file, not just in this shell" \
+        "$(cat "${CLAUDE_CONFIG_DIR}/settings.json" 2>&1)"
 says "doctor now sees the client" "claude code   pointed here" "$bin" doctor --port "$port"
+says "doctor names where it read that from" "settings.json" "$bin" doctor --port "$port"
 says "doctor probes the backend" "anthropic-key" "$bin" doctor --port "$port"
 
 step "5. Real traffic"

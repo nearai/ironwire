@@ -245,10 +245,14 @@ which are routing problems.
       gives a syntax error and no clue why
 - [x] `ironwire service install|uninstall|status`, `ironwire completions`
 - [x] `ironwire watch` for live routing, `ironwire privacy check` for the filter
-- [x] `ironwire init` — says what capacity this machine already has and what to
-      run, in order. It is not a wizard: it changes nothing without `--write`,
-      and it never grants a subscription consent, because a command that did
-      would make the consent prompt decorative
+- [x] `ironwire init` — the whole setup, in one command. Finds the capacity on
+      this machine, asks once whether it may use the subscriptions it found,
+      points every installed agent at IronWire in that agent's own config file,
+      and leaves the daemon running as a user service. `--dry-run` shows every
+      change without making one; `--no-service` skips the supervisor
+- [x] The consent gate is the one thing `init` will not do for you, and it is
+      now a single batched question (`CONSENT_PROMPT_VERSION` 2). It is skipped
+      entirely when stdin is not a terminal, rather than defaulting to yes
 - [x] `ironwire init --write` drops a commented `config.toml`. A test asserts
       the generated file parses **and equals the built-in defaults** — a
       template that drifts turns "a file documenting what IronWire does" into
