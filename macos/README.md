@@ -46,12 +46,19 @@ Xcode opens `Package.swift` directly if you would rather work there.
 
 ## What it shows, and what it can change
 
-**One pane**, read at a glance: every backend with its capacity, the current
-route, spend, a pin control and the privacy filter. A backend is something you
-turn on and then watch, so the switch that turns it on sits on the backend's own
-row — before consent the row invites you to enable it, after consent it shows
-what the backend is reporting. Splitting those in two put the answer to "why is
-nothing routing here" behind a tab.
+**One pane**, read at a glance: every backend with its capacity, which coding
+agents route through IronWire, the current route, spend, a pin control and the
+privacy filter. A backend is something you turn on and then watch, so the switch
+that turns it on sits on the backend's own row — off before consent, and showing
+what the backend reports after it. Splitting those in two put the answer to "why
+is nothing routing here" behind a tab.
+
+**A control says its own state, so nothing under it repeats that.** A switch
+that is off already reads "off", and a caption saying so again is what turned
+this pane into a wall of orange text. What a control cannot say is carried as
+its tooltip and its VoiceOver hint; a list nobody is reading right now — the
+coding agents, the pin targets — lives behind a menu; and prose is left for the
+things with no control at all, like a credential that is missing.
 
 The privacy mode and each subscription can be changed from that pane. Both take
 effect immediately — the daemon swaps the filter and the routing constraint
@@ -65,12 +72,12 @@ Three things it deliberately will not do:
   greyed out with its reason beside it, rather than the app working the rule out
   for itself.
 - **Enable a subscription without saying what it costs.** A subscription is a
-  switch, and one flip is the whole action — but the daemon's own summary
-  sentence sits beside that switch, always drawn and never reworded, and the
-  four costs are one expand away in the daemon's order. The answer is sent with
-  the `prompt_version` that was on screen, so it can be checked against the
-  question it answered. `docs/TRUST.md` §2 records what this trades away
-  relative to the CLI's two-step gate, which is unchanged.
+  switch, and one flip is the whole action — but the daemon's summary and every
+  one of its points are on that switch as its tooltip and its VoiceOver hint, in
+  the daemon's order and never reworded. The answer is sent with the
+  `prompt_version` that was on screen, so it can be checked against the question
+  it answered. `docs/TRUST.md` §2 records what this trades away relative to the
+  CLI's two-step gate, which is unchanged.
 - **Log you in.** A credential comes from you logging into Claude Code or Codex,
   or exporting an API key. A menu cannot conjure one, so a service without a
   credential says so and names the command that would fix it.

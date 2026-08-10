@@ -20,6 +20,25 @@ import XCTest
 
 @MainActor
 final class MenuContentTests: XCTestCase {
+    /// The `@AppStorage` key behind the one-time offer to wire every agent.
+    ///
+    /// Answered by default here. It is a launch-time banner that appears
+    /// whenever an unwired tool exists, so leaving it unanswered would add its
+    /// height to half the tool cases below and measure the banner instead of
+    /// the thing under test. Set through `UserDefaults` because that is what
+    /// `@AppStorage` reads — the real switch, not a stand-in for it.
+    private let onboardingKey = "toolsOnboardingAnswered"
+
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(true, forKey: onboardingKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: onboardingKey)
+        super.tearDown()
+    }
+
     // MARK: - Fixtures
 
     private func status(
@@ -214,13 +233,14 @@ final class MenuContentTests: XCTestCase {
         XCTAssertGreaterThan(try height(status, settings: settings), 0)
     }
 
-    /// Collapsed, the consent text costs nothing — neither the points nor the
+    /// The consent text costs no height at all — neither the points nor the
     /// summary. Checked against a prompt three times as long in both: if any of
     /// it were being drawn, the longer one would lay out taller.
     ///
     /// This is the height half of the trade recorded in `docs/TRUST.md` §2. The
-    /// row is two lines regardless of how much the daemon has to say.
-    func test_the_consent_text_is_not_drawn_until_it_is_expanded() throws {
+    /// row is a name and a switch regardless of how much the daemon has to say;
+    /// what it has to say is the switch's tooltip and its VoiceOver hint.
+    func test_the_consent_text_is_never_drawn_on_the_row() throws {
         let (shortStatus, shortSettings) = unconsented(prompt: prompt(points: 4))
         let (longStatus, longSettings) = unconsented(
             prompt: ConsentPromptView(
@@ -231,7 +251,20 @@ final class MenuContentTests: XCTestCase {
         XCTAssertEqual(
             try height(shortStatus, settings: shortSettings),
             try height(longStatus, settings: longSettings),
-            "the collapsed row grows with the consent text, so it is being drawn")
+            "the row grows with the consent text, so it is being drawn")
+    }
+
+    /// A switch that is off already reads "off", so the row does not say it
+    /// again. The comparison is against the row that *has* no switch — a prompt
+    /// this build could not read — which has to spend two lines saying the same
+    /// thing in words, and is therefore taller.
+    func test_a_row_with_a_switch_does_not_repeat_what_the_switch_says() throws {
+        let (withSwitch, withSwitchSettings) = unconsented(prompt: prompt())
+        let (noSwitch, noSwitchSettings) = unconsented(prompt: nil)
+        XCTAssertLessThan(
+            try height(withSwitch, settings: withSwitchSettings),
+            try height(noSwitch, settings: noSwitchSettings),
+            "the row with a switch is still spending lines on \"not enabled\"")
     }
 
     /// A credential that was never found is not something a menu can conjure, so
@@ -304,42 +337,64 @@ final class MenuContentTests: XCTestCase {
             privacy: PrivacySettingsView(mode: "off", summary: "off"), services: [], tools: tools)
     }
 
-    /// The state this section exists for: everything healthy, nothing routing.
-    /// An unwired tool has to occupy space, or the pane goes on implying that a
-    /// green backend means traffic is arriving.
-    func test_an_unwired_tool_says_so() throws {
-        let listed = try height(
-            status(backends: []),
-            settings: withTools([
-                ToolView(
-                    id: "claude", name: "Claude Code", installed: true, wired: false,
-                    connectCommand: "ironwire connect claude")
-            ]))
-        let nothing = try height(status(backends: []), settings: withTools([]))
-        XCTAssertGreaterThan(
-            listed, nothing, "an unwired tool is not being drawn at all")
+    private func tool(_ id: String, _ name: String, wired: Bool) -> ToolView {
+        ToolView(
+            id: id, name: name, installed: true, wired: wired,
+            connectCommand: "ironwire connect \(id)")
     }
 
-    /// A wired tool is a name and a switch; an unwired one also says "not
-    /// routed here". So the unwired case is the taller of the two, which is the
-    /// right way round — the state that needs explaining is the one that gets
-    /// the words.
-    func test_an_unwired_tool_is_taller_than_a_wired_one() throws {
+    /// The state this section exists for: everything healthy, nothing routing.
+    /// The section has to occupy space even when nothing is wired — that is the
+    /// case where its label reads "none routed here" — or the pane goes on
+    /// implying that a green backend means traffic is arriving.
+    func test_an_unwired_tool_is_still_reported() throws {
+        let listed = try height(
+            status(backends: []), settings: withTools([tool("claude", "Claude Code", wired: false)]))
+        let nothing = try height(status(backends: []), settings: withTools([]))
+        XCTAssertGreaterThan(listed, nothing, "an unwired tool is not being drawn at all")
+    }
+
+    /// Wired or not, a tool costs the same height, because the state lives in
+    /// the menu's label and its checkmarks and nowhere else. The captions this
+    /// replaced ("not routed here", and what the last write did) are what made
+    /// the pane a wall of text. With the one-time offer already answered, an
+    /// unwired agent costs the pane nothing at all.
+    func test_a_tool_costs_the_same_whether_it_is_wired_or_not() throws {
         let wired = try height(
-            status(backends: []),
-            settings: withTools([
-                ToolView(
-                    id: "claude", name: "Claude Code", installed: true, wired: true,
-                    connectCommand: "ironwire connect claude")
-            ]))
+            status(backends: []), settings: withTools([tool("claude", "Claude Code", wired: true)]))
         let unwired = try height(
+            status(backends: []), settings: withTools([tool("claude", "Claude Code", wired: false)]))
+        XCTAssertEqual(wired, unwired, "an unwired tool is drawing a caption of its own")
+    }
+
+    /// The offer to point everything here is made once, at the launch that
+    /// finds an unwired agent, and never again once it has been answered. It is
+    /// the only place in the pane that spends lines on an unwired tool.
+    func test_the_offer_to_wire_everything_is_made_once() throws {
+        let settings = withTools([tool("claude", "Claude Code", wired: false)])
+
+        UserDefaults.standard.set(false, forKey: onboardingKey)
+        let offered = try height(status(backends: []), settings: settings)
+        UserDefaults.standard.set(true, forKey: onboardingKey)
+        let answered = try height(status(backends: []), settings: settings)
+
+        XCTAssertGreaterThan(offered, answered, "the one-time offer is not being made")
+    }
+
+    /// The list is behind the menu, so a machine with every agent installed
+    /// costs exactly as much of the dropdown as a machine with one.
+    func test_the_tools_row_does_not_grow_with_the_number_of_tools() throws {
+        let one = try height(
+            status(backends: []), settings: withTools([tool("claude", "Claude Code", wired: true)]))
+        let many = try height(
             status(backends: []),
             settings: withTools([
-                ToolView(
-                    id: "claude", name: "Claude Code", installed: true, wired: false,
-                    connectCommand: "ironwire connect claude")
+                tool("claude", "Claude Code", wired: true),
+                tool("codex", "Codex", wired: false),
+                tool("gemini", "Gemini CLI", wired: false),
+                tool("opencode", "OpenCode", wired: true),
             ]))
-        XCTAssertGreaterThan(unwired, wired)
+        XCTAssertEqual(one, many, "the tools list is being drawn in the pane rather than in a menu")
     }
 
     /// The daemon reports every tool it knows about so a client *can* say

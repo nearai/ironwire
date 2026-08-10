@@ -1,10 +1,10 @@
 //! The dropdown.
 //
 // One pane. A backend is a thing you turn on and then watch, so the switch that
-// turns it on and the capacity it reports live on the same row: before consent
-// the row invites you to enable it, after consent it shows status. Splitting
-// those into a Status tab and a Settings tab meant the answer to "why is nothing
-// routing here" was behind a segmented control.
+// turns it on and the capacity it reports live on the same row: off before
+// consent, showing what the backend reports after it. Splitting those into a
+// Status tab and a Settings tab meant the answer to "why is nothing routing
+// here" was behind a segmented control.
 //
 // This mirrors `render::status()` in `src/render.rs`, which is the reference for
 // what is honest to show — and, more usefully, for what not to. Three of its
@@ -18,6 +18,16 @@
 // - **An update is news, never a button.** `docs/UPDATES.md` §1: the daemon
 //   holds credentials in the middle of streamed responses and never updates
 //   itself. A menu bar app is the most tempting place to break that.
+//
+// The fourth rule is the menu bar's own, and it is why this file keeps
+// shrinking: **a control says its own state, so nothing under it repeats that.**
+// A switch that is off already reads "off"; a caption saying so is a second
+// voice for the same fact, and a dozen of them is what made this pane a wall of
+// orange text. What a control cannot say — the consent question, the file a
+// tool's row would write — is carried as its tooltip and its VoiceOver hint,
+// and a list nobody is reading right now lives behind a submenu. Text is left
+// for the things with no control at all: a credential that is missing, a
+// warning about what a write did not do.
 
 import AppKit
 import IronWireKit
@@ -31,11 +41,6 @@ struct MenuContent: View {
     @State private var settingsError: String?
     @State private var settingsWarning: String?
     @State private var busy = false
-    /// Backends whose consent costs the user has expanded. Not persisted: a
-    /// reading aid, not a setting.
-    @State private var expanded: Set<String> = []
-    /// What the last wiring of each tool reported, keyed by tool id.
-    @State private var toolReports: [String: [String]] = [:]
     /// Whether the one-time offer to wire everything has been answered.
     /// Persisted: asking again every launch is how a prompt stops being read.
     @AppStorage("toolsOnboardingAnswered") private var onboardingAnswered = false
@@ -229,85 +234,30 @@ struct MenuContent: View {
                         .textSelection(.enabled)
                         .foregroundStyle(.secondary)
                 }
-            } else if !backend.consented {
-                invitation(backend, service: service, prompt: prompt, switchable: switchable)
-            } else {
+            } else if backend.consented {
                 capacity(backend.headroom)
                 if let health = Format.healthSummary(backend.health) {
                     Text(health)
                         .font(.caption)
                         .foregroundStyle(backend.health.isOpen ? .red : .orange)
                 }
-            }
-        }
-    }
-
-    /// What a backend says before it is enabled.
-    ///
-    /// The switch is on the row above. The row itself stays to two short lines —
-    /// a menu is read at a glance, and paragraphs per backend is what made the
-    /// old pane unreadable — so the daemon's summary and its points both live
-    /// behind **"What you are taking on"**, one click above the switch. Neither
-    /// is ever reworded, reordered, or abridged; what changed is that they are a
-    /// click away rather than always drawn, and `docs/TRUST.md` §2 records what
-    /// that costs. Where there is no usable prompt the row names the command
-    /// instead — a switch is not offered for a question this build could not
-    /// read.
-    @ViewBuilder
-    private func invitation(
-        _ backend: BackendView, service: ServiceView?, prompt: ConsentPromptView?, switchable: Bool
-    ) -> some View {
-        if switchable, let prompt {
-            Text("Not enabled — turn it on to route here.")
-                .font(.caption)
-                .foregroundStyle(.orange)
-
-            Button {
-                if expanded.contains(backend.id) {
-                    expanded.remove(backend.id)
-                } else {
-                    expanded.insert(backend.id)
+            } else if !switchable {
+                // The one unconsented row that still needs words: there is no
+                // switch here to say "off" for it, because the prompt arrived
+                // incomplete or the credential is not usable.
+                Text("not enabled")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                // The daemon's own field, verbatim. Composing one here —
+                // appending a flag, substituting a backend name — is how the old
+                // pane came to tell every backend to run `ironwire connect
+                // claude`.
+                if let command = service?.connectCommand {
+                    Text(command)
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
                 }
-            } label: {
-                HStack(spacing: 3) {
-                    Image(systemName: expanded.contains(backend.id) ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8))
-                    Text("What you are taking on")
-                }
-                .font(.caption2)
-            }
-            .buttonStyle(.link)
-            .accessibilityLabel(Text("What you are taking on, \(prompt.points.count) points"))
-
-            if expanded.contains(backend.id) {
-                Text(prompt.summary)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                // Every point, in the daemon's order. The costs are not moved to
-                // the end and not summarised.
-                ForEach(Array(prompt.points.enumerated()), id: \.offset) { _, point in
-                    HStack(alignment: .top, spacing: 4) {
-                        Text("·")
-                        Text(point)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                }
-            }
-        } else {
-            Text("not enabled")
-                .font(.caption)
-                .foregroundStyle(.orange)
-            // The daemon's own field, verbatim. Composing one here — appending a
-            // flag, substituting a backend name — is how the old pane came to
-            // tell every backend to run `ironwire connect claude`.
-            if let command = service?.connectCommand {
-                Text(command)
-                    .font(.caption2.monospaced())
-                    .textSelection(.enabled)
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -328,8 +278,21 @@ struct MenuContent: View {
         .toggleStyle(.switch)
         .controlSize(.mini)
         .disabled(busy)
+        .help(consentText(prompt))
         .accessibilityLabel(Text("Enable \(service.name)"))
-        .accessibilityHint(Text(prompt.summary))
+        .accessibilityHint(Text(consentText(prompt)))
+    }
+
+    /// Everything the daemon has to say about a subscription, in its order and
+    /// unabridged, as one string.
+    ///
+    /// Carried rather than drawn: it is the switch's tooltip and its VoiceOver
+    /// hint, and it appears nowhere on the row. Paragraphs per backend is what
+    /// made this pane unreadable, and a switch that is off already says it is
+    /// off. `docs/TRUST.md` §2 records what that trade costs — the CLI is the
+    /// gate that renders the whole question and waits for an answer.
+    private func consentText(_ prompt: ConsentPromptView) -> String {
+        ([prompt.summary] + prompt.points.map { "· \($0)" }).joined(separator: "\n")
     }
 
     private func setConsent(_ service: ServiceView, granted: Bool, version: Int) {
@@ -426,69 +389,61 @@ struct MenuContent: View {
     /// Only tools that are actually here are listed. The daemon reports the
     /// others so a client *can* say "never heard of it", but a dropdown listing
     /// editors you do not have is noise.
+    ///
+    /// One line, and the list behind it. The whole question is answered by the
+    /// label — the names of the agents whose traffic arrives here, or the fact
+    /// that there are none — and the switches are for the two occasions anyone
+    /// wants them: turning one off, and turning on an agent installed after the
+    /// launch that offered to do it. Every tool having its own row and its own
+    /// caption was five lines to say what this says in one.
     @ViewBuilder
     private func toolsSection() -> some View {
         let tools = (client.settings?.tools ?? []).filter(\.installed)
         if !tools.isEmpty {
             section("Tools") {
-                ForEach(tools) { tool in
-                    VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 6) {
-                            Text(tool.name).font(.caption)
-                            Spacer()
-                            Toggle("", isOn: Binding(
-                                get: { tool.wired },
-                                set: { wanted in setTool(tool, connect: wanted) }
-                            ))
-                            .labelsHidden()
-                            .toggleStyle(.switch)
-                            .controlSize(.mini)
-                            .disabled(busy)
-                            .accessibilityLabel(Text("Route \(tool.name) through IronWire"))
-                            .accessibilityHint(Text(tool.configPath ?? tool.connectCommand))
-                        }
-                        if !tool.wired {
-                            Text("not routed here")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                        // What the last edit did, and to which file. This is
-                        // the one write that changes something outside
-                        // `$IRONWIRE_HOME`, and every other surface in this
-                        // product names the file before touching it.
-                        if let report = toolReports[tool.id] {
-                            ForEach(Array(report.enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
+                Menu(routedSummary(tools)) {
+                    // A checkmark each, which is what a menu uses to say "on".
+                    ForEach(tools) { tool in
+                        Toggle(tool.name, isOn: Binding(
+                            get: { tool.wired },
+                            set: { wanted in setTool(tool, connect: wanted) }
+                        ))
+                        .help(tool.configPath ?? tool.connectCommand)
                     }
-                    .help(tool.configPath ?? "")
                 }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(busy)
+                .accessibilityLabel(Text("Tools routed through IronWire"))
             }
         }
     }
 
-    /// Wire a tool, and keep what the daemon said it did.
+    /// Which agents actually send their traffic here, as the label of the menu
+    /// that changes it. Names rather than a count: "Claude Code" is the answer
+    /// to "is anything routing", and "2 of 3" is not.
+    private func routedSummary(_ tools: [ToolView]) -> String {
+        let wired = tools.filter(\.wired).map(\.name)
+        return wired.isEmpty ? "none routed here" : wired.joined(separator: ", ")
+    }
+
+    /// Wire a tool, or take it back off.
     ///
-    /// The report is shown rather than discarded because a slot the user was
-    /// already using is left alone — a switch that flicks back with no
-    /// explanation is the worst version of that, and the daemon has the
-    /// sentence that explains it.
+    /// The one write in this app that changes a file outside `$IRONWIRE_HOME`,
+    /// and the checkmark is not always the whole story: a slot the user was
+    /// already using is left alone, so the tool can come back wired with part of
+    /// its config still pointing somewhere else. That is the one outcome a
+    /// checkmark cannot express, so it is the one that gets a sentence.
     private func setTool(_ tool: ToolView, connect: Bool) {
         busy = true
         Task {
             settingsError = nil
+            settingsWarning = nil
             switch await client.setTool(id: tool.id, connect: connect) {
             case .success(let outcome):
-                var lines = outcome.changes
-                lines.append(contentsOf: outcome.occupied)
-                if let path = outcome.path, !lines.isEmpty {
-                    lines.append(path)
-                }
-                toolReports[tool.id] = lines
+                settingsWarning = outcome.occupied.isEmpty
+                    ? nil
+                    : outcome.occupied.joined(separator: "; ")
             case .failure(let failure):
                 settingsError = failure.message
             }
@@ -819,50 +774,62 @@ struct MenuContent: View {
 
     // MARK: - Footer
 
+    /// Settings and the way out, as menu items.
+    ///
+    /// Every menu bar app on the machine ends this way — a couple of checkmarked
+    /// preferences and Quit, all the same shape, none of them blue. A row of
+    /// link-styled buttons was neither a menu nor a toolbar.
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle("Notify on family changes and failures", isOn: $notifier.enabled)
-                .font(.caption)
-                .toggleStyle(.checkbox)
-
-            Toggle("Open at login", isOn: Binding(
-                get: { loginItem.isOn },
-                set: { loginItem.set($0) }
-            ))
-            .font(.caption)
-            .toggleStyle(.checkbox)
+        VStack(alignment: .leading, spacing: 0) {
+            MenuRow { notifier.enabled.toggle() } label: {
+                checked("Notify on family changes and failures", on: notifier.enabled)
+            }
+            MenuRow { loginItem.set(!loginItem.isOn) } label: {
+                checked("Open at login", on: loginItem.isOn)
+            }
+            // The one caption down here, and only for the states that are
+            // neither on nor off: a login item awaiting approval in System
+            // Settings, or one that could not be registered at all.
             if let detail = loginItem.detail {
                 Text(detail)
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 26)
+                    .padding(.bottom, 4)
             }
-
-            HStack(spacing: 12) {
-                if let status = client.status {
-                    Button("Copy control URL") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(
-                            "http://127.0.0.1:\(status.port)", forType: .string
-                        )
-                    }
+            // Only offered when there is something to open. A menu item that
+            // opens nothing is worse than one that is absent — a foreground
+            // `ironwire serve` logs to its own terminal and has no file.
+            if let log = Discovery.brewLog() {
+                MenuRow { NSWorkspace.shared.open(log) } label: {
+                    labelled("Open log")
                 }
-                // Only offered when there is something to open. A menu item that
-                // opens nothing is worse than one that is absent — a foreground
-                // `ironwire serve` logs to its own terminal and has no file.
-                if let log = Discovery.brewLog() {
-                    Button("Open log") { NSWorkspace.shared.open(log) }
-                } else {
-                    Button("Reveal ~/.ironwire") {
-                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: Discovery.home().path)
-                    }
-                }
-                Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
             }
-            .font(.caption)
-            .buttonStyle(.link)
+            MenuRow { NSApp.terminate(nil) } label: {
+                labelled("Quit IronWire")
+            }
+            .keyboardShortcut("q")
         }
-        .padding(12)
+        .padding(6)
+    }
+
+    /// A menu item's label, indented past the checkmark gutter so the whole
+    /// footer reads down one edge.
+    private func labelled(_ title: String) -> some View {
+        checked(title, on: false)
+    }
+
+    private func checked(_ title: String, on: Bool) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark")
+                .font(.caption.weight(.semibold))
+                .opacity(on ? 1 : 0)
+                .frame(width: 12)
+            Text(title)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(on ? [.isSelected] : [])
     }
 
     // MARK: - Chrome
@@ -877,5 +844,42 @@ struct MenuContent: View {
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A row that behaves like a menu item.
+///
+/// `MenuBarExtra(.window)` draws a panel, not a menu — the style is what lets a
+/// capacity bar be absent, see `IronWireApp.swift` — so there are no real menu
+/// items in here and the affordance has to be built: full width, left aligned,
+/// highlighted under the pointer, and the same shape whether it toggles
+/// something or quits.
+private struct MenuRow<Label: View>: View {
+    private let action: () -> Void
+    private let label: Label
+    @State private var hovering = false
+
+    init(action: @escaping () -> Void, @ViewBuilder label: () -> Label) {
+        self.action = action
+        self.label = label()
+    }
+
+    var body: some View {
+        Button(action: action) {
+            label
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                // Without this the row only responds where the text is, which
+                // is not how any other menu on the machine behaves.
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(hovering ? Color.accentColor.opacity(0.25) : .clear)
+        )
+        .onHover { hovering = $0 }
     }
 }

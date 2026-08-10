@@ -95,30 +95,33 @@ capacity the backend is reporting. There is no separate settings pane, because
 "why is nothing routing here" and "turn this on" are the same question.
 
 What it keeps: the daemon's wording, whole. The summary and every point are
-reachable from **"What you are taking on"**, one click directly above the
-switch, in the daemon's order and unabridged — never reworded, never
-summarised, never reordered so the cost reads last. Flipping the switch sends
-the answer with the `prompt_version` the daemon served, so an answer can still
-be checked against the question it answered. The app never hardcodes that
-number: at `CONSENT_PROMPT_VERSION` 2 it records 2. A prompt that arrives
-incomplete produces no switch at all.
+carried on the switch itself — its tooltip and its VoiceOver hint — in the
+daemon's order and unabridged, never reworded, never summarised, never reordered
+so the cost reads last. Flipping the switch sends the answer with the
+`prompt_version` the daemon served, so an answer can still be checked against
+the question it answered. The app never hardcodes that number: at
+`CONSENT_PROMPT_VERSION` 2 it records 2. A prompt that arrives incomplete
+produces no switch at all.
 
 **What it gives up, stated plainly.** A user can enable a subscription without
 having read a word of the prompt. The CLI renders the whole question and waits
-for an answer; this renders a switch, a one-line invitation, and a disclosure
-control. That is a weaker reading of I6 than the CLI's, and weaker than this
-app's own first version, which drew the summary sentence unconditionally beside
-the switch. It was removed because a menu bar dropdown is read at a glance and
-two paragraphs per backend is what nobody reads at all.
+for an answer; this renders a switch, and the question is a hover away. That is
+a weaker reading of I6 than the CLI's, and weaker than the two versions of this
+app that came before it — the first drew the summary beside the switch, the
+second put it behind a **"What you are taking on"** disclosure with a line of
+orange text above it. Both are gone for the same reason, one step apart: a menu
+bar dropdown is read at a glance, and a paragraph per backend is what nobody
+reads at all. What remains is a control that says its own state and nothing
+that repeats it.
 
 So the honest statement of the GUI's guarantee is narrower than §2's opening
 claim that the risk "must be presented before the first request": in the app it
-is *offered* before the first request, one click away, and recorded with its
-version either way. If that trade ever looks wrong, the fix is to put the
-summary back on the row — it is four lines of `invitation(_:service:prompt:switchable:)`
-in `MenuContent.swift`, pinned by
-`test_the_consent_text_is_not_drawn_until_it_is_expanded`. The CLI's flow is
-unchanged and remains the stronger gate.
+is *available* before the first request, and recorded with its version either
+way. If that trade ever looks wrong, the fix is to draw `consentText(_:)` on the
+row instead of passing it to `.help` — it is one line of `consentSwitch(_:prompt:)`
+in `MenuContent.swift`, pinned by `test_the_consent_text_is_never_drawn_on_the_row`
+and `test_a_row_with_a_switch_does_not_repeat_what_the_switch_says`. The CLI's
+flow is unchanged and remains the stronger gate.
 
 `ConsentPromptView.isComplete` gates the switch: a prompt that arrived without
 its summary or points produces no toggle at all, only the CLI command. A switch

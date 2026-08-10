@@ -356,22 +356,17 @@ public final class ControlClient: ObservableObject {
 
     // MARK: - Tools
 
-    /// What wiring a tool actually did.
+    /// What wiring a tool did *not* do.
     ///
-    /// Carried back rather than swallowed because this is the one write that
-    /// changes a file outside `$IRONWIRE_HOME`. Every other surface in this
-    /// product names the file before touching it; a GUI that silently edited
-    /// someone's agent config would be the exception, and there is no reason
-    /// for it to be one.
+    /// The rest of the daemon's report — the file, the keys it set, where it
+    /// put the backup — is the file the menu already names in the tool's
+    /// tooltip, said again. This is the part that is not on screen anywhere: a
+    /// slot the user was already using is left alone, so a tool can come back
+    /// checked with part of its config still pointing somewhere else, and
+    /// nothing but a sentence can say that.
     public struct ToolOutcome: Sendable, Equatable {
-        /// The file that changed.
-        public let path: String?
-        /// What changed in it.
-        public let changes: [String]
         /// Slots left alone because the user was already using them.
         public let occupied: [String]
-        /// Where the previous contents were saved, when there were any.
-        public let backup: String?
     }
 
     /// Point a coding agent at IronWire, or take it back off.
@@ -392,14 +387,11 @@ public final class ControlClient: ObservableObject {
             await refreshSettings()
             return .success(
                 ToolOutcome(
-                    path: body?["path"] as? String,
-                    changes: body?["changes"] as? [String] ?? [],
                     occupied: ((body?["occupied"] as? [[String: Any]]) ?? []).map { entry in
                         let slot = entry["slot"] as? String ?? "a setting"
                         let current = entry["current"] as? String ?? "a value of your own"
                         return "\(slot) is already `\(current)`, so IronWire left it"
-                    },
-                    backup: body?["backup"] as? String))
+                    }))
         case .unauthorised:
             connection = .unauthorised
             return .failure(PinError(message: "the control token was rejected"))
