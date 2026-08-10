@@ -11,6 +11,7 @@ pub mod pipeline;
 pub mod privacy;
 pub mod resilience;
 pub mod server;
+pub mod shutdown;
 pub mod spend;
 pub mod state;
 

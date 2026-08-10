@@ -240,8 +240,51 @@ step "9. Service management"
 says "service status names the mechanism" "Service manager" "$bin" service status
 
 step "10. Shutting down"
+# With a client holding the event stream open, which is the ordinary state:
+# `ironwire watch` in a second terminal, or the menu bar app for the length of
+# a login session. `/_ironwire/events` never ends on its own, so a graceful
+# shutdown that waits for it waits forever — `systemctl --user stop`, `brew
+# services restart` and a plain `kill` all used to hang for as long as anybody
+# had a client open. The watchdog is how "hung" is told from "slow": if the
+# daemon is still there after ten seconds, it is not going to leave.
+"$bin" watch --port "$port" >"$work/watch.out" 2>&1 &
+watcher=$!
+sleep 1
+
+# Asked of `ps` rather than `wait`, and Z counts as gone: nothing has reaped
+# the daemon yet, so a zombie is a process that has exited and a `kill -0`
+# would still say it is there.
+gone() {
+    local state
+    state=$(ps -p "$1" -o state= 2>/dev/null | tr -d ' ')
+    [ -z "$state" ] || [ "${state#Z}" != "$state" ]
+}
+
 kill "$daemon_pid" 2>/dev/null
+hung=1
+for _ in $(seq 1 20); do
+    if gone "$daemon_pid"; then hung=0; break; fi
+    sleep 0.5
+done
+# A daemon that ignored SIGTERM will ignore it for the rest of the run, and
+# `wait` on it would hang this script rather than report the failure it just
+# found.
+[ "$hung" -eq 1 ] && kill -9 "$daemon_pid" 2>/dev/null
 wait "$daemon_pid" 2>/dev/null
+wait "$watcher" 2>/dev/null
+
+if [ "$hung" -eq 1 ]; then
+    bad "a client on the event stream does not hold the daemon open" \
+        "the daemon was still running ten seconds after SIGTERM"
+else
+    ok "a client on the event stream does not hold the daemon open"
+fi
+# And the client is told, rather than left looking at a socket that died.
+if grep -q "closed the stream" "$work/watch.out"; then
+    ok "watch says the daemon closed the stream"
+else
+    bad "watch says the daemon closed the stream" "$(cat "$work/watch.out")"
+fi
 daemon_pid=""
 out=$("$bin" status --port "$port" 2>&1)
 if grep -q "not running" <<<"$out"; then

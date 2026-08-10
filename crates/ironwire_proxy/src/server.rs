@@ -63,6 +63,12 @@ pub async fn bind(port: u16) -> Result<tokio::net::TcpListener, ServeError> {
 
 /// Serve on an already-bound listener until `shutdown` resolves.
 ///
+/// Draining is the point of the graceful part: a streamed model response
+/// mid-turn is the outage this product exists to prevent, so an in-flight
+/// request gets to finish. The one response that would never finish is the
+/// event stream, which is held open by design — so the handlers are told
+/// first, and they end it themselves (`crate::shutdown`).
+///
 /// # Errors
 ///
 /// [`ServeError::Io`] when the server fails.
@@ -73,8 +79,12 @@ pub async fn serve_on(
 ) -> Result<(), ServeError> {
     let port = listener.local_addr().map_or(0, |addr| addr.port());
     tracing::info!(port, "IronWire listening");
+    let closing = state.shutdown.clone();
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            closing.begin();
+        })
         .await
         .map_err(|source| ServeError::Io { port, source })
 }
@@ -122,6 +132,69 @@ mod tests {
         assert!(
             addr.ip().is_loopback(),
             "IronWire bound {addr}, which is not loopback"
+        );
+    }
+
+    /// The bug a menu bar app made routine: `/_ironwire/events` is held open
+    /// for the life of a client, so a graceful shutdown that waits for it waits
+    /// forever. `systemctl --user stop`, `brew services restart` and a plain
+    /// `kill` all hung for as long as anybody had a client open.
+    ///
+    /// Over a real socket rather than `oneshot`, because the thing under test
+    /// is the draining behaviour of the server and not the handler — a
+    /// `oneshot` call never has a connection for `axum` to wait on.
+    #[tokio::test]
+    async fn a_held_open_event_stream_does_not_outlive_the_daemon() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = bind(0).await.expect("binds");
+        let port = listener.local_addr().expect("local addr").port();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_on(listener, state(), async move {
+            let _ = stopped.await;
+        }));
+
+        // Hold the stream open the way the menu bar app does, and read the
+        // framing so the connection is established before anything stops.
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connects");
+        client
+            .write_all(
+                b"GET /_ironwire/events HTTP/1.1\r\n\
+                  host: 127.0.0.1\r\n\
+                  authorization: Bearer test-token\r\n\r\n",
+            )
+            .await
+            .expect("writes the request");
+        let mut head = [0_u8; 12];
+        client
+            .read_exact(&mut head)
+            .await
+            .expect("reads a response");
+        assert!(
+            String::from_utf8_lossy(&head).contains("200"),
+            "the event stream did not open: {}",
+            String::from_utf8_lossy(&head)
+        );
+
+        stop.send(()).expect("the server is still running");
+
+        let served = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the daemon is still waiting for a stream that never ends")
+            .expect("the server task panicked");
+        assert!(served.is_ok(), "serving failed: {served:?}");
+
+        // And the client is told why, rather than finding a dead socket.
+        let mut rest = String::new();
+        client
+            .read_to_string(&mut rest)
+            .await
+            .expect("reads the rest of the stream");
+        assert!(
+            rest.contains(": closing"),
+            "the stream ended without saying the daemon was closing: {rest:?}"
         );
     }
 

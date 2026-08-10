@@ -890,12 +890,19 @@ async fn health() -> Response {
 /// response stream itself, and injecting there would put words in the model's
 /// mouth — so this side channel is how a user finds out that their family
 /// changed (`crate::events`).
+///
+/// This is the one response in the daemon with no end of its own: a client
+/// holds it for as long as it likes, and a quiet system sends nothing down it
+/// for hours. So it is also the one that has to watch for the daemon stopping
+/// and close itself, or graceful shutdown waits for it forever
+/// (`crate::shutdown`).
 async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
 
     let mut rx = state.events.subscribe();
+    let closing = state.shutdown.clone();
     let stream = async_stream::stream! {
         // A comment frame immediately, so a client knows it is connected before
         // anything has happened — otherwise `ironwire watch` looks hung on a
@@ -904,20 +911,34 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
             axum::body::Bytes::from_static(b": connected\n\n"),
         );
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let payload = serde_json::to_string(&event)
-                        .unwrap_or_else(|_| "{}".to_string());
-                    yield Ok(axum::body::Bytes::from(format!("data: {payload}\n\n")));
+            tokio::select! {
+                // Biased, so a shutdown announced in the same breath as an
+                // event wins the race: the frame would be written into a
+                // connection that is about to go, and leaving is the news.
+                biased;
+                () = closing.begins() => {
+                    // Framing, like `: connected` — both clients read comment
+                    // frames as framing, and this one tells them the stream
+                    // ended because the daemon stopped rather than because the
+                    // connection broke.
+                    yield Ok(axum::body::Bytes::from_static(b": closing\n\n"));
+                    break;
                 }
-                // The bus is lossy on purpose: a subscriber that fell behind is
-                // told so rather than silently shown a gap.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    yield Ok(axum::body::Bytes::from(format!(
-                        ": lagged {n}\n\n"
-                    )));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                received = rx.recv() => match received {
+                    Ok(event) => {
+                        let payload = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(axum::body::Bytes::from(format!("data: {payload}\n\n")));
+                    }
+                    // The bus is lossy on purpose: a subscriber that fell behind is
+                    // told so rather than silently shown a gap.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        yield Ok(axum::body::Bytes::from(format!(
+                            ": lagged {n}\n\n"
+                        )));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     };

@@ -16,6 +16,7 @@ use ironwire_usage::UsageReport;
 
 use crate::events::EventBus;
 use crate::privacy::PrivacyFilter;
+use crate::shutdown::Shutdown;
 
 /// Take a lock, recovering from poisoning.
 ///
@@ -205,6 +206,11 @@ pub struct AppState {
     /// Route and health events, for `ironwire watch` and the menu bar app.
     /// Lossy and non-blocking by construction (`crate::events`).
     pub events: EventBus,
+    /// Announced when the daemon starts stopping, so a handler holding a
+    /// response open forever can end it (`crate::shutdown`). The event stream
+    /// is the only one that needs it, and without it graceful shutdown waits
+    /// for a connection that by design never closes.
+    pub shutdown: Shutdown,
     /// The optional privacy filter. `None` unless the user turned it on and
     /// configured something for it to match (`docs/PRIVACY.md`).
     ///
@@ -296,6 +302,7 @@ impl AppState {
             update: Arc::new(Mutex::new(UpdateStatus::Unknown)),
             breakers: Arc::new(BreakerBoard::default()),
             events: EventBus::new(),
+            shutdown: Shutdown::new(),
             privacy: Arc::new(Mutex::new(
                 PrivacyFilter::from_config(&config.privacy).map(Arc::new),
             )),
