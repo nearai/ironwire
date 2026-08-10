@@ -132,6 +132,22 @@ pub struct CaptureConfig {
     /// `0` disables pruning — an explicit choice someone can make, not the
     /// default, and not the accident it currently is.
     pub retain_days: u32,
+    /// Ask cross-family backends for per-token log-probabilities, recording
+    /// this many alternatives per token. `0` — the default — does not ask.
+    ///
+    /// Off by default for three separate reasons, any one of which would be
+    /// enough. It changes what the provider is asked to produce, so a captured
+    /// exchange is not comparable to an uncaptured one. It inflates every
+    /// streamed response materially, which on an agent loop is per-turn cost
+    /// rather than a one-off. And the distributions are conditioned on the
+    /// whole context, which makes them more sensitive than the text they
+    /// describe — see `docs/PRIVACY.md` §8, and note this only holds together
+    /// at all because substitution happens *before* the request goes out.
+    ///
+    /// Cross-family only. The native lane's byte-identity claim
+    /// (`docs/PROTOCOL.md` §2) is untouched by this setting, and a request that
+    /// is not translated is never modified to carry it.
+    pub logprobs: u8,
 }
 
 impl Default for CaptureConfig {
@@ -140,6 +156,7 @@ impl Default for CaptureConfig {
             enabled: true,
             bodies: false,
             retain_days: 90,
+            logprobs: 0,
         }
     }
 }
@@ -1251,6 +1268,7 @@ mod tests {
                 enabled: true,
                 bodies: true,
                 retain_days: 30,
+                logprobs: 5,
             },
             usage: UsageConfig {
                 enabled: true,

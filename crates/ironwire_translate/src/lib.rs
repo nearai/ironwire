@@ -22,6 +22,8 @@ pub mod response;
 pub mod stream;
 pub mod tool_ids;
 
-pub use request::{Dropped, anthropic_to_chat_completions};
+pub use request::{
+    Dropped, MAX_TOP_LOGPROBS, anthropic_to_chat_completions, anthropic_to_chat_completions_with,
+};
 pub use response::chat_completion_to_anthropic;
 pub use stream::ChatToAnthropicStream;

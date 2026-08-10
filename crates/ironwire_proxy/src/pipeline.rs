@@ -336,7 +336,7 @@ async fn dispatch_inner(
 
         attempts += 1;
         let request = if decision.translated {
-            match translate_request(&body, path, &decision, peek) {
+            match translate_request(&body, path, &decision, peek, state.config.capture.logprobs) {
                 Ok(request) => request,
                 Err(reason) => {
                     // Refusing beats sending a body the target cannot parse.
@@ -513,6 +513,7 @@ fn translate_request(
     path: &str,
     decision: &RouteDecision,
     peek: &RequestPeek,
+    top_logprobs: u8,
 ) -> Result<UpstreamRequest, String> {
     if !path.ends_with("/v1/messages") {
         return Err(format!("{path} has no cross-family equivalent"));
@@ -525,8 +526,14 @@ fn translate_request(
         .or(peek.requested_model.as_deref())
         .unwrap_or("default");
 
-    let (translated, dropped) =
-        ironwire_translate::anthropic_to_chat_completions(&parsed, model, peek.stream);
+    // Only reachable here, on the path that already rebuilds the body. A
+    // native-lane request is never modified to carry this.
+    let (translated, dropped) = ironwire_translate::anthropic_to_chat_completions_with(
+        &parsed,
+        model,
+        peek.stream,
+        top_logprobs,
+    );
     // A block type this build does not model makes the whole cross-family
     // route ineligible. We cannot tell whether it was load-bearing — a
     // `document` the user asked a question about looks exactly like one that

@@ -414,6 +414,52 @@ naturally captures the signal that matters: *model proposed X → tool returned 
 error → model repaired it with Y → next call succeeded.* A later opt-in hooks
 plugin can add `git diff`, test results and human acceptance to close the loop.
 
+### `capture.logprobs` — per-token distributions, cross-family only
+
+`capture.logprobs = <k>` asks a Chat Completions backend for the top *k*
+alternatives per generated token. `0`, the default, does not ask.
+
+The point is a signal the transcript does not carry: *where the model was
+uncertain*. A trace's value is not that it is unlike the others; it is that a
+human's judgement resolved something the model was unsure about, and entropy at
+a decision point is the only thing here that localises that.
+
+**Cross-family only, and that is a design constraint rather than a limitation
+of the implementation.** Rule 1 says the native lane forwards bytes;
+`docs/PROTOCOL.md` §2 enumerates the mutations and `tests/passthrough.rs` pins
+them. Asking for logprobs is a body mutation, so it happens only in
+`anthropic_to_chat_completions_with`, on the path that already builds a fresh
+body. A request that is not translated is never modified to carry it, at any
+setting.
+
+Three reasons it is off by default, any one sufficient:
+
+- It changes what the provider is asked to produce, so a captured exchange is
+  **not comparable** to an uncaptured one. The same non-comparability the
+  privacy filter records per exchange (`docs/PRIVACY.md` §3) applies here.
+- It inflates every streamed response materially — on an agent loop that is
+  per-turn bandwidth and storage, not a one-off.
+- The distributions are conditioned on the whole context, which makes them more
+  sensitive than the text they describe.
+
+That last point is worth stating precisely, because it is the one place where
+this feature and the privacy filter interact and the interaction is favourable.
+Logprobs describe whatever the provider actually saw. Because substitution
+happens on the way **out**, before the request is sent, an upstream running
+under the filter generates conditioned on placeholders — so the distributions
+describe the substituted text, and there was never an unsubstituted generation
+to leak. Redaction applied *after* generation could not make that claim: it
+cannot scrub numbers produced before it ran. This is the right order, and it is
+the only reason capturing distributions is coherent with the filter at all. It
+is bounded by the filter's false-negative rate, which `docs/PRIVACY.md` §7 is
+explicit cannot be measured on real user data — so this reduces the exposure
+rather than removing it, and no interface may say otherwise.
+
+Not built yet: nothing reads the distributions. They are requested and land in
+the response the ledger already observes. A consumer is a separate decision,
+and deliberately so — capture with no audience is how a number nobody checks
+stays wrong.
+
 ---
 
 ## 9. Failure semantics

@@ -45,11 +45,38 @@ impl Dropped {
     }
 }
 
+/// Upper bound the OpenAI-shaped API places on `top_logprobs`.
+pub const MAX_TOP_LOGPROBS: u8 = 20;
+
 /// Translate an Anthropic Messages request body into a Chat Completions body.
 ///
 /// `model` replaces the client's model string; the caller has already chosen it.
 #[must_use]
 pub fn anthropic_to_chat_completions(body: &Value, model: &str, stream: bool) -> (Value, Dropped) {
+    anthropic_to_chat_completions_with(body, model, stream, 0)
+}
+
+/// As [`anthropic_to_chat_completions`], additionally asking the backend for
+/// per-token log-probabilities.
+///
+/// `top_logprobs` is the number of alternatives wanted per token; `0` means do
+/// not ask, and values above [`MAX_TOP_LOGPROBS`] are clamped rather than
+/// rejected so a misconfiguration degrades to a working request.
+///
+/// This is only reachable on the **cross-family** path, which already builds a
+/// new body from scratch. The native lane makes a byte-identity claim
+/// (`docs/PROTOCOL.md` §2, `tests/passthrough.rs`) and nothing here touches it.
+///
+/// Asking for logprobs changes what the provider is asked to produce, so an
+/// exchange captured this way is not comparable to one that was not — the same
+/// property the privacy filter records per exchange (`docs/PRIVACY.md` §3).
+#[must_use]
+pub fn anthropic_to_chat_completions_with(
+    body: &Value,
+    model: &str,
+    stream: bool,
+    top_logprobs: u8,
+) -> (Value, Dropped) {
     let mut dropped = Dropped::default();
     let mut messages: Vec<Value> = Vec::new();
 
@@ -83,6 +110,13 @@ pub fn anthropic_to_chat_completions(body: &Value, model: &str, stream: bool) ->
     }
     if let Some(temperature) = body.get("temperature") {
         request.insert("temperature".into(), temperature.clone());
+    }
+    if top_logprobs > 0 {
+        request.insert("logprobs".into(), json!(true));
+        request.insert(
+            "top_logprobs".into(),
+            json!(top_logprobs.min(MAX_TOP_LOGPROBS)),
+        );
     }
 
     if let Some(tools) = body.get("tools").and_then(Value::as_array)
@@ -261,6 +295,61 @@ fn translate_tool_choice(choice: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- logprob capture ------------------------------------------------------
+
+    /// The three-argument entry point is what every existing caller uses, and
+    /// it must keep producing exactly the body it produces today. Capture is a
+    /// change to what we ask the provider for; it does not happen by accident.
+    #[test]
+    fn test_no_logprobs_by_default() {
+        let (out, _) = anthropic_to_chat_completions(&claude_code_body(), "near-x", true);
+        assert!(out.get("logprobs").is_none());
+        assert!(out.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn test_zero_top_logprobs_means_off() {
+        let (out, _) = anthropic_to_chat_completions_with(&claude_code_body(), "near-x", true, 0);
+        assert!(out.get("logprobs").is_none());
+        assert!(out.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn test_logprobs_requested_when_configured() {
+        let (out, _) = anthropic_to_chat_completions_with(&claude_code_body(), "near-x", true, 5);
+        assert_eq!(out["logprobs"], json!(true));
+        assert_eq!(out["top_logprobs"], json!(5));
+    }
+
+    /// The OpenAI-shaped API caps `top_logprobs` at 20. A misconfigured value
+    /// should degrade to a working request rather than have the backend reject
+    /// the turn.
+    #[test]
+    fn test_top_logprobs_clamped_to_api_maximum() {
+        let (out, _) = anthropic_to_chat_completions_with(&claude_code_body(), "near-x", true, 200);
+        assert_eq!(out["top_logprobs"], json!(20));
+    }
+
+    /// Capture must not disturb anything else about the translation — it is an
+    /// addition to the request, not a different request.
+    #[test]
+    fn test_logprobs_do_not_perturb_the_rest_of_the_body() {
+        let (plain, _) = anthropic_to_chat_completions(&claude_code_body(), "near-x", true);
+        let (captured, _) =
+            anthropic_to_chat_completions_with(&claude_code_body(), "near-x", true, 5);
+
+        let (plain_obj, mut captured_obj) = (
+            plain.as_object().unwrap().clone(),
+            captured.as_object().unwrap().clone(),
+        );
+        captured_obj.remove("logprobs");
+        captured_obj.remove("top_logprobs");
+        assert_eq!(
+            plain_obj, captured_obj,
+            "enabling capture changed something other than the logprob keys"
+        );
+    }
 
     /// A Claude Code turn with everything the translation has to handle.
     fn claude_code_body() -> Value {
