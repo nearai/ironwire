@@ -79,19 +79,23 @@ The obvious objection is that a remotely-updatable document controlling a
 credential-holding proxy is a supply-chain hole. The design answers it
 structurally rather than with validation:
 
-> **No type in the catalog schema can express a host, a URL, or a filesystem
-> path.**
+> **The catalog may say what to set, never what to set it to.**
 
 Base URLs, credential file locations, and the credential→host binding stay
 compiled into the binary. Whoever holds the signing key can change *which beta
-flag we send*; they cannot change *where we send the token*. `TRUST.md` I2 holds
-even against a compromised signing key.
+flag we send*, and which of *our own* façades a tool is pointed at; they cannot
+change *where we send the token*. `TRUST.md` I2 holds even against a compromised
+signing key.
 
-Validation was the alternative and it is weaker: a check is one refactor away
-from being wrong, while an unrepresentable field stays unrepresentable. A test
-in `ironwire_catalog::schema` walks the serialized document and fails on any
-field name that looks like a location, so adding one is a deliberate act that
-lands in review as a `TRUST.md` change.
+The mechanism is still structural rather than validating. A catalog entry names
+a façade, not an address, so the redirect is unrepresentable rather than
+checked-for. Where a document *does* have to name something — the file a tool
+keeps its config in — the shape is constrained instead: a dotdir under the
+user's home, a `.json` or `.toml` file, `.` and `..` refused, separators outside
+the charset. `ironwire_catalog::schema` has a test per constraint, and the
+original name-walk still runs over the provider constants, which name nothing.
+
+See `TRUST.md` §6 for why the earlier, broader wording was replaced.
 
 ### Rules
 

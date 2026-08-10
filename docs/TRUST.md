@@ -13,7 +13,7 @@ defaults: changing one is a product decision, not a config change.
 | # | Invariant | Enforcement |
 |---|---|---|
 | I1 | **Loopback only.** IronWire binds `127.0.0.1` and has no remote mode, no `--host`, no tunnel helper. | Hardcoded bind address; test asserts the listener is loopback. |
-| I2 | **Credentials never leave the machine.** No credential, refresh token or derived bearer is written to any network destination other than the credential's own issuer. | Egress allowlist keyed by credential; test asserts a credential is only ever attached to its issuer's host. The signed catalog channel **cannot express a host, URL, or path** (§7), so I2 holds even against a compromised signing key. |
+| I2 | **Credentials never leave the machine.** No credential, refresh token or derived bearer is written to any network destination other than the credential's own issuer. | Egress allowlist keyed by credential; test asserts a credential is only ever attached to its issuer's host. The signed catalog channel **may say what to set, never what to set it to** (§6), so I2 holds even against a compromised signing key. |
 | I3 | **No hosted IronWire holds anyone's subscription token.** There is no server-side product that proxies a user's subscription. | Non-goal, stated in DESIGN.md §11. |
 | I4 | **Single user.** No multi-tenant routing, no shared pools, no capacity resale. | No tenancy concept exists in the type system. |
 | I5 | **No identity forgery.** IronWire never synthesizes another product's client identity to unlock a subscription. | See §3. |
@@ -262,12 +262,33 @@ rollback-protected, and fails closed onto the values compiled into the binary.
 The constraint that makes a remotely-updatable document acceptable in a
 credential-holding proxy is structural, not procedural:
 
-> **No type in the catalog schema can express a host, a URL, or a filesystem
-> path.**
+> **The catalog may say what to set, never what to set it to.**
 
 Whoever holds the signing key can change which beta flag we send. They cannot
-change where we send the token. Adding such a field is a change to *this*
-document, not to a schema.
+change where we send the token.
+
+This was originally the stronger-sounding "no type in the schema can express a
+host, a URL, or a filesystem path", enforced by banning field *names* containing
+`url`, `host` or `path`. That was a proxy for the real property, and it had to
+go when the catalog began describing where a tool keeps its config. What
+replaced it is narrower in what it forbids and stricter about what matters:
+
+- **A value for a location is unrepresentable.** A catalog entry points a tool's
+  config key at one of *our* façades by naming it — `anthropic` or `open_ai` —
+  and the scheme, host and port come from the running daemon. There is no
+  variant that carries a string, so "point Claude Code at evil.example" cannot
+  be written down, let alone signed.
+- **A location is constrained, not free.** A tool's config is a dotdir under the
+  user's home plus a `.json` or `.toml` file. `.` and `..` are refused,
+  separators are outside the permitted charset, and the extension requirement is
+  what rules out `~/.ssh/config` and `~/.aws/credentials`. The worst a
+  compromised key achieves is writing the user's own loopback URL into another
+  of their dotfiles.
+- **The provider constants still name nothing**, and the original name-walk test
+  still runs over that part of the document.
+
+Adding a field that carries a value for a location, or widening where a config
+may live, is a change to *this* document, not to a schema.
 
 ---
 
