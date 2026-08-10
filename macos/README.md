@@ -46,14 +46,16 @@ Xcode opens `Package.swift` directly if you would rather work there.
 
 ## What it shows, and what it can change
 
-**Status** is the pane you read at a glance: every backend with its capacity,
-the current route, spend, and a pin control. **Settings** is a separate pane, so
-a consent question never buries what the status pane is trying to say.
+**One pane**, read at a glance: every backend with its capacity, the current
+route, spend, a pin control and the privacy filter. A backend is something you
+turn on and then watch, so the switch that turns it on sits on the backend's own
+row — before consent the row invites you to enable it, after consent it shows
+what the backend is reporting. Splitting those in two put the answer to "why is
+nothing routing here" behind a tab.
 
-From Settings you can change the privacy mode and enable or disable a
-subscription backend. Both take effect immediately — the daemon swaps the filter
-and the routing constraint without a restart — and both are written down, so
-they survive one.
+The privacy mode and each subscription can be changed from that pane. Both take
+effect immediately — the daemon swaps the filter and the routing constraint
+without a restart — and both are written down, so they survive one.
 
 Three things it deliberately will not do:
 
@@ -62,12 +64,13 @@ Three things it deliberately will not do:
   every backend out of service. The daemon reports that, and the option is
   greyed out with its reason beside it, rather than the app working the rule out
   for itself.
-- **Enable a subscription in one click.** `docs/TRUST.md` §2 says a subscription
-  stays off until you answer a specific question in plain language, and that the
-  answer is recorded against the version of the question you were asked. So the
-  app shows the daemon's own wording in full — every point, in its order — and
-  sends back the version that was on screen. There is no abridged version: a
-  shortened consent question is a different question.
+- **Enable a subscription without saying what it costs.** A subscription is a
+  switch, and one flip is the whole action — but the daemon's own summary
+  sentence sits beside that switch, always drawn and never reworded, and the
+  four costs are one expand away in the daemon's order. The answer is sent with
+  the `prompt_version` that was on screen, so it can be checked against the
+  question it answered. `docs/TRUST.md` §2 records what this trades away
+  relative to the CLI's two-step gate, which is unchanged.
 - **Log you in.** A credential comes from you logging into Claude Code or Codex,
   or exporting an API key. A menu cannot conjure one, so a service without a
   credential says so and names the command that would fix it.
@@ -109,8 +112,7 @@ Sources/IronWireKit/           everything decidable without a window
   NotificationPolicy.swift     which events are worth interrupting someone for
 Sources/IronWire/              views and wiring only
   IronWireApp.swift            the MenuBarExtra scene
-  MenuContent.swift            the status pane
-  SettingsContent.swift        the settings pane, including the consent question
+  MenuContent.swift            the pane: backends, consent switches, privacy
   MenuBarIcon.swift            drawing the four icon states
   LoginItem.swift              the "Open at login" toggle, over SMAppService
   Notifications.swift          opt-in UNUserNotificationCenter

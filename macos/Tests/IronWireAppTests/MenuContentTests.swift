@@ -36,13 +36,20 @@ final class MenuContentTests: XCTestCase {
             update: update, lastRoute: lastRoute)
     }
 
-    private func render(_ status: StatusView?, connection: ControlClient.Connection = .connected) -> NSImage? {
+    private func render(
+        _ status: StatusView?, connection: ControlClient.Connection = .connected,
+        settings: SettingsView? = nil
+    ) -> NSImage? {
         let view = MenuContent(
-            client: .fixture(status: status, connection: connection),
+            client: .fixture(status: status, connection: connection, settings: settings),
             notifier: Notifier(), loginItem: LoginItem())
         let renderer = ImageRenderer(content: view)
         renderer.scale = 2
         return renderer.nsImage
+    }
+
+    private func height(_ status: StatusView?, settings: SettingsView? = nil) throws -> CGFloat {
+        try XCTUnwrap(render(status, settings: settings)).size.height
     }
 
     /// The laid-out height of a menu showing one backend in a given state.
@@ -150,6 +157,130 @@ final class MenuContentTests: XCTestCase {
                     lastRoute: LastRouteView(backend: "a", rung: .unrecognised("different_provider")),
                     update: .unrecognised("rollback_required"))))
         XCTAssertGreaterThan(rendered.size.height, 0)
+    }
+
+    // MARK: - Consent, on the backend row
+    //
+    // The switch and the capacity share a row now, so these live here rather
+    // than in a settings pane of their own.
+
+    private func prompt(points: Int = 4, version: Int = 2) -> ConsentPromptView {
+        ConsentPromptView(
+            version: version, backendId: "claude-sub", product: "Claude",
+            summary: "IronWire will read the OAuth token that Claude Code stores on this machine "
+                + "and send requests to api.anthropic.com with it, from this computer only.",
+            points: (0..<points).map { "Point number \($0), which is a whole sentence about a real cost." },
+            question: "Enable the Claude subscription backend?")
+    }
+
+    private func settings(
+        options: [PrivacyOptionView] = [],
+        services: [ServiceView] = []
+    ) -> SettingsView {
+        SettingsView(
+            privacy: PrivacySettingsView(
+                mode: "off", summary: "off", options: options, trustedBackends: []),
+            services: services)
+    }
+
+    private func unconsented(prompt: ConsentPromptView?) -> (StatusView, SettingsView) {
+        (
+            status(backends: [
+                BackendView(id: "claude-sub", name: "Claude subscription", consented: false)
+            ]),
+            settings(services: [
+                ServiceView(
+                    id: "claude-sub", name: "Claude subscription", authenticated: true,
+                    requiresConsent: true, consented: false, consentPrompt: prompt,
+                    connectCommand: "ironwire connect claude")
+            ])
+        )
+    }
+
+    /// The two conditions a switch is gated on, and proof the row lays out with
+    /// one. Asserted as predicates rather than by height: the fallback row for a
+    /// prompt this build could not read is also two lines, so the two cases are
+    /// deliberately the same height and a height comparison would prove nothing.
+    func test_a_switch_is_offered_only_for_a_credential_and_a_readable_question() throws {
+        let service = ServiceView(
+            id: "claude-sub", name: "Claude subscription", authenticated: true,
+            requiresConsent: true, consented: false, consentPrompt: prompt(),
+            connectCommand: "ironwire connect claude")
+        XCTAssertTrue(service.canToggle)
+        XCTAssertTrue(service.consentPrompt?.isComplete == true)
+
+        let (status, settings) = unconsented(prompt: prompt())
+        XCTAssertGreaterThan(try height(status, settings: settings), 0)
+    }
+
+    /// Collapsed, the consent text costs nothing — neither the points nor the
+    /// summary. Checked against a prompt three times as long in both: if any of
+    /// it were being drawn, the longer one would lay out taller.
+    ///
+    /// This is the height half of the trade recorded in `docs/TRUST.md` §2. The
+    /// row is two lines regardless of how much the daemon has to say.
+    func test_the_consent_text_is_not_drawn_until_it_is_expanded() throws {
+        let (shortStatus, shortSettings) = unconsented(prompt: prompt(points: 4))
+        let (longStatus, longSettings) = unconsented(
+            prompt: ConsentPromptView(
+                version: 2, backendId: "claude-sub", product: "Claude",
+                summary: String(repeating: "A very long summary sentence. ", count: 12),
+                points: (0..<12).map { "Point \($0), which is a whole sentence about a real cost." },
+                question: "Enable the Claude subscription backend?"))
+        XCTAssertEqual(
+            try height(shortStatus, settings: shortSettings),
+            try height(longStatus, settings: longSettings),
+            "the collapsed row grows with the consent text, so it is being drawn")
+    }
+
+    /// A credential that was never found is not something a menu can conjure, so
+    /// there is nothing to switch and the row names the command instead.
+    func test_a_backend_with_no_credential_offers_a_command_not_a_switch() throws {
+        let service = ServiceView(
+            id: "claude-sub", name: "Claude subscription", authenticated: false,
+            detail: "no Claude Code login found", requiresConsent: true, consented: false,
+            consentPrompt: prompt(), connectCommand: "ironwire connect claude")
+        XCTAssertFalse(service.canToggle)
+        let rendered = render(
+            status(backends: [
+                BackendView(
+                    id: "claude-sub", name: "Claude subscription", authenticated: false,
+                    consented: false)
+            ]),
+            settings: settings(services: [service]))
+        XCTAssertNotNil(rendered)
+    }
+
+    // MARK: - The privacy ladder
+
+    /// A greyed-out option that does not say why is worse than one that is not
+    /// there. The reason has to occupy space on screen.
+    func test_the_reason_a_mode_is_unavailable_takes_up_room() throws {
+        let base = status(backends: [])
+        let withReason = try height(
+            base,
+            settings: settings(options: [
+                PrivacyOptionView(id: "off", describes: "requests are forwarded unchanged"),
+                PrivacyOptionView(
+                    id: "full", describes: "only trusted backends", selectable: false,
+                    unavailableBecause: "`full` routes only to backends you have named, and none are named."),
+            ]))
+        let withoutReason = try height(
+            base,
+            settings: settings(options: [
+                PrivacyOptionView(id: "off", describes: "requests are forwarded unchanged"),
+                PrivacyOptionView(id: "full", describes: "only trusted backends", selectable: false),
+            ]))
+        XCTAssertGreaterThan(
+            withReason, withoutReason,
+            "the explanation for an unselectable mode is not being drawn")
+    }
+
+    /// With no settings document there is nothing to offer, so the pane falls
+    /// back to the daemon's own words and still lays out.
+    func test_the_privacy_line_falls_back_to_the_daemons_words() throws {
+        XCTAssertGreaterThan(
+            try height(status(backends: [], privacy: "redacting emails and API keys")), 0)
     }
 
     /// Every backend a daemon reported has to be offerable, including ones that

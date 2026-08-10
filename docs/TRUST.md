@@ -86,6 +86,44 @@ The answer is recorded with a timestamp and the exact prompt version in
 running on subscription credentials. `ironwire disconnect claude --subscription`
 revokes it.
 
+#### In the menu bar app
+
+The GUI grants the same consent with a switch rather than a two-step gate, and
+the difference is deliberate. The switch lives **on the backend's own row**:
+before consent that row invites you to enable it, after consent it shows the
+capacity the backend is reporting. There is no separate settings pane, because
+"why is nothing routing here" and "turn this on" are the same question.
+
+What it keeps: the daemon's wording, whole. The summary and every point are
+reachable from **"What you are taking on"**, one click directly above the
+switch, in the daemon's order and unabridged — never reworded, never
+summarised, never reordered so the cost reads last. Flipping the switch sends
+the answer with the `prompt_version` the daemon served, so an answer can still
+be checked against the question it answered. The app never hardcodes that
+number: at `CONSENT_PROMPT_VERSION` 2 it records 2. A prompt that arrives
+incomplete produces no switch at all.
+
+**What it gives up, stated plainly.** A user can enable a subscription without
+having read a word of the prompt. The CLI renders the whole question and waits
+for an answer; this renders a switch, a one-line invitation, and a disclosure
+control. That is a weaker reading of I6 than the CLI's, and weaker than this
+app's own first version, which drew the summary sentence unconditionally beside
+the switch. It was removed because a menu bar dropdown is read at a glance and
+two paragraphs per backend is what nobody reads at all.
+
+So the honest statement of the GUI's guarantee is narrower than §2's opening
+claim that the risk "must be presented before the first request": in the app it
+is *offered* before the first request, one click away, and recorded with its
+version either way. If that trade ever looks wrong, the fix is to put the
+summary back on the row — it is four lines of `invitation(_:service:prompt:switchable:)`
+in `MenuContent.swift`, pinned by
+`test_the_consent_text_is_not_drawn_until_it_is_expanded`. The CLI's flow is
+unchanged and remains the stronger gate.
+
+`ConsentPromptView.isComplete` gates the switch: a prompt that arrived without
+its summary or points produces no toggle at all, only the CLI command. A switch
+is not offered for a question this build could not read.
+
 `ironclaw_llm` emits a `tracing::warn!` at this point. A warning in a log is not
 consent; this is.
 
@@ -181,10 +219,30 @@ engineering cannot fix.
 
 Full design in [`UPDATES.md`](./UPDATES.md); the trust-relevant parts:
 
-**IronWire never updates its own binary.** It is a daemon holding credentials in
-the middle of a streamed response, and a self-update is arbitrary code execution
-as the user with access to their subscription tokens. `ironwire update` reports
-and prints the command that belongs to the user's install; it never acts.
+**The daemon never updates itself.** It holds credentials in the middle of a
+streamed response, and a self-update is arbitrary code execution as the user
+with access to their subscription tokens. `ironwire update` reports and prints
+the command that belongs to the user's install; it never acts.
+
+**The menu bar app may.** It is a separate artifact and a pure client: it holds
+no credentials, carries no traffic, and can be replaced while the daemon keeps
+serving. The mid-stream argument above is about the daemon and does not reach
+it. Two of the three reasons behind notify-only still do, so an app updater is
+bounded by them rather than exempt from them:
+
+- It runs **unsandboxed as the user** (`macos/README.md` explains why), so it can
+  read `~/.claude/.credentials.json` and `$IRONWIRE_HOME/control.token`. A
+  hijacked update channel is therefore still credential access, and the updater
+  must be Developer ID signed, notarised, and its appcast signed with a key held
+  in release infrastructure — not in this repository.
+- If a package manager owns the install, self-updating desyncs it. A Homebrew
+  cask must declare `auto_updates true` so the two do not fight.
+
+**If the app ever carries the daemon binary, the daemon's rule wins.** Bundling
+the two into one artifact means an app update is also a daemon update, and the
+mid-stream argument returns in full. The only acceptable form is the one
+`UPDATES.md` §3 already names: stage the new binary, and swap it when the daemon
+has no in-flight stream — or at next login. Never under a live response.
 
 **The update check is the only request IronWire makes that is not the user's own
 work.** It is bounded accordingly:

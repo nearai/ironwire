@@ -133,9 +133,11 @@ the channel is inert rather than dangerous before it is real.
 
 ## 3. What is deliberately not built
 
-- **Self-update of the binary.** See §1. If it is ever added it belongs to the
-  shell-installer channel only, and needs staged download plus drain-and-exec so
-  no in-flight stream is cut.
+- **Self-update of the daemon binary.** See §1. If it is ever added it belongs to
+  the shell-installer channel only, and needs staged download plus drain-and-exec
+  so no in-flight stream is cut. This applies whether the update arrives from the
+  shell installer or from inside an app bundle that happens to carry the daemon —
+  see `TRUST.md` §6.
 - **Auto-apply at idle.** A reasonable opt-in later. Not a default: a proxy that
   changes its own behaviour unprompted is hard to trust and harder to debug.
 - **A quirks field that names a host or path.** See §2. This is a `TRUST.md`

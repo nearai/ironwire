@@ -1,5 +1,11 @@
 //! The dropdown.
 //
+// One pane. A backend is a thing you turn on and then watch, so the switch that
+// turns it on and the capacity it reports live on the same row: before consent
+// the row invites you to enable it, after consent it shows status. Splitting
+// those into a Status tab and a Settings tab meant the answer to "why is nothing
+// routing here" was behind a segmented control.
+//
 // This mirrors `render::status()` in `src/render.rs`, which is the reference for
 // what is honest to show — and, more usefully, for what not to. Three of its
 // rules are load-bearing here:
@@ -9,9 +15,9 @@
 // - **The privacy line is verbatim.** No shield, no lock, no "protected".
 //   `docs/TRUST.md` I7 forbids describing the filter by what the user is safe
 //   from, and an icon is a description.
-// - **An update is news, never a button.** `docs/UPDATES.md` §1: IronWire holds
-//   credentials in the middle of streamed responses and never updates itself. A
-//   menu bar app is the most tempting place in the product to break that.
+// - **An update is news, never a button.** `docs/UPDATES.md` §1: the daemon
+//   holds credentials in the middle of streamed responses and never updates
+//   itself. A menu bar app is the most tempting place to break that.
 
 import AppKit
 import IronWireKit
@@ -22,16 +28,12 @@ struct MenuContent: View {
     @ObservedObject var notifier: Notifier
     @ObservedObject var loginItem: LoginItem
     @State private var pinError: String?
-    @State private var pane: Pane = .status
-
-    /// The two halves of the menu. Settings is a separate pane rather than more
-    /// rows: the status pane is read at a glance under pressure, and burying
-    /// what it says under a consent question would be the wrong trade.
-    enum Pane: String, CaseIterable, Identifiable {
-        case status = "Status"
-        case settings = "Settings"
-        var id: String { rawValue }
-    }
+    @State private var settingsError: String?
+    @State private var settingsWarning: String?
+    @State private var busy = false
+    /// Backends whose consent costs the user has expanded. Not persisted: a
+    /// reading aid, not a setting.
+    @State private var expanded: Set<String> = []
 
     private var iconState: IconState { IconState.from(client.status) }
 
@@ -39,31 +41,23 @@ struct MenuContent: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if client.status != nil {
-                Picker("", selection: $pane) {
-                    ForEach(Pane.allCases) { Text($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-            }
             if let status = client.status {
                 ScrollView {
-                    switch pane {
-                    case .status:
-                        VStack(alignment: .leading, spacing: 14) {
-                            backendSection(status)
-                            balanceSection(status.balance)
-                            routeSection(status)
-                            pinSection(status)
-                            privacySection(status)
-                            updateSection(status.update)
+                    VStack(alignment: .leading, spacing: 14) {
+                        backendSection(status)
+                        balanceSection(status.balance)
+                        routeSection(status)
+                        pinSection(status)
+                        privacySection(status)
+                        updateSection(status.update)
+                        if let settingsWarning {
+                            Text(settingsWarning).font(.caption).foregroundStyle(.orange)
                         }
-                        .padding(12)
-                    case .settings:
-                        SettingsContent(client: client)
+                        if let settingsError {
+                            Text(settingsError).font(.caption).foregroundStyle(.red)
+                        }
                     }
+                    .padding(12)
                 }
                 .frame(maxHeight: 420)
             } else {
@@ -81,6 +75,9 @@ struct MenuContent: View {
             // The system is the authority on this, and the user can change it in
             // System Settings while we are not looking.
             loginItem.refresh()
+            // The consent prompts and the privacy ladder live here, and this
+            // pane cannot offer either without them.
+            Task { await client.refreshSettings() }
         }
         .onDisappear { client.menuIsOpen = false }
     }
@@ -169,6 +166,13 @@ struct MenuContent: View {
 
     // MARK: - Backends
 
+    /// The settings-side record for a backend, when it has one. The two
+    /// documents are joined here rather than in the daemon because they have
+    /// different refresh rates: status polls, settings is fetched on open.
+    private func service(for id: String) -> ServiceView? {
+        client.settings?.services.first { $0.id == id }
+    }
+
     @ViewBuilder
     private func backendSection(_ status: StatusView) -> some View {
         if status.backends.isEmpty {
@@ -187,23 +191,38 @@ struct MenuContent: View {
     }
 
     private func backendRow(_ backend: BackendView) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let service = service(for: backend.id)
+        let prompt = service?.consentPrompt
+        let switchable = service?.canToggle == true && prompt?.isComplete == true
+
+        return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(backend.name).font(.callout.weight(.medium))
                 Spacer()
-                Text(Format.kind(backend.kind))
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if switchable, let service, let prompt {
+                    consentSwitch(service, prompt: prompt)
+                } else {
+                    Text(Format.kind(backend.kind))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             if !backend.authenticated {
+                // A credential this app cannot conjure. It comes from the user
+                // logging into Claude Code or Codex, or exporting an API key, so
+                // the row names that command rather than offering a login.
                 Text(backend.detail ?? "not connected")
                     .font(.caption)
                     .foregroundStyle(.red)
+                if let command = service?.connectCommand {
+                    Text(command)
+                        .font(.caption2.monospaced())
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
             } else if !backend.consented {
-                Text("awaiting consent — run `ironwire connect claude --subscription`")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                invitation(backend, service: service, prompt: prompt, switchable: switchable)
             } else {
                 capacity(backend.headroom)
                 if let health = Format.healthSummary(backend.health) {
@@ -212,6 +231,109 @@ struct MenuContent: View {
                         .foregroundStyle(backend.health.isOpen ? .red : .orange)
                 }
             }
+        }
+    }
+
+    /// What a backend says before it is enabled.
+    ///
+    /// The switch is on the row above. The row itself stays to two short lines —
+    /// a menu is read at a glance, and paragraphs per backend is what made the
+    /// old pane unreadable — so the daemon's summary and its points both live
+    /// behind **"What you are taking on"**, one click above the switch. Neither
+    /// is ever reworded, reordered, or abridged; what changed is that they are a
+    /// click away rather than always drawn, and `docs/TRUST.md` §2 records what
+    /// that costs. Where there is no usable prompt the row names the command
+    /// instead — a switch is not offered for a question this build could not
+    /// read.
+    @ViewBuilder
+    private func invitation(
+        _ backend: BackendView, service: ServiceView?, prompt: ConsentPromptView?, switchable: Bool
+    ) -> some View {
+        if switchable, let prompt {
+            Text("Not enabled — turn it on to route here.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+
+            Button {
+                if expanded.contains(backend.id) {
+                    expanded.remove(backend.id)
+                } else {
+                    expanded.insert(backend.id)
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: expanded.contains(backend.id) ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8))
+                    Text("What you are taking on")
+                }
+                .font(.caption2)
+            }
+            .buttonStyle(.link)
+            .accessibilityLabel(Text("What you are taking on, \(prompt.points.count) points"))
+
+            if expanded.contains(backend.id) {
+                Text(prompt.summary)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Every point, in the daemon's order. The costs are not moved to
+                // the end and not summarised.
+                ForEach(Array(prompt.points.enumerated()), id: \.offset) { _, point in
+                    HStack(alignment: .top, spacing: 4) {
+                        Text("·")
+                        Text(point)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            Text("not enabled")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            // The daemon's own field, verbatim. Composing one here — appending a
+            // flag, substituting a backend name — is how the old pane came to
+            // tell every backend to run `ironwire connect claude`.
+            if let command = service?.connectCommand {
+                Text(command)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The switch that grants or revokes consent.
+    ///
+    /// One flip is the whole action. The version travels with it — the one that
+    /// was on screen, not the newest this build knows about, because an answer
+    /// belongs to the question it answered.
+    private func consentSwitch(_ service: ServiceView, prompt: ConsentPromptView) -> some View {
+        Toggle("", isOn: Binding(
+            get: { service.consented },
+            set: { wanted in
+                setConsent(service, granted: wanted, version: wanted ? prompt.version : 0)
+            }
+        ))
+        .labelsHidden()
+        .toggleStyle(.switch)
+        .controlSize(.mini)
+        .disabled(busy)
+        .accessibilityLabel(Text("Enable \(service.name)"))
+        .accessibilityHint(Text(prompt.summary))
+    }
+
+    private func setConsent(_ service: ServiceView, granted: Bool, version: Int) {
+        busy = true
+        Task {
+            settingsError = nil
+            let outcome = await client.setConsent(
+                backend: service.id, granted: granted, promptVersion: version)
+            if case .failure(let failure) = outcome {
+                settingsError = failure.message
+            }
+            busy = false
         }
     }
 
@@ -375,17 +497,95 @@ struct MenuContent: View {
 
     // MARK: - Privacy
 
+    /// The filter, as a control when the daemon has told us what is selectable
+    /// and as its own words when it has not.
+    ///
+    /// Either way this says what the filter is *doing*, never what the user is
+    /// safe from: no shield, no lock, no "protected" (`docs/TRUST.md` I7).
     @ViewBuilder
     private func privacySection(_ status: StatusView) -> some View {
-        if let privacy = status.privacy {
+        if let privacy = client.settings?.privacy, !privacy.options.isEmpty {
             section("Privacy filter") {
-                // Verbatim, and only ever verbatim. The daemon says what the
-                // filter is *doing*; anything this app added would be a claim
-                // about what the user is safe from (`docs/TRUST.md` I7).
+                privacyControl(privacy)
+
+                // What each mode substitutes is a tooltip, not a paragraph. A
+                // menu read at a glance cannot afford four lines describing a
+                // setting whose name is already on screen.
+                //
+                // A greyed-out segment cannot carry its reason beside it the way
+                // a list row could, so the reasons go here. These *are* drawn:
+                // an option disabled for unstated reasons is worse than one that
+                // is absent, and it is the only prose in this section.
+                ForEach(privacy.options.filter { !$0.selectable && $0.unavailableBecause != nil }) { option in
+                    Text("\(option.id): \(option.unavailableBecause ?? "")")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        } else if let privacy = status.privacy {
+            section("Privacy filter") {
                 Text(privacy)
                     .font(.caption)
                     .textSelection(.enabled)
             }
+        }
+    }
+
+    /// The ladder as one control.
+    ///
+    /// Hand-rolled rather than a segmented `Picker` because `Picker` cannot
+    /// disable an individual segment, and `full` being unselectable — with its
+    /// reason — is the one thing this control has to get right.
+    private func privacyControl(_ privacy: PrivacySettingsView) -> some View {
+        HStack(spacing: 2) {
+            ForEach(privacy.options) { option in
+                let isCurrent = option.id == privacy.mode
+                Button {
+                    apply(mode: option.id)
+                } label: {
+                    Text(option.id)
+                        .font(.caption2.weight(isCurrent ? .semibold : .regular))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(isCurrent ? Color.accentColor.opacity(0.30) : Color.clear)
+                )
+                .disabled(!option.selectable || busy || isCurrent)
+                .opacity(option.selectable ? 1 : 0.45)
+                .help(option.describes)
+                // Without this the segments are four unlabelled buttons to
+                // VoiceOver, which is how the mode choice becomes unusable.
+                .accessibilityLabel(Text(option.id))
+                .accessibilityHint(Text(option.selectable ? option.describes : (option.unavailableBecause ?? option.describes)))
+                .accessibilityAddTraits(isCurrent ? [.isSelected] : [])
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.secondary.opacity(0.12)))
+    }
+
+    private func apply(mode: String) {
+        busy = true
+        Task {
+            settingsError = nil
+            settingsWarning = nil
+            switch await client.setPrivacyMode(mode) {
+            case .success(let outcome):
+                // Applied, but not saved. Said plainly rather than swallowed:
+                // the user would otherwise find the old mode back after a
+                // restart with no idea why.
+                settingsWarning = outcome.warning
+            case .failure(let failure):
+                settingsError = failure.message
+            }
+            busy = false
         }
     }
 
