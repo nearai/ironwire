@@ -46,10 +46,12 @@ public struct StatusView: Decodable, Sendable, Equatable {
     public let update: UpdateStatus
     /// The most recent route this daemon took.
     public let lastRoute: LastRouteView?
+    /// IronWire's own traffic over its own window. Never a provider's quota.
+    public let usage: UsageView
 
     private enum CodingKeys: String, CodingKey {
         case version, port, trackedConversations, pin, backends, balance
-        case privacy, quirksSerial, update, lastRoute
+        case privacy, quirksSerial, update, lastRoute, usage
     }
 
     public init(from decoder: Decoder) throws {
@@ -64,6 +66,7 @@ public struct StatusView: Decodable, Sendable, Equatable {
         quirksSerial = try c.decodeIfPresent(UInt64.self, forKey: .quirksSerial) ?? 0
         update = try c.decodeIfPresent(UpdateStatus.self, forKey: .update) ?? .unknown
         lastRoute = try c.decodeIfPresent(LastRouteView.self, forKey: .lastRoute)
+        usage = try c.decodeIfPresent(UsageView.self, forKey: .usage) ?? UsageView()
     }
 
     /// Test seam. Nothing in the app constructs one of these — it comes off the
@@ -72,8 +75,9 @@ public struct StatusView: Decodable, Sendable, Equatable {
         version: String, port: Int, trackedConversations: Int = 0, pin: String? = nil,
         backends: [BackendView] = [], balance: BalanceView = BalanceView(),
         privacy: String? = nil, quirksSerial: UInt64 = 0, update: UpdateStatus = .upToDate,
-        lastRoute: LastRouteView? = nil
+        lastRoute: LastRouteView? = nil, usage: UsageView = UsageView()
     ) {
+        self.usage = usage
         self.version = version
         self.port = port
         self.trackedConversations = trackedConversations
@@ -84,6 +88,122 @@ public struct StatusView: Decodable, Sendable, Equatable {
         self.quirksSerial = quirksSerial
         self.update = update
         self.lastRoute = lastRoute
+    }
+}
+
+/// IronWire's own traffic over its own window, from the local ledger.
+///
+/// The distinction this type exists to keep is `AGENTS.md` rule 2's one
+/// apparent exception: everything here measures *what IronWire sent*, and never
+/// claims to know what a provider has left. That is why `usedPct` is only ever
+/// a percentage **of `ceiling`**, and why `ceiling.describes` is rendered
+/// verbatim beside it — a bare percentage with no stated basis is the
+/// fabrication the whole screen avoids.
+public struct UsageView: Decodable, Sendable, Equatable {
+    /// Open windows, one per backend with traffic, busiest first.
+    public let sessions: [SessionUsageView]
+    /// Completed windows the percentile was taken over. Zero means there is no
+    /// history yet, which is why a session may carry no ceiling at all.
+    public let completedSessions: Int
+    /// Length of a window, in hours.
+    public let sessionHours: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case sessions, completedSessions, sessionHours
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessions = try c.decodeIfPresent([SessionUsageView].self, forKey: .sessions) ?? []
+        completedSessions = try c.decodeIfPresent(Int.self, forKey: .completedSessions) ?? 0
+        sessionHours = try c.decodeIfPresent(Int.self, forKey: .sessionHours) ?? 5
+    }
+
+    public init(
+        sessions: [SessionUsageView] = [], completedSessions: Int = 0, sessionHours: Int = 5
+    ) {
+        self.sessions = sessions
+        self.completedSessions = completedSessions
+        self.sessionHours = sessionHours
+    }
+}
+
+/// One backend's open window.
+public struct SessionUsageView: Decodable, Sendable, Equatable, Identifiable {
+    /// Backend id. Also the identity — one open window per backend.
+    public let backend: String
+    /// Minutes until the window closes.
+    public let remainingMinutes: Double
+    /// Exchanges in it.
+    public let exchanges: Int
+    /// Percent of `ceiling` consumed. `nil` without a ceiling, and rendered as
+    /// nothing rather than as zero.
+    public let usedPct: Double?
+    /// Minutes until the ceiling is reached at the current rate. `nil` when
+    /// there is no ceiling, no rate, or nothing left of it.
+    public let exhaustsInMinutes: Double?
+    /// What the percentage is measured against, when there is one.
+    public let ceiling: CeilingView?
+
+    public var id: String { backend }
+
+    private enum CodingKeys: String, CodingKey {
+        case backend, remainingMinutes, exchanges, usedPct, exhaustsInMinutes, ceiling
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? ""
+        remainingMinutes = try c.decodeIfPresent(Double.self, forKey: .remainingMinutes) ?? 0
+        exchanges = try c.decodeIfPresent(Int.self, forKey: .exchanges) ?? 0
+        usedPct = try c.decodeIfPresent(Double.self, forKey: .usedPct)
+        exhaustsInMinutes = try c.decodeIfPresent(Double.self, forKey: .exhaustsInMinutes)
+        ceiling = try c.decodeIfPresent(CeilingView.self, forKey: .ceiling)
+    }
+
+    public init(
+        backend: String, remainingMinutes: Double = 0, exchanges: Int = 0,
+        usedPct: Double? = nil, exhaustsInMinutes: Double? = nil, ceiling: CeilingView? = nil
+    ) {
+        self.backend = backend
+        self.remainingMinutes = remainingMinutes
+        self.exchanges = exchanges
+        self.usedPct = usedPct
+        self.exhaustsInMinutes = exhaustsInMinutes
+        self.ceiling = ceiling
+    }
+
+    /// Whether the ceiling arrives before the window closes — the one question
+    /// this section exists to answer. Mirrors `SessionUsage::exhausts_before_close`.
+    public var exhaustsBeforeClose: Bool {
+        guard let minutes = exhaustsInMinutes else { return false }
+        return minutes < remainingMinutes
+    }
+}
+
+/// What an open window is being compared against.
+public struct CeilingView: Decodable, Sendable, Equatable {
+    /// The daemon's own phrase for where this came from, e.g. `your own p90
+    /// over 14 sessions`. Rendered verbatim: it is what stops a percentage
+    /// reading as a provider's limit.
+    public let describes: String
+    /// Whether even the source of the figure calls it unverified.
+    public let unverified: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case describes = "description"
+        case unverified
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        describes = try c.decodeIfPresent(String.self, forKey: .describes) ?? ""
+        unverified = try c.decodeIfPresent(Bool.self, forKey: .unverified) ?? false
+    }
+
+    public init(describes: String, unverified: Bool = false) {
+        self.describes = describes
+        self.unverified = unverified
     }
 }
 

@@ -45,6 +45,7 @@ struct MenuContent: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         backendSection(status)
+                        usageSection(status.usage)
                         balanceSection(status.balance)
                         routeSection(status)
                         pinSection(status)
@@ -360,6 +361,60 @@ struct MenuContent: View {
         case .good: return .green
         case .warn: return .orange
         case .bad: return .red
+        }
+    }
+
+    // MARK: - Usage
+
+    /// What IronWire itself has sent this window.
+    ///
+    /// This is the one block on the screen that shows a percentage without the
+    /// provider having reported anything, and it is allowed to because it is
+    /// not a claim about the provider (`AGENTS.md` rule 2, the `ironwire_usage`
+    /// exception). The guard is that a percentage is never drawn without
+    /// `ceiling.describes` next to it saying what it is a percentage *of* —
+    /// "your own p90 over 14 sessions" is a different sentence from "42% of
+    /// your plan", and only the first one is true.
+    @ViewBuilder
+    private func usageSection(_ usage: UsageView) -> some View {
+        if !usage.sessions.isEmpty {
+            section("This \(usage.sessionHours)h window") {
+                ForEach(usage.sessions) { session in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(session.backend).font(.caption)
+                            Spacer()
+                            if let pct = session.usedPct {
+                                Text("\(Int(pct.rounded()))%")
+                                    .font(.caption)
+                                    .foregroundStyle(colour(for: Format.usageLevel(usedPct: pct)))
+                            } else {
+                                // No ceiling to be a percentage of. The
+                                // exchange count is a fact; a percentage here
+                                // would be one we made up.
+                                Text("\(session.exchanges) exchange(s)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if let ceiling = session.ceiling {
+                            Text(ceiling.unverified
+                                ? "of \(ceiling.describes) (unverified)"
+                                : "of \(ceiling.describes)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        // The question the block exists to answer, and only
+                        // said when the daemon has the rate to answer it.
+                        if session.exhaustsBeforeClose, let minutes = session.exhaustsInMinutes {
+                            Text("at this rate, reached in \(Format.duration(Int(minutes * 60)))")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
         }
     }
 

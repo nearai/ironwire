@@ -28,12 +28,13 @@ final class MenuContentTests: XCTestCase {
         lastRoute: LastRouteView? = nil,
         privacy: String? = nil,
         update: UpdateStatus = .upToDate,
-        pin: String? = nil
+        pin: String? = nil,
+        usage: UsageView = UsageView()
     ) -> StatusView {
         StatusView(
             version: "0.1.0", port: 8463, trackedConversations: 2, pin: pin,
             backends: backends, balance: balance, privacy: privacy,
-            update: update, lastRoute: lastRoute)
+            update: update, lastRoute: lastRoute, usage: usage)
     }
 
     private func render(
@@ -249,6 +250,51 @@ final class MenuContentTests: XCTestCase {
             ]),
             settings: settings(services: [service]))
         XCTAssertNotNil(rendered)
+    }
+
+    // MARK: - The window
+
+    /// `AGENTS.md` rule 2's one allowed percentage, and the guard on it. This
+    /// figure is legitimate because it measures IronWire's own traffic, not a
+    /// provider's remaining capacity — but only while the daemon's phrase for
+    /// *what it is a percentage of* is drawn with it. A window carrying a
+    /// ceiling therefore lays out taller than the same window without one.
+    func test_a_usage_percentage_is_drawn_with_the_basis_it_is_measured_against() throws {
+        let withBasis = try height(
+            status(
+                backends: [],
+                usage: UsageView(sessions: [
+                    SessionUsageView(
+                        backend: "claude-sub", remainingMinutes: 120, exchanges: 9,
+                        usedPct: 42,
+                        ceiling: CeilingView(describes: "your own p90 over 14 sessions"))
+                ])))
+        let withoutBasis = try height(
+            status(
+                backends: [],
+                usage: UsageView(sessions: [
+                    SessionUsageView(backend: "claude-sub", remainingMinutes: 120, exchanges: 9)
+                ])))
+        XCTAssertGreaterThan(
+            withBasis, withoutBasis,
+            "a usage percentage is being drawn without the basis it is measured against")
+    }
+
+    /// No history yet means no ceiling, which is the state a fresh install is
+    /// in — and the one where a percentage would be invented. It has to lay out
+    /// with the exchange count instead of a number nobody measured.
+    func test_a_window_with_no_ceiling_still_lays_out() throws {
+        XCTAssertGreaterThan(
+            try height(
+                status(
+                    backends: [],
+                    usage: UsageView(
+                        sessions: [
+                            SessionUsageView(
+                                backend: "claude-sub", remainingMinutes: 240, exchanges: 1)
+                        ],
+                        completedSessions: 0))),
+            0)
     }
 
     // MARK: - The privacy ladder
