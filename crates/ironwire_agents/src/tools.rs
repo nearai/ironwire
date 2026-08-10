@@ -123,6 +123,214 @@ fn read(path: Option<&PathBuf>) -> String {
         .unwrap_or_default()
 }
 
+/// Why a tool could not be wired.
+#[derive(Debug)]
+pub enum Error {
+    /// No tool by that id, built-in or catalog-described.
+    UnknownTool(String),
+    /// The tool's config could not be located.
+    NoPath(String),
+    /// The edit itself was refused — most often a file we cannot parse.
+    Edit(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTool(id) => write!(f, "no tool called `{id}`"),
+            Self::NoPath(id) => write!(f, "could not work out where `{id}` keeps its config"),
+            Self::Edit(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// An edit that has been worked out but not made.
+///
+/// Split from [`commit`] because every path that writes to somebody's config in
+/// this codebase shows the change first. The CLI prints it; the control API
+/// hands it back so a GUI can. Neither gets to skip the step.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The file that would change.
+    pub path: PathBuf,
+    /// What would change, in words.
+    pub changes: Vec<String>,
+    /// Slots left alone because the user is already using them.
+    pub occupied: Vec<(String, String)>,
+    existing: String,
+    contents: String,
+}
+
+impl Planned {
+    /// Whether this would change anything at all.
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// Work out how to point a tool at IronWire.
+///
+/// # Errors
+///
+/// [`Error::UnknownTool`] for an id nothing knows, [`Error::NoPath`] when the
+/// config cannot be located, [`Error::Edit`] when the file cannot be read.
+pub fn plan_connect(id: &str, port: u16, catalog_document: &Catalog) -> Result<Planned, Error> {
+    match id {
+        "claude" => {
+            let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let existing = read(Some(&path));
+            let url = format!("http://127.0.0.1:{port}/anthropic");
+            let edit = claude_settings::connect(&existing, &statusline_command(), Some(&url))
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: edit
+                    .occupied
+                    .into_iter()
+                    .map(|o| (o.slot.to_string(), o.current))
+                    .collect(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+        "codex" => {
+            let path = codex_config::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let existing = read(Some(&path));
+            let edit = codex_config::connect(&existing, port)
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: Vec::new(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+        other => {
+            let agent = catalog_agent(catalog_document, other)?;
+            let home = dirs::home_dir().ok_or_else(|| Error::NoPath(other.to_string()))?;
+            let path = agent.config.resolve(&home);
+            let existing = read(Some(&path));
+            let edit = catalog::connect(agent, &existing, port)
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: edit
+                    .occupied
+                    .into_iter()
+                    .map(|o| (o.slot, o.current))
+                    .collect(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+    }
+}
+
+/// Work out how to take a tool back off IronWire.
+///
+/// # Errors
+///
+/// As [`plan_connect`].
+pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, Error> {
+    match id {
+        "claude" => {
+            let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let existing = read(Some(&path));
+            let edit = claude_settings::disconnect(&existing)
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: Vec::new(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+        "codex" => {
+            let path = codex_config::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let existing = read(Some(&path));
+            let edit = codex_config::disconnect(&existing)
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: Vec::new(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+        other => {
+            let agent = catalog_agent(catalog_document, other)?;
+            let home = dirs::home_dir().ok_or_else(|| Error::NoPath(other.to_string()))?;
+            let path = agent.config.resolve(&home);
+            let existing = read(Some(&path));
+            let edit = catalog::disconnect(agent, &existing)
+                .map_err(|error| Error::Edit(error.to_string()))?;
+            Ok(Planned {
+                path,
+                changes: edit.changes,
+                occupied: Vec::new(),
+                existing,
+                contents: edit.contents,
+            })
+        }
+    }
+}
+
+fn catalog_agent<'a>(
+    catalog_document: &'a Catalog,
+    id: &str,
+) -> Result<&'a ironwire_catalog::schema::AgentEntry, Error> {
+    catalog_document
+        .agents()
+        .into_iter()
+        .find(|agent| agent.id == id)
+        .ok_or_else(|| Error::UnknownTool(id.to_string()))
+}
+
+/// Make the edit, keeping one copy of what was there before.
+///
+/// Returns the backup's path when one was written — a file that did not exist
+/// has nothing worth preserving.
+///
+/// # Errors
+///
+/// Propagates the filesystem error.
+pub fn commit(planned: &Planned) -> std::io::Result<Option<PathBuf>> {
+    if let Some(parent) = planned.path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let backup = if planned.existing.is_empty() {
+        None
+    } else {
+        let extension = planned
+            .path
+            .extension()
+            .map_or_else(|| "bak".to_string(), |e| e.to_string_lossy().to_string());
+        let backup = planned
+            .path
+            .with_extension(format!("{extension}.ironwire-backup"));
+        std::fs::write(&backup, &planned.existing)?;
+        Some(backup)
+    };
+    std::fs::write(&planned.path, &planned.contents)?;
+    Ok(backup)
+}
+
+/// The status line command, which is this binary plus a subcommand.
+fn statusline_command() -> String {
+    std::env::current_exe().map_or_else(
+        |_| "ironwire statusline".to_string(),
+        |exe| format!("{} statusline", exe.display()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

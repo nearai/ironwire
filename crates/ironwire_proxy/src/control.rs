@@ -468,6 +468,7 @@ pub fn router() -> Router<AppState> {
         .route("/settings", get(settings))
         .route("/privacy", post(privacy))
         .route("/consent", post(consent))
+        .route("/tools", post(tools))
         .route("/probe", post(probe))
         .route("/log", get(log))
         .route("/events", get(events))
@@ -511,6 +512,79 @@ fn full_is_blocked(
             privacy.trusted_backends.join(", ")
         )
     })
+}
+
+/// Body of `POST /_ironwire/tools`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolRequest {
+    /// Which tool.
+    pub id: String,
+    /// `true` to point it here, `false` to take it back off.
+    pub connect: bool,
+}
+
+/// Point a coding agent at IronWire, or take it back off.
+///
+/// This is the one endpoint that writes to a file outside `$IRONWIRE_HOME`, and
+/// it exists because the alternative — a menu that can see an unwired agent and
+/// can only recite a command about it — is a worse answer to "why is nothing
+/// routing" than doing the edit.
+///
+/// The ceremony survives the move. Every other path that touches somebody's
+/// agent config works out the change, shows it, and only then writes; the CLI
+/// prints it, and this hands `changes` and `occupied` back so a GUI can show
+/// exactly the same thing. A slot the user is already using is still reported
+/// and still left alone — a GUI is not a licence to take one.
+async fn tools(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<ToolRequest>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+
+    let catalog = state.catalog();
+    let planned = if request.connect {
+        ironwire_agents::tools::plan_connect(
+            &request.id,
+            state.config.server.port,
+            catalog.current(),
+        )
+    } else {
+        ironwire_agents::tools::plan_disconnect(&request.id, catalog.current())
+    };
+
+    let planned = match planned {
+        Ok(planned) => planned,
+        Err(error) => return bad_request(error.to_string()),
+    };
+
+    let mut backup = None;
+    if !planned.is_noop() {
+        match ironwire_agents::tools::commit(&planned) {
+            Ok(written) => backup = written,
+            Err(error) => {
+                return server_error(format!(
+                    "{} could not be written: {error}",
+                    planned.path.display()
+                ));
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({
+        "ok": true,
+        "path": planned.path.display().to_string(),
+        "changes": planned.changes,
+        "occupied": planned
+            .occupied
+            .iter()
+            .map(|(slot, current)| serde_json::json!({"slot": slot, "current": current}))
+            .collect::<Vec<_>>(),
+        "backup": backup.map(|path| path.display().to_string()),
+    }))
+    .into_response()
 }
 
 /// What can be changed, and what it would take.
@@ -784,6 +858,16 @@ fn parse_mode(name: &str) -> Option<PrivacyMode> {
         "full" => Some(PrivacyMode::Full),
         _ => None,
     }
+}
+
+/// A refusal that is ours rather than the caller's — the request was fine and
+/// the filesystem was not.
+fn server_error(message: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 fn bad_request(message: String) -> Response {
