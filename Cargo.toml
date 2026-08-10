@@ -30,6 +30,7 @@ members = [
     "crates/ironwire_ledger",
     "crates/ironwire_usage",
     "crates/ironwire_catalog",
+    "crates/ironwire_agents",
     "crates/ironwire_update",
     "crates/ironwire_privacy",
     "crates/ironwire_translate",
@@ -52,6 +53,7 @@ ironwire_creds = { path = "crates/ironwire_creds", version = "0.1.0" }
 ironwire_ledger = { path = "crates/ironwire_ledger", version = "0.1.0" }
 ironwire_usage = { path = "crates/ironwire_usage", version = "0.1.0" }
 ironwire_catalog = { path = "crates/ironwire_catalog", version = "0.1.0" }
+ironwire_agents = { path = "crates/ironwire_agents", version = "0.1.0" }
 ironwire_update = { path = "crates/ironwire_update", version = "0.1.0" }
 ironwire_privacy = { path = "crates/ironwire_privacy", version = "0.1.0" }
 ironwire_translate = { path = "crates/ironwire_translate", version = "0.1.0" }
@@ -111,6 +113,7 @@ ironwire_privacy.workspace = true
 ironwire_creds.workspace = true
 ironwire_ledger.workspace = true
 ironwire_usage.workspace = true
+ironwire_agents.workspace = true
 ironwire_catalog.workspace = true
 ironwire_update.workspace = true
 ironwire_proxy.workspace = true

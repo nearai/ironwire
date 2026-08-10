@@ -1,6 +1,6 @@
 //! Pointing a catalog-described tool at IronWire.
 //!
-//! [`crate::claude_settings`] and [`crate::codex_config`] handle the two agents
+//! `claude_settings` and `codex_config` in the `ironwire` binary handle the two agents
 //! this binary ships knowing about, and they do more than set a URL — a status
 //! line, a provider table, a warning about what Codex cannot change afterwards.
 //! This module is for the rest: tools the signed catalog introduces, where all
@@ -27,7 +27,7 @@ use serde_json::{Map, Value};
 
 /// A slot that already held something the user put there.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Occupied {
+pub struct Occupied {
     /// The key path, so the caller can name it back to them.
     pub slot: String,
     /// What is in it.
@@ -36,7 +36,7 @@ pub(crate) struct Occupied {
 
 /// What an edit would do, so the caller can show it before doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Edit {
+pub struct Edit {
     /// The full file contents after the edit.
     pub contents: String,
     /// Human-readable lines describing what changed.
@@ -46,14 +46,14 @@ pub(crate) struct Edit {
 }
 
 impl Edit {
-    pub(crate) fn is_noop(&self) -> bool {
+    pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
     }
 }
 
 /// Why an edit could not be produced.
 #[derive(Debug)]
-pub(crate) enum Error {
+pub enum Error {
     /// The existing file is not valid for its format.
     Unparseable(String),
     /// The entry did not survive validation, so we will not act on it.
@@ -82,7 +82,7 @@ impl std::error::Error for Error {}
 /// [`Error::Unparseable`] when the file is not valid, [`Error::Unusable`] when
 /// the catalog entry fails validation. A shape this module will not edit by
 /// hand is reported as an occupied slot rather than raised as an error.
-pub(crate) fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
+pub fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
     match usable(agent)? {
         ConfigFormat::Json => json_connect(agent, existing, port),
         ConfigFormat::Toml => toml_connect(agent, existing, port),
@@ -94,7 +94,7 @@ pub(crate) fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<E
 /// # Errors
 ///
 /// As [`connect`].
-pub(crate) fn disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
+pub fn disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
     match usable(agent)? {
         ConfigFormat::Json => json_disconnect(agent, existing),
         ConfigFormat::Toml => toml_disconnect(agent, existing),
@@ -110,7 +110,7 @@ pub(crate) fn disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Err
 ///
 /// `on_path` is injected so this is decidable without a real `PATH`, and so the
 /// rule can be tested rather than only observed.
-pub(crate) fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool) -> bool {
+pub fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool) -> bool {
     // An entry we would refuse to act on is not one to report as present:
     // offering to wire a tool and then failing at the file is worse than never
     // offering.

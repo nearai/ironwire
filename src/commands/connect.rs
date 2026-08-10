@@ -18,8 +18,8 @@ use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::CodexCredentials;
 use ironwire_creds::consent::{ConsentLedger, ConsentPrompt};
 
-use crate::claude_settings;
-use crate::codex_config;
+use ironwire_agents::claude_settings;
+use ironwire_agents::codex_config;
 
 use super::paths;
 
@@ -321,7 +321,7 @@ pub(crate) fn catalog_agent_installed(agent: &ironwire_catalog::schema::AgentEnt
     let Some(home) = dirs::home_dir() else {
         return false;
     };
-    crate::agent_config::detected(agent, &home, &on_path)
+    ironwire_agents::catalog::detected(agent, &home, &on_path)
 }
 
 /// Point a catalog-described tool at IronWire.
@@ -340,7 +340,7 @@ pub(crate) fn wire_catalog_agent(
     let path = agent.config.resolve(&home);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
-    let edit = crate::agent_config::connect(agent, &existing, port)
+    let edit = ironwire_agents::catalog::connect(agent, &existing, port)
         .with_context(|| format!("{} could not be edited", path.display()))?;
 
     if !edit.is_noop() {
@@ -385,7 +385,7 @@ pub(crate) fn unwire_catalog_agent(
         return Ok(());
     };
 
-    let edit = crate::agent_config::disconnect(agent, &existing)
+    let edit = ironwire_agents::catalog::disconnect(agent, &existing)
         .with_context(|| format!("{} could not be edited", path.display()))?;
     if edit.is_noop() {
         return Ok(());

@@ -32,7 +32,7 @@ const BASE_URL: &str = "ANTHROPIC_BASE_URL";
 /// Not an error, and not a failure of the edit: their value stays, and the
 /// caller says what they could do by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Occupied {
+pub struct Occupied {
     /// Which setting — `statusLine` or `ANTHROPIC_BASE_URL`.
     pub slot: &'static str,
     /// What is in it, so the caller can name it back to them.
@@ -41,7 +41,7 @@ pub(crate) struct Occupied {
 
 /// What an edit would do, so the caller can show it before doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Edit {
+pub struct Edit {
     /// The full file contents after the edit.
     pub contents: String,
     /// Human-readable lines describing what changed.
@@ -51,12 +51,12 @@ pub(crate) struct Edit {
 }
 
 impl Edit {
-    pub(crate) fn is_noop(&self) -> bool {
+    pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
     }
 
     /// What is in a slot we left alone, if we left that one alone.
-    pub(crate) fn occupied_slot(&self, slot: &str) -> Option<&str> {
+    pub fn occupied_slot(&self, slot: &str) -> Option<&str> {
         self.occupied
             .iter()
             .find(|o| o.slot == slot)
@@ -74,7 +74,7 @@ impl Edit {
 /// Returns the parse error when the existing file is not valid JSON — we will
 /// not rewrite a file we cannot read, because the user's own syntax error would
 /// then look like ours.
-pub(crate) fn connect(
+pub fn connect(
     existing: &str,
     command: &str,
     base_url: Option<&str>,
@@ -191,7 +191,7 @@ fn points_at_us(url: &str) -> bool {
 /// # Errors
 ///
 /// Returns the parse error when the existing file is not valid JSON.
-pub(crate) fn disconnect(existing: &str) -> Result<Edit, serde_json::Error> {
+pub fn disconnect(existing: &str) -> Result<Edit, serde_json::Error> {
     let mut root = parse(existing)?;
     let mut changes = Vec::new();
 

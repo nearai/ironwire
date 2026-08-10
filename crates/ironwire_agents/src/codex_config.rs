@@ -18,7 +18,7 @@ const PREVIOUS_MARKER: &str = "# ironwire: previous model_provider =";
 
 /// What an edit would do, so the caller can show it before doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Edit {
+pub struct Edit {
     /// The full file contents after the edit.
     pub contents: String,
     /// Human-readable lines describing what changed.
@@ -27,7 +27,7 @@ pub(crate) struct Edit {
 
 impl Edit {
     /// Whether this edit would change anything at all.
-    pub(crate) fn is_noop(&self) -> bool {
+    pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
     }
 }
@@ -54,7 +54,7 @@ fn block(port: u16) -> String {
 /// Returns the parse error when the existing file is not valid TOML — we will
 /// not append to a file we cannot read, because the user's own syntax error
 /// would then look like ours.
-pub(crate) fn connect(existing: &str, port: u16) -> Result<Edit, toml::de::Error> {
+pub fn connect(existing: &str, port: u16) -> Result<Edit, toml::de::Error> {
     existing.parse::<toml::Table>()?;
 
     let mut changes = Vec::new();
@@ -88,7 +88,7 @@ pub(crate) fn connect(existing: &str, port: u16) -> Result<Edit, toml::de::Error
 /// # Errors
 ///
 /// Returns the parse error when the existing file is not valid TOML.
-pub(crate) fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
+pub fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
     existing.parse::<toml::Table>()?;
 
     let mut changes = Vec::new();

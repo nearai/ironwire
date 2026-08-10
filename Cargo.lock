@@ -1324,6 +1324,7 @@ dependencies = [
  "clap_complete",
  "dirs",
  "futures-util",
+ "ironwire_agents",
  "ironwire_catalog",
  "ironwire_core",
  "ironwire_creds",
@@ -1342,6 +1343,16 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ironwire_agents"
+version = "0.1.0"
+dependencies = [
+ "ironwire_catalog",
+ "serde_json",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
