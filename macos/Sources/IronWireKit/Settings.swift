@@ -5,9 +5,10 @@
 // an app should just do. Both would be wrong.
 //
 // So this type carries the *decisions* as well as the values. Whether `full` is
-// selectable depends on `trusted_backends`, a rule that lives in
-// `Config::validate`; the app reads `selectable` and `unavailableBecause` rather
-// than working it out. The consent question arrives as text from the daemon,
+// selectable is a rule that lives in `full_is_blocked` (`control.rs`) and is
+// more than it looks — a named destination is not a usable one — so the app
+// reads `selectable` and `unavailableBecause` and never the inputs behind them.
+// The consent question arrives as text from the daemon,
 // because a second copy of a consent prompt is a second prompt while the
 // recorded version claims otherwise (`docs/TRUST.md` §2).
 
@@ -102,12 +103,16 @@ public struct PrivacySettingsView: Decodable, Sendable, Equatable {
     /// not at all (`docs/TRUST.md` I7).
     public let summary: String
     /// Every rung of the ladder, in order.
+    ///
+    /// The daemon also publishes `trusted_backends`, and this type does not
+    /// carry it. It is the input to a rule — whether `full` has anywhere usable
+    /// to route — and the answer is already here as `selectable`. Decoding the
+    /// input would be leaving the ingredients for a second implementation of
+    /// that rule lying around next to the answer.
     public let options: [PrivacyOptionView]
-    /// Backends named as acceptable destinations under `full`.
-    public let trustedBackends: [String]
 
     private enum CodingKeys: String, CodingKey {
-        case mode, summary, options, trustedBackends
+        case mode, summary, options
     }
 
     public init(from decoder: Decoder) throws {
@@ -115,17 +120,14 @@ public struct PrivacySettingsView: Decodable, Sendable, Equatable {
         mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "off"
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? "off"
         options = try c.decodeIfPresent([PrivacyOptionView].self, forKey: .options) ?? []
-        trustedBackends = try c.decodeIfPresent([String].self, forKey: .trustedBackends) ?? []
     }
 
     public init(
-        mode: String = "off", summary: String = "off",
-        options: [PrivacyOptionView] = [], trustedBackends: [String] = []
+        mode: String = "off", summary: String = "off", options: [PrivacyOptionView] = []
     ) {
         self.mode = mode
         self.summary = summary
         self.options = options
-        self.trustedBackends = trustedBackends
     }
 }
 

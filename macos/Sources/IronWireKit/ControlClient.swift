@@ -474,8 +474,7 @@ public final class ControlClient: ObservableObject {
 
     private func authorised(path: String) -> URLRequest? {
         guard let token else { return nil }
-        guard let url = URL(string: "http://127.0.0.1:\(port)/_ironwire\(path)") else { return nil }
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: Discovery.controlURL(port: port, path: path))
         request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
         return request
     }

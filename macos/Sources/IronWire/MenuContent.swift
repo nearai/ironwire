@@ -41,6 +41,9 @@ struct MenuContent: View {
     @State private var settingsError: String?
     @State private var settingsWarning: String?
     @State private var busy = false
+    /// Whether the control URL was just put on the clipboard. A copy with no
+    /// acknowledgement leaves the user pressing it twice.
+    @State private var urlCopied = false
     /// Whether the one-time offer to wire everything has been answered.
     /// Persisted: asking again every launch is how a prompt stops being read.
     @AppStorage("toolsOnboardingAnswered") private var onboardingAnswered = false
@@ -798,6 +801,20 @@ struct MenuContent: View {
                     .padding(.horizontal, 26)
                     .padding(.bottom, 4)
             }
+            // The way out of this pane and into `curl`, for the questions a
+            // dropdown is the wrong shape for. Offered only while something is
+            // answering, and the port is the daemon's own rather than the one
+            // this app guessed at launch.
+            if let port = client.status?.port {
+                MenuRow { copyControlURL(port: port) } label: {
+                    labelled(urlCopied ? "Control URL copied" : "Copy control URL")
+                }
+                // The token is deliberately not on the clipboard with it. It is
+                // the credential for changing where someone's traffic goes, and
+                // a second copy of it living in the pasteboard is worse than a
+                // sentence naming the file it is in.
+                .help("\(Discovery.controlURL(port: port).absoluteString) — calls need the bearer token from \(Discovery.home().path)/control.token")
+            }
             // Only offered when there is something to open. A menu item that
             // opens nothing is worse than one that is absent — a foreground
             // `ironwire serve` logs to its own terminal and has no file.
@@ -812,6 +829,17 @@ struct MenuContent: View {
             .keyboardShortcut("q")
         }
         .padding(6)
+    }
+
+    private func copyControlURL(port: Int) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(
+            Discovery.controlURL(port: port).absoluteString, forType: .string)
+        urlCopied = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            urlCopied = false
+        }
     }
 
     /// A menu item's label, indented past the checkmark gutter so the whole

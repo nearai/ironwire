@@ -83,6 +83,26 @@ final class DiscoveryTests: XCTestCase {
                        FileManager.default.homeDirectoryForCurrentUser.path)
     }
 
+    // MARK: - The control URL
+
+    func test_the_control_url_is_loopback_on_the_daemons_port() {
+        XCTAssertEqual(
+            Discovery.controlURL(port: 8500).absoluteString, "http://127.0.0.1:8500/_ironwire")
+        XCTAssertEqual(
+            Discovery.controlURL(port: 8463, path: "/status").absoluteString,
+            "http://127.0.0.1:8463/_ironwire/status")
+    }
+
+    /// A path is appended under `/_ironwire` rather than replacing it, so the
+    /// URL a user is handed and the one the client calls cannot drift apart.
+    func test_a_path_is_appended_under_the_control_prefix() {
+        for path in ["/status", "/events", "/pin"] {
+            XCTAssertTrue(
+                Discovery.controlURL(port: 8463, path: path).path.hasPrefix("/_ironwire/"),
+                "\(path) escaped the control prefix")
+        }
+    }
+
     // MARK: - Token
 
     func test_a_missing_token_file_is_an_ordinary_absence_and_not_an_error() throws {

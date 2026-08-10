@@ -198,8 +198,7 @@ final class MenuContentTests: XCTestCase {
         services: [ServiceView] = []
     ) -> SettingsView {
         SettingsView(
-            privacy: PrivacySettingsView(
-                mode: "off", summary: "off", options: options, trustedBackends: []),
+            privacy: PrivacySettingsView(mode: "off", summary: "off", options: options),
             services: services)
     }
 

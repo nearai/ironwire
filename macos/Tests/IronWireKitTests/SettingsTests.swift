@@ -20,15 +20,15 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(settings.privacy.mode, "pii")
         XCTAssertEqual(settings.privacy.summary, "pii + 1 named value(s)")
         XCTAssertEqual(settings.privacy.options.count, 4)
-        XCTAssertEqual(settings.privacy.trustedBackends, ["nearai"])
         XCTAssertEqual(settings.services.count, 2)
         XCTAssertEqual(settings.services[0].id, "claude-sub")
         XCTAssertTrue(settings.services[0].requiresConsent)
         XCTAssertFalse(settings.services[0].consented)
     }
 
-    /// The rule the app must never re-derive. Whether `full` is offerable
-    /// depends on `trusted_backends`, which is `Config::validate`'s business.
+    /// The rule the app must never re-derive. Whether `full` is offerable is
+    /// `full_is_blocked`'s business, and the daemon sends the answer with the
+    /// sentence a greyed-out segment is greyed out with.
     func test_an_unselectable_mode_arrives_with_the_reason_it_is_unselectable() throws {
         let settings = try decode(Fixtures.settings)
         let full = try XCTUnwrap(settings.privacy.options.first { $0.id == "full" })

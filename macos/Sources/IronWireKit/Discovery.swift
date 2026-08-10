@@ -67,6 +67,26 @@ public enum Discovery {
         return defaultPort
     }
 
+    /// The address every control call is made against.
+    ///
+    /// One construction, used by `ControlClient` and by the menu item that puts
+    /// it on the clipboard — a second copy of this string is how the URL a user
+    /// is handed stops being the URL the app is talking to.
+    ///
+    /// Loopback only, and no token: this returns somewhere to point `curl`, and
+    /// the credential that would make it answer is the user's to fetch.
+    public static func controlURL(port: Int, path: String = "") -> URL {
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = "127.0.0.1"
+        components.port = port
+        components.path = "/_ironwire" + path
+        // A literal host with an integer port cannot fail to compose. The
+        // fallback is here so the signature can promise a URL rather than make
+        // every caller handle an impossibility.
+        return components.url ?? URL(fileURLWithPath: "/")
+    }
+
     /// Where an installed `ironwire` binary is likely to be.
     ///
     /// A GUI app does not inherit the user's shell `PATH`, so `which` is not

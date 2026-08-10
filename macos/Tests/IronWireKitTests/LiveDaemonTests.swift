@@ -169,19 +169,33 @@ final class LiveDaemonTests: XCTestCase {
         XCTAssertFalse(settings.privacy.summary.isEmpty)
     }
 
-    /// The rule this app must never re-derive: `full` needs somewhere to route.
-    /// On a machine with nothing trusted the daemon says so, and says why.
-    func test_full_is_reported_as_unselectable_when_nothing_is_trusted() async throws {
+    /// The half of the contract the pane is built on: a mode it must grey out
+    /// always arrives with the sentence it greys out *with*, and a mode it can
+    /// offer never carries one.
+    ///
+    /// What is deliberately not asserted is *when* a mode is blocked. That rule
+    /// is `full_is_blocked` in `control.rs` and it is more than "is anything
+    /// trusted" — `trusted_backends` defaults to `["nearai"]`, a backend that
+    /// registers whether or not a key was found, so a named destination is not
+    /// a usable one. A copy of that condition here is exactly the second
+    /// implementation this app exists not to have, and it was wrong within one
+    /// release of being written.
+    func test_a_privacy_mode_that_cannot_be_picked_arrives_with_the_reason() async throws {
         let client = ControlClient()
         _ = await client.refreshSettings()
         let settings = try XCTUnwrap(client.settings)
-        let full = try XCTUnwrap(settings.privacy.options.first { $0.id == "full" })
+        XCTAssertFalse(settings.privacy.options.isEmpty, "no ladder to render")
 
-        if settings.privacy.trustedBackends.isEmpty {
-            XCTAssertFalse(full.selectable)
-            XCTAssertNotNil(full.unavailableBecause, "a greyed-out option has to say why")
-        } else {
-            XCTAssertTrue(full.selectable)
+        for option in settings.privacy.options {
+            if option.selectable {
+                XCTAssertNil(
+                    option.unavailableBecause,
+                    "\(option.id) can be picked and still explains why it cannot")
+            } else {
+                let because = try XCTUnwrap(
+                    option.unavailableBecause, "\(option.id) is greyed out with nothing to show")
+                XCTAssertFalse(because.isEmpty)
+            }
         }
     }
 
