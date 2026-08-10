@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use ironwire_catalog::AnthropicCatalog;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
+use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::claude::{ANTHROPIC_HOST, ClaudeCodeCredentials};
 use ironwire_creds::{Bearer, CredentialError};
@@ -210,10 +210,10 @@ impl Backend for AnthropicBackend {
         }
     }
 
-    fn requires_client_identity(&self) -> bool {
-        // TRUST.md §3: the subscription serves the client it belongs to. The
-        // metered key serves anyone.
-        matches!(self.auth, AnthropicAuth::Subscription)
+    fn required_client_identity(&self) -> Option<ClientIdentity> {
+        // TRUST.md §3: the subscription serves the client it belongs to — and
+        // only that one. The metered key serves anyone.
+        matches!(self.auth, AnthropicAuth::Subscription).then_some(ClientIdentity::ClaudeCode)
     }
 
     async fn status(&self) -> BackendStatus {
@@ -546,11 +546,14 @@ mod tests {
     #[test]
     fn only_the_subscription_demands_a_matching_client_identity() {
         let sub = subscription_backend(DEFAULT_BASE_URL);
-        assert!(sub.requires_client_identity());
+        assert_eq!(
+            sub.required_client_identity(),
+            Some(ClientIdentity::ClaudeCode)
+        );
 
         let key = AnthropicBackend::api_key(SecretString::from("sk-ant-x"), None, 60)
             .expect("client builds");
-        assert!(!key.requires_client_identity());
+        assert_eq!(key.required_client_identity(), None);
     }
 
     #[test]

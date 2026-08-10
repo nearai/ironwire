@@ -10,7 +10,7 @@
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier};
+use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier};
 use ironwire_core::quota::QuotaSnapshot;
 
 use crate::observe::Observation;
@@ -206,10 +206,15 @@ pub trait Backend: Send + Sync {
         false
     }
 
-    /// Whether this backend requires the inbound request to carry the
-    /// originating product's own client identity (`docs/TRUST.md` §3).
-    fn requires_client_identity(&self) -> bool {
-        false
+    /// The client identity this backend will only serve, if it has one
+    /// (`docs/TRANSLATION.md` aside, this is `docs/TRUST.md` §3).
+    ///
+    /// A *specific* product, not "some identity": a subscription is served only
+    /// for the client it belongs to, and Claude Code's name must never unlock
+    /// ChatGPT's subscription. `None` means the backend serves anyone, which is
+    /// every metered key.
+    fn required_client_identity(&self) -> Option<ClientIdentity> {
+        None
     }
 
     /// Current status, including a fresh credential check.

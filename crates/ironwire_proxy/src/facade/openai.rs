@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::ConversationKey;
-use ironwire_core::protocol::Protocol;
+use ironwire_core::protocol::{ClientIdentity, Protocol};
 use ironwire_upstream::headers::{forward_request_header, forward_response_header};
 
 use crate::facade::error::FacadeError;
@@ -149,13 +149,13 @@ async fn forward(
     // the `originator` header is what identifies the client. Without this the
     // ChatGPT subscription is unreachable from Codex itself
     // (`ironwire_core::peek::originator_names_codex`).
-    if !peek.carries_client_identity
+    if peek.client_identity.is_none()
         && ironwire_core::peek::originator_names_codex(
             headers.get("originator").and_then(|v| v.to_str().ok()),
             &markers.codex_originator_prefix,
         )
     {
-        peek.carries_client_identity = true;
+        peek.client_identity = Some(ClientIdentity::Codex);
     }
     let peek = peek;
     let key = conversation_key(protocol, &parsed);
@@ -198,7 +198,8 @@ async fn forward(
         // Codex renders a line from us on a limit response, and this is the
         // moment it is worth using: the user has just been stopped and has no
         // way to tell whether IronWire had somewhere else to go.
-        FacadeError::from_pipeline(&e).on_openai_facade(peek.carries_client_identity)
+        FacadeError::from_pipeline(&e)
+            .on_openai_facade(peek.client_identity == Some(ClientIdentity::Codex))
     })?;
 
     tracing::info!(

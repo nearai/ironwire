@@ -162,7 +162,7 @@ impl BackendRegistry {
                     trusted: privacy_policy
                         .as_ref()
                         .is_none_or(|privacy| privacy.trusts(backend.id().as_str())),
-                    requires_client_identity: backend.requires_client_identity(),
+                    required_client_identity: backend.required_client_identity(),
                     models: backend.models(),
                     catalogue_from_provider: backend.catalogue_from_provider(),
                 }

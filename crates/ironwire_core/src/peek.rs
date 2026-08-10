@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 use crate::capability::{ReasoningNeed, RequestRequirements};
-use crate::protocol::Protocol;
+use crate::protocol::{ClientIdentity, Protocol};
 
 /// Rough bytes-per-token used to size prompts without tokenising.
 ///
@@ -133,9 +133,13 @@ pub struct RequestPeek {
     pub stream: bool,
     /// What the request needs a backend to preserve.
     pub requirements: RequestRequirements,
-    /// Whether the request carries the originating product's own client
-    /// identity — the eligibility signal for subscription backends.
-    pub carries_client_identity: bool,
+    /// Which product's own identity the request carries, if any — the
+    /// eligibility signal for subscription backends (`docs/TRUST.md` §3).
+    ///
+    /// Naming the product rather than answering "some identity, yes or no": a
+    /// subscription is served only for the client it belongs to, and one
+    /// product's identity must never unlock another's.
+    pub client_identity: Option<ClientIdentity>,
     /// Number of messages, for conversation-key derivation and logging.
     pub message_count: usize,
     /// Whether this looks like a request to summarize the conversation so the
@@ -266,10 +270,8 @@ impl RequestPeek {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-            carries_client_identity: anthropic_system_names(
-                system,
-                &markers.claude_code_system_prefix,
-            ),
+            client_identity: anthropic_system_names(system, &markers.claude_code_system_prefix)
+                .then_some(ClientIdentity::ClaudeCode),
             message_count: messages.map_or(0, Vec::len),
             likely_compaction: looks_like_compaction(
                 messages.map_or(0, Vec::len),
@@ -356,10 +358,11 @@ impl RequestPeek {
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             // Codex identifies itself with an `originator`/`instructions` pair;
             // the presence of its instructions block is the reliable half.
-            carries_client_identity: body
+            client_identity: body
                 .get("instructions")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s.contains(&markers.codex_instructions_marker)),
+                .is_some_and(|s| s.contains(&markers.codex_instructions_marker))
+                .then_some(ClientIdentity::Codex),
             message_count: items.map_or(0, Vec::len),
             likely_compaction: looks_like_compaction(
                 items.map_or(0, Vec::len),
@@ -547,7 +550,7 @@ mod tests {
             "system": "You are Claude Code, Anthropic's official CLI for Claude.",
             "messages": [],
         }));
-        assert!(p.carries_client_identity);
+        assert_eq!(p.client_identity, Some(ClientIdentity::ClaudeCode));
     }
 
     #[test]
@@ -557,7 +560,7 @@ mod tests {
             "system": [{"type": "text", "text": "You are Claude Code, Anthropic's official CLI."}],
             "messages": [],
         }));
-        assert!(p.carries_client_identity);
+        assert_eq!(p.client_identity, Some(ClientIdentity::ClaudeCode));
     }
 
     #[test]
@@ -569,7 +572,7 @@ mod tests {
             "system": "You are a helpful coding assistant.",
             "messages": [],
         }));
-        assert!(!p.carries_client_identity);
+        assert_eq!(p.client_identity, None);
     }
 
     /// Claude Code 2.1.226 leads with a billing header, so the identifying
@@ -585,7 +588,7 @@ mod tests {
             ],
             "messages": [],
         }));
-        assert!(p.carries_client_identity);
+        assert_eq!(p.client_identity, Some(ClientIdentity::ClaudeCode));
     }
 
     /// The other half of the same regression: by 2.1.226 the `-p` entrypoint
@@ -795,7 +798,7 @@ mod tests {
         let p = RequestPeek::inspect(Protocol::AnthropicMessages, &body, 32);
         assert_eq!(p.requested_model, None);
         assert!(!p.stream);
-        assert!(!p.carries_client_identity);
+        assert_eq!(p.client_identity, None);
         assert!(!p.requirements.tools);
         assert_eq!(p.message_count, 0);
     }

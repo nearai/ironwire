@@ -485,7 +485,7 @@ mod tests {
     fn near_ai_is_credit_capacity_and_needs_no_client_identity() {
         let b = backend(NEARAI_DEFAULT_BASE_URL);
         assert_eq!(b.kind(), BackendKind::Credits);
-        assert!(!b.requires_client_identity());
+        assert_eq!(b.required_client_identity(), None);
         assert!(b.capabilities().wires.speaks(Protocol::OpenAiChat));
     }
 
@@ -595,7 +595,7 @@ mod local_tests {
         assert_eq!(backend.kind(), BackendKind::Local);
         assert!(!backend.kind().is_metered());
         assert!(!backend.kind().requires_consent());
-        assert!(!backend.requires_client_identity());
+        assert_eq!(backend.required_client_identity(), None);
     }
 
     /// A local server that is not running is a backend `status` can explain,

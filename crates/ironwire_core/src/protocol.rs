@@ -145,6 +145,37 @@ impl Facade {
     }
 }
 
+/// Which product's own identity a request carries.
+///
+/// `docs/TRUST.md` I5: a subscription is served only for the client it belongs
+/// to, and IronWire never synthesizes that identity to unlock one.
+///
+/// This was a `bool` — "carries *some* product's identity" — which answers a
+/// different question, and answers it wrongly the moment a request can be
+/// translated onto another family's subscription. Claude Code's own identity
+/// satisfied the ChatGPT subscription's requirement, so a Claude Code turn
+/// falling back cross-wire would have arrived at `chatgpt.com` wearing Claude
+/// Code's name. That is the impersonation I5 exists to forbid, and it was
+/// unreachable only because no translator went that way. Naming the product is
+/// what makes the check the rule `docs/TRUST.md` §3 actually states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIdentity {
+    /// Anthropic's Claude Code.
+    ClaudeCode,
+    /// OpenAI's Codex CLI.
+    Codex,
+}
+
+impl fmt::Display for ClientIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        })
+    }
+}
+
 /// What kind of capacity a backend draws on. Drives both routing preference
 /// (marginal cost) and the consent requirements in `docs/TRUST.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

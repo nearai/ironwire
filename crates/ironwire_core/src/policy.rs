@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::{Capabilities, Ineligible, RequestRequirements, eligible};
 use crate::peek::RequestPeek;
-use crate::protocol::{BackendId, BackendKind, ModelTier, Protocol};
+use crate::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier, Protocol};
 use crate::quota::QuotaSnapshot;
 
 /// How far down the fidelity ladder a route sits, relative to the ideal.
@@ -100,10 +100,9 @@ pub struct Candidate {
     /// Whether the user has consented to this backend, where consent is
     /// required (`docs/TRUST.md` §2).
     pub consented: bool,
-    /// Whether this backend requires the inbound request to carry the
-    /// originating product's client identity. True for subscription backends;
-    /// see `docs/TRUST.md` §3.
-    pub requires_client_identity: bool,
+    /// The one client identity this backend will serve, if it has one. Set for
+    /// subscription backends; see `docs/TRUST.md` §3.
+    pub required_client_identity: Option<ClientIdentity>,
     /// Models this backend offers, best-first, with the tier each satisfies.
     pub models: Vec<(String, ModelTier)>,
     /// Whether the user's privacy mode permits routing here.
@@ -1070,7 +1069,13 @@ fn usable(
     }
     // TRUST.md §3: we serve a subscription only for the client it belongs to,
     // and we never synthesize that client's identity to unlock it.
-    if candidate.requires_client_identity && !peek.carries_client_identity {
+    // The identity must be the one *this* backend belongs to. Asking only
+    // "does the request carry some product's identity" let Claude Code unlock
+    // the ChatGPT subscription the moment a translator existed between the two
+    // wires — `docs/TRUST.md` I5, in the one direction it forbids.
+    if let Some(required) = candidate.required_client_identity
+        && peek.client_identity != Some(required)
+    {
         return Err(Unusable::NeedsClientIdentity);
     }
     // Checked before the capability gate on purpose: a user who forbade this
@@ -1167,7 +1172,7 @@ mod tests {
             quota: QuotaSnapshot::default(),
             healthy: true,
             consented: true,
-            requires_client_identity: false,
+            required_client_identity: None,
             models: vec![
                 ("claude-opus-4-6".to_string(), ModelTier::Frontier),
                 ("claude-sonnet-4-6".to_string(), ModelTier::Balanced),
@@ -1182,7 +1187,7 @@ mod tests {
             requested_model: Some(model.to_string()),
             stream: true,
             requirements: RequestRequirements::default(),
-            carries_client_identity: true,
+            client_identity: Some(ClientIdentity::ClaudeCode),
             message_count: 3,
             likely_compaction: false,
         }
@@ -2041,9 +2046,9 @@ mod tests {
             BackendKind::Subscription,
             Protocol::AnthropicMessages,
         );
-        sub.requires_client_identity = true;
+        sub.required_client_identity = Some(ClientIdentity::ClaudeCode);
         let mut third_party = peek("claude-opus-4-6");
-        third_party.carries_client_identity = false;
+        third_party.client_identity = None;
 
         let err = policy
             .decide(
@@ -2055,6 +2060,54 @@ mod tests {
             )
             .expect_err("subscription must be refused");
         assert_eq!(err, NoRoute::RequiresClientIdentity);
+    }
+
+    /// `docs/TRUST.md` I5, in the direction that only became reachable once
+    /// every wire could translate to every other.
+    ///
+    /// Claude Code carries Claude Code's identity, which is a real identity —
+    /// and the check used to ask only whether *some* identity was present. So a
+    /// Claude Code turn falling back cross-wire would have arrived at
+    /// `chatgpt.com` wearing Claude Code's name, which is the impersonation the
+    /// invariant exists to forbid. One product's identity must never unlock
+    /// another's subscription.
+    #[test]
+    fn one_products_identity_does_not_unlock_anothers_subscription() {
+        let mut chatgpt = candidate(
+            "codex-sub",
+            BackendKind::Subscription,
+            Protocol::OpenAiResponses,
+        );
+        chatgpt.required_client_identity = Some(ClientIdentity::Codex);
+
+        let mut from_claude_code = peek("claude-opus-4-6");
+        from_claude_code.client_identity = Some(ClientIdentity::ClaudeCode);
+
+        let err = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &from_claude_code,
+                &[chatgpt.clone()],
+                t(0),
+            )
+            .expect_err("Claude Code must not reach the ChatGPT subscription");
+        assert_eq!(err, NoRoute::RequiresClientIdentity);
+
+        // And the same backend serves the client it does belong to, translated
+        // or not — the rule is about whose subscription it is, not about wires.
+        let mut from_codex = peek("gpt-5");
+        from_codex.client_identity = Some(ClientIdentity::Codex);
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &from_codex,
+                &[chatgpt],
+                t(0),
+            )
+            .expect("Codex's own identity reaches Codex's own subscription");
+        assert_eq!(decision.backend.as_str(), "codex-sub");
     }
 
     #[test]
@@ -2299,9 +2352,9 @@ mod tests {
             BackendKind::Subscription,
             Protocol::OpenAiResponses,
         );
-        codex.requires_client_identity = true;
+        codex.required_client_identity = Some(ClientIdentity::Codex);
         let mut p = peek("gpt-5");
-        p.carries_client_identity = false;
+        p.client_identity = None;
 
         let err = Policy::new()
             .decide(key(), Protocol::OpenAiResponses, &p, &[codex], t(0))
@@ -2425,7 +2478,7 @@ mod compaction_tests {
             quota: QuotaSnapshot::default(),
             healthy: true,
             consented: true,
-            requires_client_identity: false,
+            required_client_identity: None,
             models: models
                 .iter()
                 .map(|(m, tier)| ((*m).to_string(), *tier))
@@ -2442,7 +2495,7 @@ mod compaction_tests {
             requested_model: Some("claude-opus-4-6".to_string()),
             stream: true,
             requirements: RequestRequirements::default(),
-            carries_client_identity: true,
+            client_identity: Some(ClientIdentity::ClaudeCode),
             message_count: 40,
             likely_compaction: compaction,
         }

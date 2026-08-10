@@ -150,6 +150,25 @@ This is a hard eligibility rule in `ironwire_core::policy`, not a default.
 It costs us the "point Aider at localhost and use your Claude Max" feature. That
 feature was never ours to sell.
 
+### The identity is a *product*, not a boolean
+
+The check names which client a request carries and which client a backend
+belongs to, and requires them to match. It was once a single boolean — "does
+this request carry some product's identity" — which is a different question with
+the same shape, and it gave the wrong answer in one direction.
+
+Claude Code carries a real identity: its own. So a Claude Code request satisfied
+the *ChatGPT* subscription's requirement, and a turn falling back across wires
+would have reached `chatgpt.com` wearing Claude Code's name — impersonation of
+one product to another provider, which is exactly what I5 forbids. It was
+unreachable only for as long as no translator went that way; adding the full
+translation matrix (`docs/TRANSLATION.md`) made it reachable, and the check was
+corrected in the same change rather than after somebody found it.
+
+Verifiable against the real providers: `crates/ironwire_proxy/tests/live_subscriptions.rs`
+asserts each subscription serves its own client and refuses the other's. It is
+opt-in, it reads consent rather than granting it, and it forges nothing.
+
 ---
 
 ## 4. Traces

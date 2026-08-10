@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::ConversationKey;
-use ironwire_core::protocol::Protocol;
+use ironwire_core::protocol::{ClientIdentity, Protocol};
 use ironwire_upstream::headers::{forward_request_header, forward_response_header};
 
 use crate::facade::error::FacadeError;
@@ -94,7 +94,7 @@ async fn forward(
     // user-agent has not. Without this, Claude Code 2.1.226 is not recognised
     // as Claude Code and falls off its own subscription
     // (`ironwire_core::peek::user_agent_names_claude_code`).
-    if !peek.carries_client_identity
+    if peek.client_identity.is_none()
         && ironwire_core::peek::user_agent_names_claude_code(
             headers
                 .get(axum::http::header::USER_AGENT)
@@ -102,7 +102,7 @@ async fn forward(
             &markers.claude_code_user_agent_prefix,
         )
     {
-        peek.carries_client_identity = true;
+        peek.client_identity = Some(ClientIdentity::ClaudeCode);
     }
     let peek = peek;
     let key = conversation_key(&parsed);

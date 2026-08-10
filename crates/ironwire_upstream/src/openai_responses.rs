@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures_util::StreamExt;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
+use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::codex::{CHATGPT_BASE_URL, CHATGPT_HOST, CodexCredentials, OPENAI_HOST};
 use ironwire_creds::{Bearer, CredentialError};
@@ -302,10 +302,10 @@ impl Backend for ResponsesBackend {
         }
     }
 
-    fn requires_client_identity(&self) -> bool {
-        // TRUST.md §3: the subscription serves the client it belongs to. The
-        // metered key serves anyone.
-        matches!(self.auth, ResponsesAuth::Subscription { .. })
+    fn required_client_identity(&self) -> Option<ClientIdentity> {
+        // TRUST.md §3: the subscription serves the client it belongs to — and
+        // only that one. The metered key serves anyone.
+        matches!(self.auth, ResponsesAuth::Subscription { .. }).then_some(ClientIdentity::Codex)
     }
 
     async fn status(&self) -> BackendStatus {
@@ -803,10 +803,13 @@ mod tests {
 
     #[test]
     fn only_the_subscription_demands_a_matching_client_identity() {
-        assert!(subscription(CHATGPT_BASE_URL).requires_client_identity());
+        assert_eq!(
+            subscription(CHATGPT_BASE_URL).required_client_identity(),
+            Some(ClientIdentity::Codex)
+        );
         let key = ResponsesBackend::openai_api_key(SecretString::from("sk-x"), None, 60)
             .expect("client builds");
-        assert!(!key.requires_client_identity());
+        assert_eq!(key.required_client_identity(), None);
     }
 
     #[test]
