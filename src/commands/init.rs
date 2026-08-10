@@ -490,22 +490,58 @@ fn ask(question: &str) -> Result<bool> {
 ///
 /// Only the ones that are installed: writing a settings file nothing will read
 /// is how a setup step turns into litter in someone's home directory.
-fn wire_agents(port: u16, dry_run: bool) -> Result<Vec<&'static str>> {
+fn wire_agents(port: u16, dry_run: bool) -> Result<Vec<String>> {
     let mut wired = Vec::new();
     println!();
     if connect::claude_installed() {
         connect::wire_claude(port, dry_run)?;
-        wired.push("Claude Code");
+        wired.push("Claude Code".to_string());
     }
     if connect::codex_installed() {
         connect::wire_codex(port, dry_run)?;
-        wired.push("Codex");
+        wired.push("Codex".to_string());
     }
+    wired.extend(wire_catalog_agents(port, dry_run));
     if wired.is_empty() {
         println!("No coding agent found here yet. Once one is installed, run");
         println!("`ironwire init` again and it will be pointed at IronWire.");
     }
     Ok(wired)
+}
+
+/// Tools the signed catalog taught us about since the last release.
+///
+/// One tool failing is not the run failing. These arrive from a document rather
+/// than from this binary, so a config shape we did not anticipate is a thing to
+/// report and move past — the two built-in agents above, and the daemon itself,
+/// have nothing to do with it.
+fn wire_catalog_agents(port: u16, dry_run: bool) -> Vec<String> {
+    let Ok(paths) = ironwire_core::config::PathsConfig::resolve() else {
+        return Vec::new();
+    };
+    let store = ironwire_catalog::CatalogStore::load(
+        ironwire_catalog::CATALOG_PUBLIC_KEY,
+        &paths.catalog_file(),
+    );
+    let catalog = store.current();
+
+    for (id, problem) in catalog.rejected_agents() {
+        // Said out loud rather than dropped silently: a tool the document meant
+        // to ship and we would not touch is exactly the thing worth knowing.
+        tracing::warn!(agent = id, %problem, "catalog entry ignored");
+    }
+
+    let mut wired = Vec::new();
+    for agent in catalog.agents() {
+        if !connect::catalog_agent_installed(agent) {
+            continue;
+        }
+        match connect::wire_catalog_agent(agent, port, dry_run) {
+            Ok(()) => wired.push(agent.name.clone()),
+            Err(error) => println!("  {} could not be wired: {error:#}", agent.name),
+        }
+    }
+    wired
 }
 
 /// Where the daemon ended up.
@@ -583,7 +619,7 @@ fn summarise(
     port: u16,
     found: &Found,
     enabled: &[&'static str],
-    wired: &[&'static str],
+    wired: &[String],
     daemon: &Daemon,
 ) {
     println!();
@@ -621,9 +657,9 @@ fn summarise(
     // is down sends the user at a connection error, which is a worse first
     // impression than the extra step they still have to take.
     if matches!(daemon, Daemon::Service | Daemon::AlreadyUp) {
-        if wired.contains(&"Claude Code") {
+        if wired.iter().any(|w| w == "Claude Code") {
             println!("Start a new terminal and run `claude` — it goes through IronWire now.");
-        } else if wired.contains(&"Codex") {
+        } else if wired.iter().any(|w| w == "Codex") {
             println!("Start a new `codex` session — it goes through IronWire now.");
         }
     }

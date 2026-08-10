@@ -74,8 +74,28 @@ pub(crate) fn disconnect(target: &str, subscription: bool) -> Result<()> {
         "claude" => unwire_claude(),
         // Codex is pointed here by a file we wrote, so we can undo it.
         "codex" => disconnect_codex(),
-        other => bail!("unknown target `{other}`"),
+        // Anything the catalog taught us about. Looked up by id so a tool that
+        // arrived after this binary shipped can still be undone by it.
+        other => match catalog_agent(other) {
+            Some(agent) => unwire_catalog_agent(&agent, false),
+            None => bail!("unknown target `{other}`"),
+        },
     }
+}
+
+/// A catalog-described tool by id, if the installed document has one.
+pub(crate) fn catalog_agent(id: &str) -> Option<ironwire_catalog::schema::AgentEntry> {
+    let paths = ironwire_core::config::PathsConfig::resolve().ok()?;
+    let store = ironwire_catalog::CatalogStore::load(
+        ironwire_catalog::CATALOG_PUBLIC_KEY,
+        &paths.catalog_file(),
+    );
+    store
+        .current()
+        .agents()
+        .into_iter()
+        .find(|agent| agent.id == id)
+        .cloned()
 }
 
 /// Print the environment a client needs.
@@ -292,6 +312,98 @@ pub(crate) fn wire_claude(port: u16, dry_run: bool) -> Result<()> {
     if let Some(theirs) = edit.occupied_slot("statusLine") {
         println!("  You already have a status line (`{theirs}`), so IronWire left it alone.");
         println!("  To include IronWire in it, add the output of: {command}");
+    }
+    Ok(())
+}
+
+/// Whether a catalog-described tool looks installed here.
+pub(crate) fn catalog_agent_installed(agent: &ironwire_catalog::schema::AgentEntry) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    crate::agent_config::detected(agent, &home, &on_path)
+}
+
+/// Point a catalog-described tool at IronWire.
+///
+/// The same shape as [`wire_claude`] and [`wire_codex`] on purpose: name the
+/// file before touching it, show every change, and when a slot turns out to be
+/// the user's, say what would make it ours by hand instead of doing it for
+/// them. The only difference is that nothing here is compiled in — the file and
+/// the keys come from the signed catalog, and the value never does.
+pub(crate) fn wire_catalog_agent(
+    agent: &ironwire_catalog::schema::AgentEntry,
+    port: u16,
+    dry_run: bool,
+) -> Result<()> {
+    let home = dirs::home_dir().context("no home directory")?;
+    let path = agent.config.resolve(&home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let edit = crate::agent_config::connect(agent, &existing, port)
+        .with_context(|| format!("{} could not be edited", path.display()))?;
+
+    if !edit.is_noop() {
+        println!("Writing {}:", path.display());
+        for change in &edit.changes {
+            println!("  · {change}");
+        }
+        if dry_run {
+            println!("  [dry run] nothing was written.");
+        } else {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+            }
+            let extension = if agent.config.file.ends_with(".toml") {
+                "toml"
+            } else {
+                "json"
+            };
+            write_with_backup(&path, &existing, &edit.contents, extension)?;
+            println!("  {} picks this up on its next start.", agent.name);
+        }
+    }
+
+    for occupied in &edit.occupied {
+        println!(
+            "  {} is already set to `{}`, so IronWire left it.",
+            occupied.slot, occupied.current
+        );
+    }
+    Ok(())
+}
+
+/// Undo [`wire_catalog_agent`], removing only what it added.
+pub(crate) fn unwire_catalog_agent(
+    agent: &ironwire_catalog::schema::AgentEntry,
+    dry_run: bool,
+) -> Result<()> {
+    let home = dirs::home_dir().context("no home directory")?;
+    let path = agent.config.resolve(&home);
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+
+    let edit = crate::agent_config::disconnect(agent, &existing)
+        .with_context(|| format!("{} could not be edited", path.display()))?;
+    if edit.is_noop() {
+        return Ok(());
+    }
+
+    println!("Writing {}:", path.display());
+    for change in &edit.changes {
+        println!("  · {change}");
+    }
+    if dry_run {
+        println!("  [dry run] nothing was written.");
+    } else {
+        let extension = if agent.config.file.ends_with(".toml") {
+            "toml"
+        } else {
+            "json"
+        };
+        write_with_backup(&path, &existing, &edit.contents, extension)?;
     }
     Ok(())
 }

@@ -20,6 +20,8 @@
 //! The value written is never the catalog's to choose: it comes from
 //! [`Facade::url`], which is loopback and this daemon's port.
 
+use std::path::Path;
+
 use ironwire_catalog::schema::{AgentEntry, ConfigFormat, Facade};
 use serde_json::{Map, Value};
 
@@ -97,6 +99,33 @@ pub(crate) fn disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Err
         ConfigFormat::Json => json_disconnect(agent, existing),
         ConfigFormat::Toml => toml_disconnect(agent, existing),
     }
+}
+
+/// Whether this tool looks installed on the machine.
+///
+/// Mirrors `claude_installed` / `codex_installed`, and for the same reason both
+/// halves are needed: a tool installed but never run has no config directory
+/// yet, and one installed outside `PATH` — an app bundle, a version-manager
+/// shim — still leaves its directory behind. Either is enough.
+///
+/// `on_path` is injected so this is decidable without a real `PATH`, and so the
+/// rule can be tested rather than only observed.
+pub(crate) fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool) -> bool {
+    // An entry we would refuse to act on is not one to report as present:
+    // offering to wire a tool and then failing at the file is worse than never
+    // offering.
+    if agent.problem().is_some() {
+        return false;
+    }
+    if agent
+        .config
+        .resolve(home)
+        .parent()
+        .is_some_and(Path::exists)
+    {
+        return true;
+    }
+    agent.detect.iter().any(|name| on_path(name))
 }
 
 /// The entry's format, once it has passed the schema's own validation.
@@ -831,6 +860,51 @@ mod tests {
         let edit = disconnect(&toml_agent("providers.ironwire.base_url"), existing).expect("e");
         assert!(edit.is_noop());
         assert!(edit.contents.contains("their-proxy.example"));
+    }
+
+    // ------------------------------------------------------------- detection
+
+    #[test]
+    fn a_tool_with_a_config_directory_is_detected_even_when_it_is_not_on_path() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".tool")).expect("mkdir");
+        // An app bundle or a version-manager shim leaves no name on PATH.
+        assert!(detected(
+            &agent("env.ANTHROPIC_BASE_URL"),
+            home.path(),
+            &|_| false
+        ));
+    }
+
+    #[test]
+    fn a_tool_on_path_is_detected_before_it_has_ever_been_run() {
+        let home = tempfile::tempdir().expect("tempdir");
+        // No config directory yet — it has not been started.
+        assert!(detected(
+            &agent("env.ANTHROPIC_BASE_URL"),
+            home.path(),
+            &|name| name == "tool"
+        ));
+    }
+
+    #[test]
+    fn a_tool_that_is_neither_is_not_detected() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(!detected(
+            &agent("env.ANTHROPIC_BASE_URL"),
+            home.path(),
+            &|_| false
+        ));
+    }
+
+    /// Offering to wire a tool and then refusing at the file is worse than
+    /// never offering, so an entry we would not act on is not "present".
+    #[test]
+    fn an_entry_we_would_refuse_to_write_is_never_reported_as_installed() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let mut escaping = agent("env.ANTHROPIC_BASE_URL");
+        escaping.config.dir = vec!["..".to_string()];
+        assert!(!detected(&escaping, home.path(), &|_| true));
     }
 
     /// A catalog entry that failed validation must not reach a file at all.
