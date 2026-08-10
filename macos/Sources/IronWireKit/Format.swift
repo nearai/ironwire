@@ -133,6 +133,22 @@ public enum Format {
         String(format: "$%.2f", amount + 0)
     }
 
+    /// Names the way a sentence would: "a", "a and b", "a, b and c".
+    ///
+    /// A banner that reads "Claude Code, Codex not routed" is a list; one that
+    /// reads "Claude Code and Codex are not routed" is a sentence, and the
+    /// difference is whether someone finishes reading it.
+    public static func list(_ items: [String]) -> String {
+        switch items.count {
+        case 0: return ""
+        case 1: return "\(items[0]) is"
+        default:
+            let last = items[items.count - 1]
+            let rest = items.dropLast().joined(separator: ", ")
+            return "\(rest) and \(last) are"
+        }
+    }
+
     /// Backend kind as a phrase rather than an identifier.
     public static func kind(_ raw: String) -> String {
         raw.replacingOccurrences(of: "_", with: " ")

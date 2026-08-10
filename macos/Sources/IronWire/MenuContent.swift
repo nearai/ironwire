@@ -36,6 +36,9 @@ struct MenuContent: View {
     @State private var expanded: Set<String> = []
     /// What the last wiring of each tool reported, keyed by tool id.
     @State private var toolReports: [String: [String]] = [:]
+    /// Whether the one-time offer to wire everything has been answered.
+    /// Persisted: asking again every launch is how a prompt stops being read.
+    @AppStorage("toolsOnboardingAnswered") private var onboardingAnswered = false
 
     private var iconState: IconState { IconState.from(client.status) }
 
@@ -46,6 +49,7 @@ struct MenuContent: View {
             if let status = client.status {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
+                        onboarding()
                         backendSection(status)
                         toolsSection()
                         usageSection(status.usage)
@@ -364,6 +368,47 @@ struct MenuContent: View {
         case .good: return .green
         case .warn: return .orange
         case .bad: return .red
+        }
+    }
+
+    // MARK: - Onboarding
+
+    /// Offer, once, to point every agent on this machine at IronWire.
+    ///
+    /// A daemon nothing routes through is the state a fresh install is in, and
+    /// the one a user is least equipped to diagnose: every backend healthy,
+    /// capacity plentiful, and their agent talking straight to the provider.
+    /// Asking once is the whole of the interaction — after that the switches in
+    /// the Tools section are there, and a banner that keeps coming back is one
+    /// people learn to dismiss without reading.
+    ///
+    /// Not a sheet. A modal over a menu bar panel is a dialog that blocks the
+    /// one surface the user opened to get an answer, and the answer here fits
+    /// in two lines.
+    @ViewBuilder
+    private func onboarding() -> some View {
+        let candidates = (client.settings?.tools ?? []).filter { $0.installed && !$0.wired }
+        if !onboardingAnswered, !candidates.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("\(Format.list(candidates.map(\.name))) not routed through IronWire.")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button("Point \(candidates.count == 1 ? "it" : "them") here") {
+                        onboardingAnswered = true
+                        for tool in candidates {
+                            setTool(tool, connect: true)
+                        }
+                    }
+                    .disabled(busy)
+                    Button("Not now") { onboardingAnswered = true }
+                    Spacer()
+                }
+                .font(.caption2)
+                .buttonStyle(.link)
+            }
+            .padding(8)
+            .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
         }
     }
 

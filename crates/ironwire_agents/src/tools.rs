@@ -316,8 +316,16 @@ pub fn commit(planned: &Planned) -> std::io::Result<Option<PathBuf>> {
         let backup = planned
             .path
             .with_extension(format!("{extension}.ironwire-backup"));
-        std::fs::write(&backup, &planned.existing)?;
-        Some(backup)
+        // Never overwrite one. The first backup is the only one that holds the
+        // file as it was before IronWire touched it; a second write — say a
+        // disconnect after a connect — would replace the user's original with
+        // our own edit and leave nothing to go back to. Found the hard way.
+        if backup.exists() {
+            None
+        } else {
+            std::fs::write(&backup, &planned.existing)?;
+            Some(backup)
+        }
     };
     std::fs::write(&planned.path, &planned.contents)?;
     Ok(backup)
@@ -384,5 +392,40 @@ mod tests {
     fn a_codex_provider_block_alone_is_not_wired() {
         let existing = "[model_providers.ironwire]\nbase_url = \"http://127.0.0.1:8463/openai\"\n";
         assert!(!codex_config::is_wired(existing));
+    }
+
+    /// The first backup is the only one holding the file as it was before
+    /// IronWire touched it. A connect followed by a disconnect used to replace
+    /// it with our own edit, leaving nothing to go back to.
+    #[test]
+    fn a_second_write_does_not_replace_the_original_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "ORIGINAL").expect("write");
+        let backup = path.with_extension("json.ironwire-backup");
+
+        let first = Planned {
+            path: path.clone(),
+            changes: vec!["something".to_string()],
+            occupied: Vec::new(),
+            existing: "ORIGINAL".to_string(),
+            contents: "EDITED".to_string(),
+        };
+        assert_eq!(commit(&first).expect("commit"), Some(backup.clone()));
+        assert_eq!(std::fs::read_to_string(&backup).expect("read"), "ORIGINAL");
+
+        let second = Planned {
+            path,
+            changes: vec!["something else".to_string()],
+            occupied: Vec::new(),
+            existing: "EDITED".to_string(),
+            contents: "EDITED AGAIN".to_string(),
+        };
+        assert_eq!(commit(&second).expect("commit"), None);
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read"),
+            "ORIGINAL",
+            "the original backup was overwritten by a later edit"
+        );
     }
 }

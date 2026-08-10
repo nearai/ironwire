@@ -148,4 +148,13 @@ final class FormatTests: XCTestCase {
         XCTAssertEqual(Format.routeSummary(stayed), "claude-sub")
         XCTAssertEqual(Format.routeSummary(LastRouteView(backend: "claude-sub")), "claude-sub")
     }
+
+    /// A banner is read as a sentence or not at all.
+    func test_names_are_joined_as_a_sentence_not_a_list() {
+        XCTAssertEqual(Format.list([]), "")
+        XCTAssertEqual(Format.list(["Claude Code"]), "Claude Code is")
+        XCTAssertEqual(Format.list(["Claude Code", "Codex"]), "Claude Code and Codex are")
+        XCTAssertEqual(
+            Format.list(["Claude Code", "Codex", "Zed"]), "Claude Code, Codex and Zed are")
+    }
 }
