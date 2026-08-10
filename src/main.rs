@@ -1,5 +1,6 @@
 //! The `ironwire` command-line interface.
 
+mod agent_config;
 mod claude_settings;
 mod codex_config;
 mod commands;

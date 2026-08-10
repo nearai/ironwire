@@ -183,8 +183,14 @@ pub enum Facade {
 }
 
 impl Facade {
-    /// Compiled-in path suffix. Never read from the document.
-    const fn suffix(self) -> &'static str {
+    /// Every façade, so a caller can ask "is this one of ours" without
+    /// hardcoding the list a second time.
+    pub const ALL: [Self; 2] = [Self::Anthropic, Self::OpenAi];
+
+    /// The compiled-in path this façade is served on. Never read from the
+    /// document — this is the half of the address the catalog cannot reach.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
         match self {
             Self::Anthropic => "/anthropic",
             Self::OpenAi => "/openai",
@@ -194,7 +200,7 @@ impl Facade {
     /// Where this façade actually is, on this machine, right now.
     #[must_use]
     pub fn url(self, port: u16) -> String {
-        format!("http://127.0.0.1:{port}{}", self.suffix())
+        format!("http://127.0.0.1:{port}{}", self.path())
     }
 }
 
