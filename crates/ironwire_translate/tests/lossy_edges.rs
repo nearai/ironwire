@@ -12,7 +12,22 @@
 //! block a user asked a question about would be discarded, and the model would
 //! answer as though it had never been sent.
 
-use ironwire_translate::anthropic_to_chat_completions;
+use ironwire_core::protocol::Protocol;
+use ironwire_translate::{Dropped, emit_request, parse_request};
+
+/// Anthropic in, Chat Completions out — the pair these edges were found on.
+///
+/// Parsing no longer judges anything, so what used to be one call is now
+/// parse-then-emit: the unknown block is recorded on the way in and refused
+/// on the way out, by the target that cannot express it.
+fn anthropic_to_chat_completions(
+    body: &serde_json::Value,
+    model: &str,
+    _stream: bool,
+) -> (serde_json::Value, Dropped) {
+    let ir = parse_request(Protocol::AnthropicMessages, body);
+    emit_request(Protocol::OpenAiChat, &ir, model)
+}
 use serde_json::json;
 
 fn body_with(block: serde_json::Value) -> serde_json::Value {
@@ -93,7 +108,7 @@ fn the_types_we_do_model_are_not_reported_as_unknown() {
         dropped.unknown_blocks
     );
     // The losses we *do* accept are still counted.
-    assert_eq!(dropped.thinking_blocks, 1);
+    assert_eq!(dropped.reasoning_blocks, 1);
     assert!(dropped.cache_breakpoints >= 1);
 }
 

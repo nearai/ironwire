@@ -10,7 +10,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use ironwire_catalog::AnthropicCatalog;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol};
+use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::claude::{ANTHROPIC_HOST, ClaudeCodeCredentials};
 use ironwire_creds::{Bearer, CredentialError};
@@ -37,7 +37,7 @@ pub enum AnthropicAuth {
 #[must_use]
 pub fn anthropic_capabilities() -> Capabilities {
     Capabilities {
-        protocol: Protocol::AnthropicMessages,
+        wires: Wires::only(Protocol::AnthropicMessages),
         tools: true,
         parallel_tool_calls: true,
         images: true,

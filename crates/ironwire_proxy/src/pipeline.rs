@@ -20,7 +20,6 @@ use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::{ConversationKey, NoRoute, RouteDecision};
 use ironwire_core::protocol::Protocol;
 use ironwire_ledger::{Exchange, Ledger};
-use ironwire_translate::ChatToAnthropicStream;
 use ironwire_upstream::backend::{Backend, UpstreamError, UpstreamRequest, UpstreamResponse};
 use ironwire_upstream::observe::Observation;
 use ironwire_upstream::sse::{Dialect, SseObserver};
@@ -43,7 +42,7 @@ pub struct Routed {
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     /// The router found nowhere to send this.
-    #[error("no route: {0:?}")]
+    #[error("no route: {0}")]
     NoRoute(NoRoute),
     /// Every candidate backend failed.
     #[error("all backends failed")]
@@ -335,8 +334,12 @@ async fn dispatch_inner(
         };
 
         attempts += 1;
+        // The wire this backend prefers is the one a translated route targets.
+        // The router already established that it does not speak `inbound`, or
+        // `translated` would be false.
+        let target = backend.capabilities().wires.primary();
         let request = if decision.translated {
-            match translate_request(&body, path, &decision, peek) {
+            match translate_request(&body, path, inbound, target, &decision, peek) {
                 Ok(request) => request,
                 Err(reason) => {
                     // Refusing beats sending a body the target cannot parse.
@@ -362,6 +365,8 @@ async fn dispatch_inner(
                 let response = if decision.translated {
                     translate_response(
                         response,
+                        inbound,
+                        target,
                         peek.requested_model.as_deref().unwrap_or("unknown"),
                         peek.stream,
                     )
@@ -499,22 +504,29 @@ pub fn backoff_for(attempt: usize) -> std::time::Duration {
     std::time::Duration::from_millis(250 * (1 << attempt.min(6)) as u64)
 }
 
-/// Build a Chat Completions request out of an Anthropic Messages body.
+/// Re-express a request that arrived on `inbound` for a backend speaking
+/// `target`.
 ///
-/// Only the messages endpoint is translatable. `count_tokens` has no
-/// Chat Completions equivalent, and answering it with a guess would corrupt the
-/// client's context accounting — so it is refused rather than approximated.
+/// Everything goes through the pivot IR (`docs/TRANSLATION.md`): parse on the
+/// wire it came in on, emit on the wire it is going out on. Which pair that is
+/// stops mattering here — the one thing this function still decides is what to
+/// do about content the target cannot express.
 ///
 /// # Errors
 ///
-/// A human-readable reason when this path cannot be translated.
+/// A human-readable reason when this request cannot be translated.
 fn translate_request(
     body: &Bytes,
     path: &str,
+    inbound: Protocol,
+    target: Protocol,
     decision: &RouteDecision,
     peek: &RequestPeek,
 ) -> Result<UpstreamRequest, String> {
-    if !path.ends_with("/v1/messages") {
+    // Only the completion endpoints translate. `count_tokens` has no equivalent
+    // on the other wires, and answering it with a guess would corrupt the
+    // client's context accounting — so it is refused rather than approximated.
+    if !is_completion_path(path) {
         return Err(format!("{path} has no cross-family equivalent"));
     }
     let parsed: serde_json::Value = serde_json::from_slice(body)
@@ -525,14 +537,15 @@ fn translate_request(
         .or(peek.requested_model.as_deref())
         .unwrap_or("default");
 
-    let (translated, dropped) =
-        ironwire_translate::anthropic_to_chat_completions(&parsed, model, peek.stream);
-    // A block type this build does not model makes the whole cross-family
-    // route ineligible. We cannot tell whether it was load-bearing — a
-    // `document` the user asked a question about looks exactly like one that
-    // was decorative — and answering about content the model never received is
-    // the silent degradation `docs/PROTOCOL.md` §6 refuses. The native lane
-    // carries it perfectly, so the cost is waiting for same-family capacity.
+    let conversation = ironwire_translate::parse_request(inbound, &parsed);
+    let (translated, dropped) = ironwire_translate::emit_request(target, &conversation, model);
+
+    // A block type this build does not model makes the whole cross-wire route
+    // ineligible. We cannot tell whether it was load-bearing — a `document` the
+    // user asked a question about looks exactly like one that was decorative —
+    // and answering about content the model never received is the silent
+    // degradation `docs/PROTOCOL.md` §6 refuses. The native lane carries it
+    // perfectly, so the cost is waiting for same-wire capacity.
     if !dropped.unknown_blocks.is_empty() {
         return Err(format!(
             "the request contains content this build cannot translate \
@@ -544,29 +557,40 @@ fn translate_request(
     if !dropped.is_empty() {
         tracing::info!(
             backend = %decision.backend,
-            thinking_blocks = dropped.thinking_blocks,
+            %inbound,
+            %target,
+            reasoning_blocks = dropped.reasoning_blocks,
             cache_breakpoints = dropped.cache_breakpoints,
             images = dropped.images,
-            "translated across API families; these did not survive"
+            "translated across wires; these did not survive"
         );
     }
     let body = serde_json::to_vec(&translated)
         .map_err(|e| format!("could not serialise the translated request: {e}"))?;
 
     Ok(UpstreamRequest {
-        path: "/v1/chat/completions".to_string(),
+        path: ironwire_translate::endpoint_path(target).to_string(),
         body: Bytes::from(body),
-        // The inbound headers describe the Anthropic protocol; none of them
-        // mean anything to a Chat Completions endpoint.
+        // The inbound headers describe the protocol the request arrived on;
+        // none of them mean anything to a backend speaking a different one.
         headers: Vec::new(),
         stream: peek.stream,
     })
 }
 
-/// Map a Chat Completions response back into the Anthropic shape the client is
-/// waiting for.
+/// Whether this path is a completion endpoint on some wire.
+fn is_completion_path(path: &str) -> bool {
+    path.ends_with("/v1/messages")
+        || path.ends_with("/v1/responses")
+        || path.ends_with("/v1/chat/completions")
+}
+
+/// Map an answer that arrived on `target` back into the shape the client asked
+/// for on `inbound`.
 fn translate_response(
     response: UpstreamResponse,
+    inbound: Protocol,
+    target: Protocol,
     requested_model: &str,
     stream: bool,
 ) -> UpstreamResponse {
@@ -587,9 +611,9 @@ fn translate_response(
     ));
 
     let body = if stream {
-        translated_stream(response.body, requested_model.to_string()).boxed()
+        translated_stream(response.body, inbound, target, requested_model.to_string()).boxed()
     } else {
-        translated_body(response.body, requested_model.to_string()).boxed()
+        translated_body(response.body, inbound, target, requested_model.to_string()).boxed()
     };
 
     UpstreamResponse {
@@ -599,9 +623,11 @@ fn translate_response(
     }
 }
 
-/// Buffer a non-streaming response and re-emit it in the Anthropic shape.
+/// Buffer a non-streaming response and re-emit it in the client's shape.
 fn translated_body(
     inner: futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>>,
+    inbound: Protocol,
+    target: Protocol,
     requested_model: String,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     futures_util::stream::once(async move {
@@ -612,8 +638,9 @@ fn translated_body(
         }
         let parsed: serde_json::Value =
             serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
-        let translated =
-            ironwire_translate::chat_completion_to_anthropic(&parsed, &requested_model);
+        let completion = ironwire_translate::parse_completion(target, &parsed);
+        let (translated, _) =
+            ironwire_translate::emit_completion(inbound, &completion, &requested_model);
         Ok(Bytes::from(
             serde_json::to_vec(&translated).unwrap_or_else(|_| b"{}".to_vec()),
         ))
@@ -623,9 +650,18 @@ fn translated_body(
 /// Translate the event stream chunk by chunk, so text still arrives live.
 fn translated_stream(
     inner: futures_util::stream::BoxStream<'static, Result<Bytes, UpstreamError>>,
+    inbound: Protocol,
+    target: Protocol,
     requested_model: String,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
-    let state = (inner, Some(ChatToAnthropicStream::new(requested_model)));
+    let state = (
+        inner,
+        Some(ironwire_translate::Translator::new(
+            target,
+            inbound,
+            requested_model,
+        )),
+    );
     futures_util::stream::unfold(state, |(mut inner, mut translator)| async move {
         let mut active = translator.take()?;
         loop {

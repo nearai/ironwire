@@ -185,6 +185,10 @@ agent for no reason. Those descend immediately.
 
 ## 6. Where translation is lossy, and what we do about it
 
+> The *mechanism* — the pivot IR, the parsers and emitters, and the cost of each
+> ordered pair — is `docs/TRANSLATION.md`. This section is the policy: when a
+> translated route is allowed at all, and what it costs when it is taken.
+
 ### The rule: switch families at a turn boundary, never mid tool loop
 
 This section originally claimed that a signed `thinking` block made a
@@ -198,7 +202,7 @@ What actually happens:
 | Direction | Behaviour |
 |---|---|
 | Anthropic thinking blocks → a foreign provider | The provider never validates them. We drop them during translation. Nothing errors. |
-| Foreign reasoning state → Anthropic | Anthropic **drops** it from the prompt rather than rejecting it — silently, and unbilled. |
+| Foreign reasoning state → Anthropic | Dropped by us, before it is sent. Anthropic would drop it from the prompt anyway — silently and unbilled — but relying on that is relying on somebody else's leniency. |
 | Anthropic thinking blocks → Anthropic | Must be replayed **unchanged**. Modifying one is rejected; *removing* one can trigger an ordering/signature 400. |
 
 The third row is the whole constraint, and it bites on the **return** path. A
@@ -271,15 +275,23 @@ class of over-strictness as the original reasoning rule.
 
 ### Tool-call identity
 
-Cross-family routes need `toolu_* ↔ call_*` to survive both directions, because
-the client replays whatever id we returned, forever.
+A translated route needs ids to survive both directions, because the client
+replays whatever id we returned, forever.
 
 The obvious design is a conversation-lifetime map. IronWire deliberately does
 **not** use one: a map is state that can be lost (restart, eviction), and losing
 it mints *invalid ids* — undiagnosable and unrecoverable. Instead the mapping is
-a stateless reversible encoding (`ironwire_translate::tool_ids`): a foreign id
-becomes `toolu_xw_<original>`, and the prefix is stripped on the way back. Two
-processes agree without sharing anything, and a restart changes nothing.
+a stateless reversible encoding (`ironwire_translate::tool_ids`), chosen by the
+**target** wire: Anthropic wants the `toolu_` shape, so a foreign id becomes
+`toolu_xw_<original>` and the prefix comes off on the way back; both OpenAI
+wires take arbitrary strings and need no encoding at all. Two processes agree
+without sharing anything, and a restart changes nothing.
+
+An id already native to the target goes back **unchanged**, which is why
+`ToolCallId` carries where it came from: the string alone cannot distinguish an
+Anthropic id going home from a foreign one arriving, and prefixing the first
+produces `toolu_xw_toolu_01ABC` — an id the client has never seen and cannot
+match to anything it is holding.
 
 ### Not yet done: switching mid-loop
 
@@ -297,10 +309,15 @@ tracked in `ROADMAP.md` under M3.
 
 ### Content this build does not model
 
-The translator handles `text`, `thinking`, `image`, `tool_use` and
-`tool_result`. Anything else — a `document`, a `search_result`, whatever
-Anthropic ships next — is **named in `Dropped::unknown_blocks` and makes the
-cross-family route ineligible.**
+The IR models `text`, reasoning, `image`, tool calls and tool results on every
+wire. Anything else — a `document`, a `search_result`, whatever a provider ships
+next — is **carried whole** through parsing, and then, if the target cannot
+express it, **named in `Dropped::unknown_blocks`, which makes the route
+ineligible.**
+
+Carried rather than judged on the way in, because whether a block can travel
+depends entirely on where it is going: a block goes back to its own wire
+untouched, and that round trip is what makes the parsers testable.
 
 Refusing rather than dropping, because the two are indistinguishable from here.
 A `document` block a user asked a question about looks exactly like one that was

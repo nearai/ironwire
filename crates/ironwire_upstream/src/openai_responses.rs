@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures_util::StreamExt;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol};
+use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::codex::{CHATGPT_BASE_URL, CHATGPT_HOST, CodexCredentials, OPENAI_HOST};
 use ironwire_creds::{Bearer, CredentialError};
@@ -47,7 +47,7 @@ pub enum ResponsesAuth {
 #[must_use]
 pub fn responses_capabilities() -> Capabilities {
     Capabilities {
-        protocol: Protocol::OpenAiResponses,
+        wires: Wires::only(Protocol::OpenAiResponses),
         tools: true,
         parallel_tool_calls: true,
         images: true,
@@ -829,8 +829,8 @@ mod tests {
         let key = ResponsesBackend::openai_api_key(SecretString::from("sk-x"), None, 60)
             .expect("client builds");
         assert_eq!(
-            sub.capabilities().protocol,
-            key.capabilities().protocol,
+            sub.capabilities().wires,
+            key.capabilities().wires,
             "falling from one to the other must need no translation"
         );
         assert_eq!(sub.kind(), BackendKind::Subscription);

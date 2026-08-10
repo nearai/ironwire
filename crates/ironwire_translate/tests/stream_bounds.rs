@@ -6,7 +6,20 @@
 //! hostile endpoint could take the daemon down and with it every conversation
 //! on the machine.
 
-use ironwire_translate::ChatToAnthropicStream;
+use ironwire_core::protocol::Protocol;
+use ironwire_translate::Translator;
+
+/// The pair these bounds were originally written against. They are
+/// properties of the shared framer and accumulator now, so any pair would
+/// exercise them — this one keeps the assertions about Anthropic output
+/// that the tests already make.
+fn translator() -> Translator {
+    Translator::new(
+        Protocol::OpenAiChat,
+        Protocol::AnthropicMessages,
+        "claude-opus-4-6",
+    )
+}
 
 fn frame(payload: &str) -> Vec<u8> {
     format!("data: {payload}\n\n").into_bytes()
@@ -23,7 +36,7 @@ const ARGUMENT_TEMPLATE: &str =
 fn an_upstream_that_never_sends_a_frame_boundary_does_not_grow_the_buffer() {
     // The SSE buffer holds bytes until `\n\n`. Without a bound, an endpoint
     // that simply never sends one grows it until the process dies.
-    let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+    let mut stream = translator();
     let junk = "x".repeat(64 * 1024);
     for _ in 0..200 {
         // 12 MB with no boundary anywhere.
@@ -55,7 +68,7 @@ fn an_upstream_that_never_sends_a_frame_boundary_does_not_grow_the_buffer() {
 fn an_implausible_tool_call_index_does_not_allocate() {
     // `index` is upstream-controlled and drove a `Vec::resize`. One frame
     // claiming four billion parallel tool calls was enough to abort.
-    let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+    let mut stream = translator();
     let out = stream.push(&frame(
         r#"{"choices":[{"delta":{"tool_calls":[{"index":4000000000,"id":"call_x","function":{"name":"boom","arguments":"{}"}}]}}]}"#,
     ));
@@ -81,7 +94,7 @@ fn an_implausible_tool_call_index_does_not_allocate() {
 fn a_high_but_plausible_tool_call_index_still_works() {
     // The bound must not refuse real parallelism. Models do emit several
     // concurrent calls; the limit is only there to stop the absurd.
-    let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+    let mut stream = translator();
     for index in 0..8 {
         let payload = TOOL_CALL_TEMPLATE.replace("INDEX", &index.to_string());
         let _ = stream.push(&frame(&payload));
@@ -99,7 +112,7 @@ fn unbounded_tool_arguments_are_refused_and_the_call_is_dropped() {
     // would hand the client a `tool_use` block with unparseable input, which it
     // would pass to a tool — dropping the call is visibly incomplete rather
     // than silently wrong.
-    let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+    let mut stream = translator();
     let _ = stream.push(&frame(
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_big","function":{"name":"huge","arguments":"start"}}]}}]}"#,
     ));
@@ -124,7 +137,7 @@ fn unbounded_tool_arguments_are_refused_and_the_call_is_dropped() {
 #[test]
 fn ordinary_tool_arguments_are_unaffected() {
     // The bound is generous by design; a realistic call must not notice it.
-    let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+    let mut stream = translator();
     let body = "z".repeat(32 * 1024);
     let _ = stream.push(&frame(
         r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write","arguments":"start"}}]}}]}"#,
@@ -152,7 +165,7 @@ fn a_client_always_gets_a_terminated_message_whatever_the_upstream_did() {
         b"\n\n\n\n",
         b"",
     ] {
-        let mut stream = ChatToAnthropicStream::new("claude-opus-4-6");
+        let mut stream = translator();
         let mut out = stream.push(hostile);
         out.extend_from_slice(&stream.finish());
         let text = String::from_utf8_lossy(&out);

@@ -85,12 +85,20 @@ Native pairs in the plan:
 | `/openai/v1/responses` | OpenAI API key | M2 |
 | `/openai/v1/chat/completions` | NEAR AI, OpenAI-compatible, Ollama | M2 |
 
-### Translated pairs in the plan
+### Translated pairs
 
-| Façade | Backend | Status |
+Every ordered pair of the three wires, through a canonical IR rather than a
+translator per pair (`docs/TRANSLATION.md`). All of them are gated on the same
+turn-boundary rule.
+
+| From | To | Cost beyond a native forward |
 |---|---|---|
-| `/anthropic/v1/messages` | NEAR AI / any OpenAI-compatible endpoint | **done** — `ironwire_translate`, gated on the turn-boundary rule |
-| `/openai/v1/responses` | Anthropic family | later |
+| `anthropic.messages` | `openai.responses` | signed thinking, cache breakpoints |
+| `anthropic.messages` | `openai.chat` | signed thinking, cache breakpoints, system flattened |
+| `openai.responses` | `anthropic.messages` | encrypted reasoning |
+| `openai.responses` | `openai.chat` | encrypted reasoning, typed items flattened |
+| `openai.chat` | `anthropic.messages` | — |
+| `openai.chat` | `openai.responses` | — |
 
 ### Translated lane — fallback only
 

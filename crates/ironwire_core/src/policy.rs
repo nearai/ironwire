@@ -8,6 +8,7 @@
 //! sustained pressure, not a fresh choice made 200 times an hour.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -148,10 +149,18 @@ pub enum NoRoute {
     NoBackendsConfigured,
     /// Every backend is rate-limited or unhealthy.
     AllExhausted,
-    /// Backends exist but none can preserve the request's semantics.
-    AllIneligible {
-        /// Per-backend refusal reasons.
-        reasons: Vec<(BackendId, Ineligible)>,
+    /// Backends exist and none of them could take this request.
+    ///
+    /// Carries **every** backend that was considered, including the ones that
+    /// never reached the capability gate. That is the whole point of the
+    /// variant: it used to report only the candidates that failed *eligibility*,
+    /// so a machine with two unconsented subscriptions and one backend on the
+    /// wrong wire told the user about the wrong wire and stayed silent about
+    /// the two credentials that were sitting right there. The reason a user can
+    /// act on is almost never the interesting one.
+    NoneUsable {
+        /// Per-backend refusals, most actionable first.
+        refusals: Vec<(BackendId, Refusal)>,
     },
     /// The only backends that could serve this need a client identity the
     /// request does not carry.
@@ -195,6 +204,61 @@ pub enum NoRoute {
         /// What exists, so the answer is actionable.
         available: Vec<String>,
     },
+}
+
+/// The refusal as a sentence, for a log line.
+///
+/// The `Debug` rendering this replaces put a struct literal in the daemon's
+/// log — `AllIneligible { reasons: [(BackendId("nearai"), NoTranslationPath)] }`
+/// — which is readable if you already know the codebase and useless otherwise.
+/// A log line is the one place a user looks after their agent stops.
+impl fmt::Display for NoRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoBackendsConfigured => f.write_str("no backends are configured"),
+            Self::AllExhausted => f.write_str("every backend is rate limited or unhealthy"),
+            Self::NoneUsable { refusals } => {
+                f.write_str("no backend could take this request")?;
+                for (id, why) in refusals {
+                    write!(f, "; {id}: {}", why.describe())?;
+                }
+                Ok(())
+            }
+            Self::RequiresClientIdentity => f.write_str(
+                "every backend that could serve this needs the originating product's own client identity",
+            ),
+            Self::NoTrustedBackendAvailable { tried, missing } => {
+                f.write_str("privacy.mode = full and no trusted backend could serve this")?;
+                for (id, why) in tried {
+                    write!(f, "; {id}: {why}")?;
+                }
+                if !missing.is_empty() {
+                    write!(f, "; not registered at all: {}", missing.join(", "))?;
+                }
+                Ok(())
+            }
+            Self::SpendCapReached {
+                backend,
+                spent_usd,
+                cap_usd,
+            } => write!(
+                f,
+                "{backend} has reached the ${cap_usd:.2} spend cap you set (${spent_usd:.2} spent today)"
+            ),
+            Self::UnknownRoute {
+                requested,
+                available,
+            } => write!(
+                f,
+                "`{requested}` is not a connected backend (connected: {})",
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+        }
+    }
 }
 
 /// One turn's routing inputs, travelling together because they always do.
@@ -429,10 +493,19 @@ impl Policy {
                     missing: Vec::new(),
                 });
             }
-            let cross = candidate.caps.protocol.family() != inbound.family();
+            // The same wire question `usable` asks, and for the same reason. It
+            // used to compare *families* here, which is a different question
+            // with the same shape: Responses and Chat Completions share a
+            // family and are different wires, so a pinned Codex request was
+            // handed to a Chat backend as a native forward — `translated:
+            // false`, a Responses body, and an endpoint that cannot read it.
+            // The unpinned path refused that route correctly; a pin is meant to
+            // override preference, never turn a refusal into a malformed
+            // request.
+            let cross = !candidate.caps.wires.speaks(inbound);
             eligible(&peek.requirements, &candidate.caps, cross).map_err(|why| {
-                NoRoute::AllIneligible {
-                    reasons: vec![(candidate.id.clone(), why)],
+                NoRoute::NoneUsable {
+                    refusals: vec![(candidate.id.clone(), Refusal::Ineligible(why))],
                 }
             })?;
             return Ok(RouteDecision {
@@ -653,9 +726,10 @@ impl Policy {
         candidates: &[Candidate],
         now: DateTime<Utc>,
     ) -> Result<RouteDecision, NoRoute> {
-        let mut ineligible = Vec::new();
-        let mut identity_blocked = false;
-        let mut any_available = false;
+        // Every backend that did not take the request, and why. Collected for
+        // all of them rather than only the ones that failed the capability gate
+        // — see `NoRoute::NoneUsable`.
+        let mut refusals: Vec<(BackendId, Refusal)> = Vec::new();
         let mut capped: Vec<(BackendId, f64, f64)> = Vec::new();
 
         // Rungs 0-2 all forward the request's own bytes, so they need a backend
@@ -667,28 +741,18 @@ impl Policy {
         let mut cross_family: Vec<&Candidate> = Vec::new();
 
         for candidate in candidates {
-            match usable(candidate, peek, inbound, now) {
-                Ok(()) => {}
-                Err(Unusable::Ineligible(why)) => {
-                    ineligible.push((candidate.id.clone(), why));
-                    continue;
-                }
-                Err(Unusable::NeedsClientIdentity) => {
-                    identity_blocked = true;
-                    continue;
-                }
-                Err(Unusable::Unavailable) => {
-                    if let crate::quota::Headroom::CapReached {
+            if let Err(unusable) = usable(candidate, peek, inbound, now) {
+                if matches!(unusable, Unusable::NoCapacity)
+                    && let crate::quota::Headroom::CapReached {
                         spent_usd, cap_usd, ..
                     } = candidate.quota.primary
-                    {
-                        capped.push((candidate.id.clone(), spent_usd, cap_usd));
-                    }
-                    continue;
+                {
+                    capped.push((candidate.id.clone(), spent_usd, cap_usd));
                 }
+                refusals.push((candidate.id.clone(), Refusal::from(&unusable)));
+                continue;
             }
-            any_available = true;
-            if candidate.caps.protocol == inbound {
+            if candidate.caps.wires.speaks(inbound) {
                 same_wire.push(candidate);
             } else {
                 cross_family.push(candidate);
@@ -785,7 +849,7 @@ impl Policy {
             let position = |id: &BackendId| candidates.iter().position(|c| &c.id == id);
             let passed_over_a_preferred_credential = candidates
                 .iter()
-                .filter(|c| c.caps.protocol == inbound && c.id != best.id)
+                .filter(|c| c.caps.wires.speaks(inbound) && c.id != best.id)
                 .filter(|c| serves_tier(c, tier))
                 .any(|c| {
                     let (theirs, ours) =
@@ -831,36 +895,136 @@ impl Policy {
         // Reported ahead of everything else: when the mode is what stopped the
         // request, any other reason is incidental to a backend the user had
         // already excluded.
-        if ineligible
+        if refusals
             .iter()
-            .any(|(_, why)| *why == Ineligible::NotTrustedUnderFullPrivacy)
+            .any(|(_, why)| *why == Refusal::Ineligible(Ineligible::NotTrustedUnderFullPrivacy))
         {
             return Err(NoRoute::NoTrustedBackendAvailable {
-                tried: ineligible
+                tried: refusals
                     .iter()
-                    .filter(|(_, why)| *why != Ineligible::NotTrustedUnderFullPrivacy)
-                    .map(|(id, why)| (id.clone(), format!("{why:?}")))
+                    .filter(|(_, why)| {
+                        *why != Refusal::Ineligible(Ineligible::NotTrustedUnderFullPrivacy)
+                    })
+                    .map(|(id, why)| (id.clone(), why.describe()))
                     .collect(),
                 missing: Vec::new(),
             });
         }
-        if !ineligible.is_empty() {
-            return Err(NoRoute::AllIneligible {
-                reasons: ineligible,
-            });
-        }
-        if identity_blocked && !any_available {
+        // Kept ahead of the general answer rather than behind it. This check
+        // used to sit *after* the ineligible list was returned, so one backend
+        // on the wrong wire was enough to hide the fact that everything else
+        // was waiting on a client identity — the one refusal with an actual
+        // instruction attached.
+        if !refusals.is_empty()
+            && refusals
+                .iter()
+                .all(|(_, why)| *why == Refusal::NeedsClientIdentity)
+        {
             return Err(NoRoute::RequiresClientIdentity);
+        }
+        if !refusals.is_empty() {
+            // Everything merely busy is a 429 that says come back later, which
+            // is a better answer than a list of backends with nothing wrong
+            // with them. Anything else is a configuration problem and gets the
+            // full list.
+            if refusals.iter().all(|(_, why)| why.is_transient()) {
+                return Err(NoRoute::AllExhausted);
+            }
+            // Stable sort, so backends keep registration order within a group
+            // and only actionability moves them.
+            refusals.sort_by_key(|(_, why)| u8::from(!why.is_actionable()));
+            return Err(NoRoute::NoneUsable { refusals });
         }
         Err(NoRoute::AllExhausted)
     }
 }
 
+/// Why one backend could not take this request.
+///
+/// Split finer than the router strictly needs, because the router is not the
+/// only reader: this is what a refused request tells the user, and "unavailable"
+/// covers a subscription nobody has consented to, a circuit that is open, and a
+/// window that is spent — three different things with three different answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Refusal {
+    /// A subscription whose consent has not been recorded on this machine.
+    ///
+    /// The most actionable refusal there is, and the one most likely to be
+    /// hiding behind something else: consent is per-machine, so a second device
+    /// has it unset while the credential is right there and working.
+    NotConsented,
+    /// Needs the originating product's own client identity, which this request
+    /// does not carry (`docs/TRUST.md` §3).
+    NeedsClientIdentity,
+    /// The breaker has it open, or it is failing.
+    Unhealthy,
+    /// Rate limited, or out of window capacity.
+    NoCapacity,
+    /// It could have taken the request and cannot preserve it.
+    Ineligible(Ineligible),
+}
+
+impl Refusal {
+    /// Whether this is something the user can do something about right now.
+    ///
+    /// Used to order a refusal list. A capability mismatch is a fact about the
+    /// request; an unconsented subscription is a switch nobody has flipped, and
+    /// it belongs first however many other backends have more interesting
+    /// problems.
+    #[must_use]
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, Self::NotConsented | Self::NeedsClientIdentity)
+    }
+
+    /// Whether this is a capacity problem rather than a configuration one.
+    ///
+    /// When every refusal answers `true`, the honest reply is
+    /// [`NoRoute::AllExhausted`] — a 429 that says "come back later" — rather
+    /// than a 503 listing backends that are working fine and merely busy.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Unhealthy | Self::NoCapacity)
+    }
+
+    /// One sentence, for a log line or an error body.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NotConsented => {
+                "not enabled: this subscription's consent has not been recorded on this machine"
+                    .to_string()
+            }
+            Self::NeedsClientIdentity => {
+                "needs the originating product's own client identity, which this request does not carry"
+                    .to_string()
+            }
+            Self::Unhealthy => "unhealthy: recent requests to it failed".to_string(),
+            Self::NoCapacity => "no capacity: rate limited or out of window".to_string(),
+            Self::Ineligible(why) => format!("cannot preserve this request ({why:?})"),
+        }
+    }
+}
+
 /// Why a candidate cannot serve this request right now.
 enum Unusable {
-    Unavailable,
+    Unhealthy,
+    NoCapacity,
+    NotConsented,
     NeedsClientIdentity,
     Ineligible(Ineligible),
+}
+
+impl From<&Unusable> for Refusal {
+    fn from(unusable: &Unusable) -> Self {
+        match unusable {
+            Unusable::Unhealthy => Self::Unhealthy,
+            Unusable::NoCapacity => Self::NoCapacity,
+            Unusable::NotConsented => Self::NotConsented,
+            Unusable::NeedsClientIdentity => Self::NeedsClientIdentity,
+            Unusable::Ineligible(why) => Self::Ineligible(*why),
+        }
+    }
 }
 
 /// Whether the backend a conversation is *already on* can serve this turn.
@@ -893,11 +1057,16 @@ fn usable(
     inbound: Protocol,
     now: DateTime<Utc>,
 ) -> Result<(), Unusable> {
-    if !candidate.healthy || !candidate.quota.is_available(now) {
-        return Err(Unusable::Unavailable);
+    if !candidate.healthy {
+        return Err(Unusable::Unhealthy);
     }
+    if !candidate.quota.is_available(now) {
+        return Err(Unusable::NoCapacity);
+    }
+    // Asked after health and capacity so the answer names the thing the user
+    // has to do, rather than the thing that happens to be true as well.
     if candidate.kind.requires_consent() && !candidate.consented {
-        return Err(Unusable::Unavailable);
+        return Err(Unusable::NotConsented);
     }
     // TRUST.md §3: we serve a subscription only for the client it belongs to,
     // and we never synthesize that client's identity to unlock it.
@@ -912,10 +1081,15 @@ fn usable(
     }
     // "Needs translation" is a question about the wire, not about the family:
     // Responses and Chat Completions share a family and are different wires.
-    let cross = candidate.caps.protocol != inbound;
-    if cross && !inbound.translates_to(candidate.caps.protocol) {
-        return Err(Unusable::Ineligible(Ineligible::NoTranslationPath));
-    }
+    // A backend serving several wires at one base URL answers `true` for each
+    // of them, and none of those is a translation.
+    //
+    // Every pair has a translator (`docs/TRANSLATION.md`), so this is no longer
+    // a question of whether the route is *possible* — only of what it costs,
+    // which is what the rung and the eligibility gate below are for. Content
+    // the target genuinely cannot express still refuses the route, but that is
+    // decided by the emitter, on the body, in `pipeline::translate_request`.
+    let cross = !candidate.caps.wires.speaks(inbound);
     eligible(&peek.requirements, &candidate.caps, cross).map_err(Unusable::Ineligible)
 }
 
@@ -965,6 +1139,7 @@ pub fn trivial_requirements() -> RequestRequirements {
 mod tests {
     use super::*;
     use crate::capability::ReasoningNeed;
+    use crate::protocol::Wires;
     use crate::quota::Headroom;
 
     fn t(offset: i64) -> DateTime<Utc> {
@@ -973,7 +1148,7 @@ mod tests {
 
     fn caps(protocol: Protocol) -> Capabilities {
         Capabilities {
-            protocol,
+            wires: Wires::only(protocol),
             tools: true,
             parallel_tool_calls: true,
             images: true,
@@ -1935,11 +2110,11 @@ mod tests {
             )
             .expect_err("a family change mid tool loop must be refused");
         match err {
-            NoRoute::AllIneligible { reasons } => {
+            NoRoute::NoneUsable { refusals } => {
                 assert!(
-                    reasons
+                    refusals
                         .iter()
-                        .any(|(_, why)| *why == Ineligible::MidToolLoop)
+                        .any(|(_, why)| *why == Refusal::Ineligible(Ineligible::MidToolLoop))
                 );
             }
             other => panic!("expected ineligibility, got {other:?}"),
@@ -1974,7 +2149,167 @@ mod tests {
         let err = policy
             .decide(key(), Protocol::AnthropicMessages, &p, &[near], t(0))
             .expect_err("pin must not override eligibility");
-        assert!(matches!(err, NoRoute::AllIneligible { .. }));
+        assert!(matches!(err, NoRoute::NoneUsable { .. }));
+    }
+
+    /// The pin path used to ask a *family* question where the wire question is
+    /// the one that matters. Responses and Chat Completions share a family, so
+    /// a pinned Codex request was handed to a Chat backend as a **native
+    /// forward** — `translated: false`, a Responses body, and an endpoint that
+    /// cannot read it.
+    ///
+    /// Now that every pair has a translator the route is legal, which makes the
+    /// assertion sharper rather than weaker: the pin is honoured *and* the body
+    /// is translated. A pin overrides preference, never the shape of the
+    /// request.
+    #[test]
+    fn a_pin_translates_a_body_the_backend_cannot_read_natively() {
+        let mut policy = Policy::new();
+        let chat_only = candidate("local", BackendKind::Local, Protocol::OpenAiChat);
+        policy.set_pin(Some(BackendId::from("local")), None);
+
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::OpenAiResponses,
+                &peek("gpt-5"),
+                &[chat_only],
+                t(0),
+            )
+            .expect("a pinned backend with a translator is a legal route");
+        assert_eq!(decision.backend.as_str(), "local");
+        assert!(
+            decision.translated,
+            "a Responses body was forwarded to a Chat Completions endpoint as-is"
+        );
+        assert_eq!(decision.rung, Rung::CrossFamily);
+    }
+
+    /// A provider serving several wires at one base URL is on the native lane
+    /// for each of them. NEAR AI answers both `/v1/chat/completions` and
+    /// `/v1/responses`, and claiming only the first is what left Codex with
+    /// nowhere to go on a machine where the subscriptions were not consented.
+    #[test]
+    fn a_backend_that_serves_two_wires_is_native_on_both() {
+        let mut near = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+        near.caps.wires = Wires::new(Protocol::OpenAiChat, &[Protocol::OpenAiResponses]);
+
+        for inbound in [Protocol::OpenAiResponses, Protocol::OpenAiChat] {
+            let decision = Policy::new()
+                .decide(key(), inbound, &peek("gpt-5"), &[near.clone()], t(0))
+                .expect("the wire it serves is the native lane");
+            assert_eq!(decision.backend.as_str(), "nearai");
+            assert!(
+                !decision.translated,
+                "{inbound} is served natively and must not be translated"
+            );
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+    }
+
+    /// The refusal that started this: two subscriptions nobody consented to and
+    /// one backend on a wire with no translator. The old answer named only the
+    /// wire, because it collected reasons for candidates that failed the
+    /// *capability* gate and dropped everything refused before it — so the log
+    /// discussed the one backend the user could do nothing about.
+    #[test]
+    fn a_refusal_names_the_backends_that_never_reached_the_gate() {
+        let mut claude = candidate(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+        );
+        claude.consented = false;
+        let mut codex = candidate(
+            "codex-sub",
+            BackendKind::Subscription,
+            Protocol::OpenAiResponses,
+        );
+        codex.consented = false;
+        let mut near = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+        near.healthy = false;
+
+        let err = Policy::new()
+            .decide(
+                key(),
+                Protocol::OpenAiResponses,
+                &peek("gpt-5"),
+                &[claude, codex, near],
+                t(0),
+            )
+            .expect_err("nothing can serve this");
+
+        match err {
+            NoRoute::NoneUsable { refusals } => {
+                let by_id: HashMap<_, _> = refusals
+                    .iter()
+                    .map(|(id, why)| (id.as_str().to_string(), why.clone()))
+                    .collect();
+                assert_eq!(by_id.get("claude-sub"), Some(&Refusal::NotConsented));
+                assert_eq!(by_id.get("codex-sub"), Some(&Refusal::NotConsented));
+                assert_eq!(by_id.get("nearai"), Some(&Refusal::Unhealthy));
+                // Consent leads: it is the only entry with an instruction in it.
+                assert!(refusals[0].1.is_actionable());
+            }
+            other => panic!("expected a full refusal list, got {other:?}"),
+        }
+    }
+
+    /// Backends that are merely busy still get the 429 answer. Listing three
+    /// healthy backends with nothing wrong with them, as a 503, would be a
+    /// worse reply than "come back in a minute".
+    #[test]
+    fn everything_merely_rate_limited_is_still_exhaustion() {
+        let mut a = candidate(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+        );
+        a.quota = QuotaSnapshot {
+            primary: Headroom::Exhausted { until: t(60) },
+            ..QuotaSnapshot::default()
+        };
+        let mut b = candidate(
+            "anthropic-key",
+            BackendKind::ApiKey,
+            Protocol::AnthropicMessages,
+        );
+        b.healthy = false;
+
+        let err = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &[a, b],
+                t(0),
+            )
+            .expect_err("nothing has capacity");
+        assert!(matches!(err, NoRoute::AllExhausted), "got {err:?}");
+    }
+
+    /// The identity refusal used to be unreachable whenever anything else was
+    /// ineligible: the general answer returned first and the check below it
+    /// never ran. It is the refusal with an actual instruction attached, so it
+    /// is the one that must survive.
+    #[test]
+    fn an_identity_refusal_is_not_masked_by_an_incidental_one() {
+        let mut codex = candidate(
+            "codex-sub",
+            BackendKind::Subscription,
+            Protocol::OpenAiResponses,
+        );
+        codex.requires_client_identity = true;
+        let mut p = peek("gpt-5");
+        p.carries_client_identity = false;
+
+        let err = Policy::new()
+            .decide(key(), Protocol::OpenAiResponses, &p, &[codex], t(0))
+            .expect_err("nothing can serve this");
+        assert!(
+            matches!(err, NoRoute::RequiresClientIdentity),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -2015,8 +2350,16 @@ mod tests {
         assert_eq!(err, NoRoute::NoBackendsConfigured);
     }
 
+    /// Not routed to, and — the part this test used to get wrong — not reported
+    /// as exhaustion either.
+    ///
+    /// `AllExhausted` renders as a 429: come back later, capacity will return.
+    /// It never will here, because nothing is spent and nothing is broken; a
+    /// switch has not been flipped. Answering "rate limited" to a question
+    /// whose answer is "you have not enabled this" is the same class of lie as
+    /// a capacity bar drawn at zero.
     #[test]
-    fn an_unconsented_subscription_is_never_used() {
+    fn an_unconsented_subscription_is_refused_by_name_rather_than_as_exhaustion() {
         let mut policy = Policy::new();
         let mut sub = candidate(
             "claude-sub",
@@ -2033,7 +2376,12 @@ mod tests {
                 t(0),
             )
             .expect_err("unconsented backend must not be routed to");
-        assert_eq!(err, NoRoute::AllExhausted);
+        assert_eq!(
+            err,
+            NoRoute::NoneUsable {
+                refusals: vec![(BackendId::from("claude-sub"), Refusal::NotConsented)]
+            }
+        );
     }
 }
 
@@ -2043,6 +2391,7 @@ mod compaction_tests {
     //! conversation, so fidelity outranks cost on exactly that turn.
 
     use super::*;
+    use crate::protocol::Wires;
     use crate::quota::Headroom;
 
     fn t(offset: i64) -> DateTime<Utc> {
@@ -2051,7 +2400,7 @@ mod compaction_tests {
 
     fn caps(protocol: Protocol) -> Capabilities {
         Capabilities {
-            protocol,
+            wires: Wires::only(protocol),
             tools: true,
             parallel_tool_calls: true,
             images: true,

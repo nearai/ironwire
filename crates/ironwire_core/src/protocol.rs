@@ -26,8 +26,7 @@ impl Protocol {
     /// Two protocols can share a family and still be different wires: Responses
     /// and Chat Completions do. Routing on this instead of on the protocol
     /// itself is what once let a Codex Responses body be forwarded to a Chat
-    /// Completions backend as though the native lane applied — see
-    /// [`Self::translates_to`].
+    /// Completions backend as though the native lane applied.
     #[must_use]
     pub fn family(self) -> &'static str {
         match self {
@@ -35,18 +34,82 @@ impl Protocol {
             Self::OpenAiResponses | Self::OpenAiChat => "openai",
         }
     }
+}
 
-    /// Whether a request that arrived on `self` can be re-expressed on `other`.
-    ///
-    /// This is one arm because `ironwire_translate` implements one mapping:
-    /// Anthropic Messages onto Chat Completions. Anything else — including
-    /// Responses onto Chat Completions, which *looks* like the same family —
-    /// has no translator, so a backend speaking it cannot serve the request at
-    /// all. Saying so here keeps the routing policy from inventing a lane that
-    /// does not exist.
+/// The wires a backend speaks natively, with the one it prefers first.
+///
+/// Most backends speak one. Some providers serve several at the same base URL:
+/// NEAR AI answers both `/v1/chat/completions` and `/v1/responses`, and
+/// modelling that as a single wire meant Codex could not reach it *at all* —
+/// the request arrived as `openai.responses`, the backend claimed
+/// `openai.chat`, and the router translated a request that needed no
+/// translation. Every pair does have a translator now (`docs/TRANSLATION.md`),
+/// so the cost is fidelity rather than a refusal; it is still a cost, and the
+/// native lane was there the whole time.
+///
+/// Non-empty by construction, so [`Self::primary`] is total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wires {
+    /// The wire this backend prefers, and the one a translator targets.
+    primary: Protocol,
+    /// Others it serves natively, at the same base URL.
+    also: Vec<Protocol>,
+}
+
+impl Wires {
+    /// A backend that speaks exactly one wire.
     #[must_use]
-    pub fn translates_to(self, other: Self) -> bool {
-        matches!((self, other), (Self::AnthropicMessages, Self::OpenAiChat))
+    pub fn only(protocol: Protocol) -> Self {
+        Self {
+            primary: protocol,
+            also: Vec::new(),
+        }
+    }
+
+    /// A backend that speaks `primary` and also serves `also`.
+    ///
+    /// `primary` is what a translated route targets; the rest are reachable on
+    /// the native lane and nothing more. That asymmetry is deliberate: which
+    /// wire to *translate into* is a choice with a fidelity cost, and it should
+    /// be made once, in the backend's own definition, rather than fall out of
+    /// list order.
+    #[must_use]
+    pub fn new(primary: Protocol, also: &[Protocol]) -> Self {
+        Self {
+            primary,
+            also: also.iter().copied().filter(|p| *p != primary).collect(),
+        }
+    }
+
+    /// The preferred wire.
+    #[must_use]
+    pub fn primary(&self) -> Protocol {
+        self.primary
+    }
+
+    /// Whether a request on this wire can be forwarded as-is.
+    #[must_use]
+    pub fn speaks(&self, protocol: Protocol) -> bool {
+        self.primary == protocol || self.also.contains(&protocol)
+    }
+
+    /// Every wire, preferred first. For reporting.
+    pub fn all(&self) -> impl Iterator<Item = Protocol> + '_ {
+        std::iter::once(self.primary).chain(self.also.iter().copied())
+    }
+}
+
+impl fmt::Display for Wires {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for protocol in self.all() {
+            if !first {
+                f.write_str(", ")?;
+            }
+            write!(f, "{protocol}")?;
+            first = false;
+        }
+        Ok(())
     }
 }
 

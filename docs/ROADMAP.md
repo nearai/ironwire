@@ -124,16 +124,26 @@ run against a live ChatGPT subscription.
 
 ---
 
-## M3 — First translation pair  ✅ core done
+## M3 — Translation  ✅ core done
 
-**Anthropic façade → OpenAI Chat Completions backend** (NEAR AI and any
-OpenAI-compatible endpoint), gated on the turn-boundary rule.
+Every ordered pair of the three wires, gated on the turn-boundary rule. It began
+as one pair — Anthropic façade → Chat Completions backend — and became all six
+through a canonical IR, because eighteen pairwise mappings (request, response
+and stream, per pair) is six SSE state machines that would not agree with each
+other. `docs/TRANSLATION.md` is the design.
 
 - [x] `ironwire_translate`: request, response, and streaming translation
+- [x] The pivot IR: three parsers in, three emitters out, per layer. Parsing is
+      lossless and emitting reports what the target could not carry
+- [x] Anthropic ⇄ Responses, which is what lets a Claude Code session fall back
+      onto a ChatGPT subscription — the capacity most users of this actually
+      have, and unreachable while Chat Completions was the only target
 - [x] Stateless reversible tool-id mapping (no per-conversation map to lose)
 - [x] `mid_tool_loop` gate — switch families at a turn boundary only
 - [x] `ChatCompletionsBackend` (NEAR AI + arbitrary OpenAI-compatible)
-- [x] End-to-end test: `tests/claude_code_on_nearai.rs`
+- [x] End-to-end tests: `tests/claude_code_on_nearai.rs` (A→C),
+      `tests/claude_code_on_responses.rs` (A→R), `tests/codex_on_nearai.rs`
+      (R native, and R→C)
 - [x] Rung-3 announcement UX, via a **side channel** rather than an in-band one.
       IronWire's only writable channel into a coding agent is the response
       stream, and putting a line there would put words in the model's mouth and

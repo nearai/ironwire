@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures_util::StreamExt;
 use ironwire_core::capability::Capabilities;
-use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol};
+use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
 use ironwire_creds::Bearer;
 use secrecy::{ExposeSecret, SecretString};
@@ -30,7 +30,7 @@ pub const NEARAI_DEFAULT_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 #[must_use]
 pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
     Capabilities {
-        protocol: Protocol::OpenAiChat,
+        wires: Wires::only(Protocol::OpenAiChat),
         tools: true,
         parallel_tool_calls: true,
         images: false,
@@ -38,6 +38,21 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
         prompt_cache: false,
         structured_output: false,
         context_tokens,
+    }
+}
+
+/// Capability profile for NEAR AI.
+///
+/// Chat Completions and Responses at the same base URL, which is what the
+/// provider actually serves. Chat stays *primary* because it is the only wire
+/// `ironwire_translate` can produce today, so it is the one a Claude Code
+/// fallback translates into; Responses is there so Codex arrives on the native
+/// lane instead of being refused for a translation it never needed.
+#[must_use]
+pub fn nearai_capabilities() -> Capabilities {
+    Capabilities {
+        wires: Wires::new(Protocol::OpenAiChat, &[Protocol::OpenAiResponses]),
+        ..chat_capabilities(128_000)
     }
 }
 
@@ -81,7 +96,7 @@ impl ChatCompletionsBackend {
         models: Vec<(String, ModelTier)>,
         timeout_secs: u64,
     ) -> reqwest::Result<Self> {
-        Self::new(
+        Ok(Self::new(
             BackendId::from("nearai"),
             "NEAR AI",
             BackendKind::Credits,
@@ -89,7 +104,8 @@ impl ChatCompletionsBackend {
             base_url.unwrap_or_else(|| NEARAI_DEFAULT_BASE_URL.to_string()),
             models,
             timeout_secs,
-        )
+        )?
+        .with_capabilities(nearai_capabilities()))
     }
 
     /// Build an arbitrary OpenAI-compatible backend.
@@ -470,7 +486,40 @@ mod tests {
         let b = backend(NEARAI_DEFAULT_BASE_URL);
         assert_eq!(b.kind(), BackendKind::Credits);
         assert!(!b.requires_client_identity());
-        assert_eq!(b.capabilities().protocol, Protocol::OpenAiChat);
+        assert!(b.capabilities().wires.speaks(Protocol::OpenAiChat));
+    }
+
+    /// The wire NEAR AI serves that this backend used to hide.
+    ///
+    /// Codex speaks Responses, NEAR AI answers `/v1/responses` at the same base
+    /// URL, and claiming Chat Completions alone meant the router refused the
+    /// route for a translation that was never needed — the native lane was
+    /// there the whole time.
+    #[test]
+    fn near_ai_serves_responses_as_well_as_chat_completions() {
+        let b = backend(NEARAI_DEFAULT_BASE_URL);
+        assert!(b.capabilities().wires.speaks(Protocol::OpenAiResponses));
+        assert!(b.capabilities().wires.speaks(Protocol::OpenAiChat));
+        // Chat stays the wire a translated route targets: it is the only one
+        // `ironwire_translate` can produce.
+        assert_eq!(b.capabilities().wires.primary(), Protocol::OpenAiChat);
+    }
+
+    /// A local server is not NEAR AI. Most of them serve Chat Completions and
+    /// nothing else, and advertising a wire that 404s would turn a clean
+    /// refusal into a failed request.
+    #[test]
+    fn a_local_backend_claims_only_chat_completions() {
+        let b = ChatCompletionsBackend::local(
+            BackendId::from("ollama"),
+            "Ollama",
+            "http://127.0.0.1:11434/v1".to_string(),
+            None,
+            Vec::new(),
+            60,
+        )
+        .expect("client builds");
+        assert!(!b.capabilities().wires.speaks(Protocol::OpenAiResponses));
     }
 
     #[test]
@@ -478,7 +527,7 @@ mod tests {
         // Which is what makes it the translated lane's target.
         let b = backend(NEARAI_DEFAULT_BASE_URL);
         assert_ne!(
-            b.capabilities().protocol.family(),
+            b.capabilities().wires.primary().family(),
             Protocol::AnthropicMessages.family()
         );
     }

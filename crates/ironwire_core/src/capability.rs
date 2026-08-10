@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::Protocol;
+use crate::protocol::{Protocol, Wires};
 
 /// How much the request depends on model reasoning state.
 ///
@@ -81,8 +81,8 @@ pub struct RequestRequirements {
 /// What a backend+model can preserve.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
-    /// Protocol this backend speaks natively.
-    pub protocol: Protocol,
+    /// Wires this backend speaks natively, preferred first.
+    pub wires: Wires,
     /// Tool calling.
     pub tools: bool,
     /// More than one tool call per assistant turn.
@@ -107,7 +107,7 @@ impl Capabilities {
     #[must_use]
     pub fn conservative(protocol: Protocol) -> Self {
         Self {
-            protocol,
+            wires: Wires::only(protocol),
             tools: true,
             parallel_tool_calls: false,
             images: false,
@@ -153,10 +153,6 @@ pub enum Ineligible {
     /// around. Expressed as a preference it would be one exhausted backend away
     /// from being silently ignored.
     NotTrustedUnderFullPrivacy,
-    /// The backend speaks a different wire, and this build has no translation
-    /// between the two. Not a quality loss — the request would arrive in a
-    /// shape the backend cannot read at all.
-    NoTranslationPath,
 }
 
 /// The tokens-of-warm-cache threshold above which discarding the cache makes a
@@ -220,7 +216,7 @@ mod tests {
 
     fn full_caps() -> Capabilities {
         Capabilities {
-            protocol: Protocol::AnthropicMessages,
+            wires: Wires::only(Protocol::AnthropicMessages),
             tools: true,
             parallel_tool_calls: true,
             images: true,
@@ -249,7 +245,7 @@ mod tests {
 
     fn nearai_caps() -> Capabilities {
         Capabilities {
-            protocol: Protocol::OpenAiChat,
+            wires: Wires::only(Protocol::OpenAiChat),
             tools: true,
             parallel_tool_calls: true,
             images: false,

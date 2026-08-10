@@ -123,19 +123,24 @@ impl FacadeError {
                 "Every connected backend is rate limited or unavailable. \
                  Run `ironwire status` to see when capacity returns.",
             ),
-            NoRoute::AllIneligible { reasons } => {
-                let detail = reasons
+            NoRoute::NoneUsable { refusals } => {
+                // Every backend that was considered, in the order the router
+                // put them in — most actionable first. Listing only the ones
+                // with an interesting reason is what made this message point at
+                // the wrong backend: a wire mismatch is worth saying, and it is
+                // never the sentence a user can act on.
+                let detail = refusals
                     .iter()
-                    .map(|(id, why)| format!("{id}: {why:?}"))
+                    .map(|(id, why)| format!("{id}: {}", why.describe()))
                     .collect::<Vec<_>>()
                     .join("; ");
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "api_error",
                     format!(
-                        "No connected backend can serve this request without losing \
-                         semantics ({detail}). IronWire refuses rather than silently \
-                         degrading; see `ironwire status`."
+                        "No connected backend could take this request. {detail}. \
+                         IronWire refuses rather than silently degrading; \
+                         run `ironwire status` for the full picture."
                     ),
                 )
             }
@@ -288,6 +293,7 @@ impl IntoResponse for FacadeError {
 mod tests {
     use super::*;
     use ironwire_core::capability::Ineligible;
+    use ironwire_core::policy::Refusal;
     use ironwire_core::protocol::BackendId;
 
     #[test]
@@ -371,12 +377,43 @@ mod tests {
 
     #[test]
     fn an_ineligible_route_explains_itself_rather_than_degrading() {
-        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::AllIneligible {
-            reasons: vec![(BackendId::from("nearai"), Ineligible::MidToolLoop)],
+        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::NoneUsable {
+            refusals: vec![(
+                BackendId::from("nearai"),
+                Refusal::Ineligible(Ineligible::MidToolLoop),
+            )],
         }));
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(err.message.contains("nearai"));
         assert!(err.message.contains("MidToolLoop"));
+    }
+
+    /// The failure this message was rewritten for. A machine with two
+    /// subscriptions nobody has consented to and one backend on the wrong wire
+    /// used to be told only about the wire — the two credentials sitting right
+    /// there never appeared, and neither did the only instruction that would
+    /// have fixed it.
+    #[test]
+    fn a_refusal_names_every_backend_it_considered() {
+        let err = FacadeError::from_pipeline(&PipelineError::NoRoute(NoRoute::NoneUsable {
+            refusals: vec![
+                (BackendId::from("codex-sub"), Refusal::NotConsented),
+                (BackendId::from("claude-sub"), Refusal::NotConsented),
+                (
+                    BackendId::from("nearai"),
+                    Refusal::Ineligible(Ineligible::ImagesUnsupported),
+                ),
+            ],
+        }));
+        for backend in ["codex-sub", "claude-sub", "nearai"] {
+            assert!(err.message.contains(backend), "{} is missing", backend);
+        }
+        assert!(err.message.contains("consent"));
+        // The actionable one leads, because it is the sentence with something
+        // to do in it.
+        let consent = err.message.find("codex-sub").expect("listed");
+        let wire = err.message.find("nearai").expect("listed");
+        assert!(consent < wire, "the wire mismatch is leading the message");
     }
 
     #[test]
