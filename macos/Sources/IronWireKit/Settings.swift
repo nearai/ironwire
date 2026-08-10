@@ -19,9 +19,11 @@ public struct SettingsView: Decodable, Sendable, Equatable {
     public let privacy: PrivacySettingsView
     /// Everything a user can log into.
     public let services: [ServiceView]
+    /// Every coding agent the daemon knows about, and whether it routes here.
+    public let tools: [ToolView]
 
     private enum CodingKeys: String, CodingKey {
-        case privacy, services
+        case privacy, services, tools
     }
 
     public init(from decoder: Decoder) throws {
@@ -29,11 +31,66 @@ public struct SettingsView: Decodable, Sendable, Equatable {
         privacy = try c.decodeIfPresent(PrivacySettingsView.self, forKey: .privacy)
             ?? PrivacySettingsView()
         services = try c.decodeIfPresent([ServiceView].self, forKey: .services) ?? []
+        tools = try c.decodeIfPresent([ToolView].self, forKey: .tools) ?? []
     }
 
-    public init(privacy: PrivacySettingsView = PrivacySettingsView(), services: [ServiceView] = []) {
+    public init(
+        privacy: PrivacySettingsView = PrivacySettingsView(), services: [ServiceView] = [],
+        tools: [ToolView] = []
+    ) {
         self.privacy = privacy
         self.services = services
+        self.tools = tools
+    }
+}
+
+/// One coding agent on this machine.
+///
+/// The distinction this type carries is the one the menu exists to make: a
+/// backend being healthy says IronWire *could* serve a request, and a tool
+/// being wired says anything is actually *sending* one. A consented
+/// subscription beside an unwired agent is a machine where nothing routes, and
+/// that used to be invisible.
+public struct ToolView: Decodable, Sendable, Equatable, Identifiable {
+    /// Stable id — what `ironwire disconnect <id>` accepts.
+    public let id: String
+    /// What the user calls it.
+    public let name: String
+    /// The file IronWire would edit, when one can be located.
+    public let configPath: String?
+    /// Whether the tool looks present on this machine.
+    public let installed: Bool
+    /// Whether its config currently routes through IronWire.
+    public let wired: Bool
+    /// What to run to point it here. Named rather than offered as a button:
+    /// editing somebody's agent config needs the same "name the file first"
+    /// ceremony the CLI does, which a dropdown cannot give it.
+    public let connectCommand: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, configPath, installed, wired, connectCommand
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? id
+        configPath = try c.decodeIfPresent(String.self, forKey: .configPath)
+        installed = try c.decodeIfPresent(Bool.self, forKey: .installed) ?? false
+        wired = try c.decodeIfPresent(Bool.self, forKey: .wired) ?? false
+        connectCommand = try c.decodeIfPresent(String.self, forKey: .connectCommand) ?? ""
+    }
+
+    public init(
+        id: String, name: String, configPath: String? = nil, installed: Bool = true,
+        wired: Bool = false, connectCommand: String = ""
+    ) {
+        self.id = id
+        self.name = name
+        self.configPath = configPath
+        self.installed = installed
+        self.wired = wired
+        self.connectCommand = connectCommand
     }
 }
 

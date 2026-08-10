@@ -297,6 +297,62 @@ final class MenuContentTests: XCTestCase {
             0)
     }
 
+    // MARK: - Tools
+
+    private func withTools(_ tools: [ToolView]) -> SettingsView {
+        SettingsView(
+            privacy: PrivacySettingsView(mode: "off", summary: "off"), services: [], tools: tools)
+    }
+
+    /// The state this section exists for: everything healthy, nothing routing.
+    /// An unwired tool has to occupy space, or the pane goes on implying that a
+    /// green backend means traffic is arriving.
+    func test_an_unwired_tool_says_so_and_names_the_command() throws {
+        let listed = try height(
+            status(backends: []),
+            settings: withTools([
+                ToolView(
+                    id: "claude", name: "Claude Code", installed: true, wired: false,
+                    connectCommand: "ironwire connect claude")
+            ]))
+        let nothing = try height(status(backends: []), settings: withTools([]))
+        XCTAssertGreaterThan(
+            listed, nothing, "an unwired tool is not being drawn at all")
+    }
+
+    /// A wired tool is one line; an unwired one also carries the command. So
+    /// the unwired case is the taller of the two, which is the right way round.
+    func test_an_unwired_tool_is_taller_than_a_wired_one() throws {
+        let wired = try height(
+            status(backends: []),
+            settings: withTools([
+                ToolView(
+                    id: "claude", name: "Claude Code", installed: true, wired: true,
+                    connectCommand: "ironwire connect claude")
+            ]))
+        let unwired = try height(
+            status(backends: []),
+            settings: withTools([
+                ToolView(
+                    id: "claude", name: "Claude Code", installed: true, wired: false,
+                    connectCommand: "ironwire connect claude")
+            ]))
+        XCTAssertGreaterThan(unwired, wired)
+    }
+
+    /// The daemon reports every tool it knows about so a client *can* say
+    /// "never heard of it". A dropdown listing editors you do not have is
+    /// noise, so this one shows only what is here.
+    func test_a_tool_that_is_not_installed_is_not_listed() throws {
+        let absent = try height(
+            status(backends: []),
+            settings: withTools([
+                ToolView(id: "codex", name: "Codex", installed: false, wired: false)
+            ]))
+        let none = try height(status(backends: []), settings: withTools([]))
+        XCTAssertEqual(absent, none)
+    }
+
     // MARK: - The privacy ladder
 
     /// The reason a mode cannot be picked is carried, not drawn: it is the

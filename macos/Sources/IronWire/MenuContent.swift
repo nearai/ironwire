@@ -45,6 +45,7 @@ struct MenuContent: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
                         backendSection(status)
+                        toolsSection()
                         usageSection(status.usage)
                         balanceSection(status.balance)
                         routeSection(status)
@@ -361,6 +362,50 @@ struct MenuContent: View {
         case .good: return .green
         case .warn: return .orange
         case .bad: return .red
+        }
+    }
+
+    // MARK: - Tools
+
+    /// Which agents on this machine actually send their traffic here.
+    ///
+    /// The one thing the rest of this pane cannot tell you. Every backend can
+    /// be healthy, a subscription consented and capacity plentiful, and still
+    /// nothing routes — because the agent was never pointed at IronWire and
+    /// went straight to the provider instead. A green dot beside a silent
+    /// proxy is the most misleading state this app can show, and this section
+    /// exists to make it impossible.
+    ///
+    /// Only tools that are actually here are listed. The daemon reports the
+    /// others so a client *can* say "never heard of it", but a dropdown listing
+    /// editors you do not have is noise.
+    @ViewBuilder
+    private func toolsSection() -> some View {
+        let tools = (client.settings?.tools ?? []).filter(\.installed)
+        if !tools.isEmpty {
+            section("Tools") {
+                ForEach(tools) { tool in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(tool.name).font(.caption)
+                            Spacer()
+                            Text(tool.wired ? "routed here" : "not routed here")
+                                .font(.caption2)
+                                .foregroundStyle(tool.wired ? Color.green : Color.orange)
+                        }
+                        // Named, never offered as a button. Editing an agent's
+                        // config needs the file printed before it is touched,
+                        // and a dropdown cannot give it that.
+                        if !tool.wired, !tool.connectCommand.isEmpty {
+                            Text(tool.connectCommand)
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .help(tool.configPath ?? "")
+                }
+            }
         }
     }
 
