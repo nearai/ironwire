@@ -9,9 +9,15 @@
 //!
 //! Detection follows the conventions people already have configured:
 //! `NO_COLOR` wins over everything, then `--color`, then `FORCE_COLOR` /
-//! `CLICOLOR_FORCE`, then whether stdout is a terminal that is not `dumb`.
+//! `CLICOLOR_FORCE`, then whether the stream is a terminal that is not `dumb`.
 //! The default is auto, so `ironwire status | less` and
 //! `ironwire status --json | jq` are unchanged.
+//!
+//! *Which* stream depends on what is being written. The rendered screen goes
+//! to stdout and asks about stdout; `tracing` goes to stderr and asks about
+//! stderr (`logs_coloured`). They are separate questions because the two are
+//! redirected separately, and a log line with escape sequences in it is the
+//! same bug as a coloured status screen in a pipe.
 
 use std::fmt::Display;
 use std::io::IsTerminal;
@@ -49,14 +55,10 @@ mod sgr {
 }
 
 impl Style {
-    /// Resolve a choice against the environment.
+    /// Resolve a choice against the environment, for what goes to stdout.
     pub(crate) fn resolve(choice: ColorChoice) -> Self {
         Self {
-            enabled: match choice {
-                ColorChoice::Never => false,
-                ColorChoice::Always => true,
-                ColorChoice::Auto => auto(),
-            },
+            enabled: decide(choice, std::io::stdout().is_terminal()),
         }
     }
 
@@ -133,9 +135,29 @@ impl Style {
     }
 }
 
+/// Whether the log writer should emit colour.
+///
+/// The same rules asked about stderr, because that is where the logs go. Two
+/// invocations depend on it being a separate question: `ironwire serve 2>log`
+/// should still colour a status screen on the terminal it is talking to, and
+/// `ironwire status 2>&1 | grep` has to come back greppable. A `tracing` line
+/// that carries escape sequences into a pipe is the same bug as a status
+/// screen that does — it just lands in someone's log file instead.
+pub(crate) fn logs_coloured(choice: ColorChoice) -> bool {
+    decide(choice, std::io::stderr().is_terminal())
+}
+
+fn decide(choice: ColorChoice, is_terminal: bool) -> bool {
+    match choice {
+        ColorChoice::Never => false,
+        ColorChoice::Always => true,
+        ColorChoice::Auto => auto(is_terminal),
+    }
+}
+
 /// `NO_COLOR` first, because a user who set it has said so once and should not
-/// have to say it per tool. Then the force variables, then the terminal.
-fn auto() -> bool {
+/// have to say it per tool. Then the force variables, then the stream.
+fn auto(is_terminal: bool) -> bool {
     if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         return false;
     }
@@ -145,7 +167,7 @@ fn auto() -> bool {
     if std::env::var("TERM").is_ok_and(|term| term == "dumb") {
         return false;
     }
-    std::io::stdout().is_terminal()
+    is_terminal
 }
 
 #[cfg(test)]
@@ -177,6 +199,19 @@ mod tests {
     fn never_and_always_do_not_consult_the_environment() {
         assert_eq!(Style::resolve(ColorChoice::Never), Style::plain());
         assert_eq!(Style::resolve(ColorChoice::Always), Style { enabled: true });
+    }
+
+    /// The rule the journey script enforces end to end, at the one place that
+    /// decides it: a stream that is not a terminal gets no escape sequences,
+    /// whether it is the status screen or a `tracing` line on stderr.
+    #[test]
+    fn a_stream_that_is_not_a_terminal_gets_no_colour() {
+        assert!(!decide(ColorChoice::Auto, false));
+        assert!(
+            decide(ColorChoice::Always, false),
+            "--color always is a decision, not a guess"
+        );
+        assert!(!decide(ColorChoice::Never, true));
     }
 
     #[test]

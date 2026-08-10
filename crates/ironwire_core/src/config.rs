@@ -328,7 +328,9 @@ pub struct PrivacyConfig {
     /// user can replace this list; naming their own destinations still
     /// overrides it entirely.
     ///
-    /// Ignored below `full`, with a warning at load.
+    /// Ignored below `full`, with a warning at load for a list the user wrote
+    /// themselves. The shipped default is not warned about: it is on every
+    /// machine, and `full` is on almost none.
     #[serde(
         default = "default_trusted_backends",
         skip_serializing_if = "Vec::is_empty"
@@ -748,7 +750,14 @@ impl Config {
                 ),
             });
         }
-        if self.privacy.mode() < PrivacyMode::Full && !self.privacy.trusted_backends.is_empty() {
+        // Only for a list the user actually wrote. `trusted_backends` arrives
+        // non-empty for everybody now (`default_trusted_backends`) and `mode`
+        // is below `full` for almost everybody, so warning on the value alone
+        // put a line on every command about a key nobody had touched.
+        if self.privacy.mode() < PrivacyMode::Full
+            && !self.privacy.trusted_backends.is_empty()
+            && self.privacy.trusted_backends != default_trusted_backends()
+        {
             tracing::warn!(
                 "`privacy.trusted_backends` is set but `privacy.mode` is below `full`; \
                  it restricts nothing at this level"

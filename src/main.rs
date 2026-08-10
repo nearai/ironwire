@@ -166,16 +166,21 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parsed before the subscriber exists, because `--color` decides whether
+    // the logs are coloured too. `tracing_subscriber` paints unconditionally
+    // otherwise, and its stderr is in the same pipe as everything else the
+    // moment anyone writes `ironwire status 2>&1 | grep`.
+    let cli = Cli::parse();
+    let style = style::Style::resolve(cli.color);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("IRONWIRE_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ironwire=info,warn")),
         )
         .with_target(false)
+        .with_ansi(style::logs_coloured(cli.color))
         .init();
-
-    let cli = Cli::parse();
-    let style = style::Style::resolve(cli.color);
     match cli.command {
         Command::Init {
             write,
