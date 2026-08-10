@@ -78,6 +78,13 @@ pub struct ChatToAnthropicStream {
     /// unusable too. Clearing the buffer alone is not enough — the surviving
     /// junk prefix would be glued to the next real frame and swallow it.
     resyncing: bool,
+    /// p(chosen token) for each generated token, in order, when the request
+    /// asked for logprobs. Empty otherwise, which is the default.
+    ///
+    /// Accumulated but never forwarded: the Anthropic Messages shape has
+    /// nowhere to put these, and the client does not need them. They exist for
+    /// local reduction into aggregates.
+    token_probabilities: Vec<f32>,
 }
 
 impl ChatToAnthropicStream {
@@ -96,7 +103,18 @@ impl ChatToAnthropicStream {
             closed: false,
             tool_argument_bytes: 0,
             resyncing: false,
+            token_probabilities: Vec::new(),
         }
+    }
+
+    /// Probability of each token the model emitted, in order.
+    ///
+    /// Empty unless the request asked for logprobs and the backend honoured
+    /// it. This is `exp(logprob)`, the quantity the confidence aggregates are
+    /// defined over.
+    #[must_use]
+    pub fn token_probabilities(&self) -> &[f32] {
+        &self.token_probabilities
     }
 
     /// Feed upstream bytes; returns Anthropic SSE bytes to forward downstream.
@@ -193,6 +211,10 @@ impl ChatToAnthropicStream {
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish_reason = Some(reason.to_string());
         }
+        // Before the delta check on purpose: `logprobs` is a sibling of
+        // `delta`, and the chunk carrying the finish reason often has one
+        // without the other. Accumulating after would drop the final token.
+        self.accumulate_logprobs(choice);
         let Some(delta) = choice.get("delta") else {
             return;
         };
@@ -225,6 +247,31 @@ impl ChatToAnthropicStream {
 
     /// Chat Completions identifies a streamed call by array index, and only the
     /// first fragment carries the id and name.
+    /// Record p(chosen) for each token in this chunk's `logprobs`.
+    ///
+    /// A value that does not exponentiate into a probability is dropped rather
+    /// than repaired: clamping one would bias the mean toward whichever bound
+    /// the repair chose, and a backend emitting them is wrong in a way we
+    /// should not paper over.
+    fn accumulate_logprobs(&mut self, choice: &Value) {
+        let Some(content) = choice
+            .get("logprobs")
+            .and_then(|l| l.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for entry in content {
+            let Some(logprob) = entry.get("logprob").and_then(Value::as_f64) else {
+                continue;
+            };
+            let probability = logprob.exp() as f32;
+            if probability.is_finite() && (0.0..=1.0).contains(&probability) {
+                self.token_probabilities.push(probability);
+            }
+        }
+    }
+
     fn accumulate_tool_call(&mut self, call: &Value) {
         let index = call
             .get("index")
@@ -431,6 +478,97 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn probabilities_are_empty_without_capture() {
+        let mut s = ChatToAnthropicStream::new("m");
+        s.push(chunk(json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]})).as_bytes());
+        assert!(
+            s.token_probabilities().is_empty(),
+            "no logprobs requested means nothing accumulated"
+        );
+    }
+
+    #[test]
+    fn probabilities_accumulate_across_chunks_in_order() {
+        let mut s = ChatToAnthropicStream::new("m");
+        for (text, logprob) in [("a", 0.5f64.ln()), ("b", 0.25f64.ln())] {
+            s.push(
+                chunk(json!({"choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "logprobs": {"content": [{"token": text, "logprob": logprob}]}
+                }]}))
+                .as_bytes(),
+            );
+        }
+        let probs = s.token_probabilities();
+        assert_eq!(probs.len(), 2);
+        assert!((probs[0] - 0.5).abs() < 1e-5, "got {}", probs[0]);
+        assert!((probs[1] - 0.25).abs() < 1e-5, "got {}", probs[1]);
+    }
+
+    /// `logprobs` is a sibling of `delta`, so a chunk carrying a distribution
+    /// and a finish reason but no delta must still be counted. Accumulating
+    /// after the delta check would silently drop the final token.
+    #[test]
+    fn probabilities_survive_a_chunk_with_no_delta() {
+        let mut s = ChatToAnthropicStream::new("m");
+        s.push(
+            chunk(json!({"choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "logprobs": {"content": [{"token": "!", "logprob": 0.5f64.ln()}]}
+            }]}))
+            .as_bytes(),
+        );
+        assert_eq!(s.token_probabilities().len(), 1);
+    }
+
+    /// A backend that returns a malformed logprob must not corrupt the
+    /// aggregate. Dropping beats repairing, which biases the mean.
+    #[test]
+    fn malformed_logprobs_are_dropped() {
+        let mut s = ChatToAnthropicStream::new("m");
+        s.push(
+            chunk(json!({"choices": [{
+                "index": 0,
+                "delta": {"content": "x"},
+                "logprobs": {"content": [
+                    {"token": "ok", "logprob": 0.5f64.ln()},
+                    {"token": "bad", "logprob": 5.0},
+                    {"token": "worse", "logprob": "not a number"}
+                ]}
+            }]}))
+            .as_bytes(),
+        );
+        let probs = s.token_probabilities();
+        assert_eq!(probs.len(), 1, "only the well-formed token survives");
+        assert!((probs[0] - 0.5).abs() < 1e-5);
+    }
+
+    /// Capture must not change a single downstream byte. The whole safety
+    /// argument for asking for logprobs is that the client sees the same
+    /// stream it would have seen.
+    #[test]
+    fn capture_does_not_alter_the_downstream_stream() {
+        let frames = |with_logprobs: bool| {
+            let mut s = ChatToAnthropicStream::new("m");
+            let mut out = Vec::new();
+            let mut delta = json!({"index": 0, "delta": {"content": "Hello"}});
+            if with_logprobs {
+                delta["logprobs"] = json!({"content": [{"token": "Hello", "logprob": -0.1}]});
+            }
+            out.extend_from_slice(&s.push(chunk(json!({"choices": [delta]})).as_bytes()));
+            out.extend_from_slice(&s.finish());
+            out
+        };
+        assert_eq!(
+            frames(false),
+            frames(true),
+            "requesting logprobs changed what the client receives"
+        );
     }
 
     #[test]
