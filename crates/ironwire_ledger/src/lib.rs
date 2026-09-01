@@ -49,6 +49,15 @@ pub type Result<T> = std::result::Result<T, LedgerError>;
 /// One routed exchange.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
+    /// Rowid, once the ledger has stored it. `None` on an exchange that has
+    /// been built but not yet recorded.
+    ///
+    /// Exposed because a timestamp cannot page: two exchanges can share one,
+    /// and a cutoff compared inclusively re-reads its own boundary row
+    /// forever. This is the tie-breaker a caller advances on -- see
+    /// [`Ledger::page`].
+    #[serde(default)]
+    pub id: Option<i64>,
     /// When the request arrived.
     pub started_at: DateTime<Utc>,
     /// Milliseconds until the first response byte reached the client.
@@ -350,6 +359,57 @@ impl Ledger {
             .map_err(LedgerError::from)
     }
 
+    /// One page of the window starting at `from`, oldest first.
+    ///
+    /// The paging read. `since` exists for a caller that wants the whole
+    /// window at once and can hold it; this is for one that reads forward and
+    /// must be able to stop.
+    ///
+    /// Two things a timestamp cutoff alone cannot do, and this can:
+    ///
+    /// - **Advance.** `after_id` is compared exclusively, so a caller passes
+    ///   the last id it saw and never receives that row again. A timestamp
+    ///   cutoff is inclusive against a column that is not unique -- two
+    ///   exchanges in the same millisecond share one -- so a caller paging on
+    ///   time re-reads its own boundary every request, and once `limit`
+    ///   exchanges share a timestamp it stops moving entirely.
+    /// - **Stay bounded.** `LIMIT` is applied by SQLite rather than by
+    ///   truncating a `Vec` afterwards. Truncating means an old cutoff reads
+    ///   every matching row into memory while holding the ledger mutex, which
+    ///   blocks the daemon's writes for the length of a full-ledger scan on a
+    ///   busy install -- and then throws almost all of it away.
+    ///
+    /// Ordered by `id`, not `started_at`: rowids are assigned in insert order
+    /// and are unique, so they are a total order over exactly the rows a
+    /// caller has already seen. `started_at` is neither.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn page(
+        &self,
+        from: DateTime<Utc>,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<Exchange>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(&format!(
+            "{COLUMNS} FROM exchanges
+             WHERE started_at >= ?1 AND id > ?2
+             ORDER BY id ASC LIMIT ?3"
+        ))?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                from.to_rfc3339(),
+                after_id.unwrap_or(0),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            read_exchange,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
+    }
+
     /// Aggregate the last `window`.
     ///
     /// # Errors
@@ -497,7 +557,7 @@ fn add_missing_columns(conn: &rusqlite::Connection) -> Result<()> {
 /// The column list every read shares, in the order [`read_exchange`] expects.
 /// Kept in one place because the two are only correct together, and a column
 /// added to one and not the other shifts every index after it.
-const COLUMNS: &str = "SELECT started_at, ttfb_ms, total_ms, facade, path, conversation,
+const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, conversation,
             client_session_id, backend,
             requested_model, served_model, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
@@ -505,26 +565,27 @@ const COLUMNS: &str = "SELECT started_at, ttfb_ms, total_ms, facade, path, conve
 
 fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
     Ok(Exchange {
-        started_at: parse_time(&row.get::<_, String>(0)?),
-        ttfb_ms: row.get(1)?,
-        total_ms: row.get(2)?,
-        facade: row.get(3)?,
-        path: row.get(4)?,
-        conversation: row.get(5)?,
-        client_session_id: row.get(6)?,
-        backend: row.get(7)?,
-        requested_model: row.get(8)?,
-        served_model: row.get(9)?,
-        rung: row.get(10)?,
-        attempts: row.get(11)?,
-        input_tokens: row.get(12)?,
-        cache_read_tokens: row.get(13)?,
-        cache_write_tokens: row.get(14)?,
-        output_tokens: row.get(15)?,
-        cost_usd: row.get(16)?,
-        substitutions: row.get(17)?,
-        status: row.get(18)?,
-        error: row.get(19)?,
+        id: row.get(0)?,
+        started_at: parse_time(&row.get::<_, String>(1)?),
+        ttfb_ms: row.get(2)?,
+        total_ms: row.get(3)?,
+        facade: row.get(4)?,
+        path: row.get(5)?,
+        conversation: row.get(6)?,
+        client_session_id: row.get(7)?,
+        backend: row.get(8)?,
+        requested_model: row.get(9)?,
+        served_model: row.get(10)?,
+        rung: row.get(11)?,
+        attempts: row.get(12)?,
+        input_tokens: row.get(13)?,
+        cache_read_tokens: row.get(14)?,
+        cache_write_tokens: row.get(15)?,
+        output_tokens: row.get(16)?,
+        cost_usd: row.get(17)?,
+        substitutions: row.get(18)?,
+        status: row.get(19)?,
+        error: row.get(20)?,
     })
 }
 
@@ -547,6 +608,7 @@ mod tests {
 
     fn exchange(backend: &str, at_secs: i64) -> Exchange {
         Exchange {
+            id: None,
             started_at: at(at_secs),
             ttfb_ms: Some(420),
             total_ms: Some(9_100),
@@ -659,7 +721,17 @@ mod tests {
         ledger.record(&written).expect("records");
         let read = ledger.recent(10).expect("reads");
         assert_eq!(read.len(), 1);
-        assert_eq!(read[0], written);
+        // The row comes back with the id SQLite assigned it, which an
+        // exchange on its way in does not have. Everything else round-trips
+        // unchanged.
+        assert!(read[0].id.is_some(), "a stored exchange carries its rowid");
+        assert_eq!(
+            Exchange {
+                id: None,
+                ..read[0].clone()
+            },
+            written
+        );
     }
 
     #[test]
@@ -782,6 +854,67 @@ mod tests {
         let back = ledger.recent(1).expect("read back");
         assert_eq!(back.len(), 1, "an upgraded ledger still reads");
         assert!(back[0].client_session_id.is_none());
+    }
+
+    #[test]
+    fn a_page_never_returns_a_row_the_caller_already_saw() {
+        // The boundary bug a timestamp cursor cannot avoid: `since` is
+        // inclusive, so paging on the last row's time re-reads that row every
+        // request. `after_id` is exclusive.
+        let ledger = Ledger::in_memory().expect("in-memory ledger");
+        for offset in 0..5 {
+            ledger
+                .record(&exchange("claude-sub", offset))
+                .expect("record");
+        }
+        let first = ledger.page(at(0), None, 2).expect("first page");
+        assert_eq!(first.len(), 2);
+        let cursor = first.last().and_then(|e| e.id).expect("rows carry an id");
+
+        let second = ledger.page(at(0), Some(cursor), 2).expect("second page");
+        assert_eq!(second.len(), 2);
+        assert!(
+            second.iter().all(|e| e.id != Some(cursor)),
+            "the cursor row must not come back"
+        );
+    }
+
+    #[test]
+    fn paging_advances_even_when_every_exchange_shares_a_timestamp() {
+        // The stall a timestamp cursor cannot escape: once `limit` exchanges
+        // share one instant, a caller paging on time asks the same question
+        // forever. Ids are unique, so this walks the whole window.
+        let ledger = Ledger::in_memory().expect("in-memory ledger");
+        for _ in 0..5 {
+            ledger.record(&exchange("claude-sub", 0)).expect("record");
+        }
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = ledger.page(at(0), cursor, 2).expect("page");
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().and_then(|e| e.id);
+            seen.extend(page.iter().filter_map(|e| e.id));
+            assert!(seen.len() <= 5, "paging must terminate, not loop");
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "every row seen exactly once");
+    }
+
+    #[test]
+    fn a_page_is_bounded_by_the_query_not_by_truncating_afterwards() {
+        // The whole point of the LIMIT living in SQL: an old cutoff must not
+        // read the entire ledger into memory under the mutex first.
+        let ledger = Ledger::in_memory().expect("in-memory ledger");
+        for offset in 0..50 {
+            ledger
+                .record(&exchange("claude-sub", offset))
+                .expect("record");
+        }
+        assert_eq!(ledger.page(at(0), None, 3).expect("page").len(), 3);
     }
 
     #[test]

@@ -304,6 +304,7 @@ pub(crate) mod test_support {
     /// An exchange with no usage reported — the provider said nothing.
     pub(crate) fn exchange(backend: &str, started_at: DateTime<Utc>) -> Exchange {
         Exchange {
+            id: None,
             started_at,
             ttfb_ms: Some(400),
             total_ms: Some(9_100),

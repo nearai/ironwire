@@ -4,8 +4,14 @@
 //! `ironwire log`. It is wrong for anything polling the ledger: newest-first
 //! plus a limit drops the *oldest* rows in a window, and a reader that has
 //! already advanced past them cannot tell that it missed any. So a windowed
-//! read pages forward instead -- oldest first, truncated at the far end, where
-//! the next request picks up what was cut.
+//! read pages forward instead -- oldest first, bounded in SQL, with `after_id`
+//! as the cursor.
+//!
+//! The cursor is the load-bearing half. `since` is inclusive against
+//! `started_at`, which is not unique, so a caller paging on the timestamp
+//! re-reads its boundary row every request and stops advancing entirely once
+//! `limit` exchanges share an instant. `after_id` is exclusive over a unique,
+//! insert-ordered column, so a reader walks the window exactly once.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -24,6 +30,7 @@ fn at(offset: i64) -> DateTime<Utc> {
 
 fn exchange(started_at: DateTime<Utc>) -> Exchange {
     Exchange {
+        id: None,
         started_at,
         ttfb_ms: None,
         total_ms: Some(10),
@@ -104,8 +111,10 @@ async fn a_window_starts_at_the_instant_it_names_and_runs_forward() {
 
 #[tokio::test]
 async fn a_truncated_window_cuts_the_end_the_caller_has_not_reached() {
-    // The rows dropped must be the newest, so the next request returns them.
-    // Dropping the oldest would be a gap no poller can detect.
+    // A page starts at the window's oldest row. The rows beyond it are not
+    // lost: the caller advances past them with `after_id`, which is what makes
+    // truncating here safe. Without that cursor this would be a reader that
+    // only ever sees the oldest rows in its window.
     let view = fetch(
         seeded(),
         &format!(
@@ -176,4 +185,67 @@ async fn the_summary_still_covers_the_last_day_regardless_of_the_window() {
     .await;
     assert!(view.exchanges.is_empty(), "the window is in the future");
     assert_eq!(view.last_24h.exchanges, 1, "the summary is unaffected");
+}
+
+#[tokio::test]
+async fn a_caller_pages_a_window_to_its_end_without_repeats_or_gaps() {
+    // The endpoint's contract, end to end. A reader takes a page, advances on
+    // the last id, and stops when a page is short -- seeing every row once.
+    let ledger = seeded();
+    let since = at(0).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor: Option<i64> = None;
+
+    loop {
+        let query = match cursor {
+            Some(id) => format!("?since={since}&limit=2&after_id={id}"),
+            None => format!("?since={since}&limit=2"),
+        };
+        let view = fetch(ledger.clone(), &query).await;
+        if view.exchanges.is_empty() {
+            break;
+        }
+        cursor = view.exchanges.last().and_then(|e| e.id);
+        seen.extend(view.exchanges.iter().filter_map(|e| e.id));
+        assert!(seen.len() <= 5, "paging must terminate rather than loop");
+        if view.exchanges.len() < 2 {
+            break;
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 5, "every row exactly once");
+    assert_eq!(seen.len(), unique.len(), "no row returned twice");
+}
+
+#[tokio::test]
+async fn a_window_larger_than_the_limit_still_reaches_its_newest_row() {
+    // The bug this endpoint shipped with: oldest-first truncation handed back
+    // the oldest `limit` rows and nothing else, so a caller that read one page
+    // per tick never saw a recent exchange on a busy machine.
+    let ledger = seeded();
+    let since = at(0).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut cursor: Option<i64> = None;
+    let mut last_seen: Option<i64> = None;
+
+    for _ in 0..10 {
+        let query = match cursor {
+            Some(id) => format!("?since={since}&limit=2&after_id={id}"),
+            None => format!("?since={since}&limit=2"),
+        };
+        let view = fetch(ledger.clone(), &query).await;
+        if view.exchanges.is_empty() {
+            break;
+        }
+        last_seen = view.exchanges.last().map(|e| e.started_at.timestamp());
+        cursor = view.exchanges.last().and_then(|e| e.id);
+    }
+
+    assert_eq!(
+        last_seen,
+        Some(at(4).timestamp()),
+        "the newest row in the window is reachable"
+    );
 }

@@ -894,6 +894,8 @@ impl LedgerContext {
             )
         };
         let exchange = Exchange {
+            // Assigned by SQLite on insert; an exchange on its way in has none.
+            id: None,
             started_at: self.started_at,
             ttfb_ms: None,
             total_ms: i64::try_from(self.started.elapsed().as_millis()).ok(),

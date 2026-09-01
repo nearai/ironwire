@@ -700,6 +700,7 @@ mod log_tests {
 
     fn exchange() -> Exchange {
         Exchange {
+            id: None,
             started_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("timestamp"),
             ttfb_ms: Some(400),
             total_ms: Some(9_100),
