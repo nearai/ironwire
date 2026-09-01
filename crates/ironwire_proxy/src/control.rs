@@ -439,9 +439,22 @@ pub struct ProbeView {
 /// Query for `GET /_ironwire/log`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogQuery {
-    /// How many exchanges to return, newest first.
+    /// How many exchanges to return.
     #[serde(default = "default_log_limit")]
     pub limit: usize,
+    /// Return only exchanges at or after this instant, RFC 3339.
+    ///
+    /// Use the `Z` form (`2026-09-01T12:00:00Z`) or percent-encode the offset:
+    /// a literal `+` in a query string is a space, so `+00:00` arrives as
+    /// ` 00:00` and the request is rejected as malformed.
+    ///
+    /// Changes the order to **oldest first**, because the caller of a windowed
+    /// read is paging forward: it advances its cursor to the last row it got.
+    /// Newest-first plus a limit would silently drop the *oldest* rows in the
+    /// window, which is a gap a poller cannot detect -- and a reader that never
+    /// notices a gap is worse than one that has to ask twice.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_log_limit() -> usize {
@@ -453,7 +466,8 @@ fn default_log_limit() -> usize {
 pub struct LogView {
     /// Whether local capture is on at all.
     pub enabled: bool,
-    /// Recent exchanges, newest first.
+    /// The exchanges that matched. Newest first, or oldest first when the
+    /// request named a `since` -- see [`LogQuery::since`].
     pub exchanges: Vec<Exchange>,
     /// Aggregate over the last 24 hours.
     pub last_24h: Summary,
@@ -1301,9 +1315,20 @@ async fn log(
         .into_response();
     };
 
-    let since = chrono::Utc::now() - chrono::Duration::hours(24);
-    let exchanges = ledger.recent(query.limit.min(1000)).unwrap_or_default();
-    let last_24h = ledger.summary(since).unwrap_or_default();
+    let limit = query.limit.min(1000);
+    let exchanges = match query.since {
+        // Oldest first, then truncated: the rows dropped are the ones the
+        // caller has not reached yet, so its next request picks them up.
+        Some(from) => {
+            let mut rows = ledger.since(from).unwrap_or_default();
+            rows.truncate(limit);
+            rows
+        }
+        None => ledger.recent(limit).unwrap_or_default(),
+    };
+    let last_24h = ledger
+        .summary(chrono::Utc::now() - chrono::Duration::hours(24))
+        .unwrap_or_default();
     axum::Json(LogView {
         enabled: true,
         exchanges,
