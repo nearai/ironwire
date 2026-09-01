@@ -304,12 +304,14 @@ pub(crate) mod test_support {
     /// An exchange with no usage reported — the provider said nothing.
     pub(crate) fn exchange(backend: &str, started_at: DateTime<Utc>) -> Exchange {
         Exchange {
+            id: None,
             started_at,
             ttfb_ms: Some(400),
             total_ms: Some(9_100),
             facade: "anthropic".into(),
             path: "/v1/messages".into(),
             conversation: "c-1".into(),
+            client_session_id: None,
             backend: backend.into(),
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),

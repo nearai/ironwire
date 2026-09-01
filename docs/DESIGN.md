@@ -406,10 +406,21 @@ now delegated rather than reimplemented, per the table above.
 Local capture is **on** by default and stored in
 `$IRONWIRE_HOME/ledger.sqlite`; upload is **off** by default.
 
-Recorded per exchange: timestamp, conversation key, façade, chosen backend +
-model + rung, requirements, token usage, cost, TTFT and total latency, finish
-reason, retry/fallback events, and — behind `capture.bodies = true` — the
-request and response bodies.
+Recorded per exchange: timestamp, conversation key, the client's own session id
+when it sent one, façade, chosen backend + model + rung, requirements, token
+usage, cost, TTFT and total latency, finish reason, retry/fallback events, and
+— behind `capture.bodies = true` — the request and response bodies.
+
+The session id is worth separating from the conversation key, because they
+answer different questions. The conversation key is a routing-affinity hash
+(protocol family, the head of the preamble, the tool list), deliberately stable
+across a whole session — and therefore equally stable across two sessions that
+share a tool list, and across machines. The session id is what the agent itself
+calls the session: `x-claude-code-session-id` from Claude Code, `session-id`
+from Codex, both already forwarded untouched. It is what makes a row in
+`ironwire log` line up with the session a user is actually looking at. Recorded
+only when it is a plain identifier, so nothing a client sends can reach a
+terminal as an escape sequence.
 
 The user-facing value comes first (`ironwire log`, `ironwire replay`, cost
 attribution, "what did my agent actually send"). Contribution is a separate,

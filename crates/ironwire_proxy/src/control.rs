@@ -439,9 +439,34 @@ pub struct ProbeView {
 /// Query for `GET /_ironwire/log`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LogQuery {
-    /// How many exchanges to return, newest first.
+    /// How many exchanges to return.
     #[serde(default = "default_log_limit")]
     pub limit: usize,
+    /// Return only exchanges at or after this instant, RFC 3339.
+    ///
+    /// Use the `Z` form (`2026-09-01T12:00:00Z`) or percent-encode the offset:
+    /// a literal `+` in a query string is a space, so `+00:00` arrives as
+    /// ` 00:00` and the request is rejected as malformed.
+    ///
+    /// Changes the order to **oldest first**, and pairs with [`Self::after_id`]
+    /// to page forward through the window.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Return only exchanges with an `id` greater than this. Requires
+    /// [`Self::since`].
+    ///
+    /// The cursor, and the reason `since` alone is not one. Pass the `id` of
+    /// the last row you received; the next page starts after it. Keep going
+    /// until a response is shorter than `limit`.
+    ///
+    /// Paging on the timestamp instead does not work, and fails quietly in two
+    /// ways: `since` is inclusive against a column that is not unique, so the
+    /// boundary row comes back on every request, and once `limit` exchanges
+    /// share a timestamp the caller stops advancing at all. `id` is unique and
+    /// assigned in insert order, so it is a total order over exactly the rows
+    /// already seen.
+    #[serde(default)]
+    pub after_id: Option<i64>,
 }
 
 fn default_log_limit() -> usize {
@@ -453,7 +478,11 @@ fn default_log_limit() -> usize {
 pub struct LogView {
     /// Whether local capture is on at all.
     pub enabled: bool,
-    /// Recent exchanges, newest first.
+    /// The exchanges that matched. Newest first, or oldest first when the
+    /// request named a `since` -- see [`LogQuery::since`].
+    ///
+    /// Each carries its `id`. A caller paging a window passes the last one
+    /// back as [`LogQuery::after_id`] and stops when a page is short.
     pub exchanges: Vec<Exchange>,
     /// Aggregate over the last 24 hours.
     pub last_24h: Summary,
@@ -1301,9 +1330,18 @@ async fn log(
         .into_response();
     };
 
-    let since = chrono::Utc::now() - chrono::Duration::hours(24);
-    let exchanges = ledger.recent(query.limit.min(1000)).unwrap_or_default();
-    let last_24h = ledger.summary(since).unwrap_or_default();
+    let limit = query.limit.min(1000);
+    let exchanges = match query.since {
+        // Bounded by SQLite, not by truncating afterwards: an old cutoff would
+        // otherwise read the whole ledger into memory under the mutex before
+        // discarding almost all of it, blocking writes for the length of the
+        // scan. `after_id` is what lets the caller advance -- see `LogQuery`.
+        Some(from) => ledger.page(from, query.after_id, limit).unwrap_or_default(),
+        None => ledger.recent(limit).unwrap_or_default(),
+    };
+    let last_24h = ledger
+        .summary(chrono::Utc::now() - chrono::Duration::hours(24))
+        .unwrap_or_default();
     axum::Json(LogView {
         enabled: true,
         exchanges,

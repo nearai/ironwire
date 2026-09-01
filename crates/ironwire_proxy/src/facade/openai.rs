@@ -7,6 +7,7 @@
 //! same *family* but different wires, so each gets a backend that speaks it
 //! natively and neither is translated into the other.
 
+use super::client_session_id;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -229,6 +230,7 @@ async fn forward(
         facade: "openai",
         path: path.to_string(),
         conversation: conversation.to_string(),
+        client_session_id: client_session_id(&headers, protocol),
         backend: routed.decision.backend.to_string(),
         backend_is_local,
         backend_is_metered,
