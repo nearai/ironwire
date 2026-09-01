@@ -706,6 +706,7 @@ mod log_tests {
             facade: "anthropic".into(),
             path: "/v1/messages".into(),
             conversation: "c".into(),
+            client_session_id: None,
             backend: "claude-sub".into(),
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),

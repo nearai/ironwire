@@ -176,8 +176,12 @@ opt-in, it reads consent rather than granting it, and it forges nothing.
 ### Defaults
 
 - **Local capture: on.** Metadata only — timing, model, route, rung, attempts,
-  status, and the token counts the *provider* reported. Bodies require
-  `capture.bodies = true`. Visible via `ironwire log`.
+  status, the token counts the *provider* reported, and the session id the agent
+  put in its own request header. Bodies require `capture.bodies = true`. Visible
+  via `ironwire log`.
+- **The session id is read, never added.** It is a header the client already
+  sends and IronWire already forwards; recording it changes nothing about what
+  reaches the provider, and it stays on this machine like every other row.
 - **No fabricated numbers in the ledger either.** An exchange whose usage the
   provider never reported is stored as unknown and rendered as `—`, not as
   zero: a fabricated zero would silently understate what the user spent.

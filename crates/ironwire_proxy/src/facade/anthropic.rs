@@ -5,6 +5,7 @@
 //! `count_tokens` in particular is not optional, because Claude Code drives its
 //! context budget and compaction trigger off it.
 
+use super::client_session_id;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -174,6 +175,7 @@ async fn forward(
         facade: "anthropic",
         path: path.to_string(),
         conversation: conversation.to_string(),
+        client_session_id: client_session_id(&headers, PROTOCOL),
         backend: routed.decision.backend.to_string(),
         backend_is_local,
         backend_is_metered,

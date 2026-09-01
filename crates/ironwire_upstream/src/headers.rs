@@ -5,6 +5,8 @@
 //! we have never heard of, which is how a new `anthropic-beta` value keeps
 //! working without an IronWire release.
 
+use ironwire_core::protocol::Protocol;
+
 /// Headers that describe *this* hop and must never be forwarded to the next
 /// one. Forwarding `transfer-encoding` in particular corrupts the response.
 const HOP_BY_HOP: &[&str] = &[
@@ -37,6 +39,26 @@ pub fn forward_request_header(name: &str) -> bool {
         && !REWRITTEN.contains(&lower.as_str())
 }
 
+/// The header a coding agent uses to name its own session, per inbound wire.
+///
+/// Both values are measured, not guessed: Claude Code 2.1.252 sends
+/// `x-claude-code-session-id` and Codex 0.151.0 sends `session-id`, on every
+/// request. Neither is on any list above, so both already reach the provider
+/// untouched -- this only says which one is worth *recording*.
+///
+/// Worth recording because `Exchange::conversation` cannot answer "which
+/// session was this". That key is a routing-affinity hash, stable across a
+/// whole session by design and therefore stable across two sessions that share
+/// a tool list. This is the client's own identifier, and it is what makes
+/// `ironwire log` line up with the session a user is actually looking at.
+#[must_use]
+pub fn client_session_header(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::AnthropicMessages => "x-claude-code-session-id",
+        Protocol::OpenAiResponses | Protocol::OpenAiChat => "session-id",
+    }
+}
+
 /// Whether an upstream response header should be forwarded to the client.
 ///
 /// Content encoding is included deliberately: we do not decompress, so the
@@ -63,6 +85,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_agent_names_its_session_in_its_own_header() {
+        // Measured against the real clients, not inferred from their docs:
+        // Claude Code 2.1.252 and Codex 0.151.0. If an agent renames its
+        // header, this is the test that says so rather than a ledger column
+        // that quietly goes empty.
+        assert_eq!(
+            client_session_header(Protocol::AnthropicMessages),
+            "x-claude-code-session-id"
+        );
+        assert_eq!(
+            client_session_header(Protocol::OpenAiResponses),
+            "session-id"
+        );
+        assert_eq!(client_session_header(Protocol::OpenAiChat), "session-id");
+    }
+
+    #[test]
+    fn reading_a_session_header_does_not_stop_it_reaching_the_provider() {
+        // Recording is not interception. Both headers must still forward
+        // untouched, or the client's own correlation breaks upstream.
+        for protocol in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        ] {
+            assert!(forward_request_header(client_session_header(protocol)));
+        }
+    }
 
     #[test]
     fn provider_headers_we_have_never_seen_are_forwarded() {

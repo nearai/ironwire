@@ -824,6 +824,9 @@ pub struct LedgerContext {
     pub path: String,
     /// Opaque conversation key.
     pub conversation: String,
+    /// The session id the client sent, when it sent one. Read from the header
+    /// named by `ironwire_upstream::headers::client_session_header`.
+    pub client_session_id: Option<String>,
     /// Backend that served it.
     pub backend: String,
     /// Whether that backend is metered, so its cost counts against a cap.
@@ -897,6 +900,7 @@ impl LedgerContext {
             facade: self.facade.to_string(),
             path: self.path,
             conversation: self.conversation,
+            client_session_id: self.client_session_id,
             backend: self.backend,
             requested_model: self.requested_model,
             served_model: observation.served_model.clone(),
