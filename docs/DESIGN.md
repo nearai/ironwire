@@ -332,18 +332,33 @@ One daemon per machine, lockfile at `$IRONWIRE_HOME/daemon.lock`, listening on
 
 ```
 GET  /_ironwire/status          full state snapshot (JSON)
+GET  /_ironwire/backends        the same handler as /status
+GET  /_ironwire/settings        what can be changed, what is selectable, and
+                                which coding agents are wired to us
+GET  /_ironwire/log?limit=      recent exchanges from the local ledger,
+                                also ?since= and ?after_id= to page
 GET  /_ironwire/events          SSE: route decisions, quota changes, errors
-GET  /_ironwire/backends
-GET  /_ironwire/settings        what can be changed, and what is selectable
-POST /_ironwire/pin             { model | backend | clear }
+GET  /_ironwire/health          liveness. The one route with no token
+POST /_ironwire/pin             { backend, model } — no backend clears the pin
 POST /_ironwire/privacy         { mode }
 POST /_ironwire/consent         { backend, granted, prompt_version }
-GET  /_ironwire/log?limit=      recent exchanges from the local ledger
-POST /_ironwire/shutdown
+POST /_ironwire/tools           { id, connect } — point a coding agent here
+POST /_ironwire/probe           hit every backend for real
 ```
+
+There is no shutdown route. The daemon stops on a signal, which is what a
+service manager sends anyway; an HTTP endpoint that ends the process would be
+one more thing the control token has to be trusted with.
 
 `ironwire status` and the macOS menu bar app are both **clients of this API**.
 No routing logic lives in the CLI or in Swift; otherwise they diverge.
+
+The tool list on `/settings` is that rule applied to detection. `ironwire
+connect` is what edits somebody's agent config, so IronWire is the only thing
+that knows which agents are here and which are pointed at it; both the CLI and
+the API read it from one place (`ironwire_agents::tools`). A client that
+detected agents for itself would be a second answer to that question on the
+same machine, and the wrong one.
 
 That rule is why `/settings` reports which privacy modes are *selectable* rather
 than only which exist. `full` routes solely to backends the user has named, so
