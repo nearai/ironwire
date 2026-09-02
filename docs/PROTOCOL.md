@@ -107,7 +107,7 @@ an error: a client that names no session cannot have its rows attributed to
 one.
 
 A value is stored only if it is non-empty, at most 200 bytes, and made entirely
-of `[A-Za-z0-9-_:.]`. Anything else is dropped rather than stored. This is
+of `[A-Za-z0-9_:.-]`. Anything else is dropped rather than stored. This is
 client-supplied text written to a local database that `ironwire log` renders to
 a terminal, and a row addressed by nothing beats a row that can smuggle control
 characters onto someone's screen.
