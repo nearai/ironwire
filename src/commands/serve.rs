@@ -101,6 +101,21 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let quota_writer = QuotaWriter::new(paths.quota_file());
     quota_writer.spawn(state.clone());
 
+    // Leave a pointer a desktop reader can find. `$IRONWIRE_HOME` does not
+    // reach an app launched from Finder or a desktop entry, so without this a
+    // reader whose home is elsewhere cannot tell "configured differently" from
+    // "not running". Failure here is not fatal: it costs discovery, not
+    // serving.
+    let endpoint = ironwire_core::discovery::Endpoint::new(port, paths.control_token_file());
+    match endpoint.publish() {
+        Ok(path) => {
+            if path.parent() != Some(paths.home.as_path()) {
+                println!("  discoverable at: {}", path.display());
+            }
+        }
+        Err(err) => eprintln!("  could not publish the discovery pointer: {err}"),
+    }
+
     println!("IronWire listening on http://127.0.0.1:{port}");
     println!("  Point your agents at it:  ironwire init");
     println!("  Confirm they are:         ironwire doctor");
@@ -112,6 +127,10 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     // A clean stop should lose nothing: `systemctl --user restart` and a
     // Ctrl-C both land here, and the timer may be up to its full period behind.
     quota_writer.write_now(&state);
+    // A reader that finds a pointer to a daemon that has stopped gets one
+    // refused connection -- the same answer a daemon that never ran would
+    // give -- but there is no reason to leave it lying there.
+    ironwire_core::discovery::Endpoint::withdraw();
     result
 }
 
