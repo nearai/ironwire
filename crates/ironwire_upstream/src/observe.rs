@@ -84,6 +84,14 @@ pub struct Observation {
     /// providers sometimes silently substitute, and the user deserves to see
     /// what they actually got.
     pub served_model: Option<String>,
+    /// The provider's own identifier for this response, when it gave one.
+    ///
+    /// Not a routing key and not ours: it is the handle a provider's own APIs
+    /// take for this exchange. NEAR AI's `GET /v1/signature/{id}` returns a
+    /// signed receipt over the request and response hashes for it, and without
+    /// the id that receipt is unreachable the moment the response is gone.
+    /// Recording it costs one string and keeps that door open.
+    pub upstream_id: Option<String>,
 }
 
 impl Observation {
@@ -95,6 +103,7 @@ impl Observation {
             && self.secondary.is_none()
             && self.retry_after_secs.is_none()
             && self.served_model.is_none()
+            && self.upstream_id.is_none()
     }
 }
 

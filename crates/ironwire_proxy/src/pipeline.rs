@@ -906,6 +906,7 @@ impl LedgerContext {
             backend: self.backend,
             requested_model: self.requested_model,
             served_model: observation.served_model.clone(),
+            upstream_id: observation.upstream_id.clone(),
             rung: self.rung,
             attempts: i64::try_from(self.attempts).unwrap_or(i64::MAX),
             // `None`, not `0`, when the provider reported nothing: a fabricated

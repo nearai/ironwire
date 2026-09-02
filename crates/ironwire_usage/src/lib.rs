@@ -315,6 +315,7 @@ pub(crate) mod test_support {
             backend: backend.into(),
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),
+            upstream_id: None,
             rung: "preferred".into(),
             attempts: 1,
             input_tokens: None,
