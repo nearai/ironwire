@@ -87,3 +87,77 @@ mod tests {
         assert!(client_session_id(&headers, Protocol::AnthropicMessages).is_none());
     }
 }
+
+#[cfg(test)]
+mod join_contract {
+    use super::*;
+    use axum::http::HeaderMap;
+    use ironwire_core::protocol::Protocol;
+
+    fn with(name: &'static str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            name,
+            axum::http::HeaderValue::from_str(value).expect("header"),
+        );
+        headers
+    }
+
+    /// A consumer joins on this, so the header a façade reads is part of the
+    /// contract rather than an implementation detail. `docs/PROTOCOL.md` §3
+    /// states these two; a change here is a change there.
+    #[test]
+    fn each_facade_reads_the_header_protocol_md_names() {
+        assert_eq!(
+            ironwire_upstream::headers::client_session_header(Protocol::AnthropicMessages),
+            "x-claude-code-session-id"
+        );
+        assert_eq!(
+            ironwire_upstream::headers::client_session_header(Protocol::OpenAiResponses),
+            "session-id"
+        );
+        assert_eq!(
+            ironwire_upstream::headers::client_session_header(Protocol::OpenAiChat),
+            "session-id"
+        );
+    }
+
+    /// Verbatim, and that is the whole contract: a consumer holding the same
+    /// session under a different spelling must map it itself, because
+    /// IronWire never sees the other spelling and cannot.
+    ///
+    /// The values here are the two real shapes we have seen: Claude Code
+    /// sends a bare UUID, and a client whose own identifier carries a prefix
+    /// sends it with the prefix intact.
+    #[test]
+    fn the_session_id_is_stored_verbatim() {
+        let bare = "5db811ed-ce4a-45a7-ab00-56890e111668";
+        assert_eq!(
+            client_session_id(
+                &with("x-claude-code-session-id", bare),
+                Protocol::AnthropicMessages
+            )
+            .as_deref(),
+            Some(bare),
+            "no normalisation, no case folding"
+        );
+
+        let prefixed = "rollout-2026-09-02T10-14-22-5db811ed-ce4a-45a7-ab00-56890e111668";
+        assert_eq!(
+            client_session_id(&with("session-id", prefixed), Protocol::OpenAiChat).as_deref(),
+            Some(prefixed),
+            "a prefix is not stripped -- a consumer expecting a bare UUID here \
+             would join nothing, and silently"
+        );
+    }
+
+    /// A client that names no session yields no attribution, rather than a
+    /// fabricated one. Same rule as usage and capacity.
+    #[test]
+    fn no_header_is_none_not_a_placeholder() {
+        assert_eq!(
+            client_session_id(&HeaderMap::new(), Protocol::AnthropicMessages),
+            None
+        );
+    }
+}

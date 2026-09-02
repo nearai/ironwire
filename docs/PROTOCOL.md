@@ -92,6 +92,46 @@ Usage and quota come off the wire, never from a model of our own (DESIGN §4).
 An exchange whose usage could not be observed is recorded with
 `usage: unknown`, not with an estimate.
 
+### The client's session id, and what it is safe to join on
+
+Each ledger row carries `client_session_id`: **the client's own identifier,
+stored verbatim**, read from a request header IronWire forwards untouched.
+
+| Façade | Header |
+|---|---|
+| Anthropic (`Protocol::AnthropicMessages`) | `x-claude-code-session-id` |
+| OpenAI (`Protocol::OpenAiResponses`, `Protocol::OpenAiChat`) | `session-id` |
+
+`None` when the client sent no such header, which is the honest answer and not
+an error: a client that names no session cannot have its rows attributed to
+one.
+
+A value is stored only if it is non-empty, at most 200 bytes, and made entirely
+of `[A-Za-z0-9_:.-]`. Anything else is dropped rather than stored. This is
+client-supplied text written to a local database that `ironwire log` renders to
+a terminal, and a row addressed by nothing beats a row that can smuggle control
+characters onto someone's screen.
+
+**Three properties a consumer joining on this must know**, because each has
+already caused a wrong assumption:
+
+- **It is verbatim, not normalised.** IronWire does not lowercase it, strip a
+  prefix, or parse a UUID out of it. Whatever the client sent is what a row
+  carries. A consumer holding the same session under a different spelling --
+  a filename stem, a path, a prefixed form -- must do that mapping itself.
+  IronWire cannot, because it never sees the other spelling.
+- **It is not `conversation`.** That column is a routing-affinity key derived
+  from protocol family, preamble head and tool list. It is deliberately stable
+  across a whole session, which also makes it stable across two *different*
+  sessions with the same tools and across machines. It is right for stickiness
+  and wrong for attribution.
+- **It is not unique to a machine or an install.** It identifies a session as
+  its client named it, nothing more.
+
+A consumer that cannot verify the two spellings agree should say so rather than
+assume: a join that silently matches nothing is indistinguishable from a client
+that ran nothing, and both render as an empty result.
+
 ---
 
 ## 4. Cancellation
