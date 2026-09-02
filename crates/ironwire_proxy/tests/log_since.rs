@@ -41,6 +41,7 @@ fn exchange(started_at: DateTime<Utc>) -> Exchange {
         backend: "claude-sub".into(),
         requested_model: None,
         served_model: None,
+        upstream_id: None,
         rung: "same_model".into(),
         attempts: 1,
         input_tokens: None,

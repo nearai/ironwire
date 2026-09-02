@@ -711,6 +711,7 @@ mod log_tests {
             backend: "claude-sub".into(),
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),
+            upstream_id: None,
             rung: "preferred".into(),
             attempts: 1,
             input_tokens: Some(12),

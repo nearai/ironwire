@@ -165,6 +165,7 @@ impl SseObserver {
         if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
             self.observation.served_model = Some(model.to_string());
         }
+        self.note_upstream_id(value.get("id"));
         let usage = match self.dialect {
             Dialect::Anthropic => value.get("usage").and_then(anthropic_usage),
             Dialect::OpenAiResponses | Dialect::OpenAiChat => {
@@ -173,6 +174,23 @@ impl SseObserver {
         };
         if let Some(usage) = usage {
             self.merge_usage(usage);
+        }
+    }
+
+    /// Record the provider's response id the first time a frame carries one.
+    ///
+    /// First wins, deliberately. A streamed response repeats its id on many
+    /// frames and they agree; if some future provider shape ever disagreed,
+    /// the opening frame is the one that named the response the receipt will
+    /// be about.
+    fn note_upstream_id(&mut self, value: Option<&serde_json::Value>) {
+        if self.observation.upstream_id.is_some() {
+            return;
+        }
+        if let Some(id) = value.and_then(serde_json::Value::as_str)
+            && !id.is_empty()
+        {
+            self.observation.upstream_id = Some(id.to_string());
         }
     }
 
@@ -185,6 +203,7 @@ impl SseObserver {
                 {
                     self.observation.served_model = Some(model.to_string());
                 }
+                self.note_upstream_id(value.pointer("/message/id"));
                 if let Some(usage) = value.pointer("/message/usage").and_then(anthropic_usage) {
                     self.merge_usage(usage);
                 }
@@ -205,6 +224,7 @@ impl SseObserver {
         {
             self.observation.served_model = Some(model.to_string());
         }
+        self.note_upstream_id(value.pointer("/response/id"));
         if let Some(usage) = value.pointer("/response/usage").and_then(openai_usage) {
             self.merge_usage(usage);
         }
@@ -214,6 +234,7 @@ impl SseObserver {
         if let Some(model) = value.get("model").and_then(serde_json::Value::as_str) {
             self.observation.served_model = Some(model.to_string());
         }
+        self.note_upstream_id(value.get("id"));
         if let Some(usage) = value.get("usage").and_then(openai_usage) {
             self.merge_usage(usage);
         }
@@ -453,5 +474,70 @@ mod document_tests {
         );
         let usage = observer.finish().usage.expect("usage was reported");
         assert_eq!(usage.input_tokens, 5);
+    }
+}
+
+#[cfg(test)]
+mod upstream_id_tests {
+    use super::*;
+
+    /// The id is what makes a provider's own receipt reachable later. Without
+    /// it, `GET /v1/signature/{id}` has nothing to ask about.
+    #[test]
+    fn a_whole_openai_response_yields_its_id() {
+        let mut obs = SseObserver::new(Dialect::OpenAiChat);
+        obs.consume_document(
+            &serde_json::json!({"id": "c54961ab1d594cf591e5566caa21196b", "model": "Qwen/Qwen3.6-27B-FP8"}),
+        );
+        assert_eq!(
+            obs.observation.upstream_id.as_deref(),
+            Some("c54961ab1d594cf591e5566caa21196b")
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_yields_the_id_from_message_start() {
+        let mut obs = SseObserver::new(Dialect::Anthropic);
+        obs.consume_anthropic(&serde_json::json!({
+            "type": "message_start",
+            "message": {"id": "msg_0123", "model": "claude-opus-4-6"}
+        }));
+        assert_eq!(obs.observation.upstream_id.as_deref(), Some("msg_0123"));
+    }
+
+    #[test]
+    fn a_responses_stream_yields_the_id_from_the_response_object() {
+        let mut obs = SseObserver::new(Dialect::OpenAiResponses);
+        obs.consume_openai_responses(&serde_json::json!({
+            "response": {"id": "resp_77", "model": "gpt-5"}
+        }));
+        assert_eq!(obs.observation.upstream_id.as_deref(), Some("resp_77"));
+    }
+
+    /// A streamed response repeats its id on many frames. First wins, so a
+    /// later frame cannot rename the response the receipt is about.
+    #[test]
+    fn a_later_frame_does_not_rename_the_response() {
+        let mut obs = SseObserver::new(Dialect::OpenAiChat);
+        obs.consume_openai_chat(&serde_json::json!({"id": "first", "model": "m"}));
+        obs.consume_openai_chat(&serde_json::json!({"id": "second", "model": "m"}));
+        assert_eq!(obs.observation.upstream_id.as_deref(), Some("first"));
+    }
+
+    /// A provider that reports no id leaves the field empty rather than
+    /// inventing one -- the same rule the rest of this module follows for
+    /// usage and capacity.
+    #[test]
+    fn no_id_reported_is_none_not_a_placeholder() {
+        let mut obs = SseObserver::new(Dialect::OpenAiChat);
+        obs.consume_openai_chat(&serde_json::json!({"model": "m"}));
+        assert_eq!(obs.observation.upstream_id, None);
+    }
+
+    #[test]
+    fn an_empty_id_is_not_recorded() {
+        let mut obs = SseObserver::new(Dialect::OpenAiChat);
+        obs.consume_openai_chat(&serde_json::json!({"id": "", "model": "m"}));
+        assert_eq!(obs.observation.upstream_id, None);
     }
 }

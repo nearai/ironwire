@@ -87,6 +87,16 @@ pub struct Exchange {
     pub requested_model: Option<String>,
     /// Model that actually served it, as the provider reported.
     pub served_model: Option<String>,
+    /// The provider's own identifier for this response, when it gave one.
+    ///
+    /// The handle a provider's own APIs take for this exchange. NEAR AI's
+    /// `GET /v1/signature/{id}` returns a receipt signed by the enclave that
+    /// served it, over the request and response hashes; without the id that
+    /// receipt is unreachable the moment the response is gone. Recording it
+    /// costs one string and keeps that door open -- and it stays a local row
+    /// like everything else here.
+    #[serde(default)]
+    pub upstream_id: Option<String>,
     /// Fidelity rung.
     pub rung: String,
     /// Backends tried and rejected before this one succeeded.
@@ -281,10 +291,10 @@ impl Ledger {
         conn.execute(
             "INSERT INTO exchanges (
                 started_at, ttfb_ms, total_ms, facade, path, conversation, client_session_id,
-                backend, requested_model, served_model, rung, attempts,
+                backend, requested_model, served_model, upstream_id, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -296,6 +306,7 @@ impl Ledger {
                 exchange.backend,
                 exchange.requested_model,
                 exchange.served_model,
+                exchange.upstream_id,
                 exchange.rung,
                 exchange.attempts,
                 exchange.input_tokens,
@@ -531,7 +542,7 @@ impl Ledger {
 /// installs and no upgrade. Every read goes through `COLUMNS`, so a missing one
 /// is not a degraded row, it is every query failing. Hence this list, applied
 /// on open.
-const ADDED_COLUMNS: &[(&str, &str)] = &[("client_session_id", "TEXT")];
+const ADDED_COLUMNS: &[(&str, &str)] = &[("client_session_id", "TEXT"), ("upstream_id", "TEXT")];
 
 /// Add any column in [`ADDED_COLUMNS`] the open ledger does not have.
 ///
@@ -559,7 +570,7 @@ fn add_missing_columns(conn: &rusqlite::Connection) -> Result<()> {
 /// added to one and not the other shifts every index after it.
 const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, conversation,
             client_session_id, backend,
-            requested_model, served_model, rung, attempts,
+            requested_model, served_model, upstream_id, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error";
 
@@ -576,16 +587,17 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         backend: row.get(8)?,
         requested_model: row.get(9)?,
         served_model: row.get(10)?,
-        rung: row.get(11)?,
-        attempts: row.get(12)?,
-        input_tokens: row.get(13)?,
-        cache_read_tokens: row.get(14)?,
-        cache_write_tokens: row.get(15)?,
-        output_tokens: row.get(16)?,
-        cost_usd: row.get(17)?,
-        substitutions: row.get(18)?,
-        status: row.get(19)?,
-        error: row.get(20)?,
+        upstream_id: row.get(11)?,
+        rung: row.get(12)?,
+        attempts: row.get(13)?,
+        input_tokens: row.get(14)?,
+        cache_read_tokens: row.get(15)?,
+        cache_write_tokens: row.get(16)?,
+        output_tokens: row.get(17)?,
+        cost_usd: row.get(18)?,
+        substitutions: row.get(19)?,
+        status: row.get(20)?,
+        error: row.get(21)?,
     })
 }
 
@@ -619,6 +631,7 @@ mod tests {
             backend: backend.into(),
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),
+            upstream_id: None,
             rung: "preferred".into(),
             attempts: 1,
             input_tokens: Some(12),
@@ -711,6 +724,59 @@ mod tests {
         assert_eq!(
             ledger.summary(at(-60)).expect("summarises").cache_hit_rate,
             None
+        );
+    }
+
+    /// A ledger written by an older IronWire has no `upstream_id` column.
+    /// `ADDED_COLUMNS` is what makes opening it work rather than failing every
+    /// query, so this opens a pre-existing table and reads through it.
+    #[test]
+    fn an_older_ledger_gains_the_column_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE exchanges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    ttfb_ms INTEGER, total_ms INTEGER,
+                    facade TEXT NOT NULL, path TEXT NOT NULL,
+                    conversation TEXT NOT NULL,
+                    backend TEXT NOT NULL,
+                    requested_model TEXT, served_model TEXT,
+                    rung TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    input_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, output_tokens INTEGER,
+                    cost_usd REAL, substitutions INTEGER, status INTEGER NOT NULL,
+                    error TEXT
+                )",
+            )
+            .expect("old schema");
+        }
+        let ledger = Ledger::open(&path).expect("opens an older ledger");
+        assert!(
+            ledger.page(at(0), None, 10).expect("reads").is_empty(),
+            "an upgraded ledger reads rather than failing every query"
+        );
+    }
+
+    /// The id is what makes a provider's own receipt reachable later, so it
+    /// has to survive the round trip rather than being dropped on write.
+    #[test]
+    fn an_upstream_id_survives_the_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).expect("open");
+        let mut exchange = exchange("claude-sub", 0);
+        exchange.upstream_id = Some("c54961ab1d594cf591e5566caa21196b".into());
+        ledger.record(&exchange).expect("records");
+
+        let rows = ledger.page(at(0), None, 10).expect("reads");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].upstream_id.as_deref(),
+            Some("c54961ab1d594cf591e5566caa21196b"),
+            "the provider's response id must come back as it went in"
         );
     }
 
