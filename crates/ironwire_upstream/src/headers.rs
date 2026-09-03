@@ -30,6 +30,22 @@ const AUTH: &[&str] = &["authorization", "x-api-key", "api-key"];
 /// than the connection to the provider.
 const REWRITTEN: &[&str] = &["host", "content-length", "accept-encoding"];
 
+/// Headers addressed to IronWire itself. Read here, never forwarded: a
+/// provider did not ask for them, and forwarding one would tell it there is a
+/// proxy in the path.
+const ADDRESSED_TO_US: &[&str] = &[NEUTRAL_SESSION_HEADER];
+
+/// The one header any client can use to name its session to IronWire.
+///
+/// The two native headers below are what Claude Code and Codex already send.
+/// Everything else that speaks Chat Completions -- Aider, Cline, Roo -- sends
+/// no session header at all, so their rows can never be attributed. A client
+/// or wrapper that can add a request header sets this one and becomes
+/// attributable without IronWire having to know it exists. It takes
+/// precedence over the native header when both are present, because it is
+/// the one the client chose to address to us.
+pub const NEUTRAL_SESSION_HEADER: &str = "x-ironwire-session-id";
+
 /// Whether an inbound request header should be forwarded upstream.
 #[must_use]
 pub fn forward_request_header(name: &str) -> bool {
@@ -37,6 +53,7 @@ pub fn forward_request_header(name: &str) -> bool {
     !HOP_BY_HOP.contains(&lower.as_str())
         && !AUTH.contains(&lower.as_str())
         && !REWRITTEN.contains(&lower.as_str())
+        && !ADDRESSED_TO_US.contains(&lower.as_str())
 }
 
 /// The header a coding agent uses to name its own session, per inbound wire.
@@ -107,6 +124,28 @@ mod tests {
     fn reading_a_session_header_does_not_stop_it_reaching_the_provider() {
         // Recording is not interception. Both headers must still forward
         // untouched, or the client's own correlation breaks upstream.
+        for protocol in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        ] {
+            assert!(forward_request_header(client_session_header(protocol)));
+        }
+    }
+
+    #[test]
+    fn the_neutral_session_header_is_addressed_to_us_and_stops_here() {
+        // A client that names its session to IronWire is talking to this hop,
+        // not to the provider. Forwarding it would hand a provider a header
+        // it never asked for, and would leak that a proxy is in the path.
+        assert_eq!(NEUTRAL_SESSION_HEADER, "x-ironwire-session-id");
+        assert!(!forward_request_header(NEUTRAL_SESSION_HEADER));
+        assert!(!forward_request_header("X-IronWire-Session-Id"));
+    }
+
+    #[test]
+    fn the_native_session_headers_still_reach_the_provider() {
+        // Adding a header of our own must not change what happens to theirs.
         for protocol in [
             Protocol::AnthropicMessages,
             Protocol::OpenAiResponses,
