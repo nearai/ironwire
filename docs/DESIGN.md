@@ -448,6 +448,64 @@ naturally captures the signal that matters: *model proposed X → tool returned 
 error → model repaired it with Y → next call succeeded.* A later opt-in hooks
 plugin can add `git diff`, test results and human acceptance to close the loop.
 
+### `capture.logprobs` — per-token confidence, cross-family only
+
+`capture.logprobs = true` asks a Chat Completions backend for the
+log-probability of each token it generates. `false`, the default, does not ask.
+It needs `capture.enabled` as well: with no ledger there is nothing to write the
+result into, and asking would be per-turn cost with no reader.
+
+The point is a signal the transcript does not carry: *where the model was
+uncertain*. A trace's value is not that it is unlike the others; it is that a
+human's judgement resolved something the model was unsure about, and entropy at
+a decision point is the only thing here that localises that.
+
+**One wire, and that is a fact about the wires rather than a limitation of the
+implementation.** Chat Completions has `logprobs: true`. Anthropic Messages has
+no such parameter at all and answers an unknown field with a 400 — on every
+request, not on some of them. Responses spells it as `top_logprobs` plus an
+`include` entry, and has no boolean form. So the pivot IR carries the intent
+(`Params::logprobs`) and exactly one emitter honours it; the other two drop it,
+which is the one place a silent drop is correct rather than a bug.
+
+**`logprobs`, never `top_logprobs`.** The alternatives are tokens the model
+considered and the user never saw. Nothing reads them: the confidence
+reduction they would feed is defined over the chosen token. Asking for them would be bandwidth on every
+frame and — because `capture.bodies = true` records response bodies verbatim —
+a way to persist continuations that were never generated into text. The two
+flags together would compose into exactly that, so the alternatives are not
+requested at all rather than requested and dropped.
+
+**Cross-family only.** Rule 1 says the native lane forwards bytes;
+`docs/PROTOCOL.md` §2 enumerates the mutations and
+`crates/ironwire_proxy/tests/passthrough.rs` pins them. The setting is applied
+in one place — `pipeline::translate_request`, on the path that already builds a
+fresh body — so a request that is not translated is never modified to carry it,
+at any setting. A client that asked for log-probabilities itself keeps them
+either way: the setting ORs into the parsed request rather than replacing it.
+
+Three reasons it is off by default, any one sufficient:
+
+- It changes what the provider is asked to produce, so a captured exchange is
+  **not comparable** to an uncaptured one. The same non-comparability the
+  privacy filter records per exchange ([`PRIVACY.md`](./PRIVACY.md) §3).
+- It inflates every response materially — on an agent loop that is per-turn
+  bandwidth and storage, not a one-off.
+- The distributions are conditioned on the whole context, which makes them more
+  sensitive than the text they describe.
+
+That last point is where this feature and the privacy filter interact, and the
+interaction is favourable. Log-probabilities describe whatever the provider
+actually saw. Because substitution happens on the way **out**, before the
+request is sent, an upstream running under the filter generates conditioned on
+placeholders — so the numbers describe the substituted text, and there was
+never an unsubstituted generation to leak. Redaction applied *after* generation
+could not make that claim: it cannot scrub numbers produced before it ran. It
+is still bounded by the filter's false-negative rate, which
+[`PRIVACY.md`](./PRIVACY.md) §7 is explicit cannot be measured on real user
+data — so this reduces the exposure rather than removing it, and no interface
+may say otherwise.
+
 ---
 
 ## 9. Failure semantics

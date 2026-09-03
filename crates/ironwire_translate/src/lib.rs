@@ -198,6 +198,56 @@ mod tests {
         }
     }
 
+    /// The one parameter only one of the three wires has.
+    ///
+    /// Anthropic Messages has no log-probability parameter and answers an
+    /// unknown field with a 400 — on *every* request, not on some of them — and
+    /// Responses spells it as `top_logprobs` plus an `include` entry rather
+    /// than a boolean, so a `logprobs: true` there is either ignored or
+    /// rejected. Emitting it from the pivot unconditionally would therefore
+    /// break two lanes out of three the moment capture was switched on, which
+    /// is exactly the shape of bug a per-wire test catches and a
+    /// hand-transcribed fixture does not.
+    #[test]
+    fn only_the_chat_completions_wire_asks_for_log_probabilities() {
+        let mut conversation = Conversation::default();
+        conversation.params.logprobs = true;
+        conversation.turns.push(ir::Turn {
+            role: ir::Role::User,
+            blocks: vec![ir::Block::Text("hi".into())],
+        });
+        conversation.params.max_tokens = Some(16);
+
+        for to in EVERY {
+            let (out, _) = emit_request(to, &conversation, "target-model");
+            let object = out.as_object().expect("an object body");
+            assert!(
+                !object.contains_key("top_logprobs"),
+                "{to} asked for alternative tokens nothing reads"
+            );
+            match to {
+                Protocol::OpenAiChat => assert_eq!(object.get("logprobs"), Some(&json!(true))),
+                _ => assert!(
+                    !object.contains_key("logprobs"),
+                    "{to} has no such parameter and would reject the request"
+                ),
+            }
+        }
+    }
+
+    /// The default must produce exactly the body it produced before capture
+    /// existed. Asking a provider for something extra is a decision, never an
+    /// accident.
+    #[test]
+    fn no_wire_asks_for_log_probabilities_unless_something_did() {
+        let conversation = Conversation::default();
+        for to in EVERY {
+            let (out, _) = emit_request(to, &conversation, "target-model");
+            let text = out.to_string();
+            assert!(!text.contains("logprobs"), "{to}: {text}");
+        }
+    }
+
     #[test]
     fn a_translated_request_goes_to_the_targets_own_endpoint() {
         assert_eq!(endpoint_path(Protocol::AnthropicMessages), "/v1/messages");

@@ -88,6 +88,9 @@ pub fn parse_request(body: &Value) -> Conversation {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or_default(),
+            // Responses spells this as `top_logprobs` plus an `include`
+            // entry rather than a boolean, and nothing here reads it yet.
+            logprobs: false,
         },
     }
 }

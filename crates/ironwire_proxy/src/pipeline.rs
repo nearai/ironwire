@@ -339,7 +339,15 @@ async fn dispatch_inner(
         // `translated` would be false.
         let target = backend.capabilities().wires.primary();
         let request = if decision.translated {
-            match translate_request(&body, path, inbound, target, &decision, peek) {
+            match translate_request(
+                &body,
+                path,
+                inbound,
+                target,
+                &decision,
+                peek,
+                capture_logprobs(&state.config.capture),
+            ) {
                 Ok(request) => request,
                 Err(reason) => {
                     // Refusing beats sending a body the target cannot parse.
@@ -522,6 +530,7 @@ fn translate_request(
     target: Protocol,
     decision: &RouteDecision,
     peek: &RequestPeek,
+    logprobs: bool,
 ) -> Result<UpstreamRequest, String> {
     // Only the completion endpoints translate. `count_tokens` has no equivalent
     // on the other wires, and answering it with a guess would corrupt the
@@ -537,7 +546,14 @@ fn translate_request(
         .or(peek.requested_model.as_deref())
         .unwrap_or("default");
 
-    let conversation = ironwire_translate::parse_request(inbound, &parsed);
+    let mut conversation = ironwire_translate::parse_request(inbound, &parsed);
+    // OR rather than assignment: a client that asked for log-probabilities
+    // itself keeps them whatever the capture setting says. This is the only
+    // place the setting is applied, and it is on the path that already builds a
+    // fresh body — the native lane is never reached from here, so its
+    // byte-identity claim (`docs/PROTOCOL.md` §2) is untouched. Which wires can
+    // actually express it is the emitters' business, not this function's.
+    conversation.params.logprobs |= logprobs;
     let (translated, dropped) = ironwire_translate::emit_request(target, &conversation, model);
 
     // A block type this build does not model makes the whole cross-wire route
@@ -576,6 +592,17 @@ fn translate_request(
         headers: Vec::new(),
         stream: peek.stream,
     })
+}
+
+/// Whether to ask a translated request for per-token log-probabilities.
+///
+/// Both switches, not either. `capture.logprobs` says the user wants the
+/// signal; `capture.enabled` is what decides whether there is a ledger to write
+/// the aggregate into. With capture off, asking would inflate every response on
+/// the cross-family lane and be read by nobody, which is the one combination
+/// worth refusing outright rather than honouring literally.
+fn capture_logprobs(capture: &ironwire_core::config::CaptureConfig) -> bool {
+    capture.enabled && capture.logprobs
 }
 
 /// Whether this path is a completion endpoint on some wire.
