@@ -8,6 +8,11 @@ pub use error::FacadeError;
 
 /// The client's own session id, when it sent one.
 ///
+/// Read from `x-ironwire-session-id` when the client sent it, and otherwise
+/// from the native header for the facade's protocol. The neutral header is
+/// the one the client chose to address to IronWire, so it takes precedence
+/// whenever both are present.
+///
 /// Bounded and sanitised before it reaches the ledger: this is client-supplied
 /// text, and it is written to a local database that `ironwire log` renders to a
 /// terminal. Anything that is not a plain identifier is dropped rather than
@@ -17,10 +22,15 @@ pub(crate) fn client_session_id(
     headers: &axum::http::HeaderMap,
     protocol: ironwire_core::protocol::Protocol,
 ) -> Option<String> {
-    let raw = headers
-        .get(ironwire_upstream::headers::client_session_header(protocol))?
-        .to_str()
-        .ok()?;
+    // The header addressed to us wins; the native one is the fallback. A
+    // neutral header that fails validation is a client that sent us garbage,
+    // and the answer is nothing -- not its native id filed instead.
+    let name = if headers.contains_key(ironwire_upstream::headers::NEUTRAL_SESSION_HEADER) {
+        ironwire_upstream::headers::NEUTRAL_SESSION_HEADER
+    } else {
+        ironwire_upstream::headers::client_session_header(protocol)
+    };
+    let raw = headers.get(name)?.to_str().ok()?;
     let ok = !raw.is_empty()
         && raw.len() <= 200
         && raw
@@ -158,6 +168,55 @@ mod join_contract {
         assert_eq!(
             client_session_id(&HeaderMap::new(), Protocol::AnthropicMessages),
             None
+        );
+    }
+
+    /// A client with no native session header can still name its session.
+    #[test]
+    fn the_neutral_header_is_read_on_every_facade() {
+        let id = "aider-2026-09-03-0001";
+        for protocol in [
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::OpenAiChat,
+        ] {
+            assert_eq!(
+                client_session_id(&with("x-ironwire-session-id", id), protocol).as_deref(),
+                Some(id),
+                "{protocol:?} must read the neutral header"
+            );
+        }
+    }
+
+    /// The header the client addressed to us wins over the one it addresses
+    /// to the provider. A wrapper that sets ours has said which id it wants
+    /// the row filed under.
+    #[test]
+    fn the_neutral_header_takes_precedence_over_the_native_one() {
+        let mut headers = with("x-claude-code-session-id", "native-id");
+        headers.insert(
+            "x-ironwire-session-id",
+            axum::http::HeaderValue::from_static("chosen-id"),
+        );
+        assert_eq!(
+            client_session_id(&headers, Protocol::AnthropicMessages).as_deref(),
+            Some("chosen-id")
+        );
+    }
+
+    /// The same validation applies: a hostile neutral header is dropped, and
+    /// does not fall through to the native one either.
+    #[test]
+    fn a_hostile_neutral_header_is_dropped_not_bypassed() {
+        let mut headers = with("x-claude-code-session-id", "native-id");
+        headers.insert(
+            "x-ironwire-session-id",
+            axum::http::HeaderValue::from_static("not a session id"),
+        );
+        assert_eq!(
+            client_session_id(&headers, Protocol::AnthropicMessages),
+            None,
+            "a client that sent us garbage does not get its native id filed instead"
         );
     }
 }

@@ -97,10 +97,17 @@ An exchange whose usage could not be observed is recorded with
 Each ledger row carries `client_session_id`: **the client's own identifier,
 stored verbatim**, read from a request header IronWire forwards untouched.
 
-| Façade | Header |
+| Façade | Header read |
 |---|---|
+| Any | `x-ironwire-session-id`, when present (takes precedence) |
 | Anthropic (`Protocol::AnthropicMessages`) | `x-claude-code-session-id` |
 | OpenAI (`Protocol::OpenAiResponses`, `Protocol::OpenAiChat`) | `session-id` |
+
+`x-ironwire-session-id` is addressed to IronWire and is **not forwarded** to
+the provider. The two native headers are forwarded untouched, as before. A
+client that sends no native session header -- Aider, Cline, Roo -- can set
+the neutral one wherever its provider settings allow an extra request
+header, and its rows become attributable without an IronWire release.
 
 `None` when the client sent no such header, which is the honest answer and not
 an error: a client that names no session cannot have its rows attributed to
