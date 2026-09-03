@@ -166,6 +166,15 @@ struct Parser {
     usage: Usage,
     /// Responses only: which output index is which call.
     responses_call_index: Vec<usize>,
+    /// `ln p(chosen token)` for each generated token, in order, when the
+    /// request asked for log-probabilities. Empty otherwise, which is the
+    /// default.
+    ///
+    /// Accumulated but never forwarded: no client asked for these and the
+    /// target's shape may have nowhere to put them. They exist to be reduced
+    /// locally into `ironwire_core::confidence` aggregates. Bounded by
+    /// `chat::MAX_TOKEN_LOGPROBS`.
+    token_logprobs: Vec<f64>,
 }
 
 impl Parser {
@@ -177,6 +186,7 @@ impl Parser {
             stop: None,
             usage: Usage::default(),
             responses_call_index: Vec::new(),
+            token_logprobs: Vec::new(),
         }
     }
 
@@ -313,6 +323,12 @@ impl Parser {
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.stop = Some(chat::parse_stop_reason(Some(reason)));
         }
+        // Before the delta check on purpose: `logprobs` is a sibling of `delta`,
+        // and the chunk carrying the finish reason often has one without the
+        // other. Accumulating after would drop the final token. Bounded inside,
+        // so a frame that is nothing but `logprobs` cannot grow the vector
+        // without limit while producing no output.
+        chat::accumulate_token_logprobs(choice, &mut self.token_logprobs);
         let Some(delta) = choice.get("delta") else {
             return;
         };
@@ -865,6 +881,17 @@ impl Translator {
         }
     }
 
+    /// `ln p(chosen token)` for each token the model emitted, in order.
+    ///
+    /// Empty unless the request asked for log-probabilities and the backend
+    /// honoured it. Log-probabilities rather than probabilities: the reduction
+    /// exponentiates once, in `f64`, and narrowing earlier is what
+    /// `ironwire_core::confidence` documents as the thing to avoid.
+    #[must_use]
+    pub fn token_logprobs(&self) -> &[f64] {
+        &self.parser.token_logprobs
+    }
+
     /// Feed upstream bytes; returns downstream bytes to forward.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.buffer.extend_from_slice(chunk);
@@ -1130,6 +1157,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- log-probability capture ------------------------------------------
+
+    fn chat_frame(value: serde_json::Value) -> String {
+        format!("data: {value}\n\n")
+    }
+
+    /// A stream that was never asked for log-probabilities accumulates none,
+    /// which is every stream by default.
+    #[test]
+    fn nothing_is_accumulated_when_the_backend_sends_no_logprobs() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        t.push(&chat_stream());
+        t.finish();
+        assert!(t.token_logprobs().is_empty());
+    }
+
+    #[test]
+    fn logprobs_accumulate_across_frames_in_order() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        for (text, logprob) in [("a", -0.5f64), ("b", -1.5)] {
+            t.push(
+                chat_frame(json!({"id": "c", "choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "logprobs": {"content": [{"token": text, "logprob": logprob}]}
+                }]}))
+                .as_bytes(),
+            );
+        }
+        assert_eq!(t.token_logprobs(), [-0.5, -1.5]);
+    }
+
+    /// `logprobs` is a sibling of `delta`, so a frame carrying a distribution
+    /// and a finish reason but no delta must still be counted. Accumulating
+    /// after the delta check would silently drop the final token.
+    #[test]
+    fn logprobs_survive_a_frame_with_no_delta() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        t.push(
+            chat_frame(json!({"id": "c", "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "logprobs": {"content": [{"token": "!", "logprob": -0.25}]}
+            }]}))
+            .as_bytes(),
+        );
+        assert_eq!(t.token_logprobs(), [-0.25]);
+    }
+
+    /// The same frame twice is two tokens; one frame is not counted twice.
+    #[test]
+    fn a_frame_is_counted_once() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        let frame = chat_frame(json!({"id": "c", "choices": [{
+            "index": 0,
+            "delta": {"content": "x"},
+            "logprobs": {"content": [{"token": "x", "logprob": -0.1}]}
+        }]}));
+        t.push(frame.as_bytes());
+        assert_eq!(t.token_logprobs().len(), 1);
+        t.push(frame.as_bytes());
+        assert_eq!(t.token_logprobs().len(), 2);
+    }
+
+    /// An entry with no usable `logprob` is skipped rather than repaired: a
+    /// stand-in value would be folded into the mean and never seen again.
+    #[test]
+    fn a_malformed_logprob_entry_is_skipped() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        t.push(
+            chat_frame(json!({"id": "c", "choices": [{
+                "index": 0,
+                "delta": {"content": "x"},
+                "logprobs": {"content": [
+                    {"token": "ok", "logprob": -0.5},
+                    {"token": "bad", "logprob": "not a number"},
+                    {"token": "worse"}
+                ]}
+            }]}))
+            .as_bytes(),
+        );
+        assert_eq!(t.token_logprobs(), [-0.5]);
+    }
+
+    /// The fourth place an upstream controls how much we allocate. An endpoint
+    /// that streams `logprobs` entries forever must not grow this vector
+    /// forever — the aggregate over the prefix is still a true statement, and
+    /// an OOM is every conversation on the machine.
+    #[test]
+    fn accumulation_stops_at_the_cap_rather_than_growing() {
+        let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+        let entries: Vec<serde_json::Value> = (0..4096)
+            .map(|_| json!({"token": "x", "logprob": -0.1}))
+            .collect();
+        let frame = chat_frame(json!({"id": "c", "choices": [{
+            "index": 0,
+            "delta": {"content": "x"},
+            "logprobs": {"content": entries}
+        }]}));
+        for _ in 0..40 {
+            t.push(frame.as_bytes());
+        }
+        assert_eq!(t.token_logprobs().len(), chat::MAX_TOKEN_LOGPROBS);
+    }
+
+    /// Capture must not change a single downstream byte. The whole safety
+    /// argument for asking for log-probabilities is that the client sees the
+    /// same stream it would have seen.
+    #[test]
+    fn capture_does_not_alter_what_the_client_receives() {
+        let frames = |with_logprobs: bool| {
+            let mut t = Translator::new(Protocol::OpenAiChat, Protocol::AnthropicMessages, "m");
+            let mut choice = json!({"index": 0, "delta": {"content": "Hello"}});
+            if with_logprobs {
+                choice["logprobs"] = json!({"content": [{"token": "Hello", "logprob": -0.1}]});
+            }
+            let mut out = t.push(chat_frame(json!({"id": "c", "choices": [choice]})).as_bytes());
+            out.extend(t.finish());
+            out
+        };
+        assert_eq!(
+            frames(false),
+            frames(true),
+            "asking for log-probabilities changed what the client receives"
+        );
     }
 
     /// The single highest-consequence field in the translation. Reported as a

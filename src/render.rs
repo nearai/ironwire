@@ -722,6 +722,7 @@ mod log_tests {
             substitutions: None,
             status: 200,
             error: None,
+            confidence: None,
         }
     }
 

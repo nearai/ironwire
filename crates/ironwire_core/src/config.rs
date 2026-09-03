@@ -132,6 +132,29 @@ pub struct CaptureConfig {
     /// `0` disables pruning — an explicit choice someone can make, not the
     /// default, and not the accident it currently is.
     pub retain_days: u32,
+    /// Ask a Chat Completions backend for the log-probability of each token it
+    /// generates. `false` — the default — does not ask.
+    ///
+    /// A boolean rather than a count of alternatives. The only consumer is the
+    /// confidence reduction in [`crate::confidence`], which is defined over
+    /// p(chosen token) and never reads the alternatives, so a `top_logprobs: k`
+    /// knob would be bandwidth paid for on every turn and read by nobody.
+    ///
+    /// Off by default for three separate reasons, any one of which would be
+    /// enough. It changes what the provider is asked to produce, so a captured
+    /// exchange is not comparable to an uncaptured one. It inflates every
+    /// response materially, which on an agent loop is per-turn cost rather
+    /// than a one-off. And the distributions are conditioned on the whole
+    /// context, which makes them more sensitive than the text they describe —
+    /// see `docs/PRIVACY.md`, and note this only holds together at all because
+    /// substitution happens *before* the request goes out.
+    ///
+    /// Needs `enabled`: with no ledger there is nothing to write the aggregate
+    /// to, and asking would be cost with no reader. Cross-family only — the
+    /// native lane's byte-identity claim (`docs/PROTOCOL.md` §2) is untouched
+    /// by this setting, and a request that is not translated is never modified
+    /// to carry it.
+    pub logprobs: bool,
 }
 
 impl Default for CaptureConfig {
@@ -140,6 +163,7 @@ impl Default for CaptureConfig {
             enabled: true,
             bodies: false,
             retain_days: 90,
+            logprobs: false,
         }
     }
 }
@@ -1251,6 +1275,7 @@ mod tests {
                 enabled: true,
                 bodies: true,
                 retain_days: 30,
+                logprobs: true,
             },
             usage: UsageConfig {
                 enabled: true,
@@ -1281,6 +1306,16 @@ mod tests {
         let text = toml::to_string(&cfg).expect("serializes");
         let back: Config = toml::from_str(&text).expect("deserializes");
         assert_eq!(cfg, back);
+    }
+
+    /// `capture.logprobs` was added after the first release. A config written
+    /// before it must still load, and must not quietly start asking a provider
+    /// for something the user never opted into.
+    #[test]
+    fn a_config_written_before_logprobs_existed_still_loads_with_it_off() {
+        let cfg: Config = toml::from_str("[capture]\nenabled = true\nbodies = false\n")
+            .expect("an older config still deserializes");
+        assert!(!cfg.capture.logprobs);
     }
 
     #[test]

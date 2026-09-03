@@ -274,6 +274,16 @@ pub struct Params {
     pub reasoning: Option<ReasoningRequest>,
     /// Whether the client asked for SSE.
     pub stream: bool,
+    /// Whether per-token log-probabilities were asked for.
+    ///
+    /// Only one wire can express this. Chat Completions has `logprobs: true`;
+    /// Anthropic Messages has no such parameter at all and rejects an unknown
+    /// field, and Responses spells it as `top_logprobs` plus an `include`
+    /// entry rather than a boolean. So this is carried in the pivot and
+    /// honoured by exactly one emitter — the other two drop it silently, which
+    /// is the one place in this module that is correct rather than a bug: a
+    /// request the target cannot express is not a request that lost content.
+    pub logprobs: bool,
 }
 
 /// A whole request, wire-independent.

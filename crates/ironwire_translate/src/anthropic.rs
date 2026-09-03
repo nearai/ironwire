@@ -63,6 +63,9 @@ pub fn parse_request(body: &Value) -> Conversation {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or_default(),
+            // Anthropic Messages has no log-probability parameter, so a
+            // request that arrived here never asked for one.
+            logprobs: false,
         },
     }
 }

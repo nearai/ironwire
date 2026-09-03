@@ -136,6 +136,13 @@ pub fn parse_request(body: &Value) -> Conversation {
                 .get("stream")
                 .and_then(Value::as_bool)
                 .unwrap_or_default(),
+            // Read back so a same-wire round trip is lossless. The capture
+            // setting ORs into this at the pipeline; a client that asked for
+            // itself is honoured either way.
+            logprobs: body
+                .get("logprobs")
+                .and_then(Value::as_bool)
+                .unwrap_or_default(),
         },
     }
 }
@@ -309,6 +316,16 @@ pub fn emit_request(conversation: &Conversation, model: &str) -> (Value, Dropped
         .and_then(|r| r.effort.as_ref())
     {
         request.insert("reasoning_effort".into(), json!(effort));
+    }
+    // `logprobs` alone, never `top_logprobs`. The alternatives are model output
+    // the user never sees, they inflate every frame, and the only consumer —
+    // `ironwire_core::confidence` — is defined over the chosen token. Asking
+    // for something nobody reads is bandwidth and exposure, both for free.
+    //
+    // This is the only emitter that writes it. Anthropic Messages has no such
+    // parameter and rejects unknown fields; Responses has no boolean form.
+    if conversation.params.logprobs {
+        request.insert("logprobs".into(), json!(true));
     }
 
     if !conversation.tools.is_empty() {
@@ -502,6 +519,66 @@ pub fn parse_completion(response: &Value) -> Completion {
     }
 }
 
+/// Most per-token log-probabilities we will accumulate for one response.
+///
+/// The entries arrive from the upstream, one per generated token, and are
+/// pushed onto a `Vec` — so this is the fourth place an upstream controls how
+/// much we allocate, alongside `MAX_FRAME_BYTES`, `MAX_TOOL_CALLS` and
+/// `MAX_TOOL_ARGUMENT_BYTES` in `crate::stream`. IronWire lets a user point at
+/// an arbitrary OpenAI-compatible endpoint, which makes an unbounded stream of
+/// `logprobs` frames reachable rather than theoretical. A hundred and thirty
+/// thousand `f64`s is a megabyte, and far past any real response: the longest
+/// output any of these providers will produce is tens of thousands of tokens.
+///
+/// Past the cap we stop pushing rather than dropping what we have. The mean is
+/// then over a prefix, and `token_count` says how long that prefix was — an
+/// aggregate over the first 131072 tokens is a true statement about them.
+pub const MAX_TOKEN_LOGPROBS: usize = 1 << 17;
+
+/// Append `ln p(chosen token)` for every token in one `choice`'s `logprobs`.
+///
+/// Values are carried as log-probabilities all the way to the reduction, which
+/// exponentiates once in `f64`; see `ironwire_core::confidence` for why the
+/// order matters. A malformed entry is skipped rather than repaired.
+///
+/// Shared by the streaming and non-streaming paths so the two cannot disagree
+/// about what was captured.
+pub fn accumulate_token_logprobs(choice: &Value, out: &mut Vec<f64>) {
+    let Some(content) = choice
+        .get("logprobs")
+        .and_then(|l| l.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for entry in content {
+        if out.len() >= MAX_TOKEN_LOGPROBS {
+            return;
+        }
+        if let Some(logprob) = entry.get("logprob").and_then(Value::as_f64) {
+            out.push(logprob);
+        }
+    }
+}
+
+/// Every log-probability in a non-streaming Chat Completions answer.
+///
+/// The streaming path accumulates frame by frame in `crate::stream`; a
+/// `stream: false` request has the whole thing in one body, and would otherwise
+/// pay for the inflated response and record nothing.
+#[must_use]
+pub fn completion_token_logprobs(response: &Value) -> Vec<f64> {
+    let mut out = Vec::new();
+    if let Some(choice) = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+    {
+        accumulate_token_logprobs(choice, &mut out);
+    }
+    out
+}
+
 /// Map a Chat Completions `finish_reason` onto the IR.
 ///
 /// `tool_calls` → [`StopReason::ToolUse`] is the one that matters: get it wrong
@@ -670,6 +747,43 @@ mod tests {
                 {"role": "user", "content": "go ahead and fix it"}
             ]
         }))
+    }
+
+    /// Capture must not disturb anything else about the translation — it is an
+    /// addition to the request, not a different request.
+    #[test]
+    fn logprobs_do_not_perturb_the_rest_of_the_body() {
+        let plain_ir = claude_code_ir();
+        let mut captured_ir = claude_code_ir();
+        captured_ir.params.logprobs = true;
+
+        let (plain, _) = emit_request(&plain_ir, "near-x");
+        let (captured, _) = emit_request(&captured_ir, "near-x");
+
+        let (plain_obj, mut captured_obj) = (
+            plain.as_object().expect("object").clone(),
+            captured.as_object().expect("object").clone(),
+        );
+        assert_eq!(captured_obj.remove("logprobs"), Some(json!(true)));
+        assert_eq!(
+            plain_obj, captured_obj,
+            "enabling capture changed something other than the logprob key"
+        );
+    }
+
+    /// Parsing is lossless by rule, and this wire is the one that can say it.
+    /// Reading it back is also what keeps a client's own request honoured
+    /// independently of the capture setting.
+    #[test]
+    fn a_clients_own_logprobs_request_survives_the_round_trip() {
+        let ir = parse_request(&json!({
+            "model": "qwen3",
+            "logprobs": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(ir.params.logprobs);
+        let (out, _) = emit_request(&ir, "near-x");
+        assert_eq!(out["logprobs"], json!(true));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt};
+use ironwire_core::confidence::ConfidenceAggregates;
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::{ConversationKey, NoRoute, RouteDecision};
 use ironwire_core::protocol::Protocol;
@@ -36,6 +37,47 @@ pub struct Routed {
     /// Errors from backends tried and rejected, for the log and for the error
     /// we return if everything fails.
     pub rejected: Vec<(String, String)>,
+    /// Where the translated response will leave its confidence aggregate.
+    ///
+    /// Filled asynchronously, when the response finishes, which is after this
+    /// struct is handed back — so the façade carries the handle into the ledger
+    /// entry rather than a value. Stays empty on the native lane and whenever
+    /// `capture.logprobs` is off, which is nearly always.
+    pub confidence: ConfidenceSink,
+}
+
+/// A slot one translated response writes its confidence aggregate into.
+///
+/// The aggregate is only known when the last frame has been translated, and the
+/// ledger entry is only written when the response body ends or is dropped —
+/// which is strictly later. A shared slot is what connects the two without
+/// making the stream carry the ledger or the ledger poll the stream.
+#[derive(Clone, Debug, Default)]
+pub struct ConfidenceSink(Arc<std::sync::Mutex<Option<ConfidenceAggregates>>>);
+
+impl ConfidenceSink {
+    /// Record the aggregate for the response that just finished.
+    ///
+    /// Reduces from log-probabilities and stores nothing when there were none,
+    /// so an absent aggregate never becomes a measured zero.
+    fn record(&self, logprobs: &[f64]) {
+        let Some(aggregates) = ironwire_core::confidence::reduce_token_logprobs(logprobs) else {
+            return;
+        };
+        match self.0.lock() {
+            Ok(mut slot) => *slot = Some(aggregates),
+            Err(poisoned) => *poisoned.into_inner() = Some(aggregates),
+        }
+    }
+
+    /// What was recorded, if anything.
+    #[must_use]
+    pub fn get(&self) -> Option<ConfidenceAggregates> {
+        match self.0.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
 }
 
 /// Failure of the whole pipeline.
@@ -276,6 +318,7 @@ async fn dispatch_inner(
         Err(poisoned) => poisoned.into_inner().current_backend(&key),
     };
 
+    let confidence = ConfidenceSink::default();
     let mut rejected: Vec<(String, String)> = Vec::new();
     let mut attempts = 0usize;
     let mut last_error: Option<UpstreamError> = None;
@@ -339,7 +382,15 @@ async fn dispatch_inner(
         // `translated` would be false.
         let target = backend.capabilities().wires.primary();
         let request = if decision.translated {
-            match translate_request(&body, path, inbound, target, &decision, peek) {
+            match translate_request(
+                &body,
+                path,
+                inbound,
+                target,
+                &decision,
+                peek,
+                capture_logprobs(&state.config.capture),
+            ) {
                 Ok(request) => request,
                 Err(reason) => {
                     // Refusing beats sending a body the target cannot parse.
@@ -369,6 +420,7 @@ async fn dispatch_inner(
                         target,
                         peek.requested_model.as_deref().unwrap_or("unknown"),
                         peek.stream,
+                        confidence.clone(),
                     )
                 } else {
                     response
@@ -408,6 +460,7 @@ async fn dispatch_inner(
                         decision,
                         attempts,
                         rejected,
+                        confidence,
                     },
                 ));
             }
@@ -522,6 +575,7 @@ fn translate_request(
     target: Protocol,
     decision: &RouteDecision,
     peek: &RequestPeek,
+    logprobs: bool,
 ) -> Result<UpstreamRequest, String> {
     // Only the completion endpoints translate. `count_tokens` has no equivalent
     // on the other wires, and answering it with a guess would corrupt the
@@ -537,7 +591,14 @@ fn translate_request(
         .or(peek.requested_model.as_deref())
         .unwrap_or("default");
 
-    let conversation = ironwire_translate::parse_request(inbound, &parsed);
+    let mut conversation = ironwire_translate::parse_request(inbound, &parsed);
+    // OR rather than assignment: a client that asked for log-probabilities
+    // itself keeps them whatever the capture setting says. This is the only
+    // place the setting is applied, and it is on the path that already builds a
+    // fresh body — the native lane is never reached from here, so its
+    // byte-identity claim (`docs/PROTOCOL.md` §2) is untouched. Which wires can
+    // actually express it is the emitters' business, not this function's.
+    conversation.params.logprobs |= logprobs;
     let (translated, dropped) = ironwire_translate::emit_request(target, &conversation, model);
 
     // A block type this build does not model makes the whole cross-wire route
@@ -578,6 +639,17 @@ fn translate_request(
     })
 }
 
+/// Whether to ask a translated request for per-token log-probabilities.
+///
+/// Both switches, not either. `capture.logprobs` says the user wants the
+/// signal; `capture.enabled` is what decides whether there is a ledger to write
+/// the aggregate into. With capture off, asking would inflate every response on
+/// the cross-family lane and be read by nobody, which is the one combination
+/// worth refusing outright rather than honouring literally.
+fn capture_logprobs(capture: &ironwire_core::config::CaptureConfig) -> bool {
+    capture.enabled && capture.logprobs
+}
+
 /// Whether this path is a completion endpoint on some wire.
 fn is_completion_path(path: &str) -> bool {
     path.ends_with("/v1/messages")
@@ -593,6 +665,7 @@ fn translate_response(
     target: Protocol,
     requested_model: &str,
     stream: bool,
+    confidence: ConfidenceSink,
 ) -> UpstreamResponse {
     let mut headers: Vec<(String, String)> = response
         .headers
@@ -611,9 +684,23 @@ fn translate_response(
     ));
 
     let body = if stream {
-        translated_stream(response.body, inbound, target, requested_model.to_string()).boxed()
+        translated_stream(
+            response.body,
+            inbound,
+            target,
+            requested_model.to_string(),
+            confidence,
+        )
+        .boxed()
     } else {
-        translated_body(response.body, inbound, target, requested_model.to_string()).boxed()
+        translated_body(
+            response.body,
+            inbound,
+            target,
+            requested_model.to_string(),
+            confidence,
+        )
+        .boxed()
     };
 
     UpstreamResponse {
@@ -629,6 +716,7 @@ fn translated_body(
     inbound: Protocol,
     target: Protocol,
     requested_model: String,
+    confidence: ConfidenceSink,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     futures_util::stream::once(async move {
         let collected: Vec<Bytes> = inner.filter_map(|c| async move { c.ok() }).collect().await;
@@ -638,6 +726,14 @@ fn translated_body(
         }
         let parsed: serde_json::Value =
             serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+        // A `stream: false` request paid for the inflated response too, so it
+        // is read here rather than only on the streaming path. Capturing on one
+        // path and not the other is the worst of both: cost with no signal.
+        if target == Protocol::OpenAiChat {
+            confidence.record(&ironwire_translate::chat::completion_token_logprobs(
+                &parsed,
+            ));
+        }
         let completion = ironwire_translate::parse_completion(target, &parsed);
         let (translated, _) =
             ironwire_translate::emit_completion(inbound, &completion, &requested_model);
@@ -653,6 +749,7 @@ fn translated_stream(
     inbound: Protocol,
     target: Protocol,
     requested_model: String,
+    confidence: ConfidenceSink,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     let state = (
         inner,
@@ -661,31 +758,40 @@ fn translated_stream(
             inbound,
             requested_model,
         )),
+        confidence,
     );
-    futures_util::stream::unfold(state, |(mut inner, mut translator)| async move {
-        let mut active = translator.take()?;
-        loop {
-            match inner.next().await {
-                Some(Ok(chunk)) => {
-                    let out = active.push(&chunk);
-                    if out.is_empty() {
-                        // Nothing to forward yet — keep reading rather than
-                        // emitting an empty frame.
-                        continue;
+    futures_util::stream::unfold(
+        state,
+        |(mut inner, mut translator, confidence)| async move {
+            let mut active = translator.take()?;
+            loop {
+                match inner.next().await {
+                    Some(Ok(chunk)) => {
+                        let out = active.push(&chunk);
+                        if out.is_empty() {
+                            // Nothing to forward yet — keep reading rather than
+                            // emitting an empty frame.
+                            continue;
+                        }
+                        translator = Some(active);
+                        return Some((Ok(Bytes::from(out)), (inner, translator, confidence)));
                     }
-                    translator = Some(active);
-                    return Some((Ok(Bytes::from(out)), (inner, translator)));
-                }
-                // The upstream failed mid-stream. We are past the point of no
-                // return (PROTOCOL.md §5), so close the client's stream
-                // properly instead of leaving it hanging.
-                Some(Err(_)) | None => {
-                    let out = active.finish();
-                    return Some((Ok(Bytes::from(out)), (inner, None)));
+                    // The upstream failed mid-stream. We are past the point of no
+                    // return (PROTOCOL.md §5), so close the client's stream
+                    // properly instead of leaving it hanging.
+                    Some(Err(_)) | None => {
+                        let out = active.finish();
+                        // The last place the translator is whole. A client that
+                        // disconnected early still leaves the aggregate over what
+                        // it did receive, which is the same rule the observation
+                        // path follows.
+                        confidence.record(active.token_logprobs());
+                        return Some((Ok(Bytes::from(out)), (inner, None, confidence)));
+                    }
                 }
             }
-        }
-    })
+        },
+    )
 }
 
 /// Rewrite the `model` key, and only that key.
@@ -850,6 +956,11 @@ pub struct LedgerContext {
     pub substitutions: Option<i64>,
     /// Status returned to the client.
     pub status: u16,
+    /// Where the translated response leaves its confidence aggregate.
+    ///
+    /// A handle rather than a value: this context is assembled before the
+    /// response streams, and the aggregate is only known once it has finished.
+    pub confidence: ConfidenceSink,
 }
 
 impl LedgerContext {
@@ -919,6 +1030,11 @@ impl LedgerContext {
             substitutions: self.substitutions,
             status: i64::from(self.status),
             error: None,
+            // Read here rather than earlier: this runs when the body ends or is
+            // dropped, which is the first moment the whole response has been
+            // translated. `None` on every native-lane row, and on every
+            // cross-family one where nothing asked for log-probabilities.
+            confidence: self.confidence.get(),
         };
         // Metered spend only, and recorded even when the exchange failed:
         // tokens burned by a request that 500'd were still billed.
@@ -972,6 +1088,104 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use std::sync::Mutex;
+
+    /// Reducing log-probabilities and then dropping the result on the floor is
+    /// the failure this whole path exists to avoid, so the assertion is that
+    /// the aggregate reaches a ledger row a person can query — not that some
+    /// intermediate held it.
+    #[tokio::test]
+    async fn a_streamed_confidence_aggregate_reaches_the_ledger() {
+        let frames = [
+            r#"data: {"id":"c","choices":[{"index":0,"delta":{"content":"Hi"},"logprobs":{"content":[{"token":"Hi","logprob":-0.6931471805599453}]}}]}"#,
+            r#"data: {"id":"c","choices":[{"index":0,"finish_reason":"stop","logprobs":{"content":[{"token":"!","logprob":-0.6931471805599453}]}}]}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+
+        let confidence = ConfidenceSink::default();
+        let body = stream::iter(vec![Ok(Bytes::from(frames))]).boxed();
+        let translated = translated_stream(
+            body,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            "claude-opus-4-6".to_string(),
+            confidence.clone(),
+        );
+        let _: Vec<_> = translated.collect().await;
+
+        let ledger = ironwire_ledger::Ledger::in_memory().expect("ledger");
+        let spend = Mutex::new(crate::spend::SpendTracker::default());
+        ledger_context(confidence).write(&ledger, &spend, &Observation::default());
+
+        let row = ledger.recent(1).expect("reads");
+        let aggregate = row[0].confidence.expect("the aggregate reached the row");
+        assert_eq!(aggregate.token_count, 2);
+        assert!((aggregate.mean_confidence - 0.5).abs() < 1e-6);
+    }
+
+    /// `stream: false` pays for the same inflated response. Capturing only on
+    /// the streaming path would mean the cost with none of the signal.
+    #[tokio::test]
+    async fn a_non_streamed_answer_is_reduced_too() {
+        let body = Bytes::from_static(
+            br#"{"id":"c","choices":[{"index":0,"message":{"content":"Hi"},"finish_reason":"stop",
+                 "logprobs":{"content":[{"token":"Hi","logprob":-0.6931471805599453}]}}]}"#,
+        );
+        let confidence = ConfidenceSink::default();
+        let translated = translated_body(
+            stream::iter(vec![Ok(body)]).boxed(),
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            "claude-opus-4-6".to_string(),
+            confidence.clone(),
+        );
+        let _: Vec<_> = translated.collect().await;
+
+        let aggregate = confidence.get().expect("an aggregate");
+        assert_eq!(aggregate.token_count, 1);
+        assert!((aggregate.mean_confidence - 0.5).abs() < 1e-6);
+    }
+
+    /// The overwhelmingly common row: capture off, nothing captured, and no
+    /// measured-looking zero written where there was no measurement.
+    #[tokio::test]
+    async fn a_response_with_no_logprobs_writes_no_confidence() {
+        let frames = r#"data: {"id":"c","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}]}"#;
+        let confidence = ConfidenceSink::default();
+        let translated = translated_stream(
+            stream::iter(vec![Ok(Bytes::from(frames))]).boxed(),
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiChat,
+            "claude-opus-4-6".to_string(),
+            confidence.clone(),
+        );
+        let _: Vec<_> = translated.collect().await;
+
+        let ledger = ironwire_ledger::Ledger::in_memory().expect("ledger");
+        let spend = Mutex::new(crate::spend::SpendTracker::default());
+        ledger_context(confidence).write(&ledger, &spend, &Observation::default());
+        assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
+    }
+
+    fn ledger_context(confidence: ConfidenceSink) -> LedgerContext {
+        LedgerContext {
+            started_at: Utc::now(),
+            started: std::time::Instant::now(),
+            facade: "anthropic",
+            path: "/v1/messages".to_string(),
+            conversation: "c-1".to_string(),
+            client_session_id: None,
+            backend: "near-ai".to_string(),
+            backend_is_metered: false,
+            backend_is_local: false,
+            requested_model: Some("claude-opus-4-6".to_string()),
+            rung: "translated".to_string(),
+            attempts: 1,
+            substitutions: None,
+            status: 200,
+            confidence,
+        }
+    }
 
     #[test]
     fn an_unchanged_model_forwards_the_original_bytes_exactly() {

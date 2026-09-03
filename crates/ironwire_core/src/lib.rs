@@ -14,6 +14,7 @@
 
 pub mod atomic;
 pub mod capability;
+pub mod confidence;
 pub mod config;
 pub mod config_edit;
 pub mod discovery;
