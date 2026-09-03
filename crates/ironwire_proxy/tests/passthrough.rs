@@ -195,6 +195,7 @@ async fn only_the_enumerated_headers_are_mutated() {
                 .header("x-stainless-lang", "js")
                 .header("x-api-key", "CLIENT-KEY-MUST-NOT-LEAK")
                 .header("authorization", "Bearer CLIENT-TOKEN-MUST-NOT-LEAK")
+                .header("x-ironwire-session-id", "aider-1")
                 .body(Body::from(CLIENT_BODY))
                 .expect("request builds"),
         )
@@ -225,6 +226,13 @@ async fn only_the_enumerated_headers_are_mutated() {
     assert!(
         !got.headers.iter().any(|(_, v)| v.contains("MUST-NOT-LEAK")),
         "a credential the client sent must never reach the provider"
+    );
+
+    // Stripped: addressed to IronWire, so the provider never sees it.
+    assert_eq!(
+        header("x-ironwire-session-id"),
+        None,
+        "a header addressed to IronWire must not announce the proxy upstream"
     );
 }
 

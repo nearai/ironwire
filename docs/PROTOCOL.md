@@ -44,7 +44,11 @@ For a native-lane request, IronWire performs exactly these mutations:
    `transfer-encoding`, `keep-alive`, `upgrade`, `proxy-*`), set `host`.
 4. **`model`**: rewritten *only* when policy selected a different model, via a
    targeted JSON edit of that one key — never a full re-serialize.
-5. **Nothing else.** The body is otherwise the bytes the client sent.
+5. **Headers addressed to IronWire**: strip `x-ironwire-session-id`. It names
+   the client's session to IronWire itself (§3), not to the provider; the
+   provider never asked for it, and forwarding one would announce that there
+   is a proxy in the path.
+6. **Nothing else.** The body is otherwise the bytes the client sent.
 
 > **The one documented exception, and it is opt-in.** The privacy filter
 > (`docs/PRIVACY.md`) substitutes values on the way out and restores them on the
@@ -95,7 +99,7 @@ An exchange whose usage could not be observed is recorded with
 ### The client's session id, and what it is safe to join on
 
 Each ledger row carries `client_session_id`: **the client's own identifier,
-stored verbatim**, read from a request header IronWire forwards untouched.
+stored verbatim**, read from a request header the client sent.
 
 | Façade | Header read |
 |---|---|
@@ -109,15 +113,18 @@ client that sends no native session header -- Aider, Cline, Roo -- can set
 the neutral one wherever its provider settings allow an extra request
 header, and its rows become attributable without an IronWire release.
 
+The value has to be an identifier: **at most 200 characters, made only of
+`A-Za-z0-9`, `-`, `_`, `:` and `.`**. Anything else -- a space, a `#`, an
+emoji -- is recorded as nothing at all, silently, and the row comes back
+unattributed. `my project #3` is not a session id; `my-project-3` is.
+
 `None` when the client sent no such header, which is the honest answer and not
 an error: a client that names no session cannot have its rows attributed to
 one.
 
-A value is stored only if it is non-empty, at most 200 bytes, and made entirely
-of `[A-Za-z0-9_:.-]`. Anything else is dropped rather than stored. This is
-client-supplied text written to a local database that `ironwire log` renders to
-a terminal, and a row addressed by nothing beats a row that can smuggle control
-characters onto someone's screen.
+The charset above is why: this is client-supplied text written to a local
+database that `ironwire log` renders to a terminal, and a row addressed by
+nothing beats a row that can smuggle control characters onto someone's screen.
 
 **Three properties a consumer joining on this must know**, because each has
 already caused a wrong assumption:

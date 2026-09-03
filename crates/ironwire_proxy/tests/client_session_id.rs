@@ -76,7 +76,7 @@ fn state_for(base_url: &str, ledger: Ledger) -> AppState {
     .with_ledger(Some(ledger))
 }
 
-fn request(session: Option<&str>) -> Request<Body> {
+fn request(header: &'static str, session: Option<&str>) -> Request<Body> {
     let body = json!({
         "model": "claude-opus-4-6",
         "max_tokens": 64,
@@ -88,16 +88,19 @@ fn request(session: Option<&str>) -> Request<Body> {
         .uri("/anthropic/v1/messages")
         .header("content-type", "application/json");
     if let Some(session) = session {
-        builder = builder.header("x-claude-code-session-id", session);
+        builder = builder.header(header, session);
     }
     builder.body(Body::from(body)).expect("request builds")
 }
 
-async fn recorded(session: Option<&str>) -> Option<String> {
+async fn recorded_under(header: &'static str, session: Option<&str>) -> Option<String> {
     let base = upstream().await;
     let ledger = Ledger::in_memory().expect("ledger opens");
     let state = state_for(&base, ledger.clone());
-    let response = app(state).oneshot(request(session)).await.expect("served");
+    let response = app(state)
+        .oneshot(request(header, session))
+        .await
+        .expect("served");
     assert_eq!(response.status(), StatusCode::OK);
 
     // The ledger write happens when the response body is consumed.
@@ -107,11 +110,33 @@ async fn recorded(session: Option<&str>) -> Option<String> {
     rows[0].client_session_id.clone()
 }
 
+/// The native header Claude Code already sends.
+async fn recorded(session: Option<&str>) -> Option<String> {
+    recorded_under("x-claude-code-session-id", session).await
+}
+
+/// The vendor-neutral header any client can be configured to send.
+async fn recorded_neutral(session: &str) -> Option<String> {
+    recorded_under("x-ironwire-session-id", Some(session)).await
+}
+
 #[tokio::test]
 async fn the_session_the_agent_named_is_the_session_on_the_row() {
     assert_eq!(
         recorded(Some("5db811ed-ce4a-45a7-ab00-56890e111668")).await,
         Some("5db811ed-ce4a-45a7-ab00-56890e111668".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_neutral_session_header_reaches_the_row_too() {
+    // A client with no native session header -- Aider, Cline, Roo -- names its
+    // session with this one. Nothing about it is Anthropic-specific, so the
+    // value has to survive the whole route on a façade that also has a native
+    // header of its own.
+    assert_eq!(
+        recorded_neutral("aider-1").await,
+        Some("aider-1".to_string())
     );
 }
 
