@@ -519,6 +519,66 @@ pub fn parse_completion(response: &Value) -> Completion {
     }
 }
 
+/// Most per-token log-probabilities we will accumulate for one response.
+///
+/// The entries arrive from the upstream, one per generated token, and are
+/// pushed onto a `Vec` — so this is the fourth place an upstream controls how
+/// much we allocate, alongside `MAX_FRAME_BYTES`, `MAX_TOOL_CALLS` and
+/// `MAX_TOOL_ARGUMENT_BYTES` in `crate::stream`. IronWire lets a user point at
+/// an arbitrary OpenAI-compatible endpoint, which makes an unbounded stream of
+/// `logprobs` frames reachable rather than theoretical. A hundred and thirty
+/// thousand `f64`s is a megabyte, and far past any real response: the longest
+/// output any of these providers will produce is tens of thousands of tokens.
+///
+/// Past the cap we stop pushing rather than dropping what we have. The mean is
+/// then over a prefix, and `token_count` says how long that prefix was — an
+/// aggregate over the first 131072 tokens is a true statement about them.
+pub const MAX_TOKEN_LOGPROBS: usize = 1 << 17;
+
+/// Append `ln p(chosen token)` for every token in one `choice`'s `logprobs`.
+///
+/// Values are carried as log-probabilities all the way to the reduction, which
+/// exponentiates once in `f64`; see `ironwire_core::confidence` for why the
+/// order matters. A malformed entry is skipped rather than repaired.
+///
+/// Shared by the streaming and non-streaming paths so the two cannot disagree
+/// about what was captured.
+pub fn accumulate_token_logprobs(choice: &Value, out: &mut Vec<f64>) {
+    let Some(content) = choice
+        .get("logprobs")
+        .and_then(|l| l.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for entry in content {
+        if out.len() >= MAX_TOKEN_LOGPROBS {
+            return;
+        }
+        if let Some(logprob) = entry.get("logprob").and_then(Value::as_f64) {
+            out.push(logprob);
+        }
+    }
+}
+
+/// Every log-probability in a non-streaming Chat Completions answer.
+///
+/// The streaming path accumulates frame by frame in `crate::stream`; a
+/// `stream: false` request has the whole thing in one body, and would otherwise
+/// pay for the inflated response and record nothing.
+#[must_use]
+pub fn completion_token_logprobs(response: &Value) -> Vec<f64> {
+    let mut out = Vec::new();
+    if let Some(choice) = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+    {
+        accumulate_token_logprobs(choice, &mut out);
+    }
+    out
+}
+
 /// Map a Chat Completions `finish_reason` onto the IR.
 ///
 /// `tool_calls` → [`StopReason::ToolUse`] is the one that matters: get it wrong

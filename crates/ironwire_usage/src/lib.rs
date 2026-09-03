@@ -326,6 +326,7 @@ pub(crate) mod test_support {
             substitutions: None,
             status: 200,
             error: None,
+            confidence: None,
         }
     }
 

@@ -52,6 +52,7 @@ fn exchange(started_at: DateTime<Utc>) -> Exchange {
         substitutions: None,
         status: 200,
         error: None,
+        confidence: None,
     }
 }
 

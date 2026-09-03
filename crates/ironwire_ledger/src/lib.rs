@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use ironwire_core::confidence::{ConfidenceAggregates, ConfidenceBucket};
+
 /// Price an exchange from its observed token counts.
 ///
 /// Delegates to `ironclaw_common::llm_costs` — the price table every NEAR AI
@@ -126,6 +128,15 @@ pub struct Exchange {
     pub status: i64,
     /// Error, when the exchange failed.
     pub error: Option<String>,
+    /// How confident the model was, reduced from per-token log-probabilities.
+    ///
+    /// `None` unless `capture.logprobs` was on, the route was cross-family, and
+    /// the backend honoured the request — so on nearly every row. Stored as
+    /// four flat columns rather than a blob: a mean nobody can query is a mean
+    /// nobody will look at. The distributions themselves are never written
+    /// here; they are reduced in the proxy and discarded (`docs/DESIGN.md` §8).
+    #[serde(default)]
+    pub confidence: Option<ConfidenceAggregates>,
 }
 
 impl Exchange {
@@ -242,7 +253,11 @@ CREATE TABLE IF NOT EXISTS exchanges (
     cost_usd           REAL,
     substitutions      INTEGER,
     status             INTEGER NOT NULL,
-    error              TEXT
+    error              TEXT,
+    mean_confidence         REAL,
+    confidence_variability  REAL,
+    confidence_bucket       TEXT,
+    confidence_tokens       INTEGER
 );
 CREATE INDEX IF NOT EXISTS exchanges_started_at ON exchanges (started_at);
 CREATE INDEX IF NOT EXISTS exchanges_conversation ON exchanges (conversation);
@@ -293,8 +308,10 @@ impl Ledger {
                 started_at, ttfb_ms, total_ms, facade, path, conversation, client_session_id,
                 backend, requested_model, served_model, upstream_id, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-                cost_usd, substitutions, status, error
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                cost_usd, substitutions, status, error,
+                mean_confidence, confidence_variability, confidence_bucket, confidence_tokens
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+                       ?22,?23,?24,?25)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -317,6 +334,12 @@ impl Ledger {
                 exchange.substitutions,
                 exchange.status,
                 exchange.error,
+                exchange.confidence.map(|c| f64::from(c.mean_confidence)),
+                exchange.confidence.map(|c| f64::from(c.variability)),
+                exchange.confidence.map(|c| c.bucket.as_str()),
+                exchange
+                    .confidence
+                    .and_then(|c| i64::try_from(c.token_count).ok()),
             ],
         )?;
         self.writes
@@ -542,7 +565,14 @@ impl Ledger {
 /// installs and no upgrade. Every read goes through `COLUMNS`, so a missing one
 /// is not a degraded row, it is every query failing. Hence this list, applied
 /// on open.
-const ADDED_COLUMNS: &[(&str, &str)] = &[("client_session_id", "TEXT"), ("upstream_id", "TEXT")];
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("client_session_id", "TEXT"),
+    ("upstream_id", "TEXT"),
+    ("mean_confidence", "REAL"),
+    ("confidence_variability", "REAL"),
+    ("confidence_bucket", "TEXT"),
+    ("confidence_tokens", "INTEGER"),
+];
 
 /// Add any column in [`ADDED_COLUMNS`] the open ledger does not have.
 ///
@@ -572,7 +602,39 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
             client_session_id, backend,
             requested_model, served_model, upstream_id, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
-            cost_usd, substitutions, status, error";
+            cost_usd, substitutions, status, error,
+            mean_confidence, confidence_variability, confidence_bucket, confidence_tokens";
+
+/// Rebuild the confidence aggregate from its four columns.
+///
+/// All four or nothing. A row written before these columns existed has them all
+/// null; a partial set means something wrote half an aggregate, and half an
+/// aggregate is not a weaker claim than a whole one, it is a different one. An
+/// unrecognised bucket name — which is what a *newer* IronWire writing into the
+/// same file would leave — is treated the same way, so a downgrade reads an
+/// absence rather than a guess.
+fn read_confidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ConfidenceAggregates>> {
+    let mean: Option<f64> = row.get(22)?;
+    let variability: Option<f64> = row.get(23)?;
+    let bucket: Option<String> = row.get(24)?;
+    let tokens: Option<i64> = row.get(25)?;
+    let (Some(mean), Some(variability), Some(bucket), Some(tokens)) =
+        (mean, variability, bucket, tokens)
+    else {
+        return Ok(None);
+    };
+    let (Some(bucket), Ok(token_count)) =
+        (ConfidenceBucket::parse(&bucket), usize::try_from(tokens))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ConfidenceAggregates {
+        mean_confidence: mean as f32,
+        variability: variability as f32,
+        bucket,
+        token_count,
+    }))
+}
 
 fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
     Ok(Exchange {
@@ -598,6 +660,7 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         substitutions: row.get(19)?,
         status: row.get(20)?,
         error: row.get(21)?,
+        confidence: read_confidence(row)?,
     })
 }
 
@@ -642,6 +705,7 @@ mod tests {
             substitutions: None,
             status: 200,
             error: None,
+            confidence: None,
         }
     }
 
@@ -759,6 +823,40 @@ mod tests {
             ledger.page(at(0), None, 10).expect("reads").is_empty(),
             "an upgraded ledger reads rather than failing every query"
         );
+    }
+
+    /// The whole point of reducing log-probabilities in the proxy is that the
+    /// four numbers reach a place a person can query. Accumulating them and
+    /// never storing them is the failure mode this test exists to prevent.
+    #[test]
+    fn a_confidence_aggregate_survives_the_round_trip() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut written = exchange("claude-sub", 0);
+        written.confidence = Some(ConfidenceAggregates {
+            mean_confidence: 0.5,
+            variability: 0.25,
+            bucket: ConfidenceBucket::Ambiguous,
+            token_count: 137,
+        });
+        ledger.record(&written).expect("records");
+
+        let read = ledger.recent(1).expect("reads");
+        let back = read[0].confidence.expect("the aggregate came back");
+        assert!((back.mean_confidence - 0.5).abs() < f32::EPSILON);
+        assert!((back.variability - 0.25).abs() < f32::EPSILON);
+        assert_eq!(back.bucket, ConfidenceBucket::Ambiguous);
+        assert_eq!(back.token_count, 137);
+    }
+
+    /// Capture is off by default, so this is the overwhelmingly common row. An
+    /// absent aggregate must read back absent rather than as a measured zero —
+    /// the same rule the token counts and the substitution count already
+    /// follow.
+    #[test]
+    fn an_exchange_with_no_logprobs_stores_no_confidence() {
+        let ledger = Ledger::in_memory().expect("opens");
+        ledger.record(&exchange("claude-sub", 0)).expect("records");
+        assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
     }
 
     /// The id is what makes a provider's own receipt reachable later, so it

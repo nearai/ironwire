@@ -423,7 +423,8 @@ Local capture is **on** by default and stored in
 
 Recorded per exchange: timestamp, conversation key, the client's own session id
 when it sent one, façade, chosen backend + model + rung, requirements, token
-usage, cost, TTFT and total latency, finish reason, retry/fallback events, and
+usage, cost, TTFT and total latency, finish reason, retry/fallback events,
+— behind `capture.logprobs = true` — the confidence aggregates below, and
 — behind `capture.bodies = true` — the request and response bodies.
 
 The session id is worth separating from the conversation key, because they
@@ -470,7 +471,7 @@ which is the one place a silent drop is correct rather than a bug.
 
 **`logprobs`, never `top_logprobs`.** The alternatives are tokens the model
 considered and the user never saw. Nothing reads them: the confidence
-reduction they would feed is defined over the chosen token. Asking for them would be bandwidth on every
+reduction below is defined over the chosen token. Asking for them would be bandwidth on every
 frame and — because `capture.bodies = true` records response bodies verbatim —
 a way to persist continuations that were never generated into text. The two
 flags together would compose into exactly that, so the alternatives are not
@@ -505,6 +506,33 @@ is still bounded by the filter's false-negative rate, which
 [`PRIVACY.md`](./PRIVACY.md) §7 is explicit cannot be measured on real user
 data — so this reduces the exposure rather than removing it, and no interface
 may say otherwise.
+
+### Confidence aggregates
+
+The raw distributions never leave the machine and are never written to the
+ledger. `ironwire_core::confidence` reduces them, at the end of the exchange, to
+four numbers — mean p(chosen token), its population standard deviation across
+tokens, a coarse bucket, and the token count the mean is over — and those are
+what the ledger records, in `mean_confidence`, `confidence_variability`,
+`confidence_bucket` and `confidence_tokens` — four flat, queryable columns,
+added through the same additive migration as every other late column, so an
+older ledger file keeps working and an older IronWire keeps reading it. Four aggregates give an attacker
+essentially nothing to invert; a per-token distribution gives them a great deal.
+
+The vocabulary is borrowed from Swayamdipta et al., *Dataset Cartography*
+(2020), and the borrowing is inexact in a way the module documents rather than
+papers over: cartography measures p(gold) across training epochs, and
+single-pass generation has neither epochs nor a gold label. `variability` here
+is dispersion across *tokens*, which differs in kind rather than degree. The
+names match the Trace Commons envelope fields they feed, which is the only
+reason to keep them.
+
+Both paths are covered. Streaming accumulates in the pivot stream parser as
+frames arrive; a non-streaming answer is read out of the buffered body in
+`pipeline::translated_body`. The original version of this feature captured only
+on the streaming path, which meant a `stream: false` request paid for the
+inflated response and recorded nothing — a cost with no signal is the worst of
+both.
 
 ---
 
