@@ -37,6 +37,11 @@ pub struct Routed {
     /// Errors from backends tried and rejected, for the log and for the error
     /// we return if everything fails.
     pub rejected: Vec<(String, String)>,
+    /// The bodies this exchange put on the wire, when `capture.bodies` is on.
+    ///
+    /// `None` when capture is off -- which is the default, because bodies are
+    /// the user's source code (`docs/TRUST.md` §4).
+    pub capture: Option<Capture>,
     /// Where the translated response will leave its confidence aggregate.
     ///
     /// Filled asynchronously, when the response finishes, which is after this
@@ -411,8 +416,22 @@ async fn dispatch_inner(
             }
         };
 
+        // Cloned before the request moves into the backend, because these are
+        // the bytes the upstream will hash: `send` puts `request.body` on the
+        // wire unchanged. Cheap -- `Bytes` is refcounted.
+        let capture = state
+            .bodies
+            .as_ref()
+            .map(|_| Capture::of_request(request.body.clone()));
+
         match backend.send(request).await {
-            Ok(response) => {
+            Ok(mut response) => {
+                // Teed before translation, for the same reason. On a translated
+                // route the bytes the client eventually sees are ours, not the
+                // provider's, and only the provider's are in its receipt.
+                if let Some(capture) = capture.as_ref() {
+                    response.body = capture_stream(response.body, capture).boxed();
+                }
                 let response = if decision.translated {
                     translate_response(
                         response,
@@ -461,6 +480,7 @@ async fn dispatch_inner(
                         attempts,
                         rejected,
                         confidence,
+                        capture,
                     },
                 ));
             }
@@ -818,6 +838,133 @@ pub fn apply_model(body: &Bytes, model: Option<&str>) -> Bytes {
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
 }
 
+/// Largest body we will hold in memory to capture it.
+///
+/// Above this we capture nothing rather than a prefix: the whole value of a
+/// captured body is that its digest matches the one a provider signed, and the
+/// digest of the first 32 MiB of a body is not a smaller answer, it is a wrong
+/// one that reads as tampering.
+const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
+
+/// The bodies one exchange put on the wire, held for the ledger.
+///
+/// Both halves are the *upstream* bytes, which is the only pair a receipt is
+/// about: the request after any model override, privacy substitution or
+/// translation, and the response before translation back and before the
+/// privacy reverser. On a translated route the client's own bytes are a
+/// different document entirely, and hashing those would fail against every
+/// receipt while looking exactly like tampering.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    /// Exactly the bytes handed to the backend.
+    pub request: Bytes,
+    /// Exactly the bytes the backend returned -- `None` until the response
+    /// stream has been read to its end, and still `None` if it never was.
+    ///
+    /// A cancelled, restarted or oversized response leaves this empty on
+    /// purpose. There is no honest digest of a response that did not finish.
+    response: Arc<std::sync::Mutex<Option<Bytes>>>,
+}
+
+impl Capture {
+    /// Start capturing, given the request bytes about to be sent.
+    #[must_use]
+    pub fn of_request(request: Bytes) -> Self {
+        Self {
+            request,
+            response: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// The response bytes, once the stream finished cleanly.
+    #[must_use]
+    pub fn response(&self) -> Option<Bytes> {
+        match self.response.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// Tee a response stream into a [`Capture`], forwarding every byte untouched.
+///
+/// Structurally the same rule as `observe_body`: the copy can only ever learn
+/// less, and can never stall, alter or fail the forwarded bytes. It differs in
+/// one way that matters -- it deliberately does **not** flush on `Drop`. A
+/// dropped stream is a response the client never saw whole, and recording its
+/// digest would claim we hashed a complete body we did not have.
+pub fn capture_stream<S>(
+    inner: S,
+    capture: &Capture,
+) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send + use<S>
+where
+    S: Stream<Item = Result<Bytes, UpstreamError>> + Send + Unpin + 'static,
+{
+    struct Tee<S> {
+        inner: S,
+        buffer: Vec<u8>,
+        /// Set once the body outgrew `MAX_CAPTURE_BYTES`, or the stream
+        /// yielded an error; from then on nothing is accumulated and nothing
+        /// will be recorded.
+        ///
+        /// The error case needs its own latch because a failed stream still
+        /// ends in `Ready(None)` afterwards, which would otherwise look
+        /// exactly like a clean finish and put the digest of half a response
+        /// on the row.
+        spoiled: bool,
+        sink: Arc<std::sync::Mutex<Option<Bytes>>>,
+    }
+
+    impl<S> Stream for Tee<S>
+    where
+        S: Stream<Item = Result<Bytes, UpstreamError>> + Unpin,
+    {
+        type Item = Result<Bytes, UpstreamError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            let polled = std::pin::Pin::new(&mut this.inner).poll_next(cx);
+            match &polled {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    if !this.spoiled {
+                        if this.buffer.len().saturating_add(chunk.len()) > MAX_CAPTURE_BYTES {
+                            this.spoiled = true;
+                            this.buffer = Vec::new();
+                        } else {
+                            this.buffer.extend_from_slice(chunk);
+                        }
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(_))) => {
+                    this.spoiled = true;
+                    this.buffer = Vec::new();
+                }
+                // A clean end, and only a clean end. An error mid-stream leaves
+                // the capture empty for the same reason a drop does.
+                std::task::Poll::Ready(None) if !this.spoiled => {
+                    let body = Bytes::from(std::mem::take(&mut this.buffer));
+                    match this.sink.lock() {
+                        Ok(mut guard) => *guard = Some(body),
+                        Err(poisoned) => *poisoned.into_inner() = Some(body),
+                    }
+                }
+                _ => {}
+            }
+            polled
+        }
+    }
+
+    Tee {
+        inner,
+        buffer: Vec::new(),
+        spoiled: false,
+        sink: Arc::clone(&capture.response),
+    }
+}
+
 /// SSE dialect matching an inbound protocol.
 #[must_use]
 pub fn dialect_for(protocol: Protocol) -> Dialect {
@@ -961,6 +1108,10 @@ pub struct LedgerContext {
     /// A handle rather than a value: this context is assembled before the
     /// response streams, and the aggregate is only known once it has finished.
     pub confidence: ConfidenceSink,
+    /// The bodies this exchange put on the wire, when capture is on.
+    pub capture: Option<Capture>,
+    /// Where captured bodies are written. `None` when `capture.bodies` is off.
+    pub bodies: Option<Arc<ironwire_ledger::bodies::BodyStore>>,
 }
 
 impl LedgerContext {
@@ -1004,6 +1155,33 @@ impl LedgerContext {
                 }),
             )
         };
+        // Both halves or neither. A request digest on a row with no response
+        // digest invites the reader to check half a receipt against a body
+        // that finished somewhere we did not see.
+        let captured = self
+            .capture
+            .as_ref()
+            .and_then(|capture| Some((capture.request.clone(), capture.response()?)));
+        let (request_sha256, response_sha256, body_ref) = match (&captured, &self.bodies) {
+            (Some((request, response)), Some(store)) => {
+                let body_ref = match store.store(request, response) {
+                    Ok(reference) => Some(reference),
+                    Err(error) => {
+                        // The digests are still true, and are what a receipt is
+                        // checked against; losing the bodies costs the trace,
+                        // not the verification.
+                        tracing::debug!(%error, "could not write the captured bodies");
+                        None
+                    }
+                };
+                (
+                    Some(ironwire_ledger::bodies::sha256_hex(request)),
+                    Some(ironwire_ledger::bodies::sha256_hex(response)),
+                    body_ref,
+                )
+            }
+            _ => (None, None, None),
+        };
         let exchange = Exchange {
             // Assigned by SQLite on insert; an exchange on its way in has none.
             id: None,
@@ -1018,6 +1196,9 @@ impl LedgerContext {
             requested_model: self.requested_model,
             served_model: observation.served_model.clone(),
             upstream_id: observation.upstream_id.clone(),
+            request_sha256,
+            response_sha256,
+            body_ref,
             rung: self.rung,
             attempts: i64::try_from(self.attempts).unwrap_or(i64::MAX),
             // `None`, not `0`, when the provider reported nothing: a fabricated
@@ -1184,6 +1365,8 @@ mod tests {
             substitutions: None,
             status: 200,
             confidence,
+            capture: None,
+            bodies: None,
         }
     }
 

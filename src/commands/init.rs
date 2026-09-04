@@ -702,7 +702,10 @@ upstream_timeout_secs = 900
 [capture]
 # Local trace ledger: what `ironwire log` reads. Metadata only.
 enabled = true
-# Request and response bodies. Off by default — these contain your source.
+# Request and response bodies, exactly as they crossed the wire, under
+# $IRONWIRE_HOME/bodies. Off by default — these contain your source. With it on,
+# each row also gets the SHA-256 of both bodies, which is what a provider's own
+# per-request receipt is a signature over.
 bodies = false
 # Days of history to keep. Pruned daily by the daemon; 0 keeps everything,
 # which is a real choice but not a good default for a file nobody watches.

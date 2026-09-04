@@ -187,6 +187,8 @@ async fn forward(
             .map(|a| i64::try_from(a.substitutions).unwrap_or(i64::MAX)),
         status: response.status.as_u16(),
         confidence: routed.confidence.clone(),
+        capture: routed.capture.clone(),
+        bodies: state.bodies.clone(),
     };
     let streaming = pipeline::is_event_stream(&response.headers);
     let observed = pipeline::observe_boxed(

@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub mod bodies;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,34 @@ pub struct Exchange {
     /// like everything else here.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// SHA-256 of the request body **exactly as it went upstream**, hex.
+    ///
+    /// Half of what a NEAR AI receipt signs (`bodies`). The bytes hashed are
+    /// the ones handed to the backend -- after a model override, after the
+    /// privacy filter, after translation -- because those are the bytes the
+    /// enclave hashed. The client's own bytes would be a different, useless
+    /// answer on exactly the routes where a receipt exists.
+    ///
+    /// `None` when body capture is off, or when the body could not be held
+    /// whole: a digest of part of a body is a wrong answer, and a wrong
+    /// digest reads as tampering.
+    #[serde(default)]
+    pub request_sha256: Option<String>,
+    /// SHA-256 of the response body **exactly as it came back**, hex.
+    ///
+    /// The other half. For a streamed response this is the digest of the raw
+    /// concatenated event stream, which is what NEAR AI's own verifier hashes
+    /// -- not of any reassembled content.
+    ///
+    /// `None` unless the stream was read to its end. A response that was
+    /// cancelled, restarted, or truncated has no honest digest.
+    #[serde(default)]
+    pub response_sha256: Option<String>,
+    /// Where the captured bodies are, under `$IRONWIRE_HOME/bodies`.
+    ///
+    /// `None` when nothing was captured. See [`bodies::BodyStore`].
+    #[serde(default)]
+    pub body_ref: Option<String>,
     /// Fidelity rung.
     pub rung: String,
     /// Backends tried and rejected before this one succeeded.
@@ -306,12 +336,13 @@ impl Ledger {
         conn.execute(
             "INSERT INTO exchanges (
                 started_at, ttfb_ms, total_ms, facade, path, conversation, client_session_id,
-                backend, requested_model, served_model, upstream_id, rung, attempts,
+                backend, requested_model, served_model, upstream_id,
+                request_sha256, response_sha256, body_ref, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error,
                 mean_confidence, confidence_variability, confidence_bucket, confidence_tokens
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                       ?22,?23,?24,?25)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                       ?21,?22,?23,?24,?25,?26,?27,?28)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -324,6 +355,9 @@ impl Ledger {
                 exchange.requested_model,
                 exchange.served_model,
                 exchange.upstream_id,
+                exchange.request_sha256,
+                exchange.response_sha256,
+                exchange.body_ref,
                 exchange.rung,
                 exchange.attempts,
                 exchange.input_tokens,
@@ -549,6 +583,28 @@ impl Ledger {
         Ok(conn.execute("DELETE FROM exchanges WHERE started_at < ?1", [cutoff])?)
     }
 
+    /// The body references on rows [`Ledger::prune`] is about to delete.
+    ///
+    /// Read before the delete, because afterwards there is nothing left to say
+    /// which files on disk are orphans. Without this, retention would bound
+    /// the ledger and leave the bodies -- the user's source code -- on the
+    /// machine forever, which is the opposite of what the setting promises.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn body_refs_before(&self, now: DateTime<Utc>, retain: Duration) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let cutoff = (now - retain).to_rfc3339();
+        let mut statement = conn.prepare(
+            "SELECT body_ref FROM exchanges WHERE started_at < ?1 AND body_ref IS NOT NULL",
+        )?;
+        let refs = statement
+            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(refs)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         match self.conn.lock() {
             Ok(conn) => conn,
@@ -568,6 +624,9 @@ impl Ledger {
 const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("client_session_id", "TEXT"),
     ("upstream_id", "TEXT"),
+    ("request_sha256", "TEXT"),
+    ("response_sha256", "TEXT"),
+    ("body_ref", "TEXT"),
     ("mean_confidence", "REAL"),
     ("confidence_variability", "REAL"),
     ("confidence_bucket", "TEXT"),
@@ -600,7 +659,8 @@ fn add_missing_columns(conn: &rusqlite::Connection) -> Result<()> {
 /// added to one and not the other shifts every index after it.
 const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, conversation,
             client_session_id, backend,
-            requested_model, served_model, upstream_id, rung, attempts,
+            requested_model, served_model, upstream_id,
+            request_sha256, response_sha256, body_ref, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error,
             mean_confidence, confidence_variability, confidence_bucket, confidence_tokens";
@@ -614,10 +674,12 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
 /// same file would leave — is treated the same way, so a downgrade reads an
 /// absence rather than a guess.
 fn read_confidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ConfidenceAggregates>> {
-    let mean: Option<f64> = row.get(22)?;
-    let variability: Option<f64> = row.get(23)?;
-    let bucket: Option<String> = row.get(24)?;
-    let tokens: Option<i64> = row.get(25)?;
+    // Indices track [`COLUMNS`], which gained three body columns at 12-14 and
+    // pushed every later field along by three.
+    let mean: Option<f64> = row.get(25)?;
+    let variability: Option<f64> = row.get(26)?;
+    let bucket: Option<String> = row.get(27)?;
+    let tokens: Option<i64> = row.get(28)?;
     let (Some(mean), Some(variability), Some(bucket), Some(tokens)) =
         (mean, variability, bucket, tokens)
     else {
@@ -650,16 +712,19 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         requested_model: row.get(9)?,
         served_model: row.get(10)?,
         upstream_id: row.get(11)?,
-        rung: row.get(12)?,
-        attempts: row.get(13)?,
-        input_tokens: row.get(14)?,
-        cache_read_tokens: row.get(15)?,
-        cache_write_tokens: row.get(16)?,
-        output_tokens: row.get(17)?,
-        cost_usd: row.get(18)?,
-        substitutions: row.get(19)?,
-        status: row.get(20)?,
-        error: row.get(21)?,
+        request_sha256: row.get(12)?,
+        response_sha256: row.get(13)?,
+        body_ref: row.get(14)?,
+        rung: row.get(15)?,
+        attempts: row.get(16)?,
+        input_tokens: row.get(17)?,
+        cache_read_tokens: row.get(18)?,
+        cache_write_tokens: row.get(19)?,
+        output_tokens: row.get(20)?,
+        cost_usd: row.get(21)?,
+        substitutions: row.get(22)?,
+        status: row.get(23)?,
+        error: row.get(24)?,
         confidence: read_confidence(row)?,
     })
 }
@@ -695,6 +760,9 @@ mod tests {
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),
             upstream_id: None,
+            request_sha256: None,
+            response_sha256: None,
+            body_ref: None,
             rung: "preferred".into(),
             attempts: 1,
             input_tokens: Some(12),
@@ -857,6 +925,46 @@ mod tests {
         let ledger = Ledger::in_memory().expect("opens");
         ledger.record(&exchange("claude-sub", 0)).expect("records");
         assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
+    }
+
+    /// Retention has to reach the bodies too. A ledger that pruned its rows
+    /// and left the user's source code on disk forever would be a privacy
+    /// promise the setting does not keep.
+    #[test]
+    fn the_bodies_due_for_removal_are_the_ones_on_the_rows_being_pruned() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut old_row = exchange("claude-sub", 0);
+        old_row.body_ref = Some("1700000000000000000-000000".into());
+        let mut recent = exchange("claude-sub", 100_000);
+        recent.body_ref = Some("1700000100000000000-000001".into());
+        // A row with capture off must not contribute a reference at all.
+        let plain = exchange("claude-sub", 1);
+        for row in [&old_row, &recent, &plain] {
+            ledger.record(row).expect("records");
+        }
+
+        let refs = ledger
+            .body_refs_before(at(50_000), Duration::seconds(0))
+            .expect("lists");
+        assert_eq!(refs, vec!["1700000000000000000-000000".to_string()]);
+    }
+
+    /// The digests are the halves of what a receipt signs, so they have to
+    /// survive the round trip through SQLite exactly as written.
+    #[test]
+    fn the_body_digests_survive_the_round_trip() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut row = exchange("nearai", 0);
+        row.request_sha256 =
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
+        row.response_sha256 =
+            Some("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into());
+        row.body_ref = Some("1700000000000000000-000000".into());
+        ledger.record(&row).expect("records");
+        let rows = ledger.recent(1).expect("reads");
+        assert_eq!(rows[0].request_sha256, row.request_sha256);
+        assert_eq!(rows[0].response_sha256, row.response_sha256);
+        assert_eq!(rows[0].body_ref, row.body_ref);
     }
 
     /// The id is what makes a provider's own receipt reachable later, so it

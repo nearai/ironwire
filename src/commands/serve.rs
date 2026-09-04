@@ -11,6 +11,7 @@ use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
 use ironwire_ledger::Ledger;
+use ironwire_ledger::bodies::BodyStore;
 use ironwire_proxy::server::ServeError;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_upstream::anthropic::AnthropicBackend;
@@ -76,12 +77,17 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     }
     // Housekeeping the user should never have to remember: capture is on by
     // default, so without this the ledger grows for the life of the install.
-    super::prune::spawn(ledger.clone(), config.capture.retain_days);
+    // Verbatim bodies, when the user asked for them. A NEAR AI receipt is a
+    // signature over the digests of the exact bytes that crossed the wire, so
+    // the ledger's digest columns are only ever filled from what this holds.
+    let bodies = open_bodies(&paths, &config);
+    super::prune::spawn(ledger.clone(), config.capture.retain_days, bodies.clone());
 
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
         .with_paths(paths.clone())
         .with_ledger(ledger)
+        .with_bodies(bodies)
         .with_catalog(catalog);
     // Resume today's spending rather than restarting it: a cap that could be
     // reset by restarting the daemon is not a cap.
@@ -304,6 +310,25 @@ fn open_ledger(paths: &PathsConfig, config: &Config) -> Option<Ledger> {
             eprintln!(
                 "Warning: could not open the trace ledger ({error}). \
                  Routing continues; `ironwire log` will be empty."
+            );
+            None
+        }
+    }
+}
+
+/// Open the body store, or explain why we are running without one.
+///
+/// Same rule as the ledger: bookkeeping never stops the proxy from serving.
+fn open_bodies(paths: &PathsConfig, config: &Config) -> Option<std::sync::Arc<BodyStore>> {
+    if !config.capture.enabled || !config.capture.bodies {
+        return None;
+    }
+    match BodyStore::open(&paths.bodies_dir()) {
+        Ok(store) => Some(std::sync::Arc::new(store)),
+        Err(error) => {
+            eprintln!(
+                "Warning: could not open the captured-body store ({error}). \
+                 Routing continues; bodies will not be recorded."
             );
             None
         }

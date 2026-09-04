@@ -189,6 +189,10 @@ pub struct AppState {
     /// ledger could not be opened — a ledger problem must never stop the proxy
     /// from doing its actual job.
     pub ledger: Option<Ledger>,
+    /// Where verbatim request and response bodies are written. `None` unless
+    /// `capture.bodies = true` -- bodies are the user's source code
+    /// (`docs/TRUST.md` §4).
+    pub bodies: Option<Arc<ironwire_ledger::bodies::BodyStore>>,
     /// Provider values refreshed through the signed catalog channel
     /// (`docs/UPDATES.md`).
     ///
@@ -296,6 +300,7 @@ impl AppState {
             policy: Arc::new(Mutex::new(Policy::new())),
             consent: Arc::new(Mutex::new(consent)),
             ledger: None,
+            bodies: None,
             catalog: Arc::new(Mutex::new(Arc::new(CatalogStore::new(
                 ironwire_catalog::CATALOG_PUBLIC_KEY,
             )))),
@@ -470,6 +475,13 @@ impl AppState {
             codex_originator_prefix: catalog.client_identity.codex_originator_prefix.clone(),
             compaction_markers: catalog.client_identity.compaction_markers.clone(),
         }
+    }
+
+    /// Attach a store for verbatim bodies.
+    #[must_use]
+    pub fn with_bodies(mut self, bodies: Option<Arc<ironwire_ledger::bodies::BodyStore>>) -> Self {
+        self.bodies = bodies;
+        self
     }
 
     /// Attach a trace ledger.

@@ -9,10 +9,12 @@
 //! remember, for the same reason: a maintenance step that requires knowing it
 //! exists is a maintenance step that does not happen.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use ironwire_ledger::Ledger;
+use ironwire_ledger::bodies::BodyStore;
 
 /// How often the daemon prunes.
 ///
@@ -26,7 +28,7 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const FIRST_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Start the background prune, unless retention is disabled.
-pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32) {
+pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc<BodyStore>>) {
     // `0` means "keep everything", which is a legitimate choice for someone
     // doing long-horizon analysis. It has to be chosen, not defaulted into.
     let Some(ledger) = ledger.filter(|_| retain_days > 0) else {
@@ -37,6 +39,24 @@ pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32) {
     tokio::spawn(async move {
         tokio::time::sleep(FIRST_DELAY).await;
         loop {
+            // Files first, and named from the rows that are about to go: once
+            // the rows are deleted nothing on disk says which bodies are
+            // orphans, and a retention setting that bounded the ledger while
+            // leaving the user's source code behind would be worse than none.
+            if let Some(bodies) = bodies.as_ref() {
+                match ledger.body_refs_before(Utc::now(), retain) {
+                    Ok(refs) => {
+                        for reference in refs {
+                            if let Err(error) = bodies.remove(&reference) {
+                                tracing::warn!(%error, "could not remove a captured body");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not list the bodies due for removal");
+                    }
+                }
+            }
             match ledger.prune(Utc::now(), retain) {
                 Ok(0) => tracing::debug!("trace ledger: nothing to prune"),
                 Ok(removed) => tracing::info!(
@@ -61,7 +81,7 @@ mod tests {
     fn retention_of_zero_starts_nothing() {
         // Asserting it does not panic is the whole point: `spawn` with no
         // runtime would, and this path must be reachable from a sync context.
-        spawn(None, 0);
-        spawn(None, 90);
+        spawn(None, 0, None);
+        spawn(None, 90, None);
     }
 }
