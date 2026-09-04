@@ -1021,6 +1021,86 @@ mod tests {
         assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
     }
 
+    /// Every column two separate pieces of work added has to survive their
+    /// merge, and the positional reader has to be right *against a migrated
+    /// file* -- where the physical column order is the order the `ALTER`s ran
+    /// in, not the order a fresh `CREATE TABLE` produces. `COLUMNS` is an
+    /// explicit select list so the two agree, and this is what says so.
+    #[test]
+    fn an_upgraded_ledger_gains_every_added_column_and_reads_both_sets_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE exchanges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL, ttfb_ms INTEGER, total_ms INTEGER,
+                    facade TEXT NOT NULL, path TEXT NOT NULL, conversation TEXT NOT NULL,
+                    backend TEXT NOT NULL, requested_model TEXT, served_model TEXT,
+                    rung TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    input_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, output_tokens INTEGER,
+                    cost_usd REAL, substitutions INTEGER, status INTEGER NOT NULL,
+                    error TEXT
+                )",
+            )
+            .expect("pre-column schema");
+        }
+
+        let ledger = Ledger::open(&path).expect("opens an older ledger");
+        let present: std::collections::BTreeSet<String> = {
+            let conn = ledger.lock();
+            let mut statement = conn
+                .prepare("PRAGMA table_info(exchanges)")
+                .expect("pragma");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("collects")
+        };
+        for (name, _) in ADDED_COLUMNS {
+            assert!(
+                present.contains(*name),
+                "the upgrade did not add `{name}`; every read goes through \
+                 COLUMNS, so a missing one fails every query"
+            );
+        }
+
+        // Both features' values, through the migrated file, read back on the
+        // right fields. A positional slip puts one where the other belongs and
+        // this is where it shows.
+        let mut row = exchange("nearai", 0);
+        row.request_sha256 = Some("a".repeat(64));
+        row.response_sha256 = Some("b".repeat(64));
+        row.body_ref = Some("1700000000000000000-000000".into());
+        row.confidence = Some(ConfidenceAggregates {
+            mean_confidence: 0.5,
+            variability: 0.25,
+            bucket: ConfidenceBucket::Ambiguous,
+            token_count: 137,
+        });
+        ledger.record(&row).expect("records");
+
+        let back = ledger.recent(1).expect("reads").remove(0);
+        assert_eq!(
+            back.request_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            back.response_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(back.body_ref.as_deref(), Some("1700000000000000000-000000"));
+        assert_eq!(back.status, 200, "a later column did not shift into status");
+        assert_eq!(back.rung, "preferred", "nor into rung");
+        let confidence = back.confidence.expect("the aggregate came back");
+        assert_eq!(confidence.bucket, ConfidenceBucket::Ambiguous);
+        assert_eq!(confidence.token_count, 137);
+        assert!((confidence.mean_confidence - 0.5).abs() < f32::EPSILON);
+    }
+
     /// The rolling window, stated as the invariant it exists for: however many
     /// turns a session takes, exactly one of them is still holding bodies.
     #[test]
