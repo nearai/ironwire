@@ -179,8 +179,9 @@ opt-in, it reads consent rather than granting it, and it forges nothing.
   status, the token counts the *provider* reported, and the session id the agent
   put in its own request header. Bodies require `capture.bodies = true`, and so
   do the body digests that go with them — a digest is derived from a body we
-  would have had to hold, so it is not a way to record less. Visible via
-  `ironwire log`.
+  would have had to hold, so it is not a way to record less. Even with it on,
+  only the *current* exchange of each session is held: the next turn releases
+  the previous one's bodies. Visible via `ironwire log`.
 - **The session id is read, never added.** It is a header the client already
   sends and IronWire already forwards; recording it changes nothing about what
   reaches the provider, and it stays on this machine like every other row.
@@ -239,8 +240,10 @@ engineering cannot fix.
   the ledger or drive routing.
 - Request/response bodies, when captured, are stored under `$IRONWIRE_HOME` with
   0700 directory permissions, and are excluded from any `ironwire report`
-  bundle unless `--include-bodies` is passed. They are removed by the same
-  retention setting that prunes the ledger rows they belong to.
+  bundle unless `--include-bodies` is passed. Each session holds at most one
+  exchange's bodies at a time — the next turn releases the last — and what
+  survives is removed by the same retention setting that prunes the ledger rows
+  it belongs to. Files a crash left unreferenced are swept at daemon start.
 
 ---
 

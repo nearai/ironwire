@@ -122,6 +122,43 @@ impl BodyStore {
         Ok(())
     }
 
+    /// Delete every file the ledger no longer claims.
+    ///
+    /// Run once at daemon start, and deliberately not on the periodic prune:
+    /// at start there is nothing in flight, whereas a sweep during serving
+    /// could land in the gap between [`BodyStore::store`] writing the files
+    /// and the row that names them being inserted, and delete a body that was
+    /// about to be referenced.
+    ///
+    /// Returns how many files were removed.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the directory cannot be listed. A file that cannot
+    /// be removed is logged past, not fatal -- a sweep that gave up halfway
+    /// would leave more behind than one that continued.
+    pub fn retain_only(&self, keep: &std::collections::BTreeSet<String>) -> io::Result<usize> {
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some((stem, suffix)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if !matches!(suffix, "req" | "res") || !is_reference(stem) || keep.contains(stem) {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => tracing::debug!(%error, "could not sweep an orphaned body"),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Unique within this process, and ordered, so two exchanges arriving in
     /// the same nanosecond still get their own pair of files.
     fn next_reference(&self) -> String {

@@ -170,6 +170,27 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// What a rolling body window is scoped by.
+    ///
+    /// The agent's own session id when it sent one -- that is the unit
+    /// downstream means by "the final call of a session". A client that sends
+    /// no session header falls back to the conversation key, which is always
+    /// present but is a routing-affinity hash: it is equally stable across two
+    /// concurrent sessions that share a tool list, so those two rotate against
+    /// each other and one of them can lose its final bodies early.
+    ///
+    /// That trade is deliberate and it only ever errs one way. Over-merging
+    /// deletes *more* than it should, which costs an attestation; the
+    /// alternative -- exempting rows with no session id from rotation -- would
+    /// keep every exchange's prompts and completions forever for exactly the
+    /// clients we know least about.
+    #[must_use]
+    pub fn retention_key(&self) -> &str {
+        self.client_session_id
+            .as_deref()
+            .unwrap_or(&self.conversation)
+    }
+
     /// Whether the provider reported any usage at all.
     ///
     /// An exchange with no usage is recorded as such rather than as zero: a
@@ -331,7 +352,11 @@ impl Ledger {
     /// [`LedgerError::Sqlite`] on a write failure. Callers on the response path
     /// must log and continue: a ledger problem must never fail a user's
     /// inference request.
-    pub fn record(&self, exchange: &Exchange) -> Result<()> {
+    ///
+    /// Returns the new row's id, which is what [`Ledger::supersede_bodies`]
+    /// rotates against: rows are ordered by *completion*, and a timestamp
+    /// cannot separate two exchanges that finished in the same instant.
+    pub fn record(&self, exchange: &Exchange) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO exchanges (
@@ -376,9 +401,78 @@ impl Ledger {
                     .and_then(|c| i64::try_from(c.token_count).ok()),
             ],
         )?;
+        let id = conn.last_insert_rowid();
         self.writes
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        Ok(())
+        Ok(id)
+    }
+
+    /// Give up the bodies of every earlier exchange in the same session.
+    ///
+    /// The rolling window: only the most recent exchange of a session keeps
+    /// its bodies, so at the end of a session exactly one exchange's bodies
+    /// remain -- the final call, which is the only one anything downstream
+    /// attests. Retaining every turn's full prompts and completions would hold
+    /// the maximum possible amount of the user's content to buy something
+    /// nothing uses.
+    ///
+    /// Returns the references whose files the caller must now unlink. The row
+    /// gives up `body_ref` and **keeps both digests**: a hash is not the
+    /// content, it is the thing a receipt is checked against, and a row that
+    /// still pointed at a file we had deleted would claim a body it cannot
+    /// produce. Afterwards such a row reads honestly as "I know what was
+    /// hashed; I no longer hold the bytes".
+    ///
+    /// Scoped by `session`, which is the caller's [`Exchange::client_session_id`]
+    /// when the client sent one and its `conversation` key otherwise -- see
+    /// [`Exchange::retention_key`].
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read or write failure.
+    pub fn supersede_bodies(&self, session: &str, before: i64) -> Result<Vec<String>> {
+        const PREDICATE: &str = "body_ref IS NOT NULL AND id < ?2
+             AND COALESCE(client_session_id, conversation) = ?1";
+        let mut conn = self.lock();
+        // One transaction, under the connection lock the whole ledger shares,
+        // so a concurrent `record` cannot land between the read and the update
+        // and have its reference dropped without its file being unlinked.
+        let tx = conn.transaction()?;
+        let superseded = {
+            let mut statement =
+                tx.prepare(&format!("SELECT body_ref FROM exchanges WHERE {PREDICATE}"))?;
+            statement
+                .query_map(rusqlite::params![session, before], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            &format!("UPDATE exchanges SET body_ref = NULL WHERE {PREDICATE}"),
+            rusqlite::params![session, before],
+        )?;
+        tx.commit()?;
+        Ok(superseded)
+    }
+
+    /// Every body reference a row still claims.
+    ///
+    /// The set a sweep keeps; anything else in the store is an orphan. Two
+    /// windows produce those, and neither is avoidable by ordering alone: a
+    /// crash after the files are written and before the row is inserted, and a
+    /// crash after a reference is dropped and before the file is unlinked.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn live_body_refs(&self) -> Result<std::collections::BTreeSet<String>> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT body_ref FROM exchanges WHERE body_ref IS NOT NULL")?;
+        let refs = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(refs)
     }
 
     /// How many exchanges have been appended since this process started.
@@ -925,6 +1019,163 @@ mod tests {
         let ledger = Ledger::in_memory().expect("opens");
         ledger.record(&exchange("claude-sub", 0)).expect("records");
         assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
+    }
+
+    /// The rolling window, stated as the invariant it exists for: however many
+    /// turns a session takes, exactly one of them is still holding bodies.
+    #[test]
+    fn only_the_most_recent_exchange_of_a_session_keeps_its_bodies() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut ids = Vec::new();
+        for turn in 0..5 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = Some("session-a".into());
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            row.request_sha256 = Some(format!("{turn:064}"));
+            let id = ledger.record(&row).expect("records");
+            let superseded = ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+            ids.push((id, superseded));
+        }
+
+        // Every turn but the first hands back exactly its predecessor.
+        assert!(ids[0].1.is_empty(), "the first turn supersedes nothing");
+        for (turn, (_, superseded)) in ids.iter().enumerate().skip(1) {
+            assert_eq!(
+                superseded,
+                &vec![format!("170000000000000000{}-00000{}", turn - 1, turn - 1)],
+                "turn {turn} releases only the turn before it"
+            );
+        }
+        let held: Vec<_> = ledger
+            .recent(10)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.body_ref.is_some())
+            .collect();
+        assert_eq!(held.len(), 1, "exactly one exchange still holds bodies");
+        assert_eq!(
+            held[0].body_ref.as_deref(),
+            Some("1700000000000000004-000004")
+        );
+    }
+
+    /// A row that gave up its bodies must not go on claiming them, and must
+    /// still say what was hashed. Those two together are what make the state
+    /// legible rather than a dangling pointer.
+    #[test]
+    fn a_superseded_row_keeps_its_digests_and_drops_its_reference() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut first = exchange("nearai", 0);
+        first.client_session_id = Some("session-a".into());
+        first.body_ref = Some("1700000000000000000-000000".into());
+        first.request_sha256 = Some("a".repeat(64));
+        first.response_sha256 = Some("b".repeat(64));
+        ledger.record(&first).expect("records");
+
+        let mut second = exchange("nearai", 1);
+        second.client_session_id = Some("session-a".into());
+        second.body_ref = Some("1700000000000000001-000001".into());
+        let id = ledger.record(&second).expect("records");
+        ledger
+            .supersede_bodies(second.retention_key(), id)
+            .expect("rotates");
+
+        let rows = ledger.recent(10).expect("reads");
+        let older = rows
+            .iter()
+            .find(|r| r.started_at == at(0))
+            .expect("first row");
+        assert_eq!(older.body_ref, None, "it no longer claims a body");
+        assert_eq!(
+            older.request_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            older.response_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+    }
+
+    /// Rotation is per session. One agent's turn must never collect another
+    /// agent's bodies.
+    #[test]
+    fn one_session_rotating_leaves_another_sessions_bodies_alone() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut other = exchange("nearai", 0);
+        other.client_session_id = Some("session-b".into());
+        other.body_ref = Some("1700000000000000000-000000".into());
+        ledger.record(&other).expect("records");
+
+        for turn in 1..4 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = Some("session-a".into());
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            let id = ledger.record(&row).expect("records");
+            let superseded = ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+            assert!(
+                !superseded.contains(&"1700000000000000000-000000".to_string()),
+                "session-b's bodies were released by session-a's turn {turn}"
+            );
+        }
+        let rows = ledger.recent(10).expect("reads");
+        let kept = rows.iter().find(|r| r.started_at == at(0)).expect("row");
+        assert_eq!(
+            kept.body_ref.as_deref(),
+            Some("1700000000000000000-000000"),
+            "the other session still holds its own"
+        );
+    }
+
+    /// A client that sends no session header still rotates, against the
+    /// conversation key. The alternative -- exempting it -- would retain
+    /// everything forever for exactly the clients we know least about.
+    #[test]
+    fn a_client_with_no_session_header_still_rotates() {
+        let ledger = Ledger::in_memory().expect("opens");
+        for turn in 0..3 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = None;
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            assert_eq!(row.retention_key(), "c-1", "falls back to the conversation");
+            let id = ledger.record(&row).expect("records");
+            ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+        }
+        let held = ledger
+            .recent(10)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.body_ref.is_some())
+            .count();
+        assert_eq!(held, 1);
+    }
+
+    /// A crash between writing the files and inserting the row, or between
+    /// dropping a reference and unlinking, leaves files nothing points at.
+    /// The startup sweep is what collects them.
+    #[test]
+    fn the_sweep_removes_files_no_row_claims_and_keeps_the_ones_it_does() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = bodies::BodyStore::open(home.path()).expect("store opens");
+        let live = store.store(b"kept", b"kept").expect("stored");
+        let orphan = store.store(b"orphan", b"orphan").expect("stored");
+
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut row = exchange("nearai", 0);
+        row.body_ref = Some(live.clone());
+        ledger.record(&row).expect("records");
+
+        let removed = store
+            .retain_only(&ledger.live_body_refs().expect("live refs"))
+            .expect("sweeps");
+        assert_eq!(removed, 2, "both files of the orphaned pair");
+        assert!(store.read(&live).is_ok(), "the referenced pair survived");
+        assert!(store.read(&orphan).is_err(), "the orphan is gone");
     }
 
     /// Retention has to reach the bodies too. A ledger that pruned its rows

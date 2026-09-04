@@ -1235,8 +1235,34 @@ impl LedgerContext {
                 ),
             }
         }
-        if let Err(error) = ledger.record(&exchange) {
-            tracing::debug!(%error, "could not write the trace ledger entry");
+        let recorded = match ledger.record(&exchange) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                tracing::debug!(%error, "could not write the trace ledger entry");
+                None
+            }
+        };
+        // The rolling window. Only ever rotates rows that are already in the
+        // ledger, which means exchanges whose response finished -- an in-flight
+        // one has no row and no files yet, so this cannot delete a body that is
+        // still streaming. Ordered by row id, i.e. by completion: two turns of
+        // one session can share a timestamp, and the later *finisher* is the
+        // one worth keeping.
+        if let (Some(id), Some(store)) = (recorded, &self.bodies)
+            && exchange.body_ref.is_some()
+        {
+            match ledger.supersede_bodies(exchange.retention_key(), id) {
+                Ok(superseded) => {
+                    for reference in superseded {
+                        if let Err(error) = store.remove(&reference) {
+                            // The reference is already gone from the row, so
+                            // the file is an orphan the startup sweep collects.
+                            tracing::debug!(%error, "could not release a superseded body");
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "could not roll the body window"),
+            }
         }
     }
 }

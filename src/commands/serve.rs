@@ -81,6 +81,11 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     // signature over the digests of the exact bytes that crossed the wire, so
     // the ledger's digest columns are only ever filled from what this holds.
     let bodies = open_bodies(&paths, &config);
+    // A crash can leave files nothing references -- after the bodies are
+    // written and before the row lands, or after a reference is dropped and
+    // before the file is unlinked. Swept at start, where nothing is in flight;
+    // a sweep while serving could delete a body about to be referenced.
+    sweep_bodies(&ledger, bodies.as_deref());
     super::prune::spawn(ledger.clone(), config.capture.retain_days, bodies.clone());
 
     let state = AppState::new(registry, config, consent, token)
@@ -332,6 +337,23 @@ fn open_bodies(paths: &PathsConfig, config: &Config) -> Option<std::sync::Arc<Bo
             );
             None
         }
+    }
+}
+
+/// Collect body files no ledger row claims. Never fatal: an uncollected
+/// orphan costs disk, and failing to serve costs the user their agent.
+fn sweep_bodies(ledger: &Option<Ledger>, bodies: Option<&BodyStore>) {
+    let (Some(ledger), Some(bodies)) = (ledger.as_ref(), bodies) else {
+        return;
+    };
+    match ledger
+        .live_body_refs()
+        .map_err(|e| e.to_string())
+        .and_then(|live| bodies.retain_only(&live).map_err(|e| e.to_string()))
+    {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(removed, "swept captured bodies no exchange claims"),
+        Err(error) => tracing::warn!(%error, "could not sweep the captured bodies"),
     }
 }
 

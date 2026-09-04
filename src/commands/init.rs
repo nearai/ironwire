@@ -703,9 +703,13 @@ upstream_timeout_secs = 900
 # Local trace ledger: what `ironwire log` reads. Metadata only.
 enabled = true
 # Request and response bodies, exactly as they crossed the wire, under
-# $IRONWIRE_HOME/bodies. Off by default — these contain your source. With it on,
-# each row also gets the SHA-256 of both bodies, which is what a provider's own
-# per-request receipt is a signature over.
+# $IRONWIRE_HOME/bodies. Off by default — these contain your source.
+#
+# Only the *current* exchange of each session is held: the next turn releases
+# the previous one's bodies, so a finished session leaves exactly one — its
+# final call, the only one anything downstream attests. The SHA-256 of both
+# bodies stays on every row, because that is what a provider's own per-request
+# receipt is a signature over, and a hash is not the content.
 bodies = false
 # Days of history to keep. Pruned daily by the daemon; 0 keeps everything,
 # which is a real choice but not a good default for a file nobody watches.
