@@ -71,6 +71,13 @@ impl PathsConfig {
         self.home.join("ledger.sqlite")
     }
 
+    /// Captured request and response bodies, when `capture.bodies = true`
+    /// (`docs/PACKAGING.md`). Mode 0700 -- these are the user's source code.
+    #[must_use]
+    pub fn bodies_dir(&self) -> PathBuf {
+        self.home.join("bodies")
+    }
+
     /// Cached signed provider-catalog document.
     #[must_use]
     pub fn catalog_file(&self) -> PathBuf {

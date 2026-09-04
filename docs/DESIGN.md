@@ -427,6 +427,30 @@ usage, cost, TTFT and total latency, finish reason, retry/fallback events,
 — behind `capture.logprobs = true` — the confidence aggregates below, and
 — behind `capture.bodies = true` — the request and response bodies.
 
+The bodies are stored **verbatim**, as bytes, and the row carries the SHA-256 of
+each alongside the provider's own response id. That combination is what makes an
+exchange checkable against the provider rather than only against ourselves: NEAR
+AI signs `<request digest>:<response digest>` and serves it at `GET
+/v1/signature/{id}`, keyed by the same id. So the bytes hashed are the ones the
+*upstream* saw — after a model override, after the privacy filter, after
+translation — and for a streamed response they are the raw concatenated event
+stream, not anything reassembled. A body that was re-serialised on the way in,
+or a response that was cancelled or restarted, has no honest digest and is
+recorded as having none.
+
+The bodies themselves are held on a **rolling window of one per session**:
+recording an exchange's bodies releases the previous exchange's for that
+session, so a finished session leaves exactly one — its final call. That is the
+only call anything downstream attests, and keeping every turn would hold the
+maximum possible amount of the user's content to buy something nothing uses. A
+released row gives up `body_ref` and keeps both digests: a hash is not the
+content, and a row still pointing at a file we had deleted would claim a body it
+cannot produce. The window is scoped by the client's own session id, falling
+back to the conversation key for a client that sends none — that over-merges two
+concurrent sessions sharing a tool list, which deletes more than it should
+rather than less. `retain_days` is unchanged and now bounds only the *age* of
+those surviving final-call bodies; the window bounds their *number*.
+
 The session id is worth separating from the conversation key, because they
 answer different questions. The conversation key is a routing-affinity hash
 (protocol family, the head of the preamble, the tool list), deliberately stable

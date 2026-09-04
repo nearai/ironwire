@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub mod bodies;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,34 @@ pub struct Exchange {
     /// like everything else here.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// SHA-256 of the request body **exactly as it went upstream**, hex.
+    ///
+    /// Half of what a NEAR AI receipt signs (`bodies`). The bytes hashed are
+    /// the ones handed to the backend -- after a model override, after the
+    /// privacy filter, after translation -- because those are the bytes the
+    /// enclave hashed. The client's own bytes would be a different, useless
+    /// answer on exactly the routes where a receipt exists.
+    ///
+    /// `None` when body capture is off, or when the body could not be held
+    /// whole: a digest of part of a body is a wrong answer, and a wrong
+    /// digest reads as tampering.
+    #[serde(default)]
+    pub request_sha256: Option<String>,
+    /// SHA-256 of the response body **exactly as it came back**, hex.
+    ///
+    /// The other half. For a streamed response this is the digest of the raw
+    /// concatenated event stream, which is what NEAR AI's own verifier hashes
+    /// -- not of any reassembled content.
+    ///
+    /// `None` unless the stream was read to its end. A response that was
+    /// cancelled, restarted, or truncated has no honest digest.
+    #[serde(default)]
+    pub response_sha256: Option<String>,
+    /// Where the captured bodies are, under `$IRONWIRE_HOME/bodies`.
+    ///
+    /// `None` when nothing was captured. See [`bodies::BodyStore`].
+    #[serde(default)]
+    pub body_ref: Option<String>,
     /// Fidelity rung.
     pub rung: String,
     /// Backends tried and rejected before this one succeeded.
@@ -140,6 +170,27 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// What a rolling body window is scoped by.
+    ///
+    /// The agent's own session id when it sent one -- that is the unit
+    /// downstream means by "the final call of a session". A client that sends
+    /// no session header falls back to the conversation key, which is always
+    /// present but is a routing-affinity hash: it is equally stable across two
+    /// concurrent sessions that share a tool list, so those two rotate against
+    /// each other and one of them can lose its final bodies early.
+    ///
+    /// That trade is deliberate and it only ever errs one way. Over-merging
+    /// deletes *more* than it should, which costs an attestation; the
+    /// alternative -- exempting rows with no session id from rotation -- would
+    /// keep every exchange's prompts and completions forever for exactly the
+    /// clients we know least about.
+    #[must_use]
+    pub fn retention_key(&self) -> &str {
+        self.client_session_id
+            .as_deref()
+            .unwrap_or(&self.conversation)
+    }
+
     /// Whether the provider reported any usage at all.
     ///
     /// An exchange with no usage is recorded as such rather than as zero: a
@@ -301,17 +352,22 @@ impl Ledger {
     /// [`LedgerError::Sqlite`] on a write failure. Callers on the response path
     /// must log and continue: a ledger problem must never fail a user's
     /// inference request.
-    pub fn record(&self, exchange: &Exchange) -> Result<()> {
+    ///
+    /// Returns the new row's id, which is what [`Ledger::supersede_bodies`]
+    /// rotates against: rows are ordered by *completion*, and a timestamp
+    /// cannot separate two exchanges that finished in the same instant.
+    pub fn record(&self, exchange: &Exchange) -> Result<i64> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO exchanges (
                 started_at, ttfb_ms, total_ms, facade, path, conversation, client_session_id,
-                backend, requested_model, served_model, upstream_id, rung, attempts,
+                backend, requested_model, served_model, upstream_id,
+                request_sha256, response_sha256, body_ref, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error,
                 mean_confidence, confidence_variability, confidence_bucket, confidence_tokens
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
-                       ?22,?23,?24,?25)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                       ?21,?22,?23,?24,?25,?26,?27,?28)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -324,6 +380,9 @@ impl Ledger {
                 exchange.requested_model,
                 exchange.served_model,
                 exchange.upstream_id,
+                exchange.request_sha256,
+                exchange.response_sha256,
+                exchange.body_ref,
                 exchange.rung,
                 exchange.attempts,
                 exchange.input_tokens,
@@ -342,9 +401,78 @@ impl Ledger {
                     .and_then(|c| i64::try_from(c.token_count).ok()),
             ],
         )?;
+        let id = conn.last_insert_rowid();
         self.writes
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        Ok(())
+        Ok(id)
+    }
+
+    /// Give up the bodies of every earlier exchange in the same session.
+    ///
+    /// The rolling window: only the most recent exchange of a session keeps
+    /// its bodies, so at the end of a session exactly one exchange's bodies
+    /// remain -- the final call, which is the only one anything downstream
+    /// attests. Retaining every turn's full prompts and completions would hold
+    /// the maximum possible amount of the user's content to buy something
+    /// nothing uses.
+    ///
+    /// Returns the references whose files the caller must now unlink. The row
+    /// gives up `body_ref` and **keeps both digests**: a hash is not the
+    /// content, it is the thing a receipt is checked against, and a row that
+    /// still pointed at a file we had deleted would claim a body it cannot
+    /// produce. Afterwards such a row reads honestly as "I know what was
+    /// hashed; I no longer hold the bytes".
+    ///
+    /// Scoped by `session`, which is the caller's [`Exchange::client_session_id`]
+    /// when the client sent one and its `conversation` key otherwise -- see
+    /// [`Exchange::retention_key`].
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read or write failure.
+    pub fn supersede_bodies(&self, session: &str, before: i64) -> Result<Vec<String>> {
+        const PREDICATE: &str = "body_ref IS NOT NULL AND id < ?2
+             AND COALESCE(client_session_id, conversation) = ?1";
+        let mut conn = self.lock();
+        // One transaction, under the connection lock the whole ledger shares,
+        // so a concurrent `record` cannot land between the read and the update
+        // and have its reference dropped without its file being unlinked.
+        let tx = conn.transaction()?;
+        let superseded = {
+            let mut statement =
+                tx.prepare(&format!("SELECT body_ref FROM exchanges WHERE {PREDICATE}"))?;
+            statement
+                .query_map(rusqlite::params![session, before], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.execute(
+            &format!("UPDATE exchanges SET body_ref = NULL WHERE {PREDICATE}"),
+            rusqlite::params![session, before],
+        )?;
+        tx.commit()?;
+        Ok(superseded)
+    }
+
+    /// Every body reference a row still claims.
+    ///
+    /// The set a sweep keeps; anything else in the store is an orphan. Two
+    /// windows produce those, and neither is avoidable by ordering alone: a
+    /// crash after the files are written and before the row is inserted, and a
+    /// crash after a reference is dropped and before the file is unlinked.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn live_body_refs(&self) -> Result<std::collections::BTreeSet<String>> {
+        let conn = self.lock();
+        let mut statement =
+            conn.prepare("SELECT body_ref FROM exchanges WHERE body_ref IS NOT NULL")?;
+        let refs = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(refs)
     }
 
     /// How many exchanges have been appended since this process started.
@@ -549,6 +677,28 @@ impl Ledger {
         Ok(conn.execute("DELETE FROM exchanges WHERE started_at < ?1", [cutoff])?)
     }
 
+    /// The body references on rows [`Ledger::prune`] is about to delete.
+    ///
+    /// Read before the delete, because afterwards there is nothing left to say
+    /// which files on disk are orphans. Without this, retention would bound
+    /// the ledger and leave the bodies -- the user's source code -- on the
+    /// machine forever, which is the opposite of what the setting promises.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn body_refs_before(&self, now: DateTime<Utc>, retain: Duration) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let cutoff = (now - retain).to_rfc3339();
+        let mut statement = conn.prepare(
+            "SELECT body_ref FROM exchanges WHERE started_at < ?1 AND body_ref IS NOT NULL",
+        )?;
+        let refs = statement
+            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(refs)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         match self.conn.lock() {
             Ok(conn) => conn,
@@ -568,6 +718,9 @@ impl Ledger {
 const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("client_session_id", "TEXT"),
     ("upstream_id", "TEXT"),
+    ("request_sha256", "TEXT"),
+    ("response_sha256", "TEXT"),
+    ("body_ref", "TEXT"),
     ("mean_confidence", "REAL"),
     ("confidence_variability", "REAL"),
     ("confidence_bucket", "TEXT"),
@@ -600,7 +753,8 @@ fn add_missing_columns(conn: &rusqlite::Connection) -> Result<()> {
 /// added to one and not the other shifts every index after it.
 const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, conversation,
             client_session_id, backend,
-            requested_model, served_model, upstream_id, rung, attempts,
+            requested_model, served_model, upstream_id,
+            request_sha256, response_sha256, body_ref, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error,
             mean_confidence, confidence_variability, confidence_bucket, confidence_tokens";
@@ -614,10 +768,12 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
 /// same file would leave — is treated the same way, so a downgrade reads an
 /// absence rather than a guess.
 fn read_confidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ConfidenceAggregates>> {
-    let mean: Option<f64> = row.get(22)?;
-    let variability: Option<f64> = row.get(23)?;
-    let bucket: Option<String> = row.get(24)?;
-    let tokens: Option<i64> = row.get(25)?;
+    // Indices track [`COLUMNS`], which gained three body columns at 12-14 and
+    // pushed every later field along by three.
+    let mean: Option<f64> = row.get(25)?;
+    let variability: Option<f64> = row.get(26)?;
+    let bucket: Option<String> = row.get(27)?;
+    let tokens: Option<i64> = row.get(28)?;
     let (Some(mean), Some(variability), Some(bucket), Some(tokens)) =
         (mean, variability, bucket, tokens)
     else {
@@ -650,16 +806,19 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         requested_model: row.get(9)?,
         served_model: row.get(10)?,
         upstream_id: row.get(11)?,
-        rung: row.get(12)?,
-        attempts: row.get(13)?,
-        input_tokens: row.get(14)?,
-        cache_read_tokens: row.get(15)?,
-        cache_write_tokens: row.get(16)?,
-        output_tokens: row.get(17)?,
-        cost_usd: row.get(18)?,
-        substitutions: row.get(19)?,
-        status: row.get(20)?,
-        error: row.get(21)?,
+        request_sha256: row.get(12)?,
+        response_sha256: row.get(13)?,
+        body_ref: row.get(14)?,
+        rung: row.get(15)?,
+        attempts: row.get(16)?,
+        input_tokens: row.get(17)?,
+        cache_read_tokens: row.get(18)?,
+        cache_write_tokens: row.get(19)?,
+        output_tokens: row.get(20)?,
+        cost_usd: row.get(21)?,
+        substitutions: row.get(22)?,
+        status: row.get(23)?,
+        error: row.get(24)?,
         confidence: read_confidence(row)?,
     })
 }
@@ -695,6 +854,9 @@ mod tests {
             requested_model: Some("claude-opus-4-6".into()),
             served_model: Some("claude-opus-4-6".into()),
             upstream_id: None,
+            request_sha256: None,
+            response_sha256: None,
+            body_ref: None,
             rung: "preferred".into(),
             attempts: 1,
             input_tokens: Some(12),
@@ -857,6 +1019,283 @@ mod tests {
         let ledger = Ledger::in_memory().expect("opens");
         ledger.record(&exchange("claude-sub", 0)).expect("records");
         assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
+    }
+
+    /// Every column two separate pieces of work added has to survive their
+    /// merge, and the positional reader has to be right *against a migrated
+    /// file* -- where the physical column order is the order the `ALTER`s ran
+    /// in, not the order a fresh `CREATE TABLE` produces. `COLUMNS` is an
+    /// explicit select list so the two agree, and this is what says so.
+    #[test]
+    fn an_upgraded_ledger_gains_every_added_column_and_reads_both_sets_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE exchanges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL, ttfb_ms INTEGER, total_ms INTEGER,
+                    facade TEXT NOT NULL, path TEXT NOT NULL, conversation TEXT NOT NULL,
+                    backend TEXT NOT NULL, requested_model TEXT, served_model TEXT,
+                    rung TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    input_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, output_tokens INTEGER,
+                    cost_usd REAL, substitutions INTEGER, status INTEGER NOT NULL,
+                    error TEXT
+                )",
+            )
+            .expect("pre-column schema");
+        }
+
+        let ledger = Ledger::open(&path).expect("opens an older ledger");
+        let present: std::collections::BTreeSet<String> = {
+            let conn = ledger.lock();
+            let mut statement = conn
+                .prepare("PRAGMA table_info(exchanges)")
+                .expect("pragma");
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("reads")
+                .collect::<rusqlite::Result<_>>()
+                .expect("collects")
+        };
+        for (name, _) in ADDED_COLUMNS {
+            assert!(
+                present.contains(*name),
+                "the upgrade did not add `{name}`; every read goes through \
+                 COLUMNS, so a missing one fails every query"
+            );
+        }
+
+        // Both features' values, through the migrated file, read back on the
+        // right fields. A positional slip puts one where the other belongs and
+        // this is where it shows.
+        let mut row = exchange("nearai", 0);
+        row.request_sha256 = Some("a".repeat(64));
+        row.response_sha256 = Some("b".repeat(64));
+        row.body_ref = Some("1700000000000000000-000000".into());
+        row.confidence = Some(ConfidenceAggregates {
+            mean_confidence: 0.5,
+            variability: 0.25,
+            bucket: ConfidenceBucket::Ambiguous,
+            token_count: 137,
+        });
+        ledger.record(&row).expect("records");
+
+        let back = ledger.recent(1).expect("reads").remove(0);
+        assert_eq!(
+            back.request_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            back.response_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        assert_eq!(back.body_ref.as_deref(), Some("1700000000000000000-000000"));
+        assert_eq!(back.status, 200, "a later column did not shift into status");
+        assert_eq!(back.rung, "preferred", "nor into rung");
+        let confidence = back.confidence.expect("the aggregate came back");
+        assert_eq!(confidence.bucket, ConfidenceBucket::Ambiguous);
+        assert_eq!(confidence.token_count, 137);
+        assert!((confidence.mean_confidence - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// The rolling window, stated as the invariant it exists for: however many
+    /// turns a session takes, exactly one of them is still holding bodies.
+    #[test]
+    fn only_the_most_recent_exchange_of_a_session_keeps_its_bodies() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut ids = Vec::new();
+        for turn in 0..5 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = Some("session-a".into());
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            row.request_sha256 = Some(format!("{turn:064}"));
+            let id = ledger.record(&row).expect("records");
+            let superseded = ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+            ids.push((id, superseded));
+        }
+
+        // Every turn but the first hands back exactly its predecessor.
+        assert!(ids[0].1.is_empty(), "the first turn supersedes nothing");
+        for (turn, (_, superseded)) in ids.iter().enumerate().skip(1) {
+            assert_eq!(
+                superseded,
+                &vec![format!("170000000000000000{}-00000{}", turn - 1, turn - 1)],
+                "turn {turn} releases only the turn before it"
+            );
+        }
+        let held: Vec<_> = ledger
+            .recent(10)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.body_ref.is_some())
+            .collect();
+        assert_eq!(held.len(), 1, "exactly one exchange still holds bodies");
+        assert_eq!(
+            held[0].body_ref.as_deref(),
+            Some("1700000000000000004-000004")
+        );
+    }
+
+    /// A row that gave up its bodies must not go on claiming them, and must
+    /// still say what was hashed. Those two together are what make the state
+    /// legible rather than a dangling pointer.
+    #[test]
+    fn a_superseded_row_keeps_its_digests_and_drops_its_reference() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut first = exchange("nearai", 0);
+        first.client_session_id = Some("session-a".into());
+        first.body_ref = Some("1700000000000000000-000000".into());
+        first.request_sha256 = Some("a".repeat(64));
+        first.response_sha256 = Some("b".repeat(64));
+        ledger.record(&first).expect("records");
+
+        let mut second = exchange("nearai", 1);
+        second.client_session_id = Some("session-a".into());
+        second.body_ref = Some("1700000000000000001-000001".into());
+        let id = ledger.record(&second).expect("records");
+        ledger
+            .supersede_bodies(second.retention_key(), id)
+            .expect("rotates");
+
+        let rows = ledger.recent(10).expect("reads");
+        let older = rows
+            .iter()
+            .find(|r| r.started_at == at(0))
+            .expect("first row");
+        assert_eq!(older.body_ref, None, "it no longer claims a body");
+        assert_eq!(
+            older.request_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(
+            older.response_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+    }
+
+    /// Rotation is per session. One agent's turn must never collect another
+    /// agent's bodies.
+    #[test]
+    fn one_session_rotating_leaves_another_sessions_bodies_alone() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut other = exchange("nearai", 0);
+        other.client_session_id = Some("session-b".into());
+        other.body_ref = Some("1700000000000000000-000000".into());
+        ledger.record(&other).expect("records");
+
+        for turn in 1..4 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = Some("session-a".into());
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            let id = ledger.record(&row).expect("records");
+            let superseded = ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+            assert!(
+                !superseded.contains(&"1700000000000000000-000000".to_string()),
+                "session-b's bodies were released by session-a's turn {turn}"
+            );
+        }
+        let rows = ledger.recent(10).expect("reads");
+        let kept = rows.iter().find(|r| r.started_at == at(0)).expect("row");
+        assert_eq!(
+            kept.body_ref.as_deref(),
+            Some("1700000000000000000-000000"),
+            "the other session still holds its own"
+        );
+    }
+
+    /// A client that sends no session header still rotates, against the
+    /// conversation key. The alternative -- exempting it -- would retain
+    /// everything forever for exactly the clients we know least about.
+    #[test]
+    fn a_client_with_no_session_header_still_rotates() {
+        let ledger = Ledger::in_memory().expect("opens");
+        for turn in 0..3 {
+            let mut row = exchange("nearai", turn);
+            row.client_session_id = None;
+            row.body_ref = Some(format!("170000000000000000{turn}-00000{turn}"));
+            assert_eq!(row.retention_key(), "c-1", "falls back to the conversation");
+            let id = ledger.record(&row).expect("records");
+            ledger
+                .supersede_bodies(row.retention_key(), id)
+                .expect("rotates");
+        }
+        let held = ledger
+            .recent(10)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.body_ref.is_some())
+            .count();
+        assert_eq!(held, 1);
+    }
+
+    /// A crash between writing the files and inserting the row, or between
+    /// dropping a reference and unlinking, leaves files nothing points at.
+    /// The startup sweep is what collects them.
+    #[test]
+    fn the_sweep_removes_files_no_row_claims_and_keeps_the_ones_it_does() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let store = bodies::BodyStore::open(home.path()).expect("store opens");
+        let live = store.store(b"kept", b"kept").expect("stored");
+        let orphan = store.store(b"orphan", b"orphan").expect("stored");
+
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut row = exchange("nearai", 0);
+        row.body_ref = Some(live.clone());
+        ledger.record(&row).expect("records");
+
+        let removed = store
+            .retain_only(&ledger.live_body_refs().expect("live refs"))
+            .expect("sweeps");
+        assert_eq!(removed, 2, "both files of the orphaned pair");
+        assert!(store.read(&live).is_ok(), "the referenced pair survived");
+        assert!(store.read(&orphan).is_err(), "the orphan is gone");
+    }
+
+    /// Retention has to reach the bodies too. A ledger that pruned its rows
+    /// and left the user's source code on disk forever would be a privacy
+    /// promise the setting does not keep.
+    #[test]
+    fn the_bodies_due_for_removal_are_the_ones_on_the_rows_being_pruned() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut old_row = exchange("claude-sub", 0);
+        old_row.body_ref = Some("1700000000000000000-000000".into());
+        let mut recent = exchange("claude-sub", 100_000);
+        recent.body_ref = Some("1700000100000000000-000001".into());
+        // A row with capture off must not contribute a reference at all.
+        let plain = exchange("claude-sub", 1);
+        for row in [&old_row, &recent, &plain] {
+            ledger.record(row).expect("records");
+        }
+
+        let refs = ledger
+            .body_refs_before(at(50_000), Duration::seconds(0))
+            .expect("lists");
+        assert_eq!(refs, vec!["1700000000000000000-000000".to_string()]);
+    }
+
+    /// The digests are the halves of what a receipt signs, so they have to
+    /// survive the round trip through SQLite exactly as written.
+    #[test]
+    fn the_body_digests_survive_the_round_trip() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut row = exchange("nearai", 0);
+        row.request_sha256 =
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
+        row.response_sha256 =
+            Some("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".into());
+        row.body_ref = Some("1700000000000000000-000000".into());
+        ledger.record(&row).expect("records");
+        let rows = ledger.recent(1).expect("reads");
+        assert_eq!(rows[0].request_sha256, row.request_sha256);
+        assert_eq!(rows[0].response_sha256, row.response_sha256);
+        assert_eq!(rows[0].body_ref, row.body_ref);
     }
 
     /// The id is what makes a provider's own receipt reachable later, so it
