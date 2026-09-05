@@ -408,6 +408,22 @@ An earlier version let these fall through a catch-all arm and vanish without
 appearing in the dropped report at all, which made this document's own promise
 false for exactly the case where it mattered most.
 
+### Admission metadata compatibility
+
+An explicitly registered session requires its registered backend and an OpenAI
+Chat output wire. This is a request requirement checked by `eligible()`: normal
+policy can skip a preferred mismatched candidate and choose the matching eligible
+backend, while pins, retries and failover can never select an unbound route.
+Normal tool-loop, privacy, consent and capability constraints still apply.
+Privacy substitution and any translation run before metadata insertion and
+capture; captured bytes are the exact buffer forwarded upstream.
+
+The selected provider must accept OpenAI Chat `metadata`. A strict provider
+that rejects that object produces its ordinary upstream error; IronWire never
+retries without the binding to make such a provider accept the request. Configure
+a compatible backend, renew the binding, or explicitly revoke it. The privacy
+cost and repeated-use semantics are recorded in `TRUST.md` §9.
+
 ## 7. Conformance testing
 
 Fidelity claims are worthless without a harness that proves them.

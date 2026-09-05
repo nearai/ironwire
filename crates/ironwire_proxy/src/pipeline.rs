@@ -4,7 +4,8 @@
 //!
 //! 1. **Mutate only what §2 enumerates.** URL, auth headers, hop-by-hop
 //!    headers, and — only when policy chose a different model — the `model`
-//!    key, plus the separately consented admission metadata insertion. Nothing else is touched, which is why provider features we have
+//!    key, plus separately consented admission metadata. Nothing else is touched,
+//!    which is why provider features we have
 //!    never heard of keep working.
 //! 2. **Failover ends at the first byte.** Once a byte of the response has
 //!    reached the client, replaying the request would duplicate content the
@@ -291,6 +292,20 @@ async fn dispatch_inner(
     headers: Vec<(String, String)>,
 ) -> Result<(UpstreamResponse, Routed), PipelineError> {
     let session = admission_session(&headers, inbound);
+    // Sessionless traffic does not touch this opt-in registry. A poisoned plain
+    // map remains usable; one panicking control request cannot brick the proxy.
+    let binding = match session.as_deref() {
+        None => None,
+        Some(session) => state
+            .admission_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot(session, Utc::now().timestamp())
+            .map_err(PipelineError::Admission)?,
+    };
+    let mut peek = peek.clone();
+    peek.requirements.admission_backend = binding.as_ref().map(|b| b.backend.clone());
+    let peek = &peek;
     let mut headers = headers;
     headers.retain(|(name, _)| {
         !name.eq_ignore_ascii_case(ironwire_upstream::headers::NEUTRAL_SESSION_HEADER)
@@ -440,24 +455,16 @@ async fn dispatch_inner(
             }
         };
 
-        // A binding is deliberately separate from routing and capture consent.
-        // Wrong-route refusals cannot fail over to an unbound send.
-        let binding = state
-            .admission_bindings
-            .lock()
-            .map_err(|_| {
-                PipelineError::Admission(ironwire_core::admission::AdmissionError::Invalid)
-            })?
-            .for_request(
-                session.as_deref(),
-                decision.backend.as_str(),
-                if decision.translated { target } else { inbound },
-                Utc::now().timestamp(),
-            )
-            .map_err(PipelineError::Admission)?
-            .map(str::to_owned);
-        if let Some(binding) = binding {
-            request.body = ironwire_core::admission::insert_binding(&request.body, &binding)
+        if binding
+            .as_ref()
+            .is_some_and(|b| b.expires_at <= Utc::now().timestamp())
+        {
+            return Err(PipelineError::Admission(
+                ironwire_core::admission::AdmissionError::Expired,
+            ));
+        }
+        if let Some(binding) = &binding {
+            request.body = ironwire_core::admission::insert_binding(&request.body, &binding.value)
                 .map(Bytes::from)
                 .map_err(PipelineError::Admission)?;
         }

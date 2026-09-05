@@ -327,24 +327,29 @@ const ADMISSION_SSE: &str = concat!(
 );
 
 fn admission_state(base: &str) -> AppState {
+    admission_state_with(&[("nearai", base)], Config::default())
+}
+fn admission_state_with(backends: &[(&str, &str)], config: Config) -> AppState {
     use ironwire_core::protocol::{BackendId, BackendKind};
     use ironwire_upstream::openai_chat::ChatCompletionsBackend;
     let mut registry = BackendRegistry::new();
-    registry.push(Arc::new(
-        ChatCompletionsBackend::new(
-            BackendId::from("nearai"),
-            "local fixture",
-            BackendKind::Credits,
-            Some(SecretString::from("test-only")),
-            base.to_owned(),
-            Vec::new(),
-            5,
-        )
-        .unwrap(),
-    ));
+    for (id, base) in backends {
+        registry.push(Arc::new(
+            ChatCompletionsBackend::new(
+                BackendId::from(*id),
+                "local fixture",
+                BackendKind::Credits,
+                Some(SecretString::from("test-only")),
+                (*base).to_owned(),
+                Vec::new(),
+                5,
+            )
+            .unwrap(),
+        ));
+    }
     AppState::new(
         registry,
-        Config::default(),
+        config,
         ConsentLedger::default(),
         "test-token".into(),
     )
@@ -538,7 +543,14 @@ async fn a_bound_session_cannot_silently_route_elsewhere_or_overwrite_client_met
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.status(),
+            if wrong_backend {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        );
         assert!(received.lock().unwrap().is_none());
         let error = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -594,5 +606,238 @@ async fn separately_enabled_capture_hashes_exactly_the_bound_bytes_sent_upstream
     assert_eq!(
         rows[0].request_sha256.as_deref(),
         Some(ironwire_ledger::bodies::sha256_hex(&captured).as_str())
+    );
+}
+
+#[tokio::test]
+async fn admission_selects_its_eligible_backend_even_when_policy_prefers_another() {
+    let (other, other_seen) = spawn_mock_response(ADMISSION_SSE).await;
+    let (bound, bound_seen) = spawn_mock_response(ADMISSION_SSE).await;
+    let state = admission_state_with(
+        &[("preferred", &other), ("nearai", &bound)],
+        Config::default(),
+    );
+    assert_eq!(
+        set_admission(&state, "test-token", true, &admission_value()).await,
+        StatusCode::OK
+    );
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-ironwire-session-id", "selected-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(other_seen.lock().unwrap().is_none());
+    assert!(
+        bound_seen
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .body
+            .contains("trace_commons_admission")
+    );
+}
+
+#[tokio::test]
+async fn privacy_and_translation_happen_before_binding_insertion() {
+    for translated in [false, true] {
+        let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+        let mut config = Config::default();
+        config.privacy.enabled = true;
+        config.privacy.named_values = vec!["sentinel-value".into()];
+        let state = admission_state_with(&[("nearai", &base)], config);
+        let binding = admission_value();
+        assert_eq!(
+            set_admission(&state, "test-token", true, &binding).await,
+            StatusCode::OK
+        );
+        let path = if translated {
+            "/anthropic/v1/messages"
+        } else {
+            "/openai/v1/chat/completions"
+        };
+        let body = r#"{"model":"fixture","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"sentinel-value"}]}"#;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("x-ironwire-session-id", "selected-session")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seen = received.lock().unwrap().clone().unwrap();
+        assert!(!seen.body.contains("sentinel-value"));
+        let sent: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+        assert_eq!(sent["metadata"]["trace_commons_admission"], binding);
+        assert!(seen.request_line.contains("chat/completions"));
+    }
+}
+
+#[tokio::test]
+async fn poisoned_admission_state_remains_available_to_control_and_traffic() {
+    for session in [None, Some("selected-session")] {
+        let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+        let state = admission_state(&base);
+        let poisoned = state.admission_bindings.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("synthetic registry panic");
+        });
+        assert_eq!(
+            set_admission(&state, "test-token", true, &admission_value()).await,
+            StatusCode::OK
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/openai/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(session) = session {
+            request = request.header("x-ironwire-session-id", session);
+        }
+        let response = app(state.clone())
+            .oneshot(request.body(Body::from(ADMISSION_REQUEST)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(received.lock().unwrap().is_some());
+        for (token, status) in [
+            ("wrong", StatusCode::UNAUTHORIZED),
+            ("test-token", StatusCode::OK),
+        ] {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/_ironwire/admission-binding?session_id=selected-session")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(status["status"], "active");
+                assert!(status.get("binding").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_bound_backend_never_fails_over_to_an_unbound_candidate() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bound = format!("http://{}", listener.local_addr().unwrap());
+    let router = axum::Router::new().fallback(|| async { StatusCode::TOO_MANY_REQUESTS });
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (other, other_seen) = spawn_mock_response(ADMISSION_SSE).await;
+    let state = admission_state_with(&[("nearai", &bound), ("other", &other)], Config::default());
+    assert_eq!(
+        set_admission(&state, "test-token", true, &admission_value()).await,
+        StatusCode::OK
+    );
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-ironwire-session-id", "selected-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_server_error() || response.status().is_client_error());
+    assert!(other_seen.lock().unwrap().is_none());
+    task.abort();
+}
+
+#[tokio::test]
+async fn authenticated_session_status_reports_expiry_and_explicit_revocation() {
+    let (base, _received) = spawn_mock_response(ADMISSION_SSE).await;
+    let state = admission_state(&base);
+    let now = chrono::Utc::now().timestamp();
+    let expired = format!("tcad1:{}:{}:{}", "a".repeat(64), "b".repeat(64), now - 1);
+    state
+        .admission_bindings
+        .lock()
+        .unwrap()
+        .register("expired-session", "nearai", &expired, true, now - 2)
+        .unwrap();
+    // A fresh registration purges expired payloads while keeping their tombstones.
+    assert_eq!(
+        set_admission(&state, "test-token", true, &admission_value()).await,
+        StatusCode::OK
+    );
+    let get = |id: &str| {
+        Request::builder()
+            .uri(format!("/_ironwire/admission-binding?session_id={id}"))
+            .header("authorization", "Bearer test-token")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app(state.clone())
+        .oneshot(get("expired-session"))
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["status"], "expired");
+    assert_eq!(status["expires_at"], now - 1);
+    assert!(
+        !String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("expired-session")
+    );
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/_ironwire/admission-binding")
+                .header("authorization", "Bearer test-token")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"session_id":"expired-session"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app(state).oneshot(get("expired-session")).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+        "inactive"
     );
 }

@@ -1270,9 +1270,20 @@ struct AdmissionBindingRevocation {
 async fn admission_binding_capability(
     State(state): State<AppState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return *response;
+    }
+    if let Some(session) = query.get("session_id") {
+        let bindings = state
+            .admission_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        return match bindings.status(session, Utc::now().timestamp()) {
+            Ok((status, expires_at)) => axum::Json(serde_json::json!({"status":status,"active":status=="active","expires_at":expires_at})).into_response(),
+            Err(_) => (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"admission-binding-invalid"}))).into_response(),
+        };
     }
     axum::Json(serde_json::json!({
         "supported":true, "max_lifetime_seconds":ironwire_core::admission::MAX_BINDING_SECONDS,
@@ -1306,13 +1317,10 @@ async fn admission_binding(
         )
             .into_response();
     }
-    let Ok(mut bindings) = state.admission_bindings.lock() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"error":"admission-binding-unavailable"})),
-        )
-            .into_response();
-    };
+    let mut bindings = state
+        .admission_bindings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match bindings.register(
         &request.session_id,
         &request.backend,
@@ -1339,13 +1347,10 @@ async fn revoke_admission_binding(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    let Ok(mut bindings) = state.admission_bindings.lock() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({"error":"admission-binding-unavailable"})),
-        )
-            .into_response();
-    };
+    let mut bindings = state
+        .admission_bindings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match bindings.revoke(&request.session_id) {
         Ok(removed) => {
             axum::Json(serde_json::json!({"active":false,"removed":removed})).into_response()

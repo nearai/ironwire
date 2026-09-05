@@ -47,6 +47,9 @@ pub enum ReasoningNeed {
 /// bounded scan of the body — never by re-serialising it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RequestRequirements {
+    /// Explicit admission binds routing to one backend; pins cannot widen it.
+    #[serde(default)]
+    pub admission_backend: Option<String>,
     /// Tool definitions are present.
     pub tools: bool,
     /// The history contains an assistant turn that issued more than one tool
@@ -125,6 +128,8 @@ impl Capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Ineligible {
+    /// Candidate cannot preserve the registered admission route.
+    AdmissionRouteMismatch,
     /// The conversation is mid tool loop, so a family change would leave the
     /// next assistant turn missing the reasoning state its `tool_use` is
     /// expected to carry. Eligible again at the next turn boundary.
@@ -177,7 +182,15 @@ pub fn eligible(
     req: &RequestRequirements,
     caps: &Capabilities,
     cross_family: bool,
+    backend: Option<(&str, crate::protocol::Protocol)>,
 ) -> Result<(), Ineligible> {
+    if req
+        .admission_backend
+        .as_deref()
+        .is_some_and(|required| Some((required, crate::protocol::Protocol::OpenAiChat)) != backend)
+    {
+        return Err(Ineligible::AdmissionRouteMismatch);
+    }
     // The one cross-family rule that is about correctness rather than cost:
     // switch families at a turn boundary, never mid tool loop.
     if cross_family && req.mid_tool_loop {
@@ -231,6 +244,7 @@ mod tests {
     /// blocks in history, tools declared, a big cached prefix.
     fn claude_code_turn() -> RequestRequirements {
         RequestRequirements {
+            admission_backend: None,
             tools: true,
             parallel_tool_calls: false,
             images: false,
@@ -257,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn admission_requires_exact_backend_and_actual_outbound_wire() {
+        let req = RequestRequirements {
+            admission_backend: Some("bound".into()),
+            ..Default::default()
+        };
+        let caps = Capabilities::conservative(Protocol::OpenAiChat);
+        assert_eq!(
+            eligible(&req, &caps, false, Some(("bound", Protocol::OpenAiChat))),
+            Ok(())
+        );
+        for route in [
+            None,
+            Some(("other", Protocol::OpenAiChat)),
+            Some(("bound", Protocol::OpenAiResponses)),
+        ] {
+            assert_eq!(
+                eligible(&req, &caps, false, route),
+                Err(Ineligible::AdmissionRouteMismatch)
+            );
+        }
+    }
+
+    #[test]
     fn signed_thinking_alone_does_not_block_a_family_change() {
         // The correction that motivated this gate's rewrite: a foreign provider
         // never validates an Anthropic signature, and Anthropic drops rather
@@ -264,7 +301,7 @@ mod tests {
         // capacity pool for no reason.
         let mut req = claude_code_turn();
         req.prompt_cache = false; // isolate the reasoning question
-        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+        assert_eq!(eligible(&req, &nearai_caps(), true, None), Ok(()));
     }
 
     #[test]
@@ -273,7 +310,7 @@ mod tests {
         req.prompt_cache = false;
         req.mid_tool_loop = true;
         assert_eq!(
-            eligible(&req, &nearai_caps(), true),
+            eligible(&req, &nearai_caps(), true, None),
             Err(Ineligible::MidToolLoop)
         );
     }
@@ -285,9 +322,9 @@ mod tests {
         let mut req = claude_code_turn();
         req.prompt_cache = false;
         req.mid_tool_loop = true;
-        assert!(eligible(&req, &nearai_caps(), true).is_err());
+        assert!(eligible(&req, &nearai_caps(), true, None).is_err());
         req.mid_tool_loop = false;
-        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+        assert_eq!(eligible(&req, &nearai_caps(), true, None), Ok(()));
     }
 
     #[test]
@@ -296,7 +333,7 @@ mod tests {
         // missing, so there is nothing to refuse.
         let mut req = claude_code_turn();
         req.mid_tool_loop = true;
-        assert_eq!(eligible(&req, &full_caps(), false), Ok(()));
+        assert_eq!(eligible(&req, &full_caps(), false, None), Ok(()));
     }
 
     #[test]
@@ -307,7 +344,7 @@ mod tests {
             reasoning: ReasoningNeed::Requested,
             ..Default::default()
         };
-        assert_eq!(eligible(&req, &nearai_caps(), true), Ok(()));
+        assert_eq!(eligible(&req, &nearai_caps(), true, None), Ok(()));
     }
 
     #[test]
@@ -323,14 +360,14 @@ mod tests {
             parallel_tool_calls: false,
             ..Default::default()
         };
-        assert_eq!(eligible(&unused, &serial, true), Ok(()));
+        assert_eq!(eligible(&unused, &serial, true, None), Ok(()));
 
         let used = RequestRequirements {
             parallel_tool_calls: true,
             ..unused
         };
         assert_eq!(
-            eligible(&used, &serial, true),
+            eligible(&used, &serial, true, None),
             Err(Ineligible::ParallelToolsUnsupported)
         );
     }
@@ -347,10 +384,10 @@ mod tests {
             ..full_caps()
         };
         assert_eq!(
-            eligible(&req, &no_cache, true),
+            eligible(&req, &no_cache, true, None),
             Err(Ineligible::WouldDiscardLargePromptCache)
         );
-        assert_eq!(eligible(&req, &no_cache, false), Ok(()));
+        assert_eq!(eligible(&req, &no_cache, false, None), Ok(()));
     }
 
     #[test]
@@ -364,7 +401,7 @@ mod tests {
             prompt_cache: false,
             ..full_caps()
         };
-        assert_eq!(eligible(&req, &no_cache, true), Ok(()));
+        assert_eq!(eligible(&req, &no_cache, true, None), Ok(()));
     }
 
     #[test]
@@ -378,7 +415,7 @@ mod tests {
             ..full_caps()
         };
         assert_eq!(
-            eligible(&req, &text_only, false),
+            eligible(&req, &text_only, false, None),
             Err(Ineligible::ImagesUnsupported)
         );
     }
@@ -394,7 +431,7 @@ mod tests {
             ..full_caps()
         };
         assert_eq!(
-            eligible(&req, &toolless, true),
+            eligible(&req, &toolless, true, None),
             Err(Ineligible::ToolsUnsupported)
         );
     }
@@ -406,7 +443,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            eligible(&req, &full_caps(), false),
+            eligible(&req, &full_caps(), false, None),
             Err(Ineligible::ContextTooSmall)
         );
     }
@@ -415,6 +452,6 @@ mod tests {
     fn an_empty_request_fits_a_conservative_backend() {
         let req = RequestRequirements::default();
         let caps = Capabilities::conservative(Protocol::OpenAiChat);
-        assert_eq!(eligible(&req, &caps, true), Ok(()));
+        assert_eq!(eligible(&req, &caps, true, None), Ok(()));
     }
 }

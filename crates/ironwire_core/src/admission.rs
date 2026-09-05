@@ -8,6 +8,8 @@ use crate::protocol::Protocol;
 pub const MAX_BINDING_SECONDS: i64 = 900;
 /// Bound memory use even when clients abandon ceremonies.
 pub const MAX_BINDINGS: usize = 32;
+/// Expired sessions remain protected until explicit revocation or renewal.
+pub const MAX_EXPIRED_SESSIONS: usize = 1024;
 
 /// Fixed labels only; never includes a session, challenge, or body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -29,16 +31,20 @@ pub enum AdmissionError {
     Capacity,
 }
 
+/// Immutable registration snapshot for an in-flight request.
 #[derive(Clone)]
-struct Binding {
-    backend: String,
-    value: String,
-    expires_at: i64,
+pub struct Binding {
+    /// The sole backend permitted by this registration.
+    pub backend: String,
+    /// Canonical metadata; never log or expose through status.
+    pub value: String,
+    /// Unix second after which sending must be refused.
+    pub expires_at: i64,
 }
 
 /// Memory-only registrations keyed by the client's exact session identifier.
 #[derive(Default)]
-pub struct AdmissionBindings(BTreeMap<String, Binding>);
+pub struct AdmissionBindings(BTreeMap<String, Binding>, BTreeMap<String, i64>);
 
 /// Same bounded identifier alphabet as the existing client session header.
 #[must_use]
@@ -70,6 +76,22 @@ impl AdmissionBindings {
         if expires_at > now.saturating_add(MAX_BINDING_SECONDS) {
             return Err(AdmissionError::Invalid);
         }
+        // Forget expired payloads, never the fact that a session requires a
+        // binding. When tombstones fill, retain the remaining expired entries
+        // and refuse capacity instead of silently restoring unbound traffic.
+        let expired: Vec<_> = self
+            .0
+            .iter()
+            .filter(|(_, b)| b.expires_at <= now)
+            .map(|(session, b)| (session.clone(), b.expires_at))
+            .collect();
+        for (session, expiry) in expired {
+            if self.1.len() >= MAX_EXPIRED_SESSIONS {
+                break;
+            }
+            self.1.insert(session.clone(), expiry);
+            self.0.remove(&session);
+        }
         if self.0.len() >= MAX_BINDINGS && !self.0.contains_key(session) {
             return Err(AdmissionError::Capacity);
         }
@@ -81,6 +103,7 @@ impl AdmissionBindings {
                 expires_at,
             },
         );
+        self.1.remove(session);
         Ok(expires_at)
     }
 
@@ -89,7 +112,41 @@ impl AdmissionBindings {
         if !valid_session(session) {
             return Err(AdmissionError::Invalid);
         }
-        Ok(self.0.remove(session).is_some())
+        let active = self.0.remove(session).is_some();
+        Ok(self.1.remove(session).is_some() || active)
+    }
+
+    /// Exact-session status exposes no registry enumeration or binding value.
+    pub fn status(
+        &self,
+        session: &str,
+        now: i64,
+    ) -> Result<(&'static str, Option<i64>), AdmissionError> {
+        if !valid_session(session) {
+            return Err(AdmissionError::Invalid);
+        }
+        if let Some(expiry) = self.1.get(session) {
+            return Ok(("expired", Some(*expiry)));
+        }
+        if let Some(binding) = self.0.get(session) {
+            return Ok((
+                if binding.expires_at > now {
+                    "active"
+                } else {
+                    "expired"
+                },
+                Some(binding.expires_at),
+            ));
+        }
+        Ok(("inactive", None))
+    }
+
+    /// A request snapshots its registration once; expiry is rechecked before send.
+    pub fn snapshot(&self, session: &str, now: i64) -> Result<Option<Binding>, AdmissionError> {
+        if self.status(session, now)?.0 == "expired" {
+            return Err(AdmissionError::Expired);
+        }
+        Ok(self.0.get(session).cloned())
     }
 
     /// Only the exact registered session/backend/wire may acquire this metadata.
@@ -101,6 +158,9 @@ impl AdmissionBindings {
         protocol: Protocol,
         now: i64,
     ) -> Result<Option<&str>, AdmissionError> {
+        if session.is_some_and(|s| self.1.contains_key(s)) {
+            return Err(AdmissionError::Expired);
+        }
         let Some(binding) = session.and_then(|session| self.0.get(session)) else {
             return Ok(None);
         };
@@ -373,5 +433,62 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&inserted).unwrap()["metadata"]["trace_commons_admission"],
             token
         );
+    }
+    #[test]
+    fn expiration_reclaims_active_capacity_without_unbinding_old_sessions() {
+        let mut state = AdmissionBindings::default();
+        for n in 0..MAX_BINDINGS {
+            state
+                .register(&format!("old-{n}"), "nearai", &binding(1000), true, 500)
+                .unwrap();
+        }
+        state
+            .register("new", "nearai", &binding(1500), true, 1000)
+            .unwrap();
+        assert_eq!(state.0.len(), 1);
+        assert_eq!(
+            state.status("old-0", 1000).unwrap(),
+            ("expired", Some(1000))
+        );
+        assert_eq!(
+            state.for_request(Some("old-0"), "nearai", Protocol::OpenAiChat, 1000),
+            Err(AdmissionError::Expired)
+        );
+        assert_eq!(state.status("unrelated", 1000).unwrap(), ("inactive", None));
+        state
+            .register("old-0", "nearai", &binding(1500), true, 1000)
+            .unwrap();
+        assert_eq!(state.status("old-0", 1000).unwrap(), ("active", Some(1500)));
+        assert!(state.revoke("old-1").unwrap());
+        assert_eq!(state.status("old-1", 1000).unwrap(), ("inactive", None));
+    }
+    #[test]
+    fn bounded_tombstones_never_forget_an_expired_session() {
+        let mut state = AdmissionBindings::default();
+        for n in 0..MAX_EXPIRED_SESSIONS {
+            state.1.insert(format!("old-{n}"), 500);
+        }
+        for n in 0..MAX_BINDINGS {
+            state
+                .register(&format!("live-{n}"), "nearai", &binding(1000), true, 500)
+                .unwrap();
+        }
+        assert_eq!(
+            state.register("overflow", "nearai", &binding(1500), true, 1000),
+            Err(AdmissionError::Capacity)
+        );
+        assert!(matches!(
+            state.snapshot("old-0", 1000),
+            Err(AdmissionError::Expired)
+        ));
+        assert!(matches!(
+            state.snapshot("live-0", 1000),
+            Err(AdmissionError::Expired)
+        ));
+        state.revoke("old-0").unwrap();
+        state
+            .register("replacement", "nearai", &binding(1500), true, 1000)
+            .unwrap();
+        assert_eq!(state.1.len(), MAX_EXPIRED_SESSIONS);
     }
 }
