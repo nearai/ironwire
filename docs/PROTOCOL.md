@@ -534,3 +534,7 @@ needs a capture from a running app, and until there is one this section states
 the uncertainty rather than implying coverage. The markers live in the signed
 catalog channel precisely so the answer can ship in minutes rather than a
 release.
+
+The admission capability also reports `body_capture_ready`: true only when the
+separate capture flags are enabled and both local ledger and body storage opened.
+It reports readiness without enabling capture or exposing stored content.

@@ -1276,7 +1276,9 @@ async fn admission_binding_capability(
     }
     axum::Json(serde_json::json!({
         "supported":true, "max_lifetime_seconds":ironwire_core::admission::MAX_BINDING_SECONDS,
-        "max_sessions":ironwire_core::admission::MAX_BINDINGS, "protocol":"openai.chat"
+        "max_sessions":ironwire_core::admission::MAX_BINDINGS, "protocol":"openai.chat",
+        "body_capture_ready":state.config.capture.enabled && state.config.capture.bodies
+            && state.ledger.is_some() && state.bodies.is_some()
     }))
     .into_response()
 }

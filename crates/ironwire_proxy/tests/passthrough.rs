@@ -411,6 +411,7 @@ async fn explicit_admission_is_the_only_added_metadata_and_capture_remains_off()
         .unwrap();
     let capability = String::from_utf8(capability.to_vec()).unwrap();
     assert!(capability.contains("max_lifetime_seconds"));
+    assert!(capability.contains("\"body_capture_ready\":false"));
     assert!(!capability.contains(&binding));
     assert!(!capability.contains("selected-session"));
     assert!(state.bodies.is_none());
