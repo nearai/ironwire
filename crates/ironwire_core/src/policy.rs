@@ -502,10 +502,21 @@ impl Policy {
             // override preference, never turn a refusal into a malformed
             // request.
             let cross = !candidate.caps.wires.speaks(inbound);
-            eligible(&peek.requirements, &candidate.caps, cross).map_err(|why| {
-                NoRoute::NoneUsable {
-                    refusals: vec![(candidate.id.clone(), Refusal::Ineligible(why))],
-                }
+            eligible(
+                &peek.requirements,
+                &candidate.caps,
+                cross,
+                Some((
+                    candidate.id.as_str(),
+                    if cross {
+                        candidate.caps.wires.primary()
+                    } else {
+                        inbound
+                    },
+                )),
+            )
+            .map_err(|why| NoRoute::NoneUsable {
+                refusals: vec![(candidate.id.clone(), Refusal::Ineligible(why))],
             })?;
             return Ok(RouteDecision {
                 backend: candidate.id.clone(),
@@ -1095,7 +1106,20 @@ fn usable(
     // the target genuinely cannot express still refuses the route, but that is
     // decided by the emitter, on the body, in `pipeline::translate_request`.
     let cross = !candidate.caps.wires.speaks(inbound);
-    eligible(&peek.requirements, &candidate.caps, cross).map_err(Unusable::Ineligible)
+    eligible(
+        &peek.requirements,
+        &candidate.caps,
+        cross,
+        Some((
+            candidate.id.as_str(),
+            if cross {
+                candidate.caps.wires.primary()
+            } else {
+                inbound
+            },
+        )),
+    )
+    .map_err(Unusable::Ineligible)
 }
 
 /// Best model this candidate offers at or below `tier`, preferring an exact

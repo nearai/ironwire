@@ -178,6 +178,8 @@ pub struct AppState {
     pub backends: BackendRegistry,
     /// Routing policy, including per-conversation affinity.
     pub policy: Arc<Mutex<Policy>>,
+    /// Explicit per-session challenges, bounded and memory-only; never status or logs.
+    pub admission_bindings: Arc<Mutex<ironwire_core::admission::AdmissionBindings>>,
     /// Recorded subscription consents (`docs/TRUST.md` §2).
     pub consent: Arc<Mutex<ConsentLedger>>,
     /// Loaded configuration.
@@ -298,6 +300,9 @@ impl AppState {
         Self {
             backends,
             policy: Arc::new(Mutex::new(Policy::new())),
+            admission_bindings: Arc::new(Mutex::new(
+                ironwire_core::admission::AdmissionBindings::default(),
+            )),
             consent: Arc::new(Mutex::new(consent)),
             ledger: None,
             bodies: None,

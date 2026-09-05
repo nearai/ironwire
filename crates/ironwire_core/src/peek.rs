@@ -187,6 +187,7 @@ impl RequestPeek {
         let system = body.get("system");
 
         let mut requirements = RequestRequirements {
+            admission_backend: None,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)
@@ -290,6 +291,7 @@ impl RequestPeek {
             .or_else(|| body.get("messages").and_then(Value::as_array));
 
         let mut requirements = RequestRequirements {
+            admission_backend: None,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)

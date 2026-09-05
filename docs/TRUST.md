@@ -359,3 +359,37 @@ the worst available outcome and exactly the kind of thing that arrives through a
 dependency. The substitution map is derived per request and never written to
 disk (`PRIVACY.md` §4): a persistent map would be a purpose-built plaintext PII
 database created in the course of trying not to expose PII.
+
+
+## 9. Explicit admission binding
+
+The local control bearer may register an account-bound challenge for one exact
+session/backend for at most 15 minutes. This is separate consent to a metadata
+mutation, not consent to capture bodies, export them, obtain credit, or fund
+inference. Registrations live only in bounded memory. Other sessions are
+unchanged, and no subscription backend receives added client identity.
+Conflicting metadata, expiry, wrong protocol, or routing to a different backend
+refuses the selected session. Revocation stops future insertions; it cannot
+recall requests already forwarded. `tests/passthrough.rs` and the admission
+binding unit/control tests pin these properties and byte/capture identity.
+
+Session headers are local assertions, not authentication. Any local process able
+to reach the facade can claim a registered session identifier and make calls
+bearing that account's binding. The control bearer authorizes registration, not
+each inference request; loopback binding does not isolate users or processes.
+Do not treat this feature as protection against a hostile local process.
+
+The provider sees the canonical account anchor and challenge nonce in metadata.
+Privacy substitution runs before insertion, so it does not hide this binding.
+One registration can bind several inference calls until expiry; it is not a
+local one-shot token. Trace Commons consumes a challenge once at admission,
+independently of the proxy's repeated use, and only the server can grant credit.
+
+Expired payloads release active slots, but bounded tombstones keep those exact
+sessions refusing until authenticated renewal or revocation. At 1024 tombstones,
+new capacity is refused rather than evicting protected sessions or blocking
+unrelated traffic. `GET /_ironwire/admission-binding?session_id=...` requires the
+control bearer and returns only that session's active/expired/inactive status
+and expiry; it does not list session identifiers or return binding values.
+Register again to renew, or DELETE that exact session to revoke. State is
+memory-only and a proxy restart clears registrations and tombstones.

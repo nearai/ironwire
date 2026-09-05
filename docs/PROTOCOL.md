@@ -48,7 +48,32 @@ For a native-lane request, IronWire performs exactly these mutations:
    the client's session to IronWire itself (§3), not to the provider; the
    provider never asked for it, and forwarding one would announce that there
    is a proxy in the path.
-6. **Nothing else.** The body is otherwise the bytes the client sent.
+6. **Explicit admission binding**: only while an authenticated local client has
+   confirmed an ephemeral binding for the exact client session and selected
+   OpenAI Chat backend, insert `metadata.trace_commons_admission`. This happens
+   after translation/model/privacy edits and before body capture, so captured
+   and upstream bytes agree. The insertion preserves all other bytes, including
+   unknown fields and whitespace. An identical existing value is unchanged;
+   conflicting or ambiguous metadata refuses before sending. Other sessions are
+   byte-identical; a bound session routed to another backend/protocol or past
+   expiry is refused, never silently sent without its binding.
+7. **Nothing else.** The body is otherwise the bytes the client sent.
+
+`GET /_ironwire/admission-binding` requires the control bearer and returns
+capability/limits only, never registered session or challenge values.
+`POST /_ironwire/admission-binding` requires the control bearer and
+`{session_id, backend, binding, confirmed:true}`. Binding spelling is
+`tcad1:<64 lowercase hex account anchor>:<64 lowercase hex nonce>:<Unix expiry>`.
+The named backend must already exist and speak OpenAI Chat without a
+subscription identity requirement. Expiry must be in the future and no more
+than 900 seconds away; an upstream challenge with a longer lifetime is refused,
+not shortened or extended. At most 32 session bindings are held in memory,
+never persisted. `DELETE /_ironwire/admission-binding` with `{session_id}` revokes
+one. Restart clears all bindings. Expired bindings remain bounded refusal
+records until removed or replaced; they do not silently resume unbound sends.
+Neither endpoint changes routing policy, provider credentials, capture.enabled,
+or capture.bodies. Binding is metadata, not admission or funding proof. The
+account binding/nonce never appears in status or log messages.
 
 > **The one documented exception, and it is opt-in.** The privacy filter
 > (`docs/PRIVACY.md`) substitutes values on the way out and restores them on the
@@ -383,6 +408,22 @@ An earlier version let these fall through a catch-all arm and vanish without
 appearing in the dropped report at all, which made this document's own promise
 false for exactly the case where it mattered most.
 
+### Admission metadata compatibility
+
+An explicitly registered session requires its registered backend and an OpenAI
+Chat output wire. This is a request requirement checked by `eligible()`: normal
+policy can skip a preferred mismatched candidate and choose the matching eligible
+backend, while pins, retries and failover can never select an unbound route.
+Normal tool-loop, privacy, consent and capability constraints still apply.
+Privacy substitution and any translation run before metadata insertion and
+capture; captured bytes are the exact buffer forwarded upstream.
+
+The selected provider must accept OpenAI Chat `metadata`. A strict provider
+that rejects that object produces its ordinary upstream error; IronWire never
+retries without the binding to make such a provider accept the request. Configure
+a compatible backend, renew the binding, or explicitly revoke it. The privacy
+cost and repeated-use semantics are recorded in `TRUST.md` §9.
+
 ## 7. Conformance testing
 
 Fidelity claims are worthless without a harness that proves them.
@@ -509,3 +550,7 @@ needs a capture from a running app, and until there is one this section states
 the uncertainty rather than implying coverage. The markers live in the signed
 catalog channel precisely so the answer can ship in minutes rather than a
 release.
+
+The admission capability also reports `body_capture_ready`: true only when the
+separate capture flags are enabled and both local ledger and body storage opened.
+It reports readiness without enabling capture or exposing stored content.

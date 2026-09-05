@@ -494,6 +494,13 @@ pub fn router() -> Router<AppState> {
         .route("/status", get(status))
         .route("/backends", get(status))
         .route("/pin", post(pin))
+        .route(
+            "/admission-binding",
+            post(admission_binding)
+                .get(admission_binding_capability)
+                .delete(revoke_admission_binding)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .route("/settings", get(settings))
         .route("/privacy", post(privacy))
         .route("/consent", post(consent))
@@ -1243,6 +1250,117 @@ fn balance(
 
     view.next_available_at = resets.into_iter().min();
     view
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionBindingRequest {
+    session_id: String,
+    backend: String,
+    binding: String,
+    confirmed: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionBindingRevocation {
+    session_id: String,
+}
+
+async fn admission_binding_capability(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    if let Some(session) = query.get("session_id") {
+        let bindings = state
+            .admission_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        return match bindings.status(session, Utc::now().timestamp()) {
+            Ok((status, expires_at)) => axum::Json(serde_json::json!({"status":status,"active":status=="active","expires_at":expires_at})).into_response(),
+            Err(_) => (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error":"admission-binding-invalid"}))).into_response(),
+        };
+    }
+    axum::Json(serde_json::json!({
+        "supported":true, "max_lifetime_seconds":ironwire_core::admission::MAX_BINDING_SECONDS,
+        "max_sessions":ironwire_core::admission::MAX_BINDINGS, "protocol":"openai.chat",
+        "body_capture_ready":state.config.capture.enabled && state.config.capture.bodies
+            && state.ledger.is_some() && state.bodies.is_some()
+    }))
+    .into_response()
+}
+
+async fn admission_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<AdmissionBindingRequest>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let supported = state
+        .backends
+        .get(&BackendId::from(request.backend.as_str()))
+        .is_some_and(|backend| {
+            backend.capabilities().wires.primary() == ironwire_core::protocol::Protocol::OpenAiChat
+                && backend.kind() != ironwire_core::protocol::BackendKind::Subscription
+                && backend.required_client_identity().is_none()
+        });
+    if !supported {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":"admission-binding-backend-unsupported"})),
+        )
+            .into_response();
+    }
+    let mut bindings = state
+        .admission_bindings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match bindings.register(
+        &request.session_id,
+        &request.backend,
+        &request.binding,
+        request.confirmed,
+        Utc::now().timestamp(),
+    ) {
+        Ok(expires_at) => {
+            axum::Json(serde_json::json!({"active":true,"expires_at":expires_at})).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn revoke_admission_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<AdmissionBindingRevocation>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let mut bindings = state
+        .admission_bindings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match bindings.revoke(&request.session_id) {
+        Ok(removed) => {
+            axum::Json(serde_json::json!({"active":false,"removed":removed})).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn pin(
