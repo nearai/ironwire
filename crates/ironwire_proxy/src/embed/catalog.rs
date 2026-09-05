@@ -60,7 +60,7 @@ pub(crate) fn spawn_refresh(
                 Ok(None) => tracing::debug!("provider catalog unchanged"),
                 // Never fatal: the compiled-in defaults, or the document
                 // already loaded, stay in force.
-                Err(_error) => tracing::debug!("provider-catalog refresh skipped"),
+                Err(error) => tracing::debug!(%error, "provider-catalog refresh skipped"),
             }
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
@@ -97,8 +97,8 @@ async fn fetch_and_apply(
 
     // Persist only after it verified, so a bad document cannot poison the
     // cache that the next startup reads.
-    if let Err(_error) = CatalogStore::persist(&signed, path) {
-        tracing::warn!("could not cache the catalog document");
+    if let Err(error) = CatalogStore::persist(&signed, path) {
+        tracing::warn!(%error, "could not cache the catalog document");
     }
     state.set_catalog(Arc::new(next));
     Ok(Some(serial))

@@ -69,6 +69,14 @@ async fn the_cli_announces_the_bound_port_and_drains_on_sigterm() {
         String::from_utf8_lossy(&refusal.stderr)
             .contains(&format!("IronWire is already running on port {port}"))
     );
+    let refusal = tokio::process::Command::new(env!("CARGO_BIN_EXE_ironwire"))
+        .args(["serve", "--port", "0"])
+        .env("IRONWIRE_HOME", &runtime)
+        .output()
+        .await
+        .unwrap();
+    assert!(!refusal.status.success());
+    assert!(String::from_utf8_lossy(&refusal.stderr).contains("ironwire serve --port 0"));
     let result = tokio::process::Command::new("kill")
         .args(["-TERM", &child.id().unwrap().to_string()])
         .status()
@@ -96,4 +104,23 @@ async fn the_cli_announces_the_bound_port_and_drains_on_sigterm() {
             .await
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn a_home_owner_still_starting_is_not_reported_as_a_running_port() {
+    let home = tempfile::tempdir().unwrap();
+    let guard = std::fs::File::create(home.path().join("daemon.lock.guard")).unwrap();
+    guard.try_lock().unwrap();
+    // Port zero cannot be a live daemon; this record belongs to an older run.
+    std::fs::write(home.path().join("daemon.lock"), "0\n").unwrap();
+    let refusal = tokio::process::Command::new(env!("CARGO_BIN_EXE_ironwire"))
+        .args(["serve", "--port", "0"])
+        .env("IRONWIRE_HOME", home.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(!refusal.status.success());
+    let error = String::from_utf8_lossy(&refusal.stderr);
+    assert!(error.contains("not answering health checks yet"), "{error}");
+    assert!(!error.contains("already running on port"));
 }

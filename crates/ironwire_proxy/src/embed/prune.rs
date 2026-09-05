@@ -49,13 +49,13 @@ pub(crate) fn spawn(
                 match ledger.body_refs_before(Utc::now(), retain) {
                     Ok(refs) => {
                         for reference in refs {
-                            if let Err(_error) = bodies.remove(&reference) {
-                                tracing::warn!("could not remove a captured body");
+                            if let Err(error) = bodies.remove(&reference) {
+                                tracing::warn!(%error, "could not remove a captured body");
                             }
                         }
                     }
-                    Err(_error) => {
-                        tracing::warn!("could not list the bodies due for removal");
+                    Err(error) => {
+                        tracing::warn!(%error, "could not list the bodies due for removal");
                     }
                 }
             }
@@ -68,7 +68,7 @@ pub(crate) fn spawn(
                 ),
                 // Never fatal. A ledger problem must not stop the proxy from
                 // doing its actual job.
-                Err(_error) => tracing::warn!("could not prune the trace ledger"),
+                Err(error) => tracing::warn!(%error, "could not prune the trace ledger"),
             }
             tokio::time::sleep(INTERVAL).await;
         }

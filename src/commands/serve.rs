@@ -7,21 +7,23 @@ use ironwire_proxy::embed::{self, EmbedError};
 /// The common case by far is a second `ironwire serve`, and the second-most
 /// common is an unrelated process squatting the port. Those need different
 /// responses, and we can tell them apart by asking.
-async fn port_in_use(port: u16) -> anyhow::Error {
+async fn is_ironwire(port: u16) -> bool {
     let health = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .ok();
-    let is_ironwire = match health {
+    match health {
         Some(client) => client
             .get(format!("http://127.0.0.1:{port}/_ironwire/health"))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success()),
         None => false,
-    };
+    }
+}
 
-    if is_ironwire {
+async fn port_in_use(port: u16) -> anyhow::Error {
+    if is_ironwire(port).await {
         anyhow::anyhow!(
             "IronWire is already running on port {port}.\n\
              Use it (`ironwire status`), or stop it and start again."
@@ -67,20 +69,34 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let paths = super::paths()?;
     let mut published = None;
     let mut proxy = match embed::start_with(&paths.home, port_override, |port, report| {
-        published = announce(&paths, port, report);
+        published = announce(
+            &ironwire_core::config::PathsConfig::rooted_at(report.home.clone()),
+            port,
+            report,
+        );
     })
     .await
     {
         Ok(proxy) => proxy,
         Err(EmbedError::PortInUse { port }) => return Err(port_in_use(port).await),
         Err(EmbedError::Lock { port }) => {
-            if port_override.unwrap_or(ironwire_core::config::Config::load(&paths)?.server.port)
-                == port
-            {
+            if !is_ironwire(port).await {
+                anyhow::bail!(
+                    "another IronWire owns {} but is not answering health checks yet; wait for it to finish starting or stopping",
+                    paths.home.display()
+                );
+            }
+            let requested = port_override.or_else(|| {
+                ironwire_core::config::Config::load(&paths)
+                    .ok()
+                    .map(|config| config.server.port)
+            });
+            if requested == Some(port) {
                 return Err(port_in_use(port).await);
             }
+            let requested = requested.map_or_else(|| "<n>".to_owned(), |port| port.to_string());
             anyhow::bail!(
-                "another IronWire is already using {}.\n\nIt is listening on port {port}. Two daemons sharing one home overwrite\neach other's consent ledger, so this one will not start.\n\nUse it:            ironwire status --port {port}\nOr give this one its own home:\n\n    IRONWIRE_HOME=~/.ironwire-alt ironwire serve --port <n>",
+                "another IronWire is already using {}.\n\nIt is listening on port {port}. Two daemons sharing one home overwrite\neach other's consent ledger, so this one will not start.\n\nUse it:            ironwire status --port {port}\nOr give this one its own home:\n\n    IRONWIRE_HOME=~/.ironwire-alt ironwire serve --port {requested}",
                 paths.home.display()
             );
         }

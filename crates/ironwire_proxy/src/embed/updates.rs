@@ -20,8 +20,8 @@ pub async fn check_now(paths: &PathsConfig, install: InstallMethod) -> UpdateSta
         at: chrono::Utc::now(),
         status: status.clone(),
     };
-    if let Err(_error) = ironwire_update::save_cache(&paths.update_cache_file(), &checked) {
-        tracing::debug!("could not cache the update check");
+    if let Err(error) = ironwire_update::save_cache(&paths.update_cache_file(), &checked) {
+        tracing::debug!(%error, "could not cache the update check");
     }
     status
 }
@@ -75,7 +75,10 @@ pub(crate) fn spawn_check(
     Some(tokio::spawn(async move {
         let status = check_now(&paths, install).await;
         if status.is_actionable() {
-            tracing::info!("a newer IronWire is available (run `ironwire update`)");
+            tracing::info!(
+                ?status,
+                "a newer IronWire is available (run `ironwire update`)"
+            );
         }
         state.set_update_status(status);
     }))

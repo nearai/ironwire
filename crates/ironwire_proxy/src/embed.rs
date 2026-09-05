@@ -53,13 +53,18 @@ pub enum EmbedError {
     #[error("could not bind the loopback listener")]
     Bind,
     /// A configured backend could not be constructed.
-    #[error("could not build the backend registry")]
-    Registry,
+    #[error("could not build the backend registry: {label}")]
+    Registry {
+        /// Fixed backend construction label; excludes credentials and URLs.
+        label: &'static str,
+    },
 }
 
 /// Startup observations rendered by the CLI; an embedded host controls its UI.
 #[derive(Default)]
 pub struct StartupReport {
+    /// Canonical home used by this proxy and its discovery pointer.
+    pub home: std::path::PathBuf,
     /// No backend could be registered.
     pub no_backends: bool,
     /// Verified catalog serial, or zero for built-in values.
@@ -225,7 +230,11 @@ pub async fn start_with(
     let mut lock = Some(lock::acquire(&paths.lock_file(), port).await?);
     let token = files::control_token(&paths).map_err(|_| EmbedError::Paths)?;
     let consent = ConsentLedger::load(&paths.consent_file());
-    let registry = build_registry(&config).map_err(|_| EmbedError::Registry)?;
+    let registry = build_registry(&config).map_err(|error| EmbedError::Registry {
+        label: error
+            .downcast_ref::<RegistryLabel>()
+            .map_or("backend construction", |label| label.0),
+    })?;
     restore_quota(&registry, &paths);
     let listener = crate::server::bind(port).await.map_err(|e| match e {
         crate::server::ServeError::PortInUse { port } => EmbedError::PortInUse { port },
@@ -236,6 +245,7 @@ pub async fn start_with(
         lock.publish(port)?;
     }
     let mut report = StartupReport {
+        home: paths.home.clone(),
         no_backends: registry.is_empty(),
         ..StartupReport::default()
     };
@@ -375,8 +385,8 @@ impl QuotaWriter {
         }
         // A bookkeeping failure must never affect routing — same rule as the
         // ledger. Warn once per change, not once per tick.
-        if let Err(_error) = ironwire_core::quota_store::write(&self.path, &rendered) {
-            tracing::warn!("could not persist observed quota");
+        if let Err(error) = ironwire_core::quota_store::write(&self.path, &rendered) {
+            tracing::warn!(path = %self.path.display(), %error, "could not persist observed quota");
             return;
         }
         *last = Some(rendered);
@@ -456,8 +466,8 @@ fn seed_spend(state: &crate::state::AppState) {
 fn spawn_catalogue_discovery(state: crate::state::AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         for backend in state.backends.all() {
-            if let Err(_error) = backend.probe().await {
-                tracing::debug!("could not learn this backend's catalogue at startup");
+            if let Err(error) = backend.probe().await {
+                tracing::debug!(backend = %backend.id(), %error, "could not learn this backend's catalogue at startup");
             }
         }
     })
@@ -513,7 +523,7 @@ fn sweep_bodies(ledger: &Option<Ledger>, bodies: Option<&BodyStore>) {
     {
         Ok(0) => {}
         Ok(removed) => tracing::info!(removed, "swept captured bodies no exchange claims"),
-        Err(_error) => tracing::warn!("could not sweep the captured bodies"),
+        Err(error) => tracing::warn!(%error, "could not sweep the captured bodies"),
     }
 }
 
@@ -532,7 +542,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     // backend the user switched off come straight back.
     let mut push = |backend: Arc<dyn ironwire_upstream::backend::Backend>| {
         if is_disabled(config, backend.id().as_str()) {
-            tracing::info!("backend disabled in config.toml; not registered");
+            tracing::info!(backend = %backend.id(), "backend disabled in config.toml; not registered");
             return;
         }
         registry.push(backend);
@@ -544,7 +554,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
                 base_url_for(config, "claude-sub", "IRONWIRE_ANTHROPIC_BASE_URL"),
                 timeout,
             )
-            .context("building the Claude subscription backend")?,
+            .context(RegistryLabel("building the Claude subscription backend"))?,
         ));
     }
 
@@ -555,7 +565,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
                 base_url_for(config, "anthropic-key", "IRONWIRE_ANTHROPIC_BASE_URL"),
                 timeout,
             )
-            .context("building the Anthropic API backend")?,
+            .context(RegistryLabel("building the Anthropic API backend"))?,
         ));
     }
 
@@ -568,7 +578,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
                 base_url_for(config, "codex-sub", "IRONWIRE_CODEX_BASE_URL"),
                 timeout,
             )
-            .context("building the ChatGPT subscription backend")?,
+            .context(RegistryLabel("building the ChatGPT subscription backend"))?,
         ));
     }
 
@@ -583,7 +593,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
                 base_url_for(config, "openai-key", "IRONWIRE_OPENAI_BASE_URL"),
                 timeout,
             )
-            .context("building the OpenAI API backend")?,
+            .context(RegistryLabel("building the OpenAI API backend"))?,
         ));
     }
 
@@ -602,7 +612,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
             models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
             timeout,
         )
-        .context("building the NEAR AI backend")?,
+        .context(RegistryLabel("building the NEAR AI backend"))?,
     ));
 
     // Anything the user declared that discovery does not produce. Appended
@@ -633,6 +643,10 @@ const DISCOVERED_IDS: &[&str] = &[
     "nearai",
 ];
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RegistryLabel(&'static str);
+
 /// Build a backend that discovery would not have produced.
 ///
 /// `Ok(None)` when the credential is simply absent — the same rule discovery
@@ -656,23 +670,25 @@ fn backend_from_config(
             Some(BackendImpl::ClaudeSubscription) => ClaudeCodeCredentials::discover()
                 .is_ok()
                 .then(|| {
-                    AnthropicBackend::subscription(entry.base_url.clone(), timeout)
-                        .context("building a configured Claude subscription backend")
+                    AnthropicBackend::subscription(entry.base_url.clone(), timeout).context(
+                        RegistryLabel("building a configured Claude subscription backend"),
+                    )
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
             Some(BackendImpl::AnthropicApi) => key("ANTHROPIC_API_KEY")
                 .map(|key| {
                     AnthropicBackend::api_key(key, entry.base_url.clone(), timeout)
-                        .context("building a configured Anthropic API backend")
+                        .context(RegistryLabel("building a configured Anthropic API backend"))
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
             Some(BackendImpl::CodexSubscription) => CodexCredentials::discover()
                 .is_ok_and(|c| c.mode == CodexMode::ChatGpt)
                 .then(|| {
-                    ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout)
-                        .context("building a configured ChatGPT subscription backend")
+                    ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout).context(
+                        RegistryLabel("building a configured ChatGPT subscription backend"),
+                    )
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
@@ -680,7 +696,7 @@ fn backend_from_config(
                 .or_else(codex_stored_key)
                 .map(|key| {
                     ResponsesBackend::openai_api_key(key, entry.base_url.clone(), timeout)
-                        .context("building a configured OpenAI API backend")
+                        .context(RegistryLabel("building a configured OpenAI API backend"))
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
@@ -696,7 +712,7 @@ fn backend_from_config(
                             .unwrap_or_default(),
                         timeout,
                     )
-                    .context("building a configured NEAR AI backend")
+                    .context(RegistryLabel("building a configured NEAR AI backend"))
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
@@ -724,7 +740,7 @@ fn backend_from_config(
                             .unwrap_or_default(),
                         timeout,
                     )
-                    .context("building a configured local backend")?,
+                    .context(RegistryLabel("building a configured local backend"))?,
                 )
                     as Arc<dyn ironwire_upstream::backend::Backend>)
             }
@@ -747,7 +763,9 @@ fn backend_from_config(
                             .unwrap_or_default(),
                         timeout,
                     )
-                    .context("building a configured OpenAI-compatible backend")?,
+                    .context(RegistryLabel(
+                        "building a configured OpenAI-compatible backend",
+                    ))?,
                 )
                     as Arc<dyn ironwire_upstream::backend::Backend>)
             }

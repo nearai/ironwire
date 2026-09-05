@@ -93,3 +93,10 @@ the merged revision. Its host should use `wait`/`is_finished` for unexpected
 completion, keep the runtime alive through draining, respect another instance's
 ownership, and explicitly choose a panic policy. The GUI offer remains Task 3,
 a separate plan after daemon integration.
+
+Startup diagnostics preserve IronWire's local housekeeping error context. The
+host-facing registry refusal carries only a fixed backend construction label,
+not the underlying error chain. `StartupReport::home` is the canonical home used
+for discovery, including when the caller supplied a symlink. A CLI lock refusal
+confirms health before claiming that the recorded port is already running;
+an owner still starting or stopping is reported separately.

@@ -313,3 +313,18 @@ async fn startup_announcement_finishes_before_health_can_report_readiness() {
     );
     proxy.shutdown().await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_reports_the_canonical_home_for_discovery() {
+    let home = home();
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("home");
+    std::os::unix::fs::symlink(home.path(), &alias).unwrap();
+    let proxy = ironwire_proxy::embed::start_with(&alias, Some(0), |_, report| {
+        assert_eq!(report.home, std::fs::canonicalize(home.path()).unwrap());
+    })
+    .await
+    .unwrap();
+    proxy.shutdown().await;
+}
