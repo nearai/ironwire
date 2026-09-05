@@ -20,6 +20,19 @@ async fn the_cli_announces_the_bound_port_and_drains_on_sigterm() {
         ));
     }
     std::fs::write(runtime.join("config.toml"), config).unwrap();
+    let paths = ironwire_core::config::PathsConfig::rooted_at(runtime.clone());
+    ironwire_update::save_cache(
+        &paths.update_cache_file(),
+        &ironwire_update::CheckedAt {
+            at: chrono::Utc::now(),
+            status: ironwire_update::UpdateStatus::Available {
+                latest: "99.0.0".to_owned(),
+                summary: None,
+                upgrade_command: Some("brew upgrade ironwire".to_owned()),
+            },
+        },
+    )
+    .unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_ironwire"))
         .args(["serve", "--port", "0"])
         .env_clear()
@@ -58,6 +71,19 @@ async fn the_cli_announces_the_bound_port_and_drains_on_sigterm() {
             .status()
             .is_success()
     );
+    let token = std::fs::read_to_string(paths.control_token_file()).unwrap();
+    let status: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/_ironwire/status"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["update"]["upgrade_command"], "brew upgrade ironwire");
     let refusal = tokio::process::Command::new(env!("CARGO_BIN_EXE_ironwire"))
         .args(["serve", "--port", &port.to_string()])
         .env("IRONWIRE_HOME", &runtime)

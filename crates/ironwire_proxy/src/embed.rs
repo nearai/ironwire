@@ -28,6 +28,18 @@ mod prune;
 #[doc(hidden)]
 pub mod updates;
 
+/// Who owns upgrading the running proxy implementation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UpdatePolicy {
+    /// The embedding application ships and upgrades the library. Do not read
+    /// standalone update notifications or check standalone IronWire releases.
+    #[default]
+    HostManaged,
+    /// The process is the standalone IronWire CLI; retain its release checks
+    /// and installer-specific notifications, subject to `updates.check`.
+    Standalone,
+}
+
 /// Fixed-label startup failures, suitable for a host's refusal state.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
@@ -218,6 +230,23 @@ pub async fn start_with(
     port_override: Option<u16>,
     on_start: impl FnOnce(u16, &StartupReport),
 ) -> Result<EmbeddedProxy, EmbedError> {
+    start_with_policy(home, port_override, UpdatePolicy::HostManaged, on_start).await
+}
+
+/// Start with an explicit owner for binary updates and a startup announcement.
+/// Only standalone CLI hosts should select [`UpdatePolicy::Standalone`].
+/// Provider catalog refresh and model discovery are independent of this policy;
+/// the existing `updates.check` configuration still controls catalog refresh.
+/// The announcement has the same ordering and restrictions as [`start_with`].
+///
+/// # Errors
+/// The same fixed-label startup refusals as [`start`].
+pub async fn start_with_policy(
+    home: &std::path::Path,
+    port_override: Option<u16>,
+    update_policy: UpdatePolicy,
+    on_start: impl FnOnce(u16, &StartupReport),
+) -> Result<EmbeddedProxy, EmbedError> {
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
@@ -281,7 +310,11 @@ pub async fn start_with(
     ) {
         background.0.push(task);
     }
-    if let Some(task) = updates::spawn_check(state.clone(), &paths, checks) {
+    // Standalone cache entries can contain installer commands for a different
+    // executable. Skip hydration as well as fetching when the host owns updates.
+    if update_policy == UpdatePolicy::Standalone
+        && let Some(task) = updates::spawn_check(state.clone(), &paths, checks)
+    {
         background.0.push(task);
     }
     if let Some(task) = catalog::spawn_refresh(state.clone(), &paths, checks) {
