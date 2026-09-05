@@ -28,15 +28,17 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const FIRST_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Start the background prune, unless retention is disabled.
-pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc<BodyStore>>) {
+pub(crate) fn spawn(
+    ledger: Option<Ledger>,
+    retain_days: u32,
+    bodies: Option<Arc<BodyStore>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     // `0` means "keep everything", which is a legitimate choice for someone
     // doing long-horizon analysis. It has to be chosen, not defaulted into.
-    let Some(ledger) = ledger.filter(|_| retain_days > 0) else {
-        return;
-    };
+    let ledger = ledger.filter(|_| retain_days > 0)?;
     let retain = chrono::Duration::days(i64::from(retain_days));
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         tokio::time::sleep(FIRST_DELAY).await;
         loop {
             // Files first, and named from the rows that are about to go: once
@@ -47,13 +49,13 @@ pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc
                 match ledger.body_refs_before(Utc::now(), retain) {
                     Ok(refs) => {
                         for reference in refs {
-                            if let Err(error) = bodies.remove(&reference) {
-                                tracing::warn!(%error, "could not remove a captured body");
+                            if let Err(_error) = bodies.remove(&reference) {
+                                tracing::warn!("could not remove a captured body");
                             }
                         }
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "could not list the bodies due for removal");
+                    Err(_error) => {
+                        tracing::warn!("could not list the bodies due for removal");
                     }
                 }
             }
@@ -66,11 +68,11 @@ pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc
                 ),
                 // Never fatal. A ledger problem must not stop the proxy from
                 // doing its actual job.
-                Err(error) => tracing::warn!(%error, "could not prune the trace ledger"),
+                Err(_error) => tracing::warn!("could not prune the trace ledger"),
             }
             tokio::time::sleep(INTERVAL).await;
         }
-    });
+    }))
 }
 
 #[cfg(test)]

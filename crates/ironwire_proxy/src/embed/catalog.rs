@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::state::AppState;
 use ironwire_catalog::{CatalogStore, SignedCatalog};
 use ironwire_core::config::PathsConfig;
-use ironwire_proxy::state::AppState;
 
 /// Where the signed document lives. Pinned for the same reason the release
 /// manifest is.
@@ -41,12 +41,16 @@ const FIRST_CHECK_DELAY: Duration = Duration::from_secs(60);
 /// Governed by the same `updates.check` switch as the release check: both are
 /// requests IronWire makes that are not the user's own work, and someone who
 /// turned one off meant both.
-pub(crate) fn spawn_refresh(state: AppState, paths: &PathsConfig, enabled: bool) {
+pub(crate) fn spawn_refresh(
+    state: AppState,
+    paths: &PathsConfig,
+    enabled: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !enabled {
-        return;
+        return None;
     }
     let path = paths.catalog_file();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         tokio::time::sleep(FIRST_CHECK_DELAY).await;
         loop {
             match fetch_and_apply(&state, &path).await {
@@ -56,11 +60,11 @@ pub(crate) fn spawn_refresh(state: AppState, paths: &PathsConfig, enabled: bool)
                 Ok(None) => tracing::debug!("provider catalog unchanged"),
                 // Never fatal: the compiled-in defaults, or the document
                 // already loaded, stay in force.
-                Err(error) => tracing::debug!(%error, "provider-catalog refresh skipped"),
+                Err(_error) => tracing::debug!("provider-catalog refresh skipped"),
             }
             tokio::time::sleep(REFRESH_INTERVAL).await;
         }
-    });
+    }))
 }
 
 /// Fetch, verify, and install — returning the new serial when one was applied.
@@ -93,8 +97,8 @@ async fn fetch_and_apply(
 
     // Persist only after it verified, so a bad document cannot poison the
     // cache that the next startup reads.
-    if let Err(error) = CatalogStore::persist(&signed, path) {
-        tracing::warn!(%error, "could not cache the catalog document");
+    if let Err(_error) = CatalogStore::persist(&signed, path) {
+        tracing::warn!("could not cache the catalog document");
     }
     state.set_catalog(Arc::new(next));
     Ok(Some(serial))
