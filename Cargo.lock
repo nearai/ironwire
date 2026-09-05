@@ -1439,6 +1439,7 @@ dependencies = [
 name = "ironwire_proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "axum",
  "base64 0.22.1",
@@ -1446,6 +1447,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "http",
  "http-body-util",
@@ -1459,6 +1461,7 @@ dependencies = [
  "ironwire_update",
  "ironwire_upstream",
  "ironwire_usage",
+ "reqwest 0.12.28",
  "secrecy",
  "serde",
  "serde_json",

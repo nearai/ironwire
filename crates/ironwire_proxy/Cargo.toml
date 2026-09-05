@@ -11,6 +11,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+# Already in the proxy tree through rustls/ring; used for platform OS randomness.
+getrandom = "0.2"
+reqwest.workspace = true
 ironwire_core.workspace = true
 ironwire_privacy.workspace = true
 ironwire_creds.workspace = true

@@ -28,15 +28,17 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const FIRST_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// Start the background prune, unless retention is disabled.
-pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc<BodyStore>>) {
+pub(crate) fn spawn(
+    ledger: Option<Ledger>,
+    retain_days: u32,
+    bodies: Option<Arc<BodyStore>>,
+) -> Option<tokio::task::JoinHandle<()>> {
     // `0` means "keep everything", which is a legitimate choice for someone
     // doing long-horizon analysis. It has to be chosen, not defaulted into.
-    let Some(ledger) = ledger.filter(|_| retain_days > 0) else {
-        return;
-    };
+    let ledger = ledger.filter(|_| retain_days > 0)?;
     let retain = chrono::Duration::days(i64::from(retain_days));
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         tokio::time::sleep(FIRST_DELAY).await;
         loop {
             // Files first, and named from the rows that are about to go: once
@@ -70,7 +72,7 @@ pub(crate) fn spawn(ledger: Option<Ledger>, retain_days: u32, bodies: Option<Arc
             }
             tokio::time::sleep(INTERVAL).await;
         }
-    });
+    }))
 }
 
 #[cfg(test)]

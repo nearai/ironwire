@@ -17,3 +17,5 @@ pub mod state;
 
 pub use server::{ServeError, serve};
 pub use state::{AppState, BackendRegistry};
+
+pub mod embed;
