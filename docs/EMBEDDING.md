@@ -23,6 +23,10 @@ The application owns the choice to start and stop; no signal handler, tracing
 subscriber, or process exit handler is installed by the library. The CLI keeps
 its terminal output, actionable port diagnostics, and Ctrl-C/SIGTERM handling.
 `startup_report()` gives hosts the startup observations the CLI renders.
+`start_with` optionally calls a synchronous announcement hook after successful
+binding and assembly, before health can answer or background tasks start. The
+CLI uses it to finish its startup instructions before reporting readiness.
+The hook must return promptly and cannot wait for the proxy to serve a request.
 
 `wait(&mut self)` observes final completion without giving away shutdown
 ownership. It is cancellation-safe and can be read again after completion. It
@@ -76,7 +80,7 @@ plan](https://github.com/TraceCommons/trace-commons/pull/609).
 - [x] Prove the home-lock test fails when acquisition is removed, then restore it.
 - [x] Prepare the verified upstream PR for review.
 
-Warnings-denied `cargo test --all-features --locked --offline` passes with 947 tests and two existing ignored tests. All-target/all-feature Clippy, formatting, and diff checks pass.
+Warnings-denied `cargo test --all-features --locked --offline` passes with 948 tests and two existing ignored tests. All-target/all-feature Clippy, formatting, and diff checks pass.
 
 The mutation produced `FAILED. 0 passed; 1 failed` at the assertion that the
 second start returns `EmbedError::Lock`. Restoring acquisition produced

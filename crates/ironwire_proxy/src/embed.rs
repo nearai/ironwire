@@ -198,6 +198,21 @@ pub async fn start(
     home: &std::path::Path,
     port_override: Option<u16>,
 ) -> Result<EmbeddedProxy, EmbedError> {
+    start_with(home, port_override, |_, _| {}).await
+}
+
+/// Start with a synchronous announcement after binding and assembly, but before
+/// accepting requests or starting background tasks. The CLI uses this to finish
+/// its startup instructions before health can report readiness. The callback
+/// must return promptly; it must not wait for this proxy to answer a request.
+///
+/// # Errors
+/// The same fixed-label startup refusals as [`start`].
+pub async fn start_with(
+    home: &std::path::Path,
+    port_override: Option<u16>,
+    on_start: impl FnOnce(u16, &StartupReport),
+) -> Result<EmbeddedProxy, EmbedError> {
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
@@ -229,10 +244,6 @@ pub async fn start(
     report.catalog_serial = catalog.serial();
     let bodies = open_bodies(&paths, &config, &mut report);
     sweep_bodies(&ledger, bodies.as_deref());
-    let mut background = Tasks(Vec::new());
-    if let Some(task) = prune::spawn(ledger.clone(), config.capture.retain_days, bodies.clone()) {
-        background.0.push(task);
-    }
     let checks = config.updates.check;
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
@@ -241,15 +252,6 @@ pub async fn start(
         .with_bodies(bodies)
         .with_catalog(catalog);
     seed_spend(&state);
-    if let Some(task) = updates::spawn_check(state.clone(), &paths, checks) {
-        background.0.push(task);
-    }
-    if let Some(task) = catalog::spawn_refresh(state.clone(), &paths, checks) {
-        background.0.push(task);
-    }
-    background.0.push(spawn_catalogue_discovery(state.clone()));
-    let quota = QuotaWriter::new(paths.quota_file());
-    background.0.push(quota.spawn(state.clone()));
     let endpoint = ironwire_core::discovery::Endpoint::new(port, paths.control_token_file());
     let pointer = OwnedPointer {
         path: paths.home.join("endpoint.json"),
@@ -260,6 +262,24 @@ pub async fn start(
         .is_some_and(|body| ironwire_core::atomic::write(&pointer.path, &body).is_ok());
     report.pointer_warning = !published;
     let pointer = published.then_some(pointer);
+    on_start(port, &report);
+    let mut background = Tasks(Vec::new());
+    if let Some(task) = prune::spawn(
+        state.ledger.clone(),
+        state.config.capture.retain_days,
+        state.bodies.clone(),
+    ) {
+        background.0.push(task);
+    }
+    if let Some(task) = updates::spawn_check(state.clone(), &paths, checks) {
+        background.0.push(task);
+    }
+    if let Some(task) = catalog::spawn_refresh(state.clone(), &paths, checks) {
+        background.0.push(task);
+    }
+    background.0.push(spawn_catalogue_discovery(state.clone()));
+    let quota = QuotaWriter::new(paths.quota_file());
+    background.0.push(quota.spawn(state.clone()));
     let (tx, rx) = tokio::sync::oneshot::channel();
     let server_state = state.clone();
     let server = tokio::spawn(crate::server::serve_on(

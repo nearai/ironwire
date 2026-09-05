@@ -273,3 +273,43 @@ async fn stale_legacy_lock_files_do_not_block_a_restart() {
     let proxy = start(home.path(), Some(0)).await.unwrap();
     proxy.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_announcement_finishes_before_health_can_report_readiness() {
+    use std::io::{Read, Write};
+    let home = home();
+    let mut announced = false;
+    let proxy = ironwire_proxy::embed::start_with(home.path(), Some(0), |port, _| {
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        client
+            .write_all(
+                b"GET /_ironwire/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let error = client
+            .read(&mut [0u8; 1])
+            .expect_err("health must not answer before announcement completes");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        announced = true;
+    })
+    .await
+    .unwrap();
+    assert!(announced);
+    assert!(
+        reqwest::get(format!(
+            "http://127.0.0.1:{}/_ironwire/health",
+            proxy.port()
+        ))
+        .await
+        .unwrap()
+        .status()
+        .is_success()
+    );
+    proxy.shutdown().await;
+}

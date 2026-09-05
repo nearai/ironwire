@@ -65,7 +65,12 @@ async fn shutdown_signal() {
 /// Start the proxy using the shared assembly, retaining CLI presentation.
 pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let paths = super::paths()?;
-    let mut proxy = match embed::start(&paths.home, port_override).await {
+    let mut published = None;
+    let mut proxy = match embed::start_with(&paths.home, port_override, |port, report| {
+        published = announce(&paths, port, report);
+    })
+    .await
+    {
         Ok(proxy) => proxy,
         Err(EmbedError::PortInUse { port }) => return Err(port_in_use(port).await),
         Err(EmbedError::Lock { port }) => {
@@ -94,8 +99,23 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    let port = proxy.port();
-    let report = proxy.startup_report();
+    let result = tokio::select! {
+        () = shutdown_signal() => { proxy.shutdown().await; Ok(()) },
+        result = proxy.wait() => result.map_err(anyhow::Error::from),
+    };
+    if let Some((path, endpoint)) = published
+        && ironwire_core::discovery::Endpoint::read_from(&path).as_ref() == Some(&endpoint)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn announce(
+    paths: &ironwire_core::config::PathsConfig,
+    port: u16,
+    report: &embed::StartupReport,
+) -> Option<(std::path::PathBuf, ironwire_core::discovery::Endpoint)> {
     if report.no_backends {
         eprintln!(
             "No backends are available.\nRun `ironwire connect claude --subscription` or set ANTHROPIC_API_KEY."
@@ -131,14 +151,5 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     println!("  Point your agents at it:  ironwire init");
     println!("  Confirm they are:         ironwire doctor");
     println!();
-    let result = tokio::select! {
-        () = shutdown_signal() => { proxy.shutdown().await; Ok(()) },
-        result = proxy.wait() => result.map_err(anyhow::Error::from),
-    };
-    if let Some(path) = published
-        && ironwire_core::discovery::Endpoint::read_from(&path).as_ref() == Some(&endpoint)
-    {
-        let _ = std::fs::remove_file(path);
-    }
-    result
+    published.map(|path| (path, endpoint))
 }
