@@ -359,3 +359,16 @@ the worst available outcome and exactly the kind of thing that arrives through a
 dependency. The substitution map is derived per request and never written to
 disk (`PRIVACY.md` §4): a persistent map would be a purpose-built plaintext PII
 database created in the course of trying not to expose PII.
+
+
+## 9. Explicit admission binding
+
+The local control bearer may register an account-bound challenge for one exact
+session/backend for at most 15 minutes. This is separate consent to a metadata
+mutation, not consent to capture bodies, export them, obtain credit, or fund
+inference. Registrations live only in bounded memory. Other sessions are
+unchanged, and no subscription backend receives added client identity.
+Conflicting metadata, expiry, wrong protocol, or routing to a different backend
+refuses the selected session. Revocation stops future insertions; it cannot
+recall requests already forwarded. `tests/passthrough.rs` and the admission
+binding unit/control tests pin these properties and byte/capture identity.

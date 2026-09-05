@@ -4,7 +4,7 @@
 //!
 //! 1. **Mutate only what §2 enumerates.** URL, auth headers, hop-by-hop
 //!    headers, and — only when policy chose a different model — the `model`
-//!    key. Nothing else is touched, which is why provider features we have
+//!    key, plus the separately consented admission metadata insertion. Nothing else is touched, which is why provider features we have
 //!    never heard of keep working.
 //! 2. **Failover ends at the first byte.** Once a byte of the response has
 //!    reached the client, replaying the request would duplicate content the
@@ -88,6 +88,9 @@ impl ConfidenceSink {
 /// Failure of the whole pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
+    /// Explicit metadata consent cannot be honored on this request.
+    #[error("{0}; renew or revoke this session's admission binding in onboarding")]
+    Admission(ironwire_core::admission::AdmissionError),
     /// The router found nowhere to send this.
     #[error("no route: {0}")]
     NoRoute(NoRoute),
@@ -261,6 +264,23 @@ pub async fn dispatch(
     result
 }
 
+/// The neutral header stays inside the pipeline and is stripped before sending.
+fn admission_session(headers: &[(String, String)], protocol: Protocol) -> Option<String> {
+    let neutral = ironwire_upstream::headers::NEUTRAL_SESSION_HEADER;
+    let native = ironwire_upstream::headers::client_session_header(protocol);
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(neutral))
+        .or_else(|| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(native))
+        })
+        .map(|(_, value)| value)
+        .filter(|value| ironwire_core::admission::valid_session(value))
+        .cloned()
+}
+
 async fn dispatch_inner(
     state: &AppState,
     inbound: Protocol,
@@ -270,7 +290,11 @@ async fn dispatch_inner(
     body: Bytes,
     headers: Vec<(String, String)>,
 ) -> Result<(UpstreamResponse, Routed), PipelineError> {
+    let session = admission_session(&headers, inbound);
     let mut headers = headers;
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case(ironwire_upstream::headers::NEUTRAL_SESSION_HEADER)
+    });
     let route_override = take_route_override(&mut headers).map(|(backend, model)| {
         (
             ironwire_core::protocol::BackendId::from(backend.as_str()),
@@ -386,7 +410,7 @@ async fn dispatch_inner(
         // The router already established that it does not speak `inbound`, or
         // `translated` would be false.
         let target = backend.capabilities().wires.primary();
-        let request = if decision.translated {
+        let mut request = if decision.translated {
             match translate_request(
                 &body,
                 path,
@@ -415,6 +439,28 @@ async fn dispatch_inner(
                 stream: peek.stream,
             }
         };
+
+        // A binding is deliberately separate from routing and capture consent.
+        // Wrong-route refusals cannot fail over to an unbound send.
+        let binding = state
+            .admission_bindings
+            .lock()
+            .map_err(|_| {
+                PipelineError::Admission(ironwire_core::admission::AdmissionError::Invalid)
+            })?
+            .for_request(
+                session.as_deref(),
+                decision.backend.as_str(),
+                if decision.translated { target } else { inbound },
+                Utc::now().timestamp(),
+            )
+            .map_err(PipelineError::Admission)?
+            .map(str::to_owned);
+        if let Some(binding) = binding {
+            request.body = ironwire_core::admission::insert_binding(&request.body, &binding)
+                .map(Bytes::from)
+                .map_err(PipelineError::Admission)?;
+        }
 
         // Cloned before the request moves into the backend, because these are
         // the bytes the upstream will hash: `send` puts `request.body` on the

@@ -51,6 +51,10 @@ const UPSTREAM_SSE: &str = concat!(
 /// exactly what this test wrote — a framework could re-frame them, which would
 /// make a byte-identity assertion meaningless.
 async fn spawn_mock() -> (String, Arc<Mutex<Option<Received>>>) {
+    spawn_mock_response(UPSTREAM_SSE).await
+}
+
+async fn spawn_mock_response(sse: &'static str) -> (String, Arc<Mutex<Option<Received>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -99,10 +103,10 @@ async fn spawn_mock() -> (String, Arc<Mutex<Option<Received>>>) {
              anthropic-ratelimit-unified-limit: 1000\r\n\
              anthropic-ratelimit-unified-remaining: 180\r\n\
              content-length: {}\r\n\r\n",
-            UPSTREAM_SSE.len()
+            sse.len()
         );
         let _ = socket.write_all(head.as_bytes()).await;
-        let _ = socket.write_all(UPSTREAM_SSE.as_bytes()).await;
+        let _ = socket.write_all(sse.as_bytes()).await;
         let _ = socket.flush().await;
     });
 
@@ -314,4 +318,280 @@ async fn usage_is_observed_from_the_stream_without_altering_it() {
         }
         other => panic!("expected an observed headroom, got {other:?}"),
     }
+}
+
+const ADMISSION_SSE: &str = concat!(
+    "data: {\"id\":\"chatcmpl-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthetic\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"chatcmpl-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+    "data: [DONE]\n\n"
+);
+
+fn admission_state(base: &str) -> AppState {
+    use ironwire_core::protocol::{BackendId, BackendKind};
+    use ironwire_upstream::openai_chat::ChatCompletionsBackend;
+    let mut registry = BackendRegistry::new();
+    registry.push(Arc::new(
+        ChatCompletionsBackend::new(
+            BackendId::from("nearai"),
+            "local fixture",
+            BackendKind::Credits,
+            Some(SecretString::from("test-only")),
+            base.to_owned(),
+            Vec::new(),
+            5,
+        )
+        .unwrap(),
+    ));
+    AppState::new(
+        registry,
+        Config::default(),
+        ConsentLedger::default(),
+        "test-token".into(),
+    )
+}
+
+fn admission_value() -> String {
+    format!(
+        "tcad1:{}:{}:{}",
+        "a".repeat(64),
+        "b".repeat(64),
+        chrono::Utc::now().timestamp() + 300
+    )
+}
+
+async fn set_admission(
+    state: &AppState,
+    token: &str,
+    confirmed: bool,
+    binding: &str,
+) -> StatusCode {
+    let body = serde_json::json!({"session_id":"selected-session", "backend":"nearai", "binding":binding, "confirmed":confirmed});
+    let request = Request::builder()
+        .method("POST")
+        .uri("/_ironwire/admission-binding")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    app(state.clone()).oneshot(request).await.unwrap().status()
+}
+
+const ADMISSION_REQUEST: &str = r#" {"model" : "fixture", "stream":true, "messages": [{"role":"user", "content":"synthetic task"}], "unknown":1.500} "#;
+
+#[tokio::test]
+async fn explicit_admission_is_the_only_added_metadata_and_capture_remains_off() {
+    let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+    let state = admission_state(&base);
+    let binding = admission_value();
+    assert_eq!(
+        set_admission(&state, "wrong", true, &binding).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        set_admission(&state, "test-token", false, &binding).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        set_admission(&state, "test-token", true, &binding).await,
+        StatusCode::OK
+    );
+    let capability = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/_ironwire/admission-binding")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(capability.status(), StatusCode::OK);
+    let capability = axum::body::to_bytes(capability.into_body(), 4096)
+        .await
+        .unwrap();
+    let capability = String::from_utf8(capability.to_vec()).unwrap();
+    assert!(capability.contains("max_lifetime_seconds"));
+    assert!(!capability.contains(&binding));
+    assert!(!capability.contains("selected-session"));
+    assert!(state.bodies.is_none());
+    assert!(!state.config.capture.bodies);
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-ironwire-session-id", "selected-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(returned, ADMISSION_SSE);
+    let recorded = received.lock().unwrap().clone().unwrap();
+    let expected =
+        ironwire_core::admission::insert_binding(ADMISSION_REQUEST.as_bytes(), &binding).unwrap();
+    assert_eq!(recorded.body.as_bytes(), expected);
+    let addition = format!(r#","metadata":{{"trace_commons_admission":"{binding}"}}"#);
+    assert_eq!(recorded.body.replace(&addition, ""), ADMISSION_REQUEST);
+    assert!(
+        !recorded
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-ironwire-session-id"))
+    );
+}
+
+#[tokio::test]
+async fn other_sessions_and_revoked_bindings_preserve_the_native_bytes() {
+    for revoke in [false, true] {
+        let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+        let state = admission_state(&base);
+        assert_eq!(
+            set_admission(&state, "test-token", true, &admission_value()).await,
+            StatusCode::OK
+        );
+        if revoke {
+            let response = app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/_ironwire/admission-binding")
+                        .header("authorization", "Bearer test-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"session_id":"selected-session"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let session = if revoke {
+            "selected-session"
+        } else {
+            "other-session"
+        };
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/openai/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("session-id", session)
+                    .body(Body::from(ADMISSION_REQUEST))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            received.lock().unwrap().as_ref().unwrap().body,
+            ADMISSION_REQUEST
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_bound_session_cannot_silently_route_elsewhere_or_overwrite_client_metadata() {
+    for wrong_backend in [false, true] {
+        let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+        let state = admission_state(&base);
+        let binding = admission_value();
+        state
+            .admission_bindings
+            .lock()
+            .unwrap()
+            .register(
+                "selected-session",
+                if wrong_backend {
+                    "different-backend"
+                } else {
+                    "nearai"
+                },
+                &binding,
+                true,
+                chrono::Utc::now().timestamp(),
+            )
+            .unwrap();
+        let body = if wrong_backend {
+            ADMISSION_REQUEST
+        } else {
+            r#"{"model":"fixture","messages":[{"role":"user","content":"synthetic"}],"metadata":{"trace_commons_admission":"already-set"}}"#
+        };
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/openai/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("x-ironwire-session-id", "selected-session")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(received.lock().unwrap().is_none());
+        let error = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error = String::from_utf8(error.to_vec()).unwrap();
+        assert!(!error.contains(&binding));
+        assert!(!error.contains("selected-session"));
+    }
+}
+
+#[tokio::test]
+async fn separately_enabled_capture_hashes_exactly_the_bound_bytes_sent_upstream() {
+    let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+    let dir = tempfile::tempdir().unwrap();
+    let bodies =
+        Arc::new(ironwire_ledger::bodies::BodyStore::open(&dir.path().join("bodies")).unwrap());
+    let ledger = ironwire_ledger::Ledger::in_memory().unwrap();
+    let mut state = admission_state(&base)
+        .with_ledger(Some(ledger.clone()))
+        .with_bodies(Some(bodies.clone()));
+    Arc::make_mut(&mut state.config).capture.bodies = true;
+    let binding = admission_value();
+    assert_eq!(
+        set_admission(&state, "test-token", true, &binding).await,
+        StatusCode::OK
+    );
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("session-id", "selected-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rows = ledger.recent(1).unwrap();
+    assert_eq!(rows.len(), 1);
+    let sent = received.lock().unwrap().clone().unwrap().body;
+    let (captured, response) = bodies.read(rows[0].body_ref.as_deref().unwrap()).unwrap();
+    assert_eq!(captured, sent.as_bytes());
+    assert_eq!(
+        captured,
+        ironwire_core::admission::insert_binding(ADMISSION_REQUEST.as_bytes(), &binding).unwrap()
+    );
+    assert_eq!(response, ADMISSION_SSE.as_bytes());
+    assert_eq!(
+        rows[0].request_sha256.as_deref(),
+        Some(ironwire_ledger::bodies::sha256_hex(&captured).as_str())
+    );
 }

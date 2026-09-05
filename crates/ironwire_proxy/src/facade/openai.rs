@@ -175,7 +175,12 @@ async fn forward(
 
     let forwarded: Vec<(String, String)> = headers
         .iter()
-        .filter(|(name, _)| forward_request_header(name.as_str()))
+        .filter(|(name, _)| {
+            forward_request_header(name.as_str())
+                || name
+                    .as_str()
+                    .eq_ignore_ascii_case(ironwire_upstream::headers::NEUTRAL_SESSION_HEADER)
+        })
         .filter_map(|(name, value)| {
             value
                 .to_str()

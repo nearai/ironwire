@@ -104,6 +104,7 @@ impl FacadeError {
     pub fn from_pipeline(error: &PipelineError) -> Self {
         match error {
             PipelineError::NoRoute(no_route) => Self::from_no_route(no_route),
+            PipelineError::Admission(_) => Self::invalid_request(error.to_string()),
             PipelineError::Upstream(upstream) | PipelineError::AllFailed { last: upstream, .. } => {
                 Self::from_upstream(upstream)
             }
