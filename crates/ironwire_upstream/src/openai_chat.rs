@@ -38,6 +38,7 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
         prompt_cache: false,
         structured_output: false,
         context_tokens,
+        unsupported_responses_tools: Vec::new(),
     }
 }
 
@@ -52,6 +53,12 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
 pub fn nearai_capabilities() -> Capabilities {
     Capabilities {
         wires: Wires::new(Protocol::OpenAiChat, &[Protocol::OpenAiResponses]),
+        // Verified against the live endpoint: a `namespace` entry returns
+        // `unknown variant `namespace`, expected one of `function`,
+        // `web_search`, `web_context_search`, `file_search`,
+        // `code_interpreter`, `computer`, `mcp``. Every other type Codex
+        // sends is on that list, so only this one is stripped.
+        unsupported_responses_tools: vec!["namespace".to_string()],
         ..chat_capabilities(128_000)
     }
 }

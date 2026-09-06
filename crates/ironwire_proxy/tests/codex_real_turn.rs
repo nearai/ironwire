@@ -38,6 +38,13 @@ use tower::ServiceExt;
 
 const FIXTURE: &str = include_str!("fixtures/codex_responses_request.json");
 
+/// NEAR AI's real answer to this fixture, quoted from a live run. The whole
+/// turn is refused over one tool entry.
+const REAL_NEARAI_REFUSAL: &str = "Failed to deserialize the JSON body into the target type: \
+     tools[8].type: unknown variant `namespace`, expected one of `function`, `web_search`, \
+     `web_context_search`, `file_search`, `code_interpreter`, `computer`, `mcp` \
+     at line 1 column 72749";
+
 /// A provider refusal in the shape an OpenAI-compatible server sends one.
 const REFUSAL: &str = r#"{"error":{"message":"tools[22]: 'name' is a required property","type":"invalid_request_error","param":"tools"}}"#;
 
@@ -221,4 +228,170 @@ async fn a_refused_turn_tells_the_client_and_the_ledger_why() {
         recorded.contains("'name' is a required property"),
         "the ledger's error column is still empty of the reason: {recorded:?}"
     );
+}
+
+/// A Responses-API stream, in the framing an OpenAI-compatible endpoint sends.
+const UPSTREAM_SSE: &str = concat!(
+    "event: response.created\n",
+    r#"data: {"type":"response.created","response":{"id":"resp_1"}}"#,
+    "\n\n",
+    "event: response.completed\n",
+    r#"data: {"type":"response.completed","response":{"id":"resp_1"}}"#,
+    "\n\n",
+);
+
+/// The same stand-in, but answering rather than refusing, so the test can look
+/// at what it was actually sent.
+async fn spawn_accepting_nearai() -> (String, Arc<Mutex<Option<Received>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let received = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&received);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let Ok(n) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(split) = find_head_end(&buf) {
+                        let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                        let length = content_length(&head).unwrap_or(0);
+                        if buf.len() - split >= length {
+                            *sink.lock().expect("lock") = Some(Received {
+                                head,
+                                body: String::from_utf8_lossy(&buf[split..split + length])
+                                    .to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-type: text/event-stream\r\n\
+                     content-length: {}\r\n\r\n",
+                    UPSTREAM_SSE.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(UPSTREAM_SSE.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}/v1"), received)
+}
+
+/// The tool entry NEAR AI refuses does not reach NEAR AI.
+///
+/// This is the native lane: the body is forwarded as the client wrote it, and
+/// that is correct for every field a provider merely does not recognise. A
+/// tool `type` is not one of those — NEAR AI deserialises `tools` strictly and
+/// throws the whole turn away over one entry. Codex sends one `namespace` per
+/// connected MCP server, so this was every Codex user with any MCP server
+/// configured.
+#[tokio::test]
+async fn a_tool_type_near_ai_rejects_never_reaches_it() {
+    let (base, received) = spawn_accepting_nearai().await;
+    let ledger = Ledger::in_memory().expect("ledger opens");
+
+    let response = app(state_for(&base, ledger))
+        .oneshot(codex_request())
+        .await
+        .expect("the proxy answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = received
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("upstream saw a request");
+    assert!(
+        seen.head.starts_with("POST /v1/responses HTTP/1.1"),
+        "{}",
+        seen.head
+    );
+
+    let sent: serde_json::Value = serde_json::from_str(&seen.body).expect("valid JSON");
+    let tools = sent["tools"].as_array().expect("tools survived");
+    let kinds: Vec<&str> = tools
+        .iter()
+        .map(|t| t["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !kinds.contains(&"namespace"),
+        "the entry that produced `{REAL_NEARAI_REFUSAL}` was forwarded anyway"
+    );
+
+    // Not over-filtered. `web_search` is on NEAR AI's own accepted list, and
+    // dropping a tool the provider would have taken is a capability the user
+    // loses for nothing.
+    assert!(
+        kinds.contains(&"web_search"),
+        "an accepted built-in was stripped too: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "function").count(),
+        11,
+        "every ordinary function must survive: {kinds:?}"
+    );
+
+    // Everything else about the body is still the client's own.
+    assert!(sent.get("client_metadata").is_some(), "body was reshaped");
+    assert_eq!(sent["include"][0], "reasoning.encrypted_content");
+    let original: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture");
+    assert_eq!(sent["instructions"], original["instructions"]);
+    assert_eq!(sent["client_metadata"], original["client_metadata"]);
+}
+
+/// Only what the backend is known to reject, and only on this wire.
+#[test]
+fn nothing_is_stripped_from_a_backend_that_accepts_it() {
+    use ironwire_core::protocol::{BackendId, Protocol};
+    use ironwire_proxy::pipeline::strip_unsupported_tools;
+
+    let body =
+        bytes::Bytes::from(r#"{"tools":[{"type":"namespace","name":"a"},{"type":"web_search"}]}"#);
+    let id = BackendId::from("openai");
+
+    // An empty list is every backend not known to reject anything — OpenAI
+    // itself takes `namespace`, which is why Codex sends it.
+    assert_eq!(
+        strip_unsupported_tools(&body, Protocol::OpenAiResponses, &[], &id),
+        body
+    );
+    // And no other wire has these shapes at all.
+    assert_eq!(
+        strip_unsupported_tools(
+            &body,
+            Protocol::AnthropicMessages,
+            &["namespace".to_string()],
+            &id
+        ),
+        body
+    );
+
+    let stripped = strip_unsupported_tools(
+        &body,
+        Protocol::OpenAiResponses,
+        &["namespace".to_string()],
+        &id,
+    );
+    let value: serde_json::Value = serde_json::from_slice(&stripped).expect("valid JSON");
+    let kinds: Vec<&str> = value["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["type"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(kinds, vec!["web_search"]);
 }

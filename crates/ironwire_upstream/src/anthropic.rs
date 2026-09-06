@@ -45,6 +45,8 @@ pub fn anthropic_capabilities() -> Capabilities {
         prompt_cache: true,
         structured_output: true,
         context_tokens: 200_000,
+        // This backend never sees a Responses body.
+        unsupported_responses_tools: Vec::new(),
     }
 }
 

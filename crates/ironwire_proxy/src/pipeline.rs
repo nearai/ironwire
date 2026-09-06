@@ -519,7 +519,12 @@ async fn dispatch_inner(
         } else {
             UpstreamRequest {
                 path: path.to_string(),
-                body: apply_model(&body, decision.model.as_deref()),
+                body: strip_unsupported_tools(
+                    &apply_model(&body, decision.model.as_deref()),
+                    inbound,
+                    &backend.capabilities().unsupported_responses_tools,
+                    &decision.backend,
+                ),
                 headers: headers.clone(),
                 stream: peek.stream,
             }
@@ -957,6 +962,81 @@ pub fn apply_model(body: &Bytes, model: Option<&str>) -> Bytes {
     object.insert(
         "model".to_string(),
         serde_json::Value::String(model.to_string()),
+    );
+    serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
+}
+
+/// Remove Responses `tools` entries this backend is known to reject.
+///
+/// The native lane forwards a body untouched, which is its whole point and is
+/// right for every field a provider merely does not recognise. A tool `type`
+/// is not one of those: NEAR AI deserialises `tools` strictly and answers a
+/// `namespace` entry with
+///
+/// ```text
+/// tools[8].type: unknown variant `namespace`, expected one of `function`,
+/// `web_search`, `web_context_search`, `file_search`, `code_interpreter`,
+/// `computer`, `mcp`
+/// ```
+///
+/// — refusing the entire turn. Codex emits one `namespace` per connected MCP
+/// server, so before this, any Codex user with a single MCP server configured
+/// could not reach NEAR AI at all.
+///
+/// Only types the backend is *known* to reject are removed
+/// ([`Capabilities::unsupported_responses_tools`]). Everything else, built-ins
+/// included, goes through: `web_search` is on NEAR AI's own accepted list, and
+/// stripping a tool the provider would have taken is a capability the user
+/// silently loses.
+///
+/// The removal is logged with what went and how much, because the model not
+/// having the user's MCP tools is a thing they need to be able to find out.
+#[must_use]
+pub fn strip_unsupported_tools(
+    body: &Bytes,
+    inbound: Protocol,
+    unsupported: &[String],
+    backend: &ironwire_core::protocol::BackendId,
+) -> Bytes {
+    // Only this wire has tool entries that are not functions, and the common
+    // case is an empty list — neither is worth reparsing a body for.
+    if inbound != Protocol::OpenAiResponses || unsupported.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(tools) = value
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body.clone();
+    };
+
+    let mut removed: Vec<String> = Vec::new();
+    tools.retain(|tool| {
+        let Some(kind) = tool.get("type").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        if unsupported.iter().any(|rejected| rejected == kind) {
+            removed.push(kind.to_string());
+            return false;
+        }
+        true
+    });
+
+    if removed.is_empty() {
+        return body.clone();
+    }
+    let mut kinds: Vec<&str> = removed.iter().map(String::as_str).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    tracing::warn!(
+        %backend,
+        count = removed.len(),
+        types = kinds.join(", "),
+        "removed tool declarations this backend rejects; the model will not \
+         have those tools for this turn"
     );
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
 }

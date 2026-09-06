@@ -56,6 +56,9 @@ pub fn responses_capabilities() -> Capabilities {
         prompt_cache: false,
         structured_output: true,
         context_tokens: 400_000,
+        // Codex talks to this endpoint natively every day; it accepts the
+        // whole tool vocabulary Codex emits.
+        unsupported_responses_tools: Vec::new(),
     }
 }
 

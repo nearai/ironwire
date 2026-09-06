@@ -1185,6 +1185,7 @@ mod tests {
             prompt_cache: true,
             structured_output: true,
             context_tokens: 200_000,
+            unsupported_responses_tools: Vec::new(),
         }
     }
 
@@ -2485,6 +2486,7 @@ mod compaction_tests {
             prompt_cache: true,
             structured_output: true,
             context_tokens: 200_000,
+            unsupported_responses_tools: Vec::new(),
         }
     }
 
