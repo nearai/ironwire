@@ -223,6 +223,76 @@ pub fn take_route_override(
     })
 }
 
+/// One exchange that never reached a backend, for the ledger.
+///
+/// A refusal is an exchange. The ledger used to hold rows whose `error` column
+/// was always `NULL` — nothing anywhere ever set it — so a user looking at a
+/// failed turn saw a status and no reason, which is the state that made the
+/// Codex-on-NEAR-AI failure take a live bisect to understand. Nothing here is
+/// hashed or elided: the detail is what the row is for.
+pub struct Refusal {
+    /// When the request arrived.
+    pub started_at: chrono::DateTime<Utc>,
+    /// When work on it started, for the elapsed time.
+    pub started: std::time::Instant,
+    /// Which façade took it.
+    pub facade: &'static str,
+    /// Path as the client asked for it.
+    pub path: String,
+    /// Conversation key.
+    pub conversation: String,
+    /// The agent's own session id, where it sent one.
+    pub client_session_id: Option<String>,
+    /// Model the client asked for.
+    pub requested_model: Option<String>,
+    /// Status IronWire is about to return.
+    pub status: u16,
+}
+
+impl Refusal {
+    /// Write the row. Never propagates: a ledger problem must not change what
+    /// the client is told.
+    pub fn write(self, ledger: &Ledger, error: &PipelineError) {
+        let backend = match error {
+            PipelineError::Upstream(upstream) | PipelineError::AllFailed { last: upstream, .. } => {
+                upstream.backend_id().map(ToString::to_string)
+            }
+            _ => None,
+        };
+        let exchange = Exchange {
+            id: None,
+            started_at: self.started_at,
+            ttfb_ms: None,
+            total_ms: i64::try_from(self.started.elapsed().as_millis()).ok(),
+            facade: self.facade.to_string(),
+            path: self.path,
+            conversation: self.conversation,
+            client_session_id: self.client_session_id,
+            backend: backend.unwrap_or_else(|| "none".to_string()),
+            requested_model: self.requested_model,
+            served_model: None,
+            upstream_id: None,
+            request_sha256: None,
+            response_sha256: None,
+            body_ref: None,
+            rung: "none".to_string(),
+            attempts: 0,
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            substitutions: None,
+            status: i64::from(self.status),
+            error: Some(error.to_string()),
+            confidence: None,
+        };
+        if let Err(error) = ledger.record(&exchange) {
+            tracing::debug!(%error, "could not write the refusal to the trace ledger");
+        }
+    }
+}
+
 /// Route and dispatch one request, failing over while it is still safe to.
 ///
 /// # Errors

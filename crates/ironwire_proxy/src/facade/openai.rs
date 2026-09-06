@@ -139,6 +139,7 @@ async fn forward(
     protocol: Protocol,
 ) -> Result<Response, FacadeError> {
     let started_at = chrono::Utc::now();
+    let started = std::time::Instant::now();
     // Parsed once, for the peek only. The bytes we forward are the bytes we
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
@@ -204,8 +205,22 @@ async fn forward(
         // Codex renders a line from us on a limit response, and this is the
         // moment it is worth using: the user has just been stopped and has no
         // way to tell whether IronWire had somewhere else to go.
-        FacadeError::from_pipeline(&e)
-            .on_openai_facade(peek.client_identity == Some(ClientIdentity::Codex))
+        let rendered = FacadeError::from_pipeline(&e)
+            .on_openai_facade(peek.client_identity == Some(ClientIdentity::Codex));
+        if let Some(ledger) = state.ledger.as_ref() {
+            pipeline::Refusal {
+                started_at,
+                started,
+                facade: "openai",
+                path: path.to_string(),
+                conversation: conversation.to_string(),
+                client_session_id: client_session_id(&headers, protocol),
+                requested_model: peek.requested_model.clone(),
+                status: rendered.status().as_u16(),
+            }
+            .write(ledger, &e);
+        }
+        rendered
     })?;
 
     tracing::info!(
@@ -231,7 +246,7 @@ async fn forward(
     let spend = std::sync::Arc::clone(&state.spend);
     let entry = pipeline::LedgerContext {
         started_at,
-        started: std::time::Instant::now(),
+        started,
         facade: "openai",
         path: path.to_string(),
         conversation: conversation.to_string(),

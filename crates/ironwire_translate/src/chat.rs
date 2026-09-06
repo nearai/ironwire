@@ -107,6 +107,9 @@ pub fn parse_request(body: &Value) -> Conversation {
             .and_then(Value::as_array)
             .map(|tools| tools.iter().map(parse_tool).collect())
             .unwrap_or_default(),
+        // Every tool on this wire is a function; only Responses has shapes
+        // that are not (`responses::sort_tool`).
+        unexpressible_tools: Vec::new(),
         tool_choice: body.get("tool_choice").and_then(parse_tool_choice),
         params: Params {
             max_tokens: body
@@ -264,7 +267,12 @@ fn parse_tool_choice(choice: &Value) -> Option<ToolChoice> {
 /// Write a Chat Completions request.
 #[must_use]
 pub fn emit_request(conversation: &Conversation, model: &str) -> (Value, Dropped) {
-    let mut dropped = Dropped::default();
+    let mut dropped = Dropped {
+        // Not modelled by the IR, so no target can emit them. Named rather
+        // than dropped in silence (`docs/TRANSLATION.md`).
+        tools: conversation.unexpressible_tools.clone(),
+        ..Dropped::default()
+    };
     let mut messages: Vec<Value> = Vec::new();
 
     // One string, because that is all this wire has. The breakpoints are

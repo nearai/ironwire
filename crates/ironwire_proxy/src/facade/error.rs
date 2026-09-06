@@ -57,6 +57,12 @@ impl FacadeError {
         }
     }
 
+    /// The status this will be returned with.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
     /// A malformed request body.
     #[must_use]
     pub fn invalid_request(message: impl Into<String>) -> Self {

@@ -62,14 +62,19 @@ pub fn parse_request(body: &Value) -> Conversation {
         _ => {}
     }
 
+    let mut tools = Vec::new();
+    let mut unexpressible_tools = Vec::new();
+    if let Some(declared) = body.get("tools").and_then(Value::as_array) {
+        for tool in declared {
+            sort_tool(tool, &mut tools, &mut unexpressible_tools);
+        }
+    }
+
     Conversation {
         system,
         turns,
-        tools: body
-            .get("tools")
-            .and_then(Value::as_array)
-            .map(|tools| tools.iter().map(parse_tool).collect())
-            .unwrap_or_default(),
+        tools,
+        unexpressible_tools,
         tool_choice: body.get("tool_choice").and_then(parse_tool_choice),
         params: Params {
             max_tokens: body.get("max_output_tokens").and_then(Value::as_u64),
@@ -213,6 +218,44 @@ fn parse_content_part(part: &Value) -> Block {
     }
 }
 
+/// Put one entry from a Responses `tools` array where it belongs.
+///
+/// Only one of the three shapes Codex sends is a function:
+///
+/// - A **function** — `{"type": "function", "name": …}` — is the ordinary
+///   case and the only one the IR models.
+/// - A **built-in** — `{"type": "web_search", …}` and its siblings — has no
+///   `name` at all. This used to produce a function named `""`, which no
+///   OpenAI-compatible server accepts: a single built-in anywhere in a
+///   client's tool list made the entire translated request a 400, and the
+///   refusal named a tool index rather than anything the user had written.
+/// - A **namespace** — `{"type": "namespace", "name": …, "tools": [ … ]}` —
+///   is a group, one per connected MCP server. Its real functions are nested
+///   inside it, and flattening them would mean choosing a name for each; the
+///   model would then call by that name and the client would not recognise
+///   what came back. So the group is reported as lost rather than guessed at.
+///
+/// Both non-function shapes are named in `unexpressible` so the emitter can
+/// say what the route cost. Nothing is silently invented.
+fn sort_tool(tool: &Value, functions: &mut Vec<ToolDef>, unexpressible: &mut Vec<String>) {
+    let kind = tool.get("type").and_then(Value::as_str);
+    let has_name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| !name.is_empty());
+
+    // A missing `type` with a name is the older function shape.
+    if matches!(kind, Some("function") | None) && has_name {
+        functions.push(parse_tool(tool));
+        return;
+    }
+
+    let kind = kind.unwrap_or("unnamed").to_string();
+    if !unexpressible.contains(&kind) {
+        unexpressible.push(kind);
+    }
+}
+
 fn parse_tool(tool: &Value) -> ToolDef {
     ToolDef {
         name: tool
@@ -254,7 +297,12 @@ fn parse_tool_choice(choice: &Value) -> Option<ToolChoice> {
 /// Write a Responses request.
 #[must_use]
 pub fn emit_request(conversation: &Conversation, model: &str) -> (Value, Dropped) {
-    let mut dropped = Dropped::default();
+    let mut dropped = Dropped {
+        // Not modelled by the IR, so no target can emit them. Named rather
+        // than dropped in silence (`docs/TRANSLATION.md`).
+        tools: conversation.unexpressible_tools.clone(),
+        ..Dropped::default()
+    };
     let mut input: Vec<Value> = Vec::new();
 
     for turn in &conversation.turns {

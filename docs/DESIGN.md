@@ -567,6 +567,7 @@ both.
 | Upstream 429 before first byte | try next rung; if none, return the provider's own 429 with `retry-after` intact |
 | Upstream 429 after first byte | terminate the SSE with a protocol-correct `error` event. **No transparent retry** — replaying would corrupt the stream |
 | Upstream 5xx before first byte | retry same backend (bounded, jittered), then descend |
+| Upstream 4xx | the request itself is wrong, so no other backend is tried; the provider's own status and its own explanation are returned to the client and written to the ledger's `error` column |
 | Client disconnects | **abort the upstream request** — abandoned requests must not burn quota |
 | Credential expired | refresh once inline; on failure mark backend `NeedsAuth`, descend, and surface it in `status` |
 | No eligible backend | protocol-correct error the client already handles; never a made-up success |

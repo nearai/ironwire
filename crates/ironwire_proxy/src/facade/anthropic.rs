@@ -85,6 +85,7 @@ async fn forward(
     path: &str,
 ) -> Result<Response, FacadeError> {
     let started_at = chrono::Utc::now();
+    let started = std::time::Instant::now();
     // Parse once, for the peek only. The bytes we forward are the bytes we
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
     let parsed: serde_json::Value = serde_json::from_slice(&body)
@@ -148,7 +149,21 @@ async fn forward(
     .await
     .map_err(|e| {
         tracing::warn!(error = %e, "no route for request");
-        FacadeError::from_pipeline(&e)
+        let rendered = FacadeError::from_pipeline(&e);
+        if let Some(ledger) = state.ledger.as_ref() {
+            pipeline::Refusal {
+                started_at,
+                started,
+                facade: "anthropic",
+                path: path.to_string(),
+                conversation: conversation.to_string(),
+                client_session_id: client_session_id(&headers, Protocol::AnthropicMessages),
+                requested_model: peek.requested_model.clone(),
+                status: rendered.status().as_u16(),
+            }
+            .write(ledger, &e);
+        }
+        rendered
     })?;
 
     tracing::info!(
@@ -176,7 +191,7 @@ async fn forward(
     let spend = std::sync::Arc::clone(&state.spend);
     let entry = pipeline::LedgerContext {
         started_at,
-        started: std::time::Instant::now(),
+        started,
         facade: "anthropic",
         path: path.to_string(),
         conversation: conversation.to_string(),
