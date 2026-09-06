@@ -18,6 +18,15 @@ proxy.shutdown().await;
 # }
 ```
 
+Embedded starts use `UpdatePolicy::HostManaged`: the embedding application's
+release process upgrades this library. They neither fetch standalone IronWire
+release notifications nor load cached installer commands left by a prior CLI
+run. The control status reports `update: {"state":"unknown"}`; the host can
+present its own application update UI. The CLI explicitly selects
+`UpdatePolicy::Standalone` through `start_with_policy`, preserving its existing
+release checks and cached notifications. Signed provider-catalog refresh still
+honors `updates.check`, and provider model discovery is unchanged for both hosts.
+
 Run this inside a Tokio runtime and keep that runtime alive through shutdown.
 The application owns the choice to start and stop; no signal handler, tracing
 subscriber, or process exit handler is installed by the library. The CLI keeps

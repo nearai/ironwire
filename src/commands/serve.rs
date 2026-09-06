@@ -68,13 +68,18 @@ async fn shutdown_signal() {
 pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
     let paths = super::paths()?;
     let mut published = None;
-    let mut proxy = match embed::start_with(&paths.home, port_override, |port, report| {
-        published = announce(
-            &ironwire_core::config::PathsConfig::rooted_at(report.home.clone()),
-            port,
-            report,
-        );
-    })
+    let mut proxy = match embed::start_with_policy(
+        &paths.home,
+        port_override,
+        embed::UpdatePolicy::Standalone,
+        |port, report| {
+            published = announce(
+                &ironwire_core::config::PathsConfig::rooted_at(report.home.clone()),
+                port,
+                report,
+            );
+        },
+    )
     .await
     {
         Ok(proxy) => proxy,

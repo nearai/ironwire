@@ -328,3 +328,60 @@ async fn startup_reports_the_canonical_home_for_discovery() {
     .unwrap();
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn embedded_hosts_ignore_standalone_upgrade_commands_even_with_checks_enabled() {
+    use ironwire_update::{CheckedAt, UpdateStatus};
+    let home = home();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("check = false", "check = true");
+    std::fs::write(config_path, config).unwrap();
+    let paths = ironwire_core::config::PathsConfig::rooted_at(home.path().to_owned());
+    let cache = paths.update_cache_file();
+    ironwire_update::save_cache(
+        &cache,
+        &CheckedAt {
+            at: chrono::Utc::now(),
+            status: UpdateStatus::Available {
+                latest: "99.0.0".to_owned(),
+                summary: None,
+                upgrade_command: Some("brew upgrade ironwire".to_owned()),
+            },
+        },
+    )
+    .unwrap();
+    let before = std::fs::read(&cache).unwrap();
+    for with_announcement in [false, true] {
+        let proxy = if with_announcement {
+            ironwire_proxy::embed::start_with(home.path(), Some(0), |_, _| {})
+                .await
+                .unwrap()
+        } else {
+            start(home.path(), Some(0)).await.unwrap()
+        };
+        let token = std::fs::read_to_string(paths.control_token_file()).unwrap();
+        let status: serde_json::Value = reqwest::Client::new()
+            .get(format!(
+                "http://127.0.0.1:{}/_ironwire/status",
+                proxy.port()
+            ))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["update"], serde_json::json!({"state": "unknown"}));
+        proxy.shutdown().await;
+        assert_eq!(
+            std::fs::read(&cache).unwrap(),
+            before,
+            "host does not rewrite the CLI's cache"
+        );
+    }
+}
