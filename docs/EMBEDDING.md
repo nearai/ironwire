@@ -68,13 +68,15 @@ redirects. A successful response is advisory grounds to refuse takeover, not
 an authenticated claim about the responder.
 
 Legacy port and home-lock opens refuse final-component links/reparse points
-and non-regular files. On macOS and Linux x86_64/aarch64, nonblocking opens also
+and non-regular files. Unix files owned by a different effective user or writable by group or others
+are refused based on metadata from the opened handle,
+and newly created files use mode 0600. On macOS and Linux x86_64/aarch64, nonblocking opens also
 prevent a planted FIFO from blocking before validation; unsupported Unix
 platforms refuse this ownership path. This does not confine ancestor paths or
 promise a wall-clock bound for arbitrary filesystems. Publication validates the
 opened file before truncating it; it is not atomic publication. Cleanup checks
 the published inode on Unix and port contents on every platform, keeping the
-home lock until the published file handle closes. Windows cleanup retains the
+home lock until the published file handle explicitly closes. Windows cleanup retains the
 legacy content check without a file-identity guarantee. A non-cooperating writer
 can still replace a path between the cleanup check and deletion. These limits
 concern `daemon.lock`; discovery `endpoint.json` has its separate ownership
