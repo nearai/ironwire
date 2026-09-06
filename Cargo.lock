@@ -1462,6 +1462,7 @@ dependencies = [
  "ironwire_upstream",
  "ironwire_usage",
  "reqwest 0.12.28",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

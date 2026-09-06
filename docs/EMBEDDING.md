@@ -61,6 +61,27 @@ probes a legacy owner's recorded port. A crashed legacy port record does not
 prevent a new start. Older binaries do not participate in the new OS lock, so
 this cannot make concurrent startup with an unmodified legacy binary atomic.
 
+The legacy `daemon.lock` probe accepts only a nonzero decimal port in at most
+1 KiB of text, including surrounding whitespace. Its health request goes to
+numeric IPv4 loopback, ignores environment proxies, and does not follow
+redirects. A successful response is advisory grounds to refuse takeover, not
+an authenticated claim about the responder.
+
+Legacy port and home-lock opens refuse final-component links/reparse points
+and non-regular files. Unix files owned by a different effective user or writable by group or others
+are refused based on metadata from the opened handle,
+and newly created files use mode 0600. On macOS and Linux x86_64/aarch64, nonblocking opens also
+prevent a planted FIFO from blocking before validation; unsupported Unix
+platforms refuse this ownership path. This does not confine ancestor paths or
+promise a wall-clock bound for arbitrary filesystems. Publication validates the
+opened file before truncating it; it is not atomic publication. Cleanup checks
+the published inode on Unix and port contents on every platform, keeping the
+home lock until the published file handle explicitly closes. Windows cleanup retains the
+legacy content check without a file-identity guarantee. A non-cooperating writer
+can still replace a path between the cleanup check and deletion. These limits
+concern `daemon.lock`; discovery `endpoint.json` has its separate ownership
+protocol.
+
 Embedded instances publish `home/endpoint.json` only. The CLI additionally
 publishes the conventional `~/.ironwire/endpoint.json` for desktop discovery.
 Cleanup checks that a pointer still describes this instance before removing it;
