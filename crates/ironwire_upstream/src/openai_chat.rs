@@ -38,6 +38,7 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
         prompt_cache: false,
         structured_output: false,
         context_tokens,
+        unsupported_responses_tools: Vec::new(),
     }
 }
 
@@ -52,6 +53,12 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
 pub fn nearai_capabilities() -> Capabilities {
     Capabilities {
         wires: Wires::new(Protocol::OpenAiChat, &[Protocol::OpenAiResponses]),
+        // Verified against the live endpoint: a `namespace` entry returns
+        // `unknown variant `namespace`, expected one of `function`,
+        // `web_search`, `web_context_search`, `file_search`,
+        // `code_interpreter`, `computer`, `mcp``. Every other type Codex
+        // sends is on that list, so only this one is stripped.
+        unsupported_responses_tools: vec!["namespace".to_string()],
         ..chat_capabilities(128_000)
     }
 }
@@ -332,7 +339,12 @@ impl Backend for ChatCompletionsBackend {
                 detail: String::from_utf8_lossy(&body).chars().take(400).collect(),
             });
         }
-        if status.is_server_error() {
+        // Any refusal, not only a server-side one. A 4xx used to fall through
+        // to the streaming path below, where a JSON error body reached the SSE
+        // guard, produced no frames, and was reported to the client as "the
+        // upstream closed without producing a response" — with the provider's
+        // actual complaint discarded unread. See `tests/codex_real_turn.rs`.
+        if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
             return Err(UpstreamError::Upstream {
                 backend: self.id.clone(),

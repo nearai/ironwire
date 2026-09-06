@@ -39,6 +39,9 @@ pub fn parse_request(body: &Value) -> Conversation {
             .and_then(Value::as_array)
             .map(|tools| tools.iter().map(parse_tool).collect())
             .unwrap_or_default(),
+        // Every tool on this wire is a function; only Responses has shapes
+        // that are not (`responses::sort_tool`).
+        unexpressible_tools: Vec::new(),
         tool_choice: body.get("tool_choice").and_then(parse_tool_choice),
         params: Params {
             max_tokens: body.get("max_tokens").and_then(Value::as_u64),
@@ -246,7 +249,12 @@ const DEFAULT_MAX_TOKENS: u64 = 8192;
 /// Write an Anthropic Messages request.
 #[must_use]
 pub fn emit_request(conversation: &Conversation, model: &str) -> (Value, Dropped) {
-    let mut dropped = Dropped::default();
+    let mut dropped = Dropped {
+        // Not modelled by the IR, so no target can emit them. Named rather
+        // than dropped in silence (`docs/TRANSLATION.md`).
+        tools: conversation.unexpressible_tools.clone(),
+        ..Dropped::default()
+    };
     let mut request = Map::new();
     request.insert("model".into(), json!(model));
     request.insert(

@@ -142,3 +142,59 @@ fn a_plain_string_content_is_not_an_unknown_block() {
         "the message was lost entirely: {out}"
     );
 }
+
+/// Codex declares three shapes in one `tools` array, and only one is a
+/// function.
+///
+/// A built-in has no `name`; a namespace keeps its functions in a nested
+/// list. Both used to come out of the parser as `ToolDef`s — the built-in as
+/// a function named `""`, the namespace as a function with an empty schema —
+/// so a translated Codex request carried a nameless tool that every
+/// OpenAI-compatible server rejects, and quietly lost every MCP tool the user
+/// had connected.
+#[test]
+fn a_responses_tool_list_yields_only_real_functions() {
+    let body = serde_json::json!({
+        "model": "gpt-5.6-codex",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "runs a command",
+                "parameters": {"type": "object", "properties": {}}
+            },
+            {"type": "web_search", "external_web_access": false},
+            {
+                "type": "namespace",
+                "name": "mcp__notion",
+                "description": "Create docs",
+                "tools": [
+                    {"type": "function", "name": "search", "parameters": {"type": "object"}}
+                ]
+            }
+        ]
+    });
+
+    let ir = ironwire_translate::parse_request(Protocol::OpenAiResponses, &body);
+    assert_eq!(ir.tools.len(), 1);
+    assert_eq!(ir.tools[0].name, "exec_command");
+    assert_eq!(
+        ir.unexpressible_tools,
+        vec!["web_search".to_string(), "namespace".to_string()]
+    );
+
+    let (chat, dropped) =
+        ironwire_translate::emit_request(Protocol::OpenAiChat, &ir, "qwen3-coder");
+    let emitted = chat["tools"].as_array().expect("tools");
+    assert_eq!(emitted.len(), 1, "{chat}");
+    for tool in emitted {
+        let name = tool["function"]["name"].as_str().unwrap_or_default();
+        assert!(!name.is_empty(), "a nameless function is a 400: {tool}");
+    }
+    // Lost, but said out loud.
+    assert_eq!(
+        dropped.tools,
+        vec!["web_search".to_string(), "namespace".to_string()]
+    );
+}

@@ -101,6 +101,21 @@ pub struct Capabilities {
     pub structured_output: bool,
     /// Context window in tokens.
     pub context_tokens: u32,
+    /// Responses `tools` entry `type`s this backend rejects outright.
+    ///
+    /// Responses lets a client declare tool entries that are not functions,
+    /// and providers do not agree on which of them exist. OpenAI accepts
+    /// everything Codex sends; NEAR AI answers a `namespace` entry with a
+    /// deserialisation error naming the variants it knows, and refuses the
+    /// whole request over it — so a Codex turn with any MCP server connected
+    /// could not reach NEAR AI at all.
+    ///
+    /// Named per backend rather than filtered to some lowest common set,
+    /// because dropping a tool the provider would have accepted is a real
+    /// capability loss. Empty for every backend not *known* to reject
+    /// something: this list is evidence, not caution.
+    #[serde(default)]
+    pub unsupported_responses_tools: Vec<String>,
 }
 
 impl Capabilities {
@@ -118,6 +133,7 @@ impl Capabilities {
             prompt_cache: false,
             structured_output: false,
             context_tokens: 128_000,
+            unsupported_responses_tools: Vec::new(),
         }
     }
 }
@@ -237,6 +253,7 @@ mod tests {
             prompt_cache: true,
             structured_output: true,
             context_tokens: 200_000,
+            unsupported_responses_tools: Vec::new(),
         }
     }
 
@@ -267,6 +284,7 @@ mod tests {
             prompt_cache: false,
             structured_output: false,
             context_tokens: 128_000,
+            unsupported_responses_tools: Vec::new(),
         }
     }
 

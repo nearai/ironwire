@@ -293,8 +293,19 @@ pub struct Conversation {
     pub system: Vec<SystemChunk>,
     /// The exchange so far.
     pub turns: Vec<Turn>,
-    /// Declared tools.
+    /// Declared tools, as functions. Only functions: see
+    /// [`Self::unexpressible_tools`].
     pub tools: Vec<ToolDef>,
+    /// Tool entries the IR cannot carry, by their wire `type`.
+    ///
+    /// Responses lets a client declare things that are not functions at all —
+    /// a provider built-in like `web_search`, or a `namespace` holding a
+    /// nested tool list. Neither has an equivalent on the other wires, and
+    /// neither can be honestly bent into one: a built-in has no name, and a
+    /// namespace's members are called by a convention this build does not
+    /// know. They are left out of [`Self::tools`] and named here, so the
+    /// emitter can report the loss rather than invent a definition.
+    pub unexpressible_tools: Vec<String>,
     /// Tool selection constraint.
     pub tool_choice: Option<ToolChoice>,
     /// Sampling and length.
@@ -410,6 +421,13 @@ pub struct Dropped {
     /// Image blocks the target cannot accept. The capability gate refuses this
     /// route when images are present, so a non-zero count here is a bug.
     pub images: usize,
+    /// Tool declarations the target cannot express, by their source `type`.
+    ///
+    /// Unlike [`Self::unknown_blocks`] this does not disqualify the route: the
+    /// model simply does not get those tools. Reported because the alternative
+    /// — what this build used to do — was to emit a function named `""` for a
+    /// built-in, which every OpenAI-compatible server rejects outright.
+    pub tools: Vec<String>,
     /// Content types this build does not recognise, by name.
     ///
     /// A non-empty list makes the **route** ineligible rather than degrading the

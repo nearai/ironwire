@@ -98,6 +98,7 @@ pub struct Conversation {
     pub system: Vec<SystemChunk>,
     pub turns: Vec<Turn>,
     pub tools: Vec<ToolDef>,
+    pub unexpressible_tools: Vec<String>,
     pub tool_choice: Option<ToolChoice>,
     pub params: Params,
 }
@@ -207,12 +208,21 @@ silent.
 | | → A | → R | → C |
 |---|---|---|---|
 | **A →** | native | thinking dropped¹, cache breakpoints dropped | thinking dropped¹, cache breakpoints dropped, system flattened to one string |
-| **R →** | encrypted reasoning dropped¹ | native | encrypted reasoning dropped¹, typed items flattened |
+| **R →** | encrypted reasoning dropped¹, non-function tools dropped² | native | encrypted reasoning dropped¹, typed items flattened, non-function tools dropped² |
 | **C →** | — | — | native |
 
 ¹ The summary text survives; only the provider-private blob is dropped. The
 receiving provider never validates a foreign blob, and the API that minted it
 drops rather than rejects it (`docs/PROTOCOL.md` §6).
+
+² Responses lets a client declare tools that are not functions: a provider
+built-in (`{"type": "web_search"}`, no `name` at all) and a `namespace`
+holding a nested tool list, one per connected MCP server. Neither has an
+equivalent on the other wires. They are left out of `tools` and named in
+`unexpressible_tools`, which `emit` copies into `Dropped::tools`. The
+alternative this replaced was worse than a drop: a built-in became a function
+named `""`, which every OpenAI-compatible server rejects, so one built-in
+anywhere in a Codex tool list made the whole translated request a 400.
 
 **What is still a hard refusal**, unchanged by any of this: an unrecognised
 content block. A `document` a user asked a question about is indistinguishable

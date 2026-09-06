@@ -84,7 +84,7 @@ pub enum UpstreamError {
     },
 
     /// The upstream returned a non-success status we pass through unchanged.
-    #[error("{backend} returned {status}")]
+    #[error("{backend} returned {status}: {}", reason(body))]
     Upstream {
         /// Which backend.
         backend: BackendId,
@@ -142,6 +142,30 @@ impl UpstreamError {
         }
     }
 
+    /// Which backend this came from, where one is known.
+    #[must_use]
+    pub fn backend_id(&self) -> Option<&BackendId> {
+        match self {
+            Self::NeedsAuth { backend, .. }
+            | Self::RateLimited { backend, .. }
+            | Self::Transport { backend, .. }
+            | Self::Upstream { backend, .. } => Some(backend),
+            Self::CredentialHostMismatch { .. } => None,
+        }
+    }
+
+    /// What the upstream said, where it said anything.
+    ///
+    /// Only meaningful on [`Self::Upstream`]; every other variant carries its
+    /// detail in the variant itself.
+    #[must_use]
+    pub fn upstream_reason(&self) -> Option<String> {
+        match self {
+            Self::Upstream { body, .. } => Some(reason(body)),
+            _ => None,
+        }
+    }
+
     /// Provider-supplied retry delay, where there is one.
     #[must_use]
     pub fn retry_after_secs(&self) -> Option<u64> {
@@ -151,6 +175,50 @@ impl UpstreamError {
             } => *retry_after_secs,
             _ => None,
         }
+    }
+}
+
+/// The provider's own explanation, pulled out of an error body.
+///
+/// A refusal the user cannot read is a refusal they cannot act on: the whole
+/// symptom this exists for was a Codex session told only that "the upstream
+/// closed without producing a response" when the provider had in fact named
+/// the offending field. Providers overwhelmingly answer with either
+/// `{"error": {"message": ...}}` or `{"error": "..."}`; anything else is
+/// shown raw. Bounded, because an error body is upstream-controlled and ends
+/// up in a log line and an error message.
+///
+/// This is not a hash-only surface. The detail is the point.
+#[must_use]
+pub fn reason(body: &Bytes) -> String {
+    const MAX: usize = 600;
+
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    if text.is_empty() {
+        return "no body".to_string();
+    }
+
+    let extracted = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| match value.get("error") {
+            Some(serde_json::Value::String(message)) => Some(message.clone()),
+            Some(error) => error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(ToString::to_string),
+            None => value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(ToString::to_string),
+        })
+        .filter(|message| !message.trim().is_empty());
+
+    let message = extracted.unwrap_or_else(|| text.to_string());
+    if message.chars().count() > MAX {
+        message.chars().take(MAX).collect::<String>() + "…"
+    } else {
+        message
     }
 }
 
@@ -319,6 +387,44 @@ mod tests {
             body: Bytes::new(),
         };
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn a_refusal_carries_the_provider_own_words() {
+        // The shape every OpenAI-compatible server uses.
+        let err = UpstreamError::Upstream {
+            backend: id(),
+            status: http::StatusCode::BAD_REQUEST,
+            body: Bytes::from_static(
+                br#"{"error":{"message":"tools[22]: 'name' is a required property"}}"#,
+            ),
+        };
+        assert!(
+            err.to_string().contains("'name' is a required property"),
+            "{err}"
+        );
+
+        // Anthropic's, and the bare-string variant some gateways send.
+        assert_eq!(
+            reason(&Bytes::from_static(br#"{"error":"model not found"}"#)),
+            "model not found"
+        );
+
+        // Not JSON at all: shown rather than discarded, which is the whole
+        // point — an unreadable refusal is one the user cannot act on.
+        assert_eq!(
+            reason(&Bytes::from_static(b"upstream connect error")),
+            "upstream connect error"
+        );
+        assert_eq!(reason(&Bytes::new()), "no body");
+    }
+
+    #[test]
+    fn a_refusal_is_bounded_because_the_body_is_not_ours() {
+        let body = Bytes::from("x".repeat(10_000));
+        let printed = reason(&body);
+        assert!(printed.chars().count() <= 601, "{}", printed.len());
+        assert!(printed.ends_with('…'));
     }
 
     #[test]

@@ -223,6 +223,76 @@ pub fn take_route_override(
     })
 }
 
+/// One exchange that never reached a backend, for the ledger.
+///
+/// A refusal is an exchange. The ledger used to hold rows whose `error` column
+/// was always `NULL` — nothing anywhere ever set it — so a user looking at a
+/// failed turn saw a status and no reason, which is the state that made the
+/// Codex-on-NEAR-AI failure take a live bisect to understand. Nothing here is
+/// hashed or elided: the detail is what the row is for.
+pub struct Refusal {
+    /// When the request arrived.
+    pub started_at: chrono::DateTime<Utc>,
+    /// When work on it started, for the elapsed time.
+    pub started: std::time::Instant,
+    /// Which façade took it.
+    pub facade: &'static str,
+    /// Path as the client asked for it.
+    pub path: String,
+    /// Conversation key.
+    pub conversation: String,
+    /// The agent's own session id, where it sent one.
+    pub client_session_id: Option<String>,
+    /// Model the client asked for.
+    pub requested_model: Option<String>,
+    /// Status IronWire is about to return.
+    pub status: u16,
+}
+
+impl Refusal {
+    /// Write the row. Never propagates: a ledger problem must not change what
+    /// the client is told.
+    pub fn write(self, ledger: &Ledger, error: &PipelineError) {
+        let backend = match error {
+            PipelineError::Upstream(upstream) | PipelineError::AllFailed { last: upstream, .. } => {
+                upstream.backend_id().map(ToString::to_string)
+            }
+            _ => None,
+        };
+        let exchange = Exchange {
+            id: None,
+            started_at: self.started_at,
+            ttfb_ms: None,
+            total_ms: i64::try_from(self.started.elapsed().as_millis()).ok(),
+            facade: self.facade.to_string(),
+            path: self.path,
+            conversation: self.conversation,
+            client_session_id: self.client_session_id,
+            backend: backend.unwrap_or_else(|| "none".to_string()),
+            requested_model: self.requested_model,
+            served_model: None,
+            upstream_id: None,
+            request_sha256: None,
+            response_sha256: None,
+            body_ref: None,
+            rung: "none".to_string(),
+            attempts: 0,
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            substitutions: None,
+            status: i64::from(self.status),
+            error: Some(error.to_string()),
+            confidence: None,
+        };
+        if let Err(error) = ledger.record(&exchange) {
+            tracing::debug!(%error, "could not write the refusal to the trace ledger");
+        }
+    }
+}
+
 /// Route and dispatch one request, failing over while it is still safe to.
 ///
 /// # Errors
@@ -449,7 +519,12 @@ async fn dispatch_inner(
         } else {
             UpstreamRequest {
                 path: path.to_string(),
-                body: apply_model(&body, decision.model.as_deref()),
+                body: strip_unsupported_tools(
+                    &apply_model(&body, decision.model.as_deref()),
+                    inbound,
+                    &backend.capabilities().unsupported_responses_tools,
+                    &decision.backend,
+                ),
                 headers: headers.clone(),
                 stream: peek.stream,
             }
@@ -887,6 +962,81 @@ pub fn apply_model(body: &Bytes, model: Option<&str>) -> Bytes {
     object.insert(
         "model".to_string(),
         serde_json::Value::String(model.to_string()),
+    );
+    serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
+}
+
+/// Remove Responses `tools` entries this backend is known to reject.
+///
+/// The native lane forwards a body untouched, which is its whole point and is
+/// right for every field a provider merely does not recognise. A tool `type`
+/// is not one of those: NEAR AI deserialises `tools` strictly and answers a
+/// `namespace` entry with
+///
+/// ```text
+/// tools[8].type: unknown variant `namespace`, expected one of `function`,
+/// `web_search`, `web_context_search`, `file_search`, `code_interpreter`,
+/// `computer`, `mcp`
+/// ```
+///
+/// — refusing the entire turn. Codex emits one `namespace` per connected MCP
+/// server, so before this, any Codex user with a single MCP server configured
+/// could not reach NEAR AI at all.
+///
+/// Only types the backend is *known* to reject are removed
+/// ([`Capabilities::unsupported_responses_tools`]). Everything else, built-ins
+/// included, goes through: `web_search` is on NEAR AI's own accepted list, and
+/// stripping a tool the provider would have taken is a capability the user
+/// silently loses.
+///
+/// The removal is logged with what went and how much, because the model not
+/// having the user's MCP tools is a thing they need to be able to find out.
+#[must_use]
+pub fn strip_unsupported_tools(
+    body: &Bytes,
+    inbound: Protocol,
+    unsupported: &[String],
+    backend: &ironwire_core::protocol::BackendId,
+) -> Bytes {
+    // Only this wire has tool entries that are not functions, and the common
+    // case is an empty list — neither is worth reparsing a body for.
+    if inbound != Protocol::OpenAiResponses || unsupported.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(tools) = value
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body.clone();
+    };
+
+    let mut removed: Vec<String> = Vec::new();
+    tools.retain(|tool| {
+        let Some(kind) = tool.get("type").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        if unsupported.iter().any(|rejected| rejected == kind) {
+            removed.push(kind.to_string());
+            return false;
+        }
+        true
+    });
+
+    if removed.is_empty() {
+        return body.clone();
+    }
+    let mut kinds: Vec<&str> = removed.iter().map(String::as_str).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    tracing::warn!(
+        %backend,
+        count = removed.len(),
+        types = kinds.join(", "),
+        "removed tool declarations this backend rejects; the model will not \
+         have those tools for this turn"
     );
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
 }

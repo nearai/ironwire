@@ -56,6 +56,9 @@ pub fn responses_capabilities() -> Capabilities {
         prompt_cache: false,
         structured_output: true,
         context_tokens: 400_000,
+        // Codex talks to this endpoint natively every day; it accepts the
+        // whole tool vocabulary Codex emits.
+        unsupported_responses_tools: Vec::new(),
     }
 }
 
@@ -408,7 +411,12 @@ impl Backend for ResponsesBackend {
                 detail: String::from_utf8_lossy(&body).chars().take(400).collect(),
             });
         }
-        if status.is_server_error() {
+        // Any refusal, not only a server-side one. A 4xx used to fall through
+        // to the streaming path below, where a JSON error body reached the SSE
+        // guard, produced no frames, and was reported to the client as "the
+        // upstream closed without producing a response" — with the provider's
+        // actual complaint discarded unread. See `tests/codex_real_turn.rs`.
+        if !status.is_success() {
             let body = response.bytes().await.unwrap_or_default();
             return Err(UpstreamError::Upstream {
                 backend: self.id.clone(),
