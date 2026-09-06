@@ -29,7 +29,20 @@ mod prune;
 pub mod updates;
 
 /// Who owns upgrading the running proxy implementation.
+///
+/// Hosts must allow future policies rather than exhaustively matching today's variants.
+///
+/// ```compile_fail,E0004
+/// use ironwire_proxy::embed::UpdatePolicy;
+/// fn standalone(policy: UpdatePolicy) -> bool {
+///     match policy {
+///         UpdatePolicy::HostManaged => false,
+///         UpdatePolicy::Standalone => true,
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UpdatePolicy {
     /// The embedding application ships and upgrades the library. Do not read
     /// standalone update notifications or check standalone IronWire releases.
