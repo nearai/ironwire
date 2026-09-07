@@ -61,7 +61,7 @@ pub enum Error {
     Unparseable(String),
     /// The existing file is JSON with comments or trailing commas — legal for
     /// the tool that wrote it, and not something this module will rewrite.
-    Jsonc(String),
+    Jsonc(Jsonc),
     /// The entry did not survive validation, so we will not act on it.
     Unusable(String),
 }
@@ -74,12 +74,20 @@ impl std::fmt::Display for Error {
                 "the file is not valid for its format — IronWire will not \
                  rewrite a file it cannot read: {detail}"
             ),
-            Self::Jsonc(detail) => write!(
+            Self::Jsonc(jsonc) if jsonc.comments => write!(
                 f,
                 "the file is JSONC — JSON with comments and trailing commas — \
                  which the tool that wrote it accepts and IronWire will not \
                  rewrite, because writing it back would delete the comments: \
-                 {detail}"
+                 {}",
+                jsonc.found
+            ),
+            Self::Jsonc(jsonc) => write!(
+                f,
+                "the file is JSONC — JSON with trailing commas — which the \
+                 tool that wrote it accepts and IronWire's JSON parser will \
+                 not read: {}",
+                jsonc.found
             ),
             Self::Unusable(detail) => write!(f, "the catalog entry is not usable: {detail}"),
         }
@@ -87,6 +95,30 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A file that will not parse as JSON, but would if the constructs JSONC adds
+/// on top of JSON were taken out of it.
+///
+/// The second half of that sentence is load-bearing and is checked, not
+/// assumed. A document can contain a trailing comma *and* be broken for an
+/// unrelated reason — `{"a": nope,}` is refused for the unquoted value, not
+/// the comma — and reporting the comma there sends the user to fix the wrong
+/// thing. So the constructs are removed and the result re-parsed; only a
+/// document that is then a valid JSON object is reported as JSONC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jsonc {
+    /// The first such construct, named with the line it is on.
+    pub found: String,
+    /// Whether the file has comments in it.
+    ///
+    /// The remediation turns on this and nothing else. A file with comments
+    /// cannot be rewritten without losing them, so the way forward is to set
+    /// the key by hand. A file whose only JSONC is a trailing comma would lose
+    /// nothing by being rewritten — it is refused because the parser will not
+    /// read it — so deleting that one comma is a real fix, and telling its
+    /// owner to remove comments they do not have is not.
+    pub comments: bool,
+}
 
 /// Point a tool at IronWire.
 ///
@@ -435,43 +467,79 @@ fn json_parse(existing: &str) -> Result<Map<String, Value>, Error> {
         Ok(_) => Err(Error::Unparseable(
             "the file is valid JSON but not an object".to_string(),
         )),
-        Err(error) => Err(jsonc_construct(existing)
-            .map_or_else(|| Error::Unparseable(error.to_string()), Error::Jsonc)),
+        Err(error) => {
+            Err(jsonc(existing).map_or_else(|| Error::Unparseable(error.to_string()), Error::Jsonc))
+        }
     }
 }
 
-/// What makes this file JSONC rather than JSON, if anything.
+/// Whether this file is JSONC rather than JSON, and what makes it so.
 ///
-/// Only ever asked after `serde_json` has already refused the file, so it does
-/// not have to decide whether the document is otherwise well formed — only
-/// whether the thing `serde_json` tripped over is a construct the tool that
-/// wrote the file accepts. Zed's shipped `initial_user_settings.json` opens
-/// with eight lines of `//` and closes two objects on a trailing comma;
-/// opencode's published schema sets `allowComments` and `allowTrailingCommas`
-/// at the root. Both are ordinary files their own tools read without
-/// complaint, and "expected value at line 1 column 1" is the wrong thing to
-/// say about either.
+/// Only ever asked after `serde_json` has already refused the file. Two things
+/// have to be true before we tell somebody their file is JSONC: it has to
+/// contain a construct JSONC allows, *and* taking those constructs out has to
+/// leave a valid JSON object. Without the second check a document that merely
+/// contains a trailing comma gets classified by it — `{"a": nope,}` is refused
+/// for the unquoted value, and naming the comma sends the user to fix
+/// something that is not the blocker. So the constructs are stripped and the
+/// result handed back to `serde_json`; if it still will not parse, this is not
+/// a JSONC file and the original error stands.
 ///
-/// Refusing is still the answer — see the module header. This only changes
-/// what the refusal says, which is the difference between a user editing one
-/// key by hand and a user thinking they have corrupted their config.
+/// The stripped text exists only to answer that question. It is never written
+/// anywhere — see the module header. Refusing is still the answer; this only
+/// decides what the refusal says, which is the difference between a user
+/// editing one key by hand and a user thinking they have corrupted their
+/// config. Zed's shipped `initial_user_settings.json` opens with eight lines
+/// of `//` and closes two objects on a trailing comma; opencode's published
+/// schema sets `allowComments` and `allowTrailingCommas` at the root. Both are
+/// ordinary files their own tools read without complaint, and "expected value
+/// at line 1 column 1" is the wrong thing to say about either.
 ///
-/// String literals are tracked because `"https://x"` is not a comment and
-/// `{"a": "b,"}` is not a trailing comma.
-fn jsonc_construct(existing: &str) -> Option<String> {
-    let bytes = existing.as_bytes();
+/// A file that strips down to a valid JSON *value* but not an object is left
+/// to the ordinary parse error: it is not a config file this module could have
+/// edited even spelled as strict JSON.
+fn jsonc(existing: &str) -> Option<Jsonc> {
+    let (without_comments, comment) = strip_comments(existing.as_bytes());
+    let (stripped, comma) = strip_trailing_commas(&without_comments);
+    // Deletions only ever span whole ASCII tokens or whole comments, so this
+    // holds; if it somehow did not, the original parse error stands.
+    let stripped = String::from_utf8(stripped).ok()?;
+
+    // In file order, so the construct named is the first one a reader meets.
+    let found = match (&comment, &comma) {
+        (Some((line, text)), Some((comma_line, _))) if line <= comma_line => {
+            format!("{text} on line {line}")
+        }
+        (_, Some((line, _))) => format!("a trailing comma on line {line}"),
+        (Some((line, text)), None) => format!("{text} on line {line}"),
+        (None, None) => return None,
+    };
+
+    matches!(
+        serde_json::from_str::<Value>(&stripped),
+        Ok(Value::Object(_))
+    )
+    .then(|| Jsonc {
+        found,
+        comments: comment.is_some(),
+    })
+}
+
+/// Remove `//` and `/* */` comments, reporting the first one found.
+///
+/// Newlines inside a block comment are kept so that every later line keeps the
+/// number it has in the file the user is looking at. String literals are
+/// tracked because `"https://x"` is not a comment.
+fn strip_comments(bytes: &[u8]) -> (Vec<u8>, Option<(usize, &'static str)>) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut first = None;
     let mut line = 1usize;
+    let mut i = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    // The last byte that was not whitespace, which is all a trailing comma
-    // needs: a `,` with a closing bracket next.
-    let mut last = None;
-    let mut comma_line = 0usize;
 
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == b'\n' {
-            line += 1;
-        }
+    while i < bytes.len() {
+        let byte = bytes[i];
         if in_string {
             if escaped {
                 escaped = false;
@@ -480,34 +548,91 @@ fn jsonc_construct(existing: &str) -> Option<String> {
             } else if byte == b'"' {
                 in_string = false;
             }
+        } else if byte == b'"' {
+            in_string = true;
+        } else if byte == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            first.get_or_insert((line, "a `//` comment"));
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            first.get_or_insert((line, "a `/* */` comment"));
+            i += 2;
+            while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                if bytes[i] == b'\n' {
+                    line += 1;
+                    out.push(b'\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
             continue;
         }
-        match byte {
-            b'"' => {
-                in_string = true;
-                last = Some(b'"');
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                return Some(format!("a `//` comment on line {line}"));
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                return Some(format!("a `/* */` comment on line {line}"));
-            }
-            b',' => {
-                comma_line = line;
-                last = Some(b',');
-            }
-            b'}' | b']' => {
-                if last == Some(b',') {
-                    return Some(format!("a trailing comma on line {comma_line}"));
-                }
-                last = Some(byte);
-            }
-            _ if byte.is_ascii_whitespace() => {}
-            _ => last = Some(byte),
+
+        if byte == b'\n' {
+            line += 1;
         }
+        // A byte buffer, not a string: `byte as char` would re-encode
+        // anything above ASCII. No byte we branch on above can appear inside
+        // a multi-byte character, so copying byte by byte is safe.
+        out.push(byte);
+        i += 1;
     }
-    None
+
+    (out, first)
+}
+
+/// Remove commas that sit immediately before a closing bracket, reporting the
+/// first one found.
+///
+/// Run on comment-free text, so "immediately before" only has to look past
+/// whitespace. String literals are tracked because `{"a": "b,"}` has no
+/// trailing comma in it.
+fn strip_trailing_commas(bytes: &[u8]) -> (Vec<u8>, Option<(usize, ())>) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut first = None;
+    let mut line = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    // Where the last comma landed in `out`, and on which line of the file,
+    // for as long as nothing but whitespace has followed it.
+    let mut pending: Option<(usize, usize)> = None;
+
+    for &byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+        } else {
+            match byte {
+                b'"' => {
+                    in_string = true;
+                    pending = None;
+                }
+                b',' => pending = Some((out.len(), line)),
+                b'}' | b']' => {
+                    if let Some((at, comma_line)) = pending.take() {
+                        first.get_or_insert((comma_line, ()));
+                        out.remove(at);
+                    }
+                }
+                _ if byte.is_ascii_whitespace() => {}
+                _ => pending = None,
+            }
+        }
+
+        if byte == b'\n' {
+            line += 1;
+        }
+        out.push(byte);
+    }
+
+    (out, first)
 }
 
 fn json_render(root: &Map<String, Value>) -> String {
@@ -914,23 +1039,76 @@ mod tests {
     #[test]
     fn a_json_file_with_comments_is_refused_as_jsonc_and_not_as_a_syntax_error() {
         let error = connect(&agent("env.X"), ZED_INITIAL_USER_SETTINGS, 8463).expect_err("refuses");
-        let Error::Jsonc(detail) = &error else {
+        let Error::Jsonc(jsonc) = &error else {
             panic!("{error:?}");
         };
-        assert_eq!(detail, "a `//` comment on line 1");
+        assert_eq!(jsonc.found, "a `//` comment on line 1");
+        assert!(jsonc.comments);
         assert!(error.to_string().contains("delete the comments"));
     }
 
     /// opencode's published schema sets `allowTrailingCommas` on its own, so a
     /// file with one and no comments is still a file its tool reads.
+    ///
+    /// The advice has to match the file. Comment loss is not why this one is
+    /// refused — there is nothing in it to lose — so the message must not say
+    /// so, or the user follows it and nothing changes.
     #[test]
-    fn a_trailing_comma_alone_is_reported_with_the_line_it_is_on() {
+    fn a_trailing_comma_alone_is_reported_without_blaming_comments() {
         let existing = "{\n  \"a\": 1,\n  \"b\": 2,\n}\n";
         let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
-        assert!(
-            matches!(&error, Error::Jsonc(detail) if detail == "a trailing comma on line 3"),
-            "{error:?}"
-        );
+        let Error::Jsonc(jsonc) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(jsonc.found, "a trailing comma on line 3");
+        assert!(!jsonc.comments);
+        assert!(!error.to_string().contains("comment"), "{error}");
+    }
+
+    /// A trailing comma is not what stops this file parsing — `nope` is. Being
+    /// told to remove the comma sends the user to fix something that is not
+    /// the blocker, and leaves them no better off when they do.
+    #[test]
+    fn a_broken_file_that_happens_to_have_a_trailing_comma_is_not_jsonc() {
+        let error = connect(&agent("env.X"), r#"{"a": nope,}"#, 8463).expect_err("refuses");
+        let Error::Unparseable(detail) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(detail.contains("line 1 column 8"), "{detail}");
+    }
+
+    /// The same, with the comment arm: a file with a real comment in it is
+    /// still not JSONC if it would not parse once the comment is gone.
+    #[test]
+    fn a_broken_file_that_happens_to_have_a_comment_is_not_jsonc() {
+        let existing = "// a note\n{\"a\": 1,, \"b\": 2}\n";
+        let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
+        assert!(matches!(error, Error::Unparseable(_)), "{error:?}");
+    }
+
+    /// Stripping happens on a copy, to answer a question. A comment inside a
+    /// string is part of a value and must survive it, or a legal JSONC file
+    /// gets called broken for a `//` its tool never treated as syntax.
+    #[test]
+    fn a_comment_marker_inside_a_value_does_not_break_the_check() {
+        let existing = "// note\n{\"env\": {\"X\": \"https://example.com\"},}\n";
+        let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
+        let Error::Jsonc(jsonc) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(jsonc.found, "a `//` comment on line 1");
+    }
+
+    /// Line numbers have to point into the file the user is looking at, so a
+    /// block comment's newlines survive the strip that removes its text.
+    #[test]
+    fn a_line_number_after_a_block_comment_still_matches_the_file() {
+        let existing = "{\n  /* one\n     two */\n  \"a\": 1,\n}\n";
+        let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
+        let Error::Jsonc(jsonc) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(jsonc.found, "a `/* */` comment on line 2");
     }
 
     /// The scanner must not read a value as syntax. A URL has `//` in it and a

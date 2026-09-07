@@ -146,14 +146,22 @@ pub enum Error {
         /// What the parser said.
         detail: String,
     },
-    /// The file is JSON with comments or trailing commas. Legal for the tool
-    /// that wrote it, refused here because writing the file back would delete
-    /// the comments. One key, set by hand, is all it takes.
+    /// The file is JSON with comments or trailing commas — legal for the tool
+    /// that wrote it, and not something IronWire's JSON writer can read.
+    ///
+    /// The remediation differs by `comments`, because the reason to refuse
+    /// does. A file with comments could not be rewritten without deleting
+    /// them, so the way out is to set the one key by hand. A file whose only
+    /// JSONC is a trailing comma loses nothing by being rewritten and is
+    /// refused only because the parser stops at the comma, so deleting it is
+    /// a fix the user can actually apply.
     Jsonc {
         /// The file that was read.
         path: PathBuf,
         /// Which construct was found, and on which line.
         detail: String,
+        /// Whether the file has comments in it.
+        comments: bool,
     },
     /// The catalog entry describing this tool did not survive validation.
     /// Nothing the user does to their config changes the answer.
@@ -194,13 +202,23 @@ impl std::fmt::Display for Error {
                  file it cannot read: {detail}. Fix the file, then run this again",
                 path.display()
             ),
-            Self::Jsonc { path, detail } => write!(
+            Self::Jsonc {
+                path,
+                detail,
+                comments: true,
+            } => write!(
                 f,
                 "{} is JSONC — JSON with comments and trailing commas — which \
                  the tool that wrote it accepts and IronWire does not edit, \
                  because writing the file back would delete the comments: \
-                 {detail}. Set the key by hand, or take the comments out and \
-                 run this again",
+                 {detail}. Set the key by hand",
+                path.display()
+            ),
+            Self::Jsonc { path, detail, .. } => write!(
+                f,
+                "{} is JSONC — JSON with trailing commas — which the tool that \
+                 wrote it accepts and IronWire's JSON parser will not read: \
+                 {detail}. Remove it and run this again, or set the key by hand",
                 path.display()
             ),
             Self::UnusableEntry { id, detail } => write!(
@@ -222,9 +240,10 @@ fn from_catalog(error: catalog::Error, path: &std::path::Path, id: &str) -> Erro
             path: path.to_path_buf(),
             detail,
         },
-        catalog::Error::Jsonc(detail) => Error::Jsonc {
+        catalog::Error::Jsonc(jsonc) => Error::Jsonc {
             path: path.to_path_buf(),
-            detail,
+            detail: jsonc.found,
+            comments: jsonc.comments,
         },
         catalog::Error::Unusable(detail) => Error::UnusableEntry {
             id: id.to_string(),
@@ -774,6 +793,7 @@ mod tests {
             Error::Jsonc {
                 path: PathBuf::from("/home/u/.config/zed/settings.json"),
                 detail: "a `//` comment on line 1".to_string(),
+                comments: true,
             }
             .reason(),
             "jsonc"
@@ -806,6 +826,7 @@ mod tests {
         let jsonc = Error::Jsonc {
             path: PathBuf::from("/home/u/.config/zed/settings.json"),
             detail: "a `//` comment on line 1".to_string(),
+            comments: true,
         }
         .to_string();
         assert!(
@@ -813,6 +834,25 @@ mod tests {
             "{jsonc}"
         );
         assert!(jsonc.contains("Set the key by hand"), "{jsonc}");
+    }
+
+    /// The advice, not just the label. A file with no comments in it must not
+    /// be told to remove its comments: a user who follows that finds nothing
+    /// to delete and the request still failing.
+    #[test]
+    fn a_file_with_no_comments_is_not_told_to_remove_comments() {
+        let jsonc = Error::Jsonc {
+            path: PathBuf::from("/home/u/.config/opencode/opencode.json"),
+            detail: "a trailing comma on line 3".to_string(),
+            comments: false,
+        }
+        .to_string();
+        assert!(!jsonc.contains("comment"), "{jsonc}");
+        assert!(jsonc.contains("Remove it and run this again"), "{jsonc}");
+        assert!(
+            jsonc.contains("/home/u/.config/opencode/opencode.json"),
+            "{jsonc}"
+        );
     }
 
     #[test]
