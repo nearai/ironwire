@@ -1127,7 +1127,13 @@ fn backend_from_config(
 /// [`SecretString`] rather than `String` because every caller wants one, and a
 /// value that spends part of its life as a plain `String` is a value with a
 /// `Debug` rendering and no zeroize on drop for that stretch.
-type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<SecretString>;
+///
+/// `Send + Sync` because a [`Credentials`] built from this is held across an
+/// await in [`start_with_options`], which makes it part of that future.
+/// Without the bounds the future is not `Send`, and an embedding host cannot
+/// `tokio::spawn` a start onto a multi-threaded runtime. Nothing in this
+/// repository spawns one, so nothing here fails without them.
+type EnvLookup<'a> = &'a (dyn Fn(&str) -> Option<SecretString> + Send + Sync);
 
 /// The real environment.
 fn real_env(name: &str) -> Option<SecretString> {
