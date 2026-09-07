@@ -53,6 +53,89 @@ pub enum UpdatePolicy {
     Standalone,
 }
 
+/// Whether this process may make the two requests IronWire makes on its own
+/// behalf: the release check, and the signed provider-catalog refresh from
+/// `ironwire.dev`.
+///
+/// [`UpdatePolicy`] answers who owns upgrading the binary; this answers whether
+/// those two requests happen. They are separate questions, and an embedding host
+/// could previously only answer the second through `updates.check` in
+/// `$IRONWIRE_HOME/config.toml` — a file it may not own, because the home can
+/// be a real user's, shared with the CLI. This is the same switch, expressed in
+/// code, and it covers exactly what that switch covers.
+///
+/// **It is not a general network kill switch, and must not be described as
+/// one.** Startup catalogue discovery still probes every registered backend
+/// over the network (`spawn_catalogue_discovery`, calling `Backend::probe`),
+/// under either value. Two things make that reach further than "only what the
+/// host configured": `build_registry` registers Claude, Codex, and API-key
+/// backends from credentials it discovers in the environment with no config
+/// entry naming them, and the NEAR AI backend is registered unconditionally.
+/// So a bare embedded start does make a request, whatever is chosen here. A
+/// host that must make no outbound request at all cannot get that from this
+/// option today; see `docs/EMBEDDING.md`.
+///
+/// Hosts must allow future values rather than exhaustively matching today's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UpdateChecks {
+    /// Honor `updates.check` from the home's configuration, defaulting to on
+    /// when there is no file. What every caller got before this existed.
+    #[default]
+    FromConfig,
+    /// Make neither of those two requests, whatever the configuration says. For
+    /// a host that would set `updates.check = false` but cannot write the home's
+    /// config. Startup backend probes are unaffected.
+    Off,
+}
+
+/// Everything an embedding host chooses about a start, other than the home,
+/// the port, and the announcement hook.
+///
+/// Construct from [`EmbedOptions::default`] and set what differs, so a future
+/// choice does not break existing callers.
+///
+/// ```
+/// use ironwire_proxy::embed::{EmbedOptions, UpdateChecks};
+/// let options = EmbedOptions::default().with_update_checks(UpdateChecks::Off);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EmbedOptions {
+    /// Who owns upgrading the running proxy implementation.
+    pub update_policy: UpdatePolicy,
+    /// Whether the release check and catalog refresh may run at all.
+    pub update_checks: UpdateChecks,
+}
+
+impl EmbedOptions {
+    /// Select who owns upgrading the running proxy implementation.
+    #[must_use]
+    pub fn with_update_policy(mut self, update_policy: UpdatePolicy) -> Self {
+        self.update_policy = update_policy;
+        self
+    }
+
+    /// Decline the requests IronWire makes on its own behalf, in code.
+    ///
+    /// There is deliberately no value that turns them back *on* over a
+    /// configured `updates.check = false`: someone who turned it off meant it,
+    /// and a host cannot un-mean it on their behalf.
+    #[must_use]
+    pub fn with_update_checks(mut self, update_checks: UpdateChecks) -> Self {
+        self.update_checks = update_checks;
+        self
+    }
+
+    /// Resolve `updates.check` against the host's choice.
+    fn checks_enabled(self, configured: bool) -> bool {
+        match self.update_checks {
+            UpdateChecks::FromConfig => configured,
+            UpdateChecks::Off => false,
+        }
+    }
+}
+
 /// Fixed-label startup failures, suitable for a host's refusal state.
 #[derive(Debug, thiserror::Error)]
 pub enum EmbedError {
@@ -100,6 +183,12 @@ pub struct StartupReport {
     pub bodies_warning: Option<String>,
     /// The home discovery pointer could not be published.
     pub pointer_warning: bool,
+    /// This start will make the two requests IronWire makes on its own behalf:
+    /// the release check and the catalog refresh. `updates.check` from the
+    /// home's configuration, after the host's [`UpdateChecks`] choice. A host
+    /// that declined can confirm here that it declined. Says nothing about
+    /// startup backend probes, which this switch does not govern.
+    pub update_checks: bool,
 }
 
 /// A server's final outcome. No internal error text crosses the host boundary.
@@ -250,6 +339,8 @@ pub async fn start_with(
 /// Only standalone CLI hosts should select [`UpdatePolicy::Standalone`].
 /// Provider catalog refresh and model discovery are independent of this policy;
 /// the existing `updates.check` configuration still controls catalog refresh.
+/// A host that cannot write that file declines in code with
+/// [`start_with_options`] and [`UpdateChecks::Off`].
 /// The announcement has the same ordering and restrictions as [`start_with`].
 ///
 /// # Errors
@@ -260,10 +351,39 @@ pub async fn start_with_policy(
     update_policy: UpdatePolicy,
     on_start: impl FnOnce(u16, &StartupReport),
 ) -> Result<EmbeddedProxy, EmbedError> {
+    start_with_options(
+        home,
+        port_override,
+        EmbedOptions::default().with_update_policy(update_policy),
+        on_start,
+    )
+    .await
+}
+
+/// Start with every host-owned choice stated, and a startup announcement.
+///
+/// [`EmbedOptions::default`] is what [`start`] uses: the host owns upgrading
+/// this library, and `updates.check` in the home's configuration still governs
+/// the release check and the catalog refresh. A host that wants neither of
+/// those two requests selects [`UpdateChecks::Off`], which suppresses both
+/// without writing to a configuration file it may not own. It does not
+/// suppress startup backend probes; see [`UpdateChecks`].
+/// The announcement has the same ordering and restrictions as [`start_with`].
+///
+/// # Errors
+/// The same fixed-label startup refusals as [`start`].
+pub async fn start_with_options(
+    home: &std::path::Path,
+    port_override: Option<u16>,
+    options: EmbedOptions,
+    on_start: impl FnOnce(u16, &StartupReport),
+) -> Result<EmbeddedProxy, EmbedError> {
+    let update_policy = options.update_policy;
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
     let config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    let checks = options.checks_enabled(config.updates.check);
     let port = port_override.unwrap_or(config.server.port);
     if config.limits.any_cap() && !config.capture.enabled {
         return Err(EmbedError::Config);
@@ -289,6 +409,7 @@ pub async fn start_with_policy(
     let mut report = StartupReport {
         home: paths.home.clone(),
         no_backends: registry.is_empty(),
+        update_checks: checks,
         ..StartupReport::default()
     };
     let ledger = open_ledger(&paths, &config, &mut report);
@@ -296,7 +417,6 @@ pub async fn start_with_policy(
     report.catalog_serial = catalog.serial();
     let bodies = open_bodies(&paths, &config, &mut report);
     sweep_bodies(&ledger, bodies.as_deref());
-    let checks = config.updates.check;
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
         .with_paths(paths.clone())
@@ -1137,5 +1257,67 @@ mod lifecycle_tests {
             ironwire_core::discovery::Endpoint::read_from(&path),
             Some(theirs)
         );
+    }
+}
+
+#[cfg(test)]
+mod update_check_tests {
+    use super::*;
+    use ironwire_creds::ConsentLedger;
+
+    fn state_in(paths: &PathsConfig) -> AppState {
+        AppState::new(
+            BackendRegistry::new(),
+            Config::default(),
+            ConsentLedger::default(),
+            "test-token".to_owned(),
+        )
+        .with_paths(paths.clone())
+    }
+
+    /// The switch a host cannot reach on disk, reached in code. `FromConfig`
+    /// must stay transparent, or every existing caller changes behaviour.
+    #[test]
+    fn a_host_can_decline_checks_the_configuration_leaves_on() {
+        assert!(EmbedOptions::default().checks_enabled(true));
+        assert!(!EmbedOptions::default().checks_enabled(false));
+        let declined = EmbedOptions::default().with_update_checks(UpdateChecks::Off);
+        assert!(!declined.checks_enabled(true), "the host's choice applies");
+        assert!(!declined.checks_enabled(false));
+    }
+
+    /// Declining is a decision about this process's own requests, not about
+    /// who ships the binary, so it composes with either policy.
+    #[test]
+    fn declining_checks_is_independent_of_who_owns_the_binary() {
+        let standalone = EmbedOptions::default()
+            .with_update_policy(UpdatePolicy::Standalone)
+            .with_update_checks(UpdateChecks::Off);
+        assert_eq!(standalone.update_policy, UpdatePolicy::Standalone);
+        assert!(!standalone.checks_enabled(true));
+    }
+
+    /// The point of the option: no catalog task exists to make the request.
+    #[tokio::test]
+    async fn a_declining_host_spawns_no_catalog_refresh() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = PathsConfig::rooted_at(home.path().to_owned());
+        let configured = true;
+
+        let declined = EmbedOptions::default().with_update_checks(UpdateChecks::Off);
+        assert!(
+            catalog::spawn_refresh(
+                state_in(&paths),
+                &paths,
+                declined.checks_enabled(configured)
+            )
+            .is_none()
+        );
+
+        let default = EmbedOptions::default();
+        let task =
+            catalog::spawn_refresh(state_in(&paths), &paths, default.checks_enabled(configured))
+                .expect("a host that has not declined still refreshes");
+        task.abort();
     }
 }

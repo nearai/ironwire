@@ -385,3 +385,139 @@ async fn embedded_hosts_ignore_standalone_upgrade_commands_even_with_checks_enab
         );
     }
 }
+
+#[tokio::test]
+async fn a_host_can_decline_update_checks_without_writing_the_home_configuration() {
+    use ironwire_proxy::embed::{EmbedOptions, UpdateChecks, start_with_options};
+    let home = home();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("check = false", "check = true");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let mut observed = None;
+    let proxy = start_with_options(
+        home.path(),
+        Some(0),
+        EmbedOptions::default().with_update_checks(UpdateChecks::Off),
+        |_, report| observed = Some(report.update_checks),
+    )
+    .await
+    .expect("starts");
+    assert_eq!(
+        observed,
+        Some(false),
+        "a declining host makes no release or catalog request"
+    );
+    assert!(!proxy.startup_report().update_checks);
+    proxy.shutdown().await;
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        config,
+        "declining is expressed in code, never by editing the host's home"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_does_not_decline_still_follows_the_configuration() {
+    use ironwire_proxy::embed::{EmbedOptions, start_with_options};
+    let home = home();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("check = false", "check = true");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let proxy = start_with_options(home.path(), Some(0), EmbedOptions::default(), |_, _| {})
+        .await
+        .expect("starts");
+    assert!(
+        proxy.startup_report().update_checks,
+        "the default must stay transparent for standalone users"
+    );
+    proxy.shutdown().await;
+}
+
+/// A backend that records that it was asked for its model catalogue.
+async fn spawn_probe_recorder() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&probes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let counter = std::sync::Arc::clone(&counter);
+            tokio::spawn(async move {
+                let mut chunk = [0u8; 8192];
+                let read = socket.read(&mut chunk).await.unwrap_or(0);
+                if String::from_utf8_lossy(&chunk[..read]).contains("/models") {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let body = "{\"data\":[]}";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), probes)
+}
+
+/// The edge of what `UpdateChecks` covers, pinned so the documentation cannot
+/// quietly grow past it. Declining stops IronWire's own two requests. It does
+/// not stop the startup catalogue probe, which is a request to a backend - and
+/// a backend can be registered without the host naming it, so "the host
+/// controls every request" would be a promise this option does not keep.
+#[tokio::test]
+async fn declining_update_checks_does_not_stop_the_startup_backend_probe() {
+    use ironwire_proxy::embed::{EmbedOptions, UpdateChecks, start_with_options};
+    let (base_url, probes) = spawn_probe_recorder().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[updates]\ncheck = true\n\
+             [[backends]]\nid = 'nearai'\nkind = 'nearai'\nbase_url = '{base_url}'\n\
+             [[backends]]\nid = 'claude-sub'\nkind = 'claude-subscription'\nenabled = false\n\
+             [[backends]]\nid = 'codex-sub'\nkind = 'codex-subscription'\nenabled = false\n\
+             [[backends]]\nid = 'anthropic-key'\nkind = 'anthropic-api'\nenabled = false\n\
+             [[backends]]\nid = 'openai-key'\nkind = 'openai-api'\nenabled = false\n"
+        ),
+    )
+    .unwrap();
+
+    let proxy = start_with_options(
+        home.path(),
+        Some(0),
+        EmbedOptions::default().with_update_checks(UpdateChecks::Off),
+        |_, report| assert!(!report.update_checks),
+    )
+    .await
+    .expect("starts");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while probes.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    proxy.shutdown().await;
+
+    assert_eq!(
+        probes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the startup probe is outside this switch; say so rather than implying otherwise"
+    );
+}
