@@ -109,6 +109,74 @@ let proxy = start_with_options(
 The alternative for a host that wants none of this remains `enabled = false`
 entries for each backend, which is again a configuration file it may not own.
 
+## Backend credentials
+
+Credential discovery is four lookups, not one. IronWire reads API keys from
+variable names — `NEARAI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+whatever `api_key_env` names for a configured backend — and it reads three
+things off disk: the credential Claude Code writes, the credential Codex
+writes, and the metered key Codex stores after `codex login --api-key`.
+
+For an embedding host, the environment was the only channel into the first of
+those and there was no channel into the other three. Reaching the environment
+after startup means `std::env::set_var`, which is `unsafe` in Rust 2024 because
+mutating the environment once threads exist is a data race with every thread
+reading it — and an embedded start is inside a running Tokio runtime by
+definition. It is also the wrong place for a secret in a shared process, where
+every other library can read it.
+
+`EmbedOptions::with_credentials` hands the whole question to the host:
+
+```rust,no_run
+# async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
+use ironwire_proxy::embed::{EmbedOptions, HostSecret, start_with_options};
+# fn key_from_the_hosts_own_vault(_name: &str) -> Option<HostSecret> { None }
+let home = std::path::Path::new("/path/to/.ironwire");
+let proxy = start_with_options(
+    home,
+    None,
+    EmbedOptions::default().with_credentials(key_from_the_hosts_own_vault),
+    |_, _| {},
+)
+.await?;
+# proxy.shutdown().await;
+# Ok(())
+# }
+```
+
+The closure is called with the variable name IronWire would otherwise read, so
+a host answers per backend without knowing anything about how the registry is
+built. It returns a `SecretString` (re-exported as `HostSecret`), which has no
+`Debug` rendering and is zeroized on drop; the value stays a `SecretString` all
+the way into the backend, and nothing about it is logged, reported by
+`startup_report`, or rendered by `EmbedOptions`'s own `Debug`.
+
+**This replaces credential discovery; it does not extend it.** With a source
+supplied, nothing else is consulted: not the process environment, and not those
+three files. `None` from the closure means there is no credential for that
+name. An empty answer is the same as no answer.
+
+The alternative — the host answers where it can, the environment fills the rest
+— was rejected. Under it a stray `ANTHROPIC_API_KEY`, or a user's Claude Code
+login sitting in their home, registers a backend the host never authorized:
+the same surprise `StartupProbes::Configured` exists to prevent, one rung
+earlier. A host that must be able to state which destinations are possible
+cannot state it while IronWire is still finding its own. Either the host
+manages credentials or IronWire does, never half of each.
+
+The consequence is worth planning for. A host that answers only
+`NEARAI_API_KEY` gets NEAR AI and nothing else — no Claude or Codex
+subscription backend, however logged-in the user running it happens to be. A
+host that answers nothing, with the unconditional NEAR AI entry disabled, gets
+an empty registry: `StartupReport::no_backends` is the field for that state,
+and until now almost nothing could reach it. Check it.
+
+Supplying no source is the default and discovers credentials exactly as before,
+from the same places, at the same points, so the CLI and every existing
+embedder are unaffected. Carrying a host's closure costs `EmbedOptions` its
+`Copy`, `PartialEq` and `Eq` derives; `Clone` and `Default` remain, and the
+`EmbedOptions::default().with_*` form above never used the others.
+
 Run this inside a Tokio runtime and keep that runtime alive through shutdown.
 The application owns the choice to start and stop; no signal handler, tracing
 subscriber, or process exit handler is installed by the library. The CLI keeps
