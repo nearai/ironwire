@@ -11,7 +11,10 @@
 //! makes editing someone else's config acceptable at all:
 //!
 //! - **Never rewrite a file we cannot parse.** A user's own syntax error must
-//!   not come back looking like ours.
+//!   not come back looking like ours. A JSON file with comments in it is a
+//!   case of this and not a syntax error — Zed and opencode both accept one —
+//!   so it is refused under its own name rather than as a parse failure, and
+//!   the refusal says which construct was found and on which line.
 //! - **Fill an empty slot; leave a full one alone.** A value already in the key
 //!   is another proxy or a deliberate choice, and taking it over would move
 //!   someone's traffic without telling them. It is reported, not overwritten.
@@ -56,6 +59,9 @@ impl Edit {
 pub enum Error {
     /// The existing file is not valid for its format.
     Unparseable(String),
+    /// The existing file is JSON with comments or trailing commas — legal for
+    /// the tool that wrote it, and not something this module will rewrite.
+    Jsonc(String),
     /// The entry did not survive validation, so we will not act on it.
     Unusable(String),
 }
@@ -68,6 +74,13 @@ impl std::fmt::Display for Error {
                 "the file is not valid for its format — IronWire will not \
                  rewrite a file it cannot read: {detail}"
             ),
+            Self::Jsonc(detail) => write!(
+                f,
+                "the file is JSONC — JSON with comments and trailing commas — \
+                 which the tool that wrote it accepts and IronWire will not \
+                 rewrite, because writing it back would delete the comments: \
+                 {detail}"
+            ),
             Self::Unusable(detail) => write!(f, "the catalog entry is not usable: {detail}"),
         }
     }
@@ -79,9 +92,10 @@ impl std::error::Error for Error {}
 ///
 /// # Errors
 ///
-/// [`Error::Unparseable`] when the file is not valid, [`Error::Unusable`] when
-/// the catalog entry fails validation. A shape this module will not edit by
-/// hand is reported as an occupied slot rather than raised as an error.
+/// [`Error::Unparseable`] when the file is not valid, [`Error::Jsonc`] when it
+/// is valid JSONC rather than JSON, [`Error::Unusable`] when the catalog entry
+/// fails validation. A shape this module will not edit by hand is reported as
+/// an occupied slot rather than raised as an error.
 pub fn connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
     match usable(agent)? {
         ConfigFormat::Json => json_connect(agent, existing, port),
@@ -421,8 +435,79 @@ fn json_parse(existing: &str) -> Result<Map<String, Value>, Error> {
         Ok(_) => Err(Error::Unparseable(
             "the file is valid JSON but not an object".to_string(),
         )),
-        Err(error) => Err(Error::Unparseable(error.to_string())),
+        Err(error) => Err(jsonc_construct(existing)
+            .map_or_else(|| Error::Unparseable(error.to_string()), Error::Jsonc)),
     }
+}
+
+/// What makes this file JSONC rather than JSON, if anything.
+///
+/// Only ever asked after `serde_json` has already refused the file, so it does
+/// not have to decide whether the document is otherwise well formed — only
+/// whether the thing `serde_json` tripped over is a construct the tool that
+/// wrote the file accepts. Zed's shipped `initial_user_settings.json` opens
+/// with eight lines of `//` and closes two objects on a trailing comma;
+/// opencode's published schema sets `allowComments` and `allowTrailingCommas`
+/// at the root. Both are ordinary files their own tools read without
+/// complaint, and "expected value at line 1 column 1" is the wrong thing to
+/// say about either.
+///
+/// Refusing is still the answer — see the module header. This only changes
+/// what the refusal says, which is the difference between a user editing one
+/// key by hand and a user thinking they have corrupted their config.
+///
+/// String literals are tracked because `"https://x"` is not a comment and
+/// `{"a": "b,"}` is not a trailing comma.
+fn jsonc_construct(existing: &str) -> Option<String> {
+    let bytes = existing.as_bytes();
+    let mut line = 1usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    // The last byte that was not whitespace, which is all a trailing comma
+    // needs: a `,` with a closing bracket next.
+    let mut last = None;
+    let mut comma_line = 0usize;
+
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' {
+            line += 1;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => {
+                in_string = true;
+                last = Some(b'"');
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                return Some(format!("a `//` comment on line {line}"));
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                return Some(format!("a `/* */` comment on line {line}"));
+            }
+            b',' => {
+                comma_line = line;
+                last = Some(b',');
+            }
+            b'}' | b']' => {
+                if last == Some(b',') {
+                    return Some(format!("a trailing comma on line {comma_line}"));
+                }
+                last = Some(byte);
+            }
+            _ if byte.is_ascii_whitespace() => {}
+            _ => last = Some(byte),
+        }
+    }
+    None
 }
 
 fn json_render(root: &Map<String, Value>) -> String {
@@ -799,6 +884,72 @@ mod tests {
     fn a_file_we_cannot_read_is_never_rewritten() {
         let error = connect(&agent("env.X"), "{ not json", 8463).expect_err("refuses");
         assert!(matches!(error, Error::Unparseable(_)));
+    }
+
+    /// Zed's own `initial_user_settings.json` — the file it writes the first
+    /// time it starts, verbatim. Eight lines of `//`, and both objects closed
+    /// on a trailing comma.
+    const ZED_INITIAL_USER_SETTINGS: &str = r#"// Zed settings
+//
+// For information on how to configure Zed, see the Zed
+// documentation: https://zed.dev/docs/configuring-zed
+//
+// To see all of Zed's default settings without changing your
+// custom settings, run `zed: open default settings` from the
+// command palette (cmd-shift-p / ctrl-shift-p)
+{
+  "ui_font_size": 16,
+  "buffer_font_size": 15,
+  "theme": {
+    "mode": "system",
+    "light": "One Light",
+    "dark": "One Dark",
+  },
+}
+"#;
+
+    /// The refusal is right — the file cannot be written back without losing
+    /// those comments. Calling it a syntax error is not: the tool that wrote
+    /// the file reads it every time it starts.
+    #[test]
+    fn a_json_file_with_comments_is_refused_as_jsonc_and_not_as_a_syntax_error() {
+        let error = connect(&agent("env.X"), ZED_INITIAL_USER_SETTINGS, 8463).expect_err("refuses");
+        let Error::Jsonc(detail) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(detail, "a `//` comment on line 1");
+        assert!(error.to_string().contains("delete the comments"));
+    }
+
+    /// opencode's published schema sets `allowTrailingCommas` on its own, so a
+    /// file with one and no comments is still a file its tool reads.
+    #[test]
+    fn a_trailing_comma_alone_is_reported_with_the_line_it_is_on() {
+        let existing = "{\n  \"a\": 1,\n  \"b\": 2,\n}\n";
+        let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
+        assert!(
+            matches!(&error, Error::Jsonc(detail) if detail == "a trailing comma on line 3"),
+            "{error:?}"
+        );
+    }
+
+    /// The scanner must not read a value as syntax. A URL has `//` in it and a
+    /// string can end in a comma; neither makes the file JSONC, and a file that
+    /// is merely broken has to keep saying so.
+    #[test]
+    fn a_url_or_a_comma_inside_a_string_is_not_a_comment() {
+        let existing = r#"{"env":{"X":"https://example.com/a","Y":"b,"} "#;
+        let error = connect(&agent("env.X"), existing, 8463).expect_err("refuses");
+        assert!(matches!(error, Error::Unparseable(_)), "{error:?}");
+    }
+
+    /// Valid JSON is never routed through the JSONC arm — commas inside an
+    /// object and slashes inside values are ordinary.
+    #[test]
+    fn valid_json_is_still_edited() {
+        let existing = r#"{"a":1,"url":"https://example.com//x"}"#;
+        let edit = connect(&agent("env.ANTHROPIC_BASE_URL"), existing, 8463).expect("edits");
+        assert!(edit.contents.contains("http://127.0.0.1:8463/anthropic"));
     }
 
     #[test]
