@@ -116,6 +116,13 @@ line rather than a visible failure. A host in that position declines the slot
 with `plan_connect_with` and `StatusLine::Decline`; the routing edit is
 unchanged, and a status line the user wrote themselves is left alone either way.
 
+Declining also removes a status line IronWire installed on an earlier connect,
+so a host that shipped `plan_connect` before adopting this fixes the
+installations it already made rather than only the next one. The `installedBy`
+marker names IronWire and not a particular binary, so in a home shared with the
+`ironwire` CLI this removes the CLI's line as well; `ironwire connect claude`
+puts it back.
+
 ## Implementation checkpoint
 
 This completes upstream Task 1 of the [Trace Commons private-inference

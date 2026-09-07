@@ -84,7 +84,8 @@ impl Edit {
 /// a command that prints nothing.
 ///
 /// Declining does not report `statusLine` as [`Occupied`]: a slot we never
-/// wanted is not one the user took from us.
+/// wanted is not one the user took from us. It does take out a status line we
+/// installed on an earlier connect — see [`clear_status_line`].
 ///
 /// # Errors
 ///
@@ -100,8 +101,9 @@ pub fn connect(
     let mut changes = Vec::new();
     let mut occupied = Vec::new();
 
-    if let Some(command) = command {
-        set_status_line(&mut root, command, &mut changes, &mut occupied);
+    match command {
+        Some(command) => set_status_line(&mut root, command, &mut changes, &mut occupied),
+        None => clear_status_line(&mut root, &mut changes),
     }
 
     if let Some(url) = base_url {
@@ -142,6 +144,29 @@ fn set_status_line(
             root.insert("statusLine".to_string(), entry(command));
             changes.push(format!("statusLine: `{command}` (added)"));
         }
+    }
+}
+
+/// Take out a status line we installed, for a caller that cannot serve one.
+///
+/// Declining is not only about the connect in front of us. A host that declines
+/// today may have installed one yesterday, through the only API there was
+/// before declining existed, and that command names the executable it cannot
+/// run — so skipping the slot would leave the stale command in the file for
+/// good. Declining has to fix an install as well as avoid making one.
+///
+/// Only ours, by the `installedBy` marker [`disconnect`] uses: "remove only
+/// what we put there" is not suspended by declining, and a line the user wrote
+/// is not ours to take out on a connect any more than it is ours to replace.
+///
+/// The marker names IronWire rather than a particular binary, so in a home
+/// shared with the `ironwire` CLI this takes out the CLI's working line too.
+/// That is the identity [`disconnect`] has always used — nothing here can tell
+/// the two apart — and `ironwire connect claude` puts it back.
+fn clear_status_line(root: &mut Map<String, Value>, changes: &mut Vec<String>) {
+    if root.get("statusLine").is_some_and(is_ours) {
+        root.remove("statusLine");
+        changes.push("statusLine: removed (this caller cannot serve one)".to_string());
     }
 }
 
@@ -381,6 +406,34 @@ mod tests {
             parsed(&edit)["env"][BASE_URL],
             "https://proxy.corp.internal"
         );
+    }
+
+    /// The case an upgrade lands in. `plan_connect` was the only API before
+    /// declining existed, so a host that used it already has a status line
+    /// naming the executable it cannot run. Declining has to fix that install,
+    /// not just avoid making another one.
+    #[test]
+    fn declining_removes_a_status_line_we_installed_before() {
+        let installed = connect("", Some(COMMAND), Some(URL)).expect("valid");
+        assert!(parsed(&installed)["statusLine"]["command"] == COMMAND);
+
+        let declined = connect(&installed.contents, None, Some(URL)).expect("valid");
+        assert!(parsed(&declined).get("statusLine").is_none());
+        assert_eq!(
+            declined.changes,
+            vec!["statusLine: removed (this caller cannot serve one)"]
+        );
+    }
+
+    /// "Remove only what we put there" is not suspended by declining. A line
+    /// the user wrote is not ours to take out on a connect any more than it is
+    /// ours to replace.
+    #[test]
+    fn declining_does_not_remove_a_status_line_of_their_own() {
+        let existing = r#"{"statusLine":{"type":"command","command":"~/bin/my-prompt.sh"},"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8463/anthropic"}}"#;
+        let edit = connect(existing, None, Some(URL)).expect("valid");
+        assert!(edit.is_noop(), "changed: {:?}", edit.changes);
+        assert_eq!(parsed(&edit)["statusLine"]["command"], "~/bin/my-prompt.sh");
     }
 
     /// A host that declined once and connects again must not accumulate an

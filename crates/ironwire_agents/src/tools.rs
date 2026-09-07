@@ -189,8 +189,12 @@ pub enum StatusLine {
     /// and the control API still get.
     #[default]
     Offer,
-    /// Leave `statusLine` untouched. For a host whose executable cannot serve
-    /// one. Routing is unaffected: the tool is still pointed at IronWire.
+    /// Install no status line, and take out one IronWire installed on an
+    /// earlier connect — that command names an executable that cannot serve
+    /// it, and leaving it would keep the tool invoking it. A status line the
+    /// user wrote themselves is left alone, as everywhere else here. For a host
+    /// whose executable cannot serve one. Routing is unaffected: the tool is
+    /// still pointed at IronWire.
     Decline,
 }
 
