@@ -265,6 +265,15 @@ pub struct Planned {
     pub changes: Vec<String>,
     /// Slots left alone because the user is already using them.
     pub occupied: Vec<(String, String)>,
+    /// Settings not written because this config does not meet their
+    /// precondition, as `(key, the key whose absence is the reason)`.
+    ///
+    /// Separate from `occupied` because the two are different answers to "what
+    /// do I do now". An occupied slot holds somebody's own value and the way
+    /// forward is to decide whether to move it. A skipped one is a statement
+    /// about this config not being the kind this setting is for, and the way
+    /// forward is usually nothing at all.
+    pub skipped: Vec<(String, String)>,
     existing: String,
     contents: String,
 }
@@ -423,6 +432,9 @@ pub fn plan_connect_with(
                     .into_iter()
                     .map(|o| (o.slot.to_string(), o.current))
                     .collect(),
+                // The hand-written two describe themselves in code and have no
+                // preconditions to carry.
+                skipped: Vec::new(),
                 existing,
                 contents: edit.contents,
             })
@@ -443,6 +455,9 @@ pub fn plan_connect_with(
                     .into_iter()
                     .map(|o| (o.slot.to_string(), o.current))
                     .collect(),
+                // The hand-written two describe themselves in code and have no
+                // preconditions to carry.
+                skipped: Vec::new(),
                 existing,
                 contents: edit.contents,
             })
@@ -461,6 +476,11 @@ pub fn plan_connect_with(
                     .occupied
                     .into_iter()
                     .map(|o| (o.slot, o.current))
+                    .collect(),
+                skipped: edit
+                    .skipped
+                    .into_iter()
+                    .map(|s| (s.slot, s.requires))
                     .collect(),
                 existing,
                 contents: edit.contents,
@@ -495,6 +515,7 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
                 path,
                 changes: edit.changes,
                 occupied: Vec::new(),
+                skipped: Vec::new(),
                 existing,
                 contents: edit.contents,
             })
@@ -510,6 +531,7 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
                 path,
                 changes: edit.changes,
                 occupied: Vec::new(),
+                skipped: Vec::new(),
                 existing,
                 contents: edit.contents,
             })
@@ -525,6 +547,7 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
                 path,
                 changes: edit.changes,
                 occupied: Vec::new(),
+                skipped: Vec::new(),
                 existing,
                 contents: edit.contents,
             })
@@ -708,6 +731,7 @@ mod tests {
             path: PathBuf::from(path),
             changes: vec!["something".to_string()],
             occupied: Vec::new(),
+            skipped: Vec::new(),
             existing: existing.to_string(),
             contents: contents.to_string(),
         };
@@ -748,6 +772,7 @@ mod tests {
             path: path.clone(),
             changes: vec!["something".to_string()],
             occupied: Vec::new(),
+            skipped: Vec::new(),
             existing: "ORIGINAL".to_string(),
             contents: "EDITED".to_string(),
         };
@@ -876,6 +901,7 @@ mod tests {
             path: path.clone(),
             changes: vec!["something".to_string()],
             occupied: Vec::new(),
+            skipped: Vec::new(),
             existing: "ORIGINAL".to_string(),
             contents: "EDITED".to_string(),
         };
@@ -886,6 +912,7 @@ mod tests {
             path,
             changes: vec!["something else".to_string()],
             occupied: Vec::new(),
+            skipped: Vec::new(),
             existing: "EDITED".to_string(),
             contents: "EDITED AGAIN".to_string(),
         };

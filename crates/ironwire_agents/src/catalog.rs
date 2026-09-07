@@ -37,6 +37,20 @@ pub struct Occupied {
     pub current: String,
 }
 
+/// A setting that was not written because its precondition is not met.
+///
+/// Reported rather than silently dropped, for the reason every other refusal
+/// here is: a connect that does nothing and says nothing is indistinguishable
+/// from one that failed, and the person reading the output is the only one who
+/// can tell whether the answer is right for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// The key that was not written.
+    pub slot: String,
+    /// The key whose absence is the reason.
+    pub requires: String,
+}
+
 /// What an edit would do, so the caller can show it before doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edit {
@@ -46,6 +60,9 @@ pub struct Edit {
     pub changes: Vec<String>,
     /// Slots left alone because the user was already using them.
     pub occupied: Vec<Occupied>,
+    /// Settings not written because the config does not meet their
+    /// precondition — see [`AgentSetting::requires`].
+    pub skipped: Vec<Skipped>,
 }
 
 impl Edit {
@@ -196,6 +213,13 @@ pub fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool)
 /// address this setting asks for today — same façade, same spelling. The port
 /// is still not part of the comparison, for the same reason `connect` follows
 /// itself across one.
+///
+/// A setting whose precondition this file does not meet is not part of the
+/// question. `connect` would not write it, so requiring it would make the tool
+/// permanently unwired and put a checkmark permanently out of reach. An entry
+/// *none* of whose settings apply is not wired either, rather than vacuously
+/// wired over an empty set — nothing of ours is in the file, and saying
+/// otherwise would report a connection that never happened.
 #[must_use]
 pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
     let Ok(format) = usable(agent) else {
@@ -209,19 +233,30 @@ pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
             let Ok(root) = json_parse(existing) else {
                 return false;
             };
-            agent.settings.iter().all(|setting| {
-                let path: Vec<&str> = setting.key.split('.').collect();
-                matches!(json_slot(&root, &path), Slot::Ours(value) if points_where_asked(&value, setting))
-            })
+            let present = |key: &str| json_present(&root, &key.split('.').collect::<Vec<_>>());
+            let applicable: Vec<_> = agent
+                .settings
+                .iter()
+                .filter(|setting| applies_here(setting, &present))
+                .collect();
+            !applicable.is_empty()
+                && applicable.iter().all(|setting| {
+                    let path: Vec<&str> = setting.key.split('.').collect();
+                    matches!(json_slot(&root, &path), Slot::Ours(value) if points_where_asked(&value, setting))
+                })
         }
         ConfigFormat::Toml => {
             let Ok(table) = toml_parse(existing) else {
                 return false;
             };
-            agent
+            let present = |key: &str| toml_present(&table, key);
+            let applicable: Vec<_> = agent
                 .settings
                 .iter()
-                .all(|setting| {
+                .filter(|setting| applies_here(setting, &present))
+                .collect();
+            !applicable.is_empty()
+                && applicable.iter().all(|setting| {
                     matches!(toml_slot(&table, &setting.key), Slot::Ours(value) if points_where_asked(&value, setting))
                 })
         }
@@ -240,6 +275,22 @@ fn usable(agent: &AgentEntry) -> Result<ConfigFormat, Error> {
         .config
         .format()
         .ok_or_else(|| Error::Unusable("no format".to_string()))
+}
+
+/// Whether this setting's precondition is met by the file as it stands.
+///
+/// A setting with no `requires` always applies, which is what every entry
+/// written before that field existed means.
+///
+/// The path is walked in the file already parsed for the edit. Nothing else is
+/// opened, and nothing outside this file is reachable: the schema holds
+/// `requires` to the same character rule as the key being written, so it cannot
+/// carry a separator or spell `..`. This is a *presence* test — the key is
+/// there, whatever its value — because that is what the case it exists for
+/// needs, and because a value test would let a document describe the contents
+/// of somebody's config rather than only its shape.
+fn applies_here(setting: &AgentSetting, present: &dyn Fn(&str) -> bool) -> bool {
+    setting.requires.as_deref().is_none_or(present)
 }
 
 /// The value this setting asks us to write.
@@ -262,8 +313,25 @@ fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
     let mut root = json_parse(existing)?;
     let mut changes = Vec::new();
     let mut occupied = Vec::new();
+    let mut skipped = Vec::new();
+
+    // Every precondition is answered against the file as we found it, not
+    // against the document as we are building it. Otherwise a setting could
+    // satisfy the condition of one written after it — an entry whose meaning
+    // depended on the order of its own settings, which is not a property worth
+    // having.
+    let before = root.clone();
 
     for setting in &agent.settings {
+        if !applies_here(setting, &|key| {
+            json_present(&before, &key.split('.').collect::<Vec<_>>())
+        }) {
+            skipped.push(Skipped {
+                slot: setting.key.clone(),
+                requires: setting.requires.clone().unwrap_or_default(),
+            });
+            continue;
+        }
         let url = value_for(setting, port)?;
         let path: Vec<&str> = setting.key.split('.').collect();
         match json_slot(&root, &path) {
@@ -288,9 +356,18 @@ fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
         contents: json_render(&root),
         changes,
         occupied,
+        skipped,
     })
 }
 
+/// Disconnect is deliberately *not* gated on preconditions.
+///
+/// A condition that held when we wrote is not guaranteed to hold when we come
+/// to remove — the user may have taken the provider block out from under our
+/// key. Filtering here would leave our value behind in exactly that case, which
+/// is the one where leaving it behind does the most damage. "Remove only what we
+/// put there" is already the rule that bounds this, and it does not need help
+/// from a precondition.
 fn json_disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
     let mut root = json_parse(existing)?;
     let mut changes = Vec::new();
@@ -307,6 +384,7 @@ fn json_disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
         contents: json_render(&root),
         changes,
         occupied: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 
@@ -342,6 +420,43 @@ fn json_slot(root: &Map<String, Value>, path: &[&str]) -> Slot {
         Some(Value::String(value)) => Slot::Blocked(value.clone()),
         Some(other) => Slot::Blocked(other.to_string()),
     }
+}
+
+/// Whether a key path resolves to anything at all in this document.
+///
+/// Presence, not value: `Slot` is about what we may write into a key and would
+/// call a non-object parent `Blocked`, which is the wrong answer to "is the
+/// provider block there". A block whose value is a string, a number or an empty
+/// object is still a block the user put there.
+fn json_present(root: &Map<String, Value>, path: &[&str]) -> bool {
+    let Some((leaf, parents)) = path.split_last() else {
+        return false;
+    };
+    let mut current = root;
+    for segment in parents {
+        match current.get(*segment) {
+            Some(Value::Object(next)) => current = next,
+            _ => return false,
+        }
+    }
+    current.contains_key(*leaf)
+}
+
+/// Whether a key path resolves to anything at all in this table. As
+/// [`json_present`].
+fn toml_present(table: &toml::Table, key: &str) -> bool {
+    let mut path = key.split('.').peekable();
+    let mut current = table;
+    while let Some(segment) = path.next() {
+        if path.peek().is_none() {
+            return current.contains_key(segment);
+        }
+        match current.get(segment) {
+            Some(toml::Value::Table(next)) => current = next,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Whether a URL is one of ours.
@@ -657,14 +772,23 @@ fn json_render(root: &Map<String, Value>) -> String {
 // user experience than succeeding and a much better one than corrupting a file.
 
 fn toml_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
-    toml_parse(existing)?;
+    let before = toml_parse(existing)?;
 
     let mut out = existing.to_string();
     let mut changes = Vec::new();
     let mut occupied = Vec::new();
+    let mut skipped = Vec::new();
     let mut written: Vec<(String, String)> = Vec::new();
 
     for setting in &agent.settings {
+        // Against the file as found, not as being built — see `json_connect`.
+        if !applies_here(setting, &|key| toml_present(&before, key)) {
+            skipped.push(Skipped {
+                slot: setting.key.clone(),
+                requires: setting.requires.clone().unwrap_or_default(),
+            });
+            continue;
+        }
         let url = value_for(setting, port)?;
         let table = toml_parse(&out)?;
         match toml_slot(&table, &setting.key) {
@@ -706,6 +830,7 @@ fn toml_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
         contents: out,
         changes,
         occupied,
+        skipped,
     })
 }
 
@@ -730,6 +855,7 @@ fn toml_disconnect(agent: &AgentEntry, existing: &str) -> Result<Edit, Error> {
         contents: out,
         changes,
         occupied: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 
@@ -962,8 +1088,170 @@ mod tests {
                 key: key.to_string(),
                 facade: Facade::Anthropic,
                 style: UrlStyle::Origin,
+                requires: None,
             }],
         }
+    }
+
+    /// The opencode shape: one key, gated on the provider block that shows the
+    /// user already uses that provider.
+    fn gated(key: &str, requires: &str) -> AgentEntry {
+        let mut entry = agent(key);
+        entry.settings[0].requires = Some(requires.to_string());
+        entry
+    }
+
+    /// The whole point. A config with no `provider.anthropic` in it belongs to
+    /// someone who does not use Anthropic in this tool, and writing the key
+    /// would not merely be useless — it would promote the provider and change
+    /// which model the tool picks.
+    #[test]
+    fn a_setting_whose_precondition_is_unmet_is_not_written() {
+        let existing = r#"{"provider":{"openai":{"options":{"apiKey":"theirs"}}}}"#;
+        let edit = connect(
+            &gated("provider.anthropic.options.baseURL", "provider.anthropic"),
+            existing,
+            8463,
+        )
+        .expect("edits");
+
+        assert!(edit.is_noop(), "{:?}", edit.changes);
+        assert!(
+            !edit.contents.contains("127.0.0.1"),
+            "nothing of ours may reach the file: {}",
+            edit.contents
+        );
+        assert!(
+            edit.contents.contains("theirs"),
+            "and their config is untouched: {}",
+            edit.contents
+        );
+        assert_eq!(edit.skipped.len(), 1);
+        assert_eq!(edit.skipped[0].slot, "provider.anthropic.options.baseURL");
+        assert_eq!(edit.skipped[0].requires, "provider.anthropic");
+        assert!(edit.occupied.is_empty(), "not occupied — inapplicable");
+    }
+
+    /// The other half, and the one that would go unnoticed if it broke: where
+    /// the precondition holds, the edit is exactly what it was before this
+    /// field existed.
+    #[test]
+    fn a_setting_whose_precondition_is_met_behaves_exactly_as_before() {
+        let existing = r#"{"provider":{"anthropic":{"options":{"apiKey":"theirs"}}}}"#;
+        let gated_edit = connect(
+            &gated("provider.anthropic.options.baseURL", "provider.anthropic"),
+            existing,
+            8463,
+        )
+        .expect("edits");
+        let ungated_edit =
+            connect(&agent("provider.anthropic.options.baseURL"), existing, 8463).expect("edits");
+
+        assert_eq!(gated_edit.contents, ungated_edit.contents);
+        assert_eq!(gated_edit.changes, ungated_edit.changes);
+        assert!(gated_edit.skipped.is_empty());
+        assert!(
+            gated_edit
+                .contents
+                .contains("http://127.0.0.1:8463/anthropic")
+        );
+    }
+
+    /// An unmet precondition is not "wired". It is also not the vacuous truth
+    /// an `all()` over an empty set would give: nothing of ours is in the file.
+    #[test]
+    fn an_entry_with_no_applicable_setting_is_not_wired() {
+        let entry = gated("provider.anthropic.options.baseURL", "provider.anthropic");
+        assert!(!is_wired(&entry, "{}"));
+        assert!(!is_wired(&entry, r#"{"provider":{"openai":{}}}"#));
+    }
+
+    /// A precondition met and the value written reads back as wired, so the
+    /// menu can show a checkmark for a tool that really is connected.
+    #[test]
+    fn a_met_precondition_with_our_value_reads_as_wired() {
+        let entry = gated("provider.anthropic.options.baseURL", "provider.anthropic");
+        let existing = r#"{"provider":{"anthropic":{"options":{"baseURL":"http://127.0.0.1:8463/anthropic"}}}}"#;
+        assert!(is_wired(&entry, existing));
+    }
+
+    /// Presence, not value. A block the user left empty still says they use the
+    /// provider, and a value test would be a bigger thing than this needs to be.
+    #[test]
+    fn presence_is_the_test_whatever_the_value_is() {
+        let entry = gated("provider.anthropic.options.baseURL", "provider.anthropic");
+        for existing in [
+            r#"{"provider":{"anthropic":{}}}"#,
+            r#"{"provider":{"anthropic":null}}"#,
+            r#"{"provider":{"anthropic":"whatever they like"}}"#,
+        ] {
+            let edit = connect(&entry, existing, 8463).expect("edits");
+            assert!(
+                edit.skipped.is_empty(),
+                "`provider.anthropic` is present in {existing}"
+            );
+        }
+    }
+
+    /// A condition that held when we wrote may not hold when we come to remove.
+    /// Gating disconnect too would strand our value in the one case where
+    /// leaving it does the most harm.
+    #[test]
+    fn disconnect_removes_our_value_even_once_the_precondition_stops_holding() {
+        let entry = gated("provider.anthropic.options.baseURL", "provider.anthropic");
+        // The user took the block out from under our key — bar the key itself.
+        let existing = r#"{"other":{"anthropic":{}},"provider":{"anthropic":{"options":{"baseURL":"http://127.0.0.1:8463/anthropic"}}}}"#;
+        let edit = disconnect(&entry, existing).expect("edits");
+        assert_eq!(edit.changes.len(), 1);
+        assert!(
+            !edit.contents.contains("127.0.0.1"),
+            "ours must be gone: {}",
+            edit.contents
+        );
+    }
+
+    /// Preconditions are answered against the file as found. Otherwise a
+    /// setting could satisfy the condition of one listed after it, and the
+    /// entry would mean different things depending on the order of its own
+    /// settings.
+    #[test]
+    fn one_setting_cannot_satisfy_the_precondition_of_another() {
+        let mut entry = agent("provider.anthropic.options.baseURL");
+        entry.settings[0].requires = None;
+        entry.settings.push(AgentSetting {
+            key: "provider.openai.options.baseURL".to_string(),
+            facade: Facade::OpenAi,
+            style: UrlStyle::Versioned,
+            // Satisfied only by what the *first* setting is about to write.
+            requires: Some("provider.anthropic".to_string()),
+        });
+
+        let edit = connect(&entry, "{}", 8463).expect("edits");
+        assert_eq!(
+            edit.changes.len(),
+            1,
+            "only the ungated one: {:?}",
+            edit.changes
+        );
+        assert_eq!(edit.skipped.len(), 1);
+        assert_eq!(edit.skipped[0].slot, "provider.openai.options.baseURL");
+    }
+
+    /// TOML gets the same rule, not a second one that drifts from it.
+    #[test]
+    fn the_precondition_applies_to_toml_too() {
+        let mut entry = gated("providers.anthropic.base_url", "providers.anthropic");
+        entry.config.file = "config.toml".to_string();
+
+        let absent = connect(&entry, "", 8463).expect("edits");
+        assert!(absent.is_noop(), "{:?}", absent.changes);
+        assert_eq!(absent.skipped.len(), 1);
+
+        let present =
+            connect(&entry, "[providers.anthropic]\nname = \"theirs\"\n", 8463).expect("edits");
+        assert_eq!(present.changes.len(), 1);
+        assert!(present.skipped.is_empty());
+        assert!(present.contents.contains("127.0.0.1:8463/anthropic"));
     }
 
     #[test]
@@ -1498,6 +1786,7 @@ mod tests {
             key: "env.OPENAI_BASE_URL".to_string(),
             facade: Facade::OpenAi,
             style: UrlStyle::Versioned,
+            requires: None,
         });
 
         let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8463/anthropic",

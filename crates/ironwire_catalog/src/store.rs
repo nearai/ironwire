@@ -296,6 +296,40 @@ mod tests {
     /// is the first that will take a document announcing it, so every earlier
     /// build refuses the document rather than writing the origin spelling into
     /// a tool that needs `/v1`.
+    /// A document carrying a precondition rides on schema 3, and a build that
+    /// accepts 3 applies it. The bump is what stops an older build reading the
+    /// same document, ignoring the condition, and writing the key
+    /// unconditionally — which is the edit the field exists to prevent.
+    #[test]
+    fn a_document_using_a_precondition_is_applied_at_the_schema_it_must_declare() {
+        let (signing, verifying) = keypair();
+        let document = serde_json::json!({
+            "schema_version": 3,
+            "serial": 1,
+            "issued_at": "2026-09-07T00:00:00Z",
+            "agents": [{
+                "id": "tool",
+                "name": "A Tool",
+                "config": {"dir": [".config", "tool"], "file": "tool.json"},
+                "settings": [{
+                    "key": "provider.anthropic.options.baseURL",
+                    "facade": "anthropic",
+                    "style": "versioned",
+                    "requires": "provider.anthropic",
+                }],
+            }],
+        })
+        .to_string();
+
+        let mut store = CatalogStore::new(verifying);
+        store.apply(&sign(&signing, &document)).expect("applies");
+
+        let current = store.current();
+        let agents = current.agents();
+        let setting = &agents.first().expect("the entry survived").settings[0];
+        assert_eq!(setting.requires.as_deref(), Some("provider.anthropic"));
+    }
+
     #[test]
     fn a_document_using_a_url_style_is_applied_at_the_schema_it_must_declare() {
         let (signing, verifying) = keypair();

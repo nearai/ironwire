@@ -375,6 +375,16 @@ pub(crate) fn wire_catalog_agent(
             occupied.slot, occupied.current
         );
     }
+    // Said out loud, because the alternative is a connect that changes nothing
+    // and explains nothing — and the person reading is the only one who can
+    // tell whether that is the right answer for their setup.
+    for skipped in &edit.skipped {
+        println!(
+            "  {} was left unset: this config has no `{}`, so {} is not \
+             configured to use that provider here.",
+            skipped.slot, skipped.requires, agent.name
+        );
+    }
     Ok(())
 }
 
