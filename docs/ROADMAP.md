@@ -85,8 +85,9 @@ see the carried items above.
   subscription rejects requests without it
 - ✅ `ironwire connect codex` / `ironwire disconnect codex` — edits
   `~/.codex/config.toml` as *text*, so comments and hand-edits survive, backs
-  up the previous contents, and restores the previous `model_provider` on
-  disconnect (`src/codex_config.rs`)
+  up the previous contents, reports a `model_provider` the user already chose
+  instead of taking it, and restores one an earlier version did take on
+  disconnect (`crates/ironwire_agents/src/codex_config.rs`)
 - ✅ NEAR AI backend over Chat Completions (landed with M3)
 - ✅ Per-backend circuit breaker (`ironwire_upstream::breaker`), wired into
   routing so a dead backend is not rediscovered every turn — with the

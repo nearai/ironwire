@@ -9,12 +9,34 @@
 //! valid TOML before anything is written.
 
 /// The table IronWire owns. Nothing outside this block, and the one
-/// `model_provider` line, is ever touched.
+/// `model_provider` line — and that one only when it is empty or already ours
+/// — is ever touched.
 const BLOCK_HEADER: &str = "[model_providers.ironwire]";
 
-/// Marker used to remember what `model_provider` said before we changed it, so
-/// `ironwire disconnect codex` can put it back.
+/// The one key outside our block that decides where Codex sends calls.
+const MODEL_PROVIDER: &str = "model_provider";
+
+/// Marker written by IronWire versions that replaced `model_provider` with our
+/// own, so `ironwire disconnect codex` could put the old value back.
+///
+/// `connect` no longer writes one — a provider the user chose is left alone
+/// now, so there is nothing to remember. It is still read, because configs
+/// carrying a marker from an earlier version are on disk and disconnect owes
+/// them their provider back.
 const PREVIOUS_MARKER: &str = "# ironwire: previous model_provider =";
+
+/// A slot that already held something the user put there.
+///
+/// The same shape, and the same meaning, as [`crate::claude_settings::Occupied`]
+/// and the catalog's: their value stays, and the caller says what they could do
+/// by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occupied {
+    /// Which setting — `model_provider` is the only one this module can leave.
+    pub slot: &'static str,
+    /// What is in it, so the caller can name it back to them.
+    pub current: String,
+}
 
 /// What an edit would do, so the caller can show it before doing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,12 +45,22 @@ pub struct Edit {
     pub contents: String,
     /// Human-readable lines describing what changed.
     pub changes: Vec<String>,
+    /// Slots left alone because the user was already using them.
+    pub occupied: Vec<Occupied>,
 }
 
 impl Edit {
     /// Whether this edit would change anything at all.
     pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
+    }
+
+    /// What is in a slot we left alone, if we left that one alone.
+    pub fn occupied_slot(&self, slot: &str) -> Option<&str> {
+        self.occupied
+            .iter()
+            .find(|o| o.slot == slot)
+            .map(|o| o.current.as_str())
     }
 }
 
@@ -49,6 +81,15 @@ fn block(port: u16) -> String {
 
 /// Compute the edit that points Codex at IronWire.
 ///
+/// Two slots, and only one of them is ever ours: `[model_providers.ironwire]`,
+/// which nothing reads until it is selected, and the top-level
+/// `model_provider`, which is what actually routes Codex. A `model_provider`
+/// the user already chose is another proxy or a deliberate choice, so it is
+/// reported and left — the same rule [`crate::claude_settings`] follows for
+/// `ANTHROPIC_BASE_URL` and the catalog follows for every key it describes.
+/// The block is still written either way, so selecting IronWire afterwards is
+/// one word rather than four lines.
+///
 /// # Errors
 ///
 /// Returns the parse error when the existing file is not valid TOML — we will
@@ -58,38 +99,47 @@ pub fn connect(existing: &str, port: u16) -> Result<Edit, toml::de::Error> {
     existing.parse::<toml::Table>()?;
 
     let mut changes = Vec::new();
+    let mut occupied = Vec::new();
     let mut out = replace_our_block(existing, &block(port), &mut changes);
 
     match top_level_model_provider(&out) {
         Some((_, value)) if value == "ironwire" => {}
-        Some((line_no, value)) => {
-            let mut lines: Vec<String> = out.lines().map(str::to_string).collect();
-            lines[line_no] = "model_provider = \"ironwire\"".to_string();
-            lines.insert(line_no, format!("{PREVIOUS_MARKER} \"{value}\""));
-            out = joined(&lines);
-            changes.push(format!(
-                "model_provider: \"{value}\" → \"ironwire\" (the old value is kept in a comment)"
-            ));
-        }
+        Some((_, value)) => occupied.push(Occupied {
+            slot: MODEL_PROVIDER,
+            current: value,
+        }),
         None => {
-            out = format!("model_provider = \"ironwire\"\n{out}");
-            changes.push("model_provider = \"ironwire\" (added)".to_string());
+            out = format!("{MODEL_PROVIDER} = \"ironwire\"\n{out}");
+            changes.push(format!("{MODEL_PROVIDER} = \"ironwire\" (added)"));
         }
     }
 
     Ok(Edit {
         contents: out,
         changes,
+        occupied,
     })
 }
 
 /// Compute the edit that undoes [`connect`].
+///
+/// `occupied` is always empty here, and that is a property rather than an
+/// omission: an undo fills no slot, so there is no slot it can find full and
+/// step around. What it does instead is remove only what IronWire put there —
+/// a `model_provider` naming anyone else is left exactly as it is.
 ///
 /// # Errors
 ///
 /// Returns the parse error when the existing file is not valid TOML.
 pub fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
     existing.parse::<toml::Table>()?;
+
+    // Whether the selection is ours to undo. A `model_provider` naming someone
+    // else is one `connect` left alone, or one the user has chosen since;
+    // either way, removing it would be this module deleting a line it never
+    // wrote — and it would look to Codex exactly like a config with no provider
+    // at all.
+    let ours = top_level_model_provider(existing).is_some_and(|(_, value)| value == "ironwire");
 
     let mut changes = Vec::new();
     let mut lines: Vec<String> = Vec::new();
@@ -112,7 +162,7 @@ pub fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
                 continue;
             }
         }
-        if let Some(previous) = trimmed.strip_prefix(PREVIOUS_MARKER) {
+        if ours && let Some(previous) = trimmed.strip_prefix(PREVIOUS_MARKER) {
             restore = Some(previous.trim().trim_matches('"').to_string());
             continue;
         }
@@ -120,18 +170,21 @@ pub fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
     }
 
     // Put back whatever `model_provider` said before, or drop the line we added.
+    // A marker is only ever honoured alongside our own selection, so a config
+    // left by an older version — which did replace the provider — still gets it
+    // back.
     let provider_line = lines
         .iter()
-        .position(|l| is_top_level_assignment(l, "model_provider"));
-    if let Some(index) = provider_line {
+        .position(|l| is_top_level_assignment(l, MODEL_PROVIDER));
+    if ours && let Some(index) = provider_line {
         match &restore {
             Some(previous) => {
-                lines[index] = format!("model_provider = \"{previous}\"");
-                changes.push(format!("model_provider: restored to \"{previous}\""));
+                lines[index] = format!("{MODEL_PROVIDER} = \"{previous}\"");
+                changes.push(format!("{MODEL_PROVIDER}: restored to \"{previous}\""));
             }
             None => {
                 lines.remove(index);
-                changes.push("model_provider: removed".to_string());
+                changes.push(format!("{MODEL_PROVIDER}: removed"));
             }
         }
     }
@@ -139,6 +192,7 @@ pub fn disconnect(existing: &str) -> Result<Edit, toml::de::Error> {
     Ok(Edit {
         contents: joined(&lines),
         changes,
+        occupied: Vec::new(),
     })
 }
 
@@ -202,7 +256,7 @@ fn top_level_model_provider(contents: &str) -> Option<(usize, String)> {
         if trimmed.starts_with('[') {
             return None;
         }
-        if is_top_level_assignment(line, "model_provider") {
+        if is_top_level_assignment(line, MODEL_PROVIDER) {
             let value = trimmed
                 .split_once('=')?
                 .1
@@ -251,7 +305,7 @@ pub fn is_wired(existing: &str) -> bool {
     existing
         .parse::<toml::Table>()
         .ok()
-        .and_then(|table| Some(table.get("model_provider")?.as_str()? == "ironwire"))
+        .and_then(|table| Some(table.get(MODEL_PROVIDER)?.as_str()? == "ironwire"))
         .unwrap_or(false)
 }
 
@@ -299,15 +353,40 @@ theme = \"dark\"  # trailing comment
     }
 
     #[test]
-    fn a_previous_provider_is_remembered_so_it_can_be_restored() {
-        let edit = connect("model_provider = \"openai\"\n", 8463).expect("edits");
-        assert!(edit.contents.contains(PREVIOUS_MARKER));
+    fn a_provider_the_user_already_chose_is_reported_and_left() {
+        // The rule `claude_settings` follows for `ANTHROPIC_BASE_URL`: a value
+        // already there is another proxy or a deliberate choice, and taking it
+        // over would move someone's traffic. The caller gets told instead.
+        let existing = "model_provider = \"my-own-proxy\"\n";
+        let edit = connect(existing, 8463).expect("edits");
+
         assert_eq!(
             table(&edit.contents)["model_provider"].as_str(),
-            Some("ironwire")
+            Some("my-own-proxy"),
+            "IronWire took over a provider the user had chosen"
         );
+        assert_eq!(edit.occupied_slot(MODEL_PROVIDER), Some("my-own-proxy"));
+        assert!(!edit.contents.contains(PREVIOUS_MARKER));
 
-        let undone = disconnect(&edit.contents).expect("edits");
+        // The block is still written: unselected it routes nothing, and having
+        // it there is what makes the manual fix one word.
+        assert_eq!(
+            table(&edit.contents)["model_providers"]["ironwire"]["base_url"].as_str(),
+            Some("http://127.0.0.1:8463/openai/v1")
+        );
+        assert!(!is_wired(&edit.contents));
+    }
+
+    #[test]
+    fn a_marker_left_by_an_older_version_still_restores_that_provider() {
+        // Versions before the occupied-slot rule replaced `model_provider` and
+        // remembered the old value in a comment. Those configs are on disk, and
+        // disconnect owes them their provider back.
+        let existing = format!(
+            "{PREVIOUS_MARKER} \"openai\"\nmodel_provider = \"ironwire\"\n\n{}",
+            block(8463)
+        );
+        let undone = disconnect(&existing).expect("edits");
         assert_eq!(
             table(&undone.contents)["model_provider"].as_str(),
             Some("openai"),
@@ -315,6 +394,32 @@ theme = \"dark\"  # trailing comment
         );
         assert!(!undone.contents.contains(BLOCK_HEADER));
         assert!(!undone.contents.contains(PREVIOUS_MARKER));
+    }
+
+    #[test]
+    fn disconnect_leaves_a_provider_it_never_selected() {
+        // Rule three: remove only what we put there. Dropping this line would
+        // look to Codex like a config with no provider at all.
+        let existing = "model_provider = \"my-own-proxy\"\n";
+        let connected = connect(existing, 8463).expect("edits").contents;
+        let undone = disconnect(&connected).expect("edits");
+        assert_eq!(
+            table(&undone.contents)["model_provider"].as_str(),
+            Some("my-own-proxy")
+        );
+        assert_eq!(table(&undone.contents), table(existing));
+    }
+
+    #[test]
+    fn an_undo_reports_no_occupied_slots_because_it_fills_none() {
+        let connected = connect("", 8463).expect("edits").contents;
+        assert!(disconnect(&connected).expect("edits").occupied.is_empty());
+        assert!(
+            disconnect("model_provider = \"my-own-proxy\"\n")
+                .expect("edits")
+                .occupied
+                .is_empty()
+        );
     }
 
     #[test]
