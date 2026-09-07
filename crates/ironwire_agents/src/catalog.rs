@@ -230,7 +230,9 @@ pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
     }
     match format {
         ConfigFormat::Json => {
-            let Ok(root) = json_parse(existing) else {
+            // Reading, not writing: see `json_parse_tolerant`. The writers a
+            // few hundred lines down deliberately keep the strict parser.
+            let Ok(root) = json_parse_tolerant(existing) else {
                 return false;
             };
             let present = |key: &str| json_present(&root, &key.split('.').collect::<Vec<_>>());
@@ -588,6 +590,77 @@ fn json_parse(existing: &str) -> Result<Map<String, Value>, Error> {
     }
 }
 
+/// The JSONC constructs taken out, and which ones were found.
+///
+/// Shared by the two questions that need it, so there is one lexer rather than
+/// two that could come to disagree about what a comment is: [`jsonc`] asks in
+/// order to name the construct in a refusal, and [`json_parse_tolerant`] asks
+/// in order to read a file it will not write.
+///
+/// The returned text exists only to be parsed and dropped. Nothing in this
+/// module writes it anywhere, and the module header's first rule depends on
+/// that staying true.
+struct Stripped {
+    /// The text with the JSONC constructs removed. Parsed and dropped, never
+    /// written -- see the module header's first rule.
+    text: String,
+    /// The first comment, and the line it is on.
+    comment: Option<(usize, &'static str)>,
+    /// The first trailing comma, and the line it is on.
+    comma: Option<(usize, ())>,
+}
+
+fn strip_jsonc(existing: &str) -> Option<Stripped> {
+    let (without_comments, comment) = strip_comments(existing.as_bytes());
+    let (stripped, comma) = strip_trailing_commas(&without_comments);
+    // Deletions only ever span whole ASCII tokens or whole comments, so this
+    // holds; if it somehow did not, the original parse error stands.
+    let text = String::from_utf8(stripped).ok()?;
+    Some(Stripped {
+        text,
+        comment,
+        comma,
+    })
+}
+
+/// Parse for reading, tolerating the JSONC a strict parse refuses.
+///
+/// [`json_parse`] is the writer's parser and stays strict, because rewriting a
+/// file we only half-understand is how a user loses their comments. Reading is
+/// not that: there is no round trip, nothing is written back, and the worst a
+/// wrong answer does here is describe the file inaccurately.
+///
+/// The asymmetry is the whole point, so it is worth stating in one place: this
+/// function may be called from anything that only *asks* about a file, and
+/// must not be called from anything that edits one.
+///
+/// Without this, a config a user wired by hand reads back as not wired for the
+/// entire class of tools whose own format is JSONC — Zed ships a settings file
+/// with eight lines of `//` in it, and opencode's published schema sets
+/// `allowComments`. `is_wired` feeding the menu means the banner then offers
+/// to connect a tool that is already connected, and the user's own correct
+/// configuration is what triggers it.
+///
+/// Strict first, so a plain JSON file takes exactly the path it always did and
+/// pays nothing for this.
+fn json_parse_tolerant(existing: &str) -> Result<Map<String, Value>, Error> {
+    match json_parse(existing) {
+        Ok(map) => Ok(map),
+        Err(strict) => {
+            let Some(stripped) = strip_jsonc(existing) else {
+                return Err(strict);
+            };
+            // Only an object is an answer. A file that strips down to a valid
+            // JSON array or scalar is not a config this module could read the
+            // keys of, and the strict error is the honest thing to return.
+            match serde_json::from_str::<Value>(&stripped.text) {
+                Ok(Value::Object(map)) => Ok(map),
+                _ => Err(strict),
+            }
+        }
+    }
+}
+
 /// Whether this file is JSONC rather than JSON, and what makes it so.
 ///
 /// Only ever asked after `serde_json` has already refused the file. Two things
@@ -614,11 +687,11 @@ fn json_parse(existing: &str) -> Result<Map<String, Value>, Error> {
 /// to the ordinary parse error: it is not a config file this module could have
 /// edited even spelled as strict JSON.
 fn jsonc(existing: &str) -> Option<Jsonc> {
-    let (without_comments, comment) = strip_comments(existing.as_bytes());
-    let (stripped, comma) = strip_trailing_commas(&without_comments);
-    // Deletions only ever span whole ASCII tokens or whole comments, so this
-    // holds; if it somehow did not, the original parse error stands.
-    let stripped = String::from_utf8(stripped).ok()?;
+    let Stripped {
+        text: stripped,
+        comment,
+        comma,
+    } = strip_jsonc(existing)?;
 
     // In file order, so the construct named is the first one a reader meets.
     let found = match (&comment, &comma) {
@@ -1333,6 +1406,85 @@ mod tests {
         assert_eq!(jsonc.found, "a `//` comment on line 1");
         assert!(jsonc.comments);
         assert!(error.to_string().contains("delete the comments"));
+    }
+
+    /// A file whose own tool calls it valid must not read as unwired just
+    /// because the writer would refuse to edit it.
+    ///
+    /// The refusal is right and stays. The answer to "is this already wired"
+    /// is a different question with no round trip in it, and getting it wrong
+    /// costs the user a banner offering to connect a tool they connected
+    /// themselves -- triggered by their own correct configuration.
+    #[test]
+    fn a_hand_wired_jsonc_file_reads_as_wired() {
+        let entry = agent("env.X");
+        let strict = r#"{"env":{"X":"http://127.0.0.1:8463/anthropic"}}"#;
+        assert!(
+            is_wired(&entry, strict),
+            "the strict spelling is the control"
+        );
+
+        for (name, existing) in [
+            (
+                "line comment",
+                "// mine\n{\"env\":{\"X\":\"http://127.0.0.1:8463/anthropic\"}}\n",
+            ),
+            (
+                "block comment",
+                "/* mine */\n{\"env\":{\"X\":\"http://127.0.0.1:8463/anthropic\"}}\n",
+            ),
+            (
+                "trailing comma",
+                "{\"env\":{\"X\":\"http://127.0.0.1:8463/anthropic\",},}\n",
+            ),
+            (
+                "all three, as Zed and opencode actually ship them",
+                "// Settings\n/* and a block */\n{\n  \"env\": {\n    \"X\": \"http://127.0.0.1:8463/anthropic\",\n  },\n}\n",
+            ),
+        ] {
+            assert!(is_wired(&entry, existing), "{name} should read as wired");
+        }
+    }
+
+    /// Tolerance is not a blanket yes.
+    ///
+    /// A reader that answered "wired" for anything it could not parse would
+    /// hide the tools that need connecting, which is the same failure as this
+    /// change fixes, pointing the other way.
+    #[test]
+    fn tolerance_does_not_make_every_file_read_as_wired() {
+        let entry = agent("env.X");
+        for (name, existing) in [
+            ("JSONC, but ours is absent", "// mine\n{\"env\":{}}\n"),
+            (
+                "JSONC, but the value is somebody else's",
+                "// mine\n{\"env\":{\"X\":\"https://api.anthropic.com\"},}\n",
+            ),
+            (
+                "not JSON at all once the comments come out",
+                "// mine\n{\"env\": nope,}\n",
+            ),
+            ("truncated", "// mine\n{\"env\":{\"X\":\n"),
+            ("an array, not a config object", "// mine\n[1, 2,]\n"),
+            ("empty once stripped", "// only a comment\n"),
+        ] {
+            assert!(!is_wired(&entry, existing), "{name} must not read as wired");
+        }
+    }
+
+    /// The writers keep the strict parser, which is the whole asymmetry:
+    /// reading a JSONC file loses nothing, rewriting one deletes the comments.
+    ///
+    /// Tying the two answers together in one test means a later change that
+    /// makes `connect` tolerant has to delete this to land, rather than
+    /// quietly widening what gets rewritten.
+    #[test]
+    fn reading_a_jsonc_file_is_tolerant_and_writing_it_is_still_refused() {
+        let entry = agent("env.X");
+        let wired = "// mine\n{\"env\":{\"X\":\"http://127.0.0.1:8463/anthropic\"},}\n";
+        assert!(is_wired(&entry, wired));
+        let error = connect(&entry, wired, 8463).expect_err("still refuses to rewrite it");
+        assert!(matches!(error, Error::Jsonc(_)), "{error:?}");
     }
 
     /// opencode's published schema sets `allowTrailingCommas` on its own, so a
