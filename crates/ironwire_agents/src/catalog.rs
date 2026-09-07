@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use ironwire_catalog::schema::{AgentEntry, ConfigFormat, Facade};
+use ironwire_catalog::schema::{AgentEntry, AgentSetting, ConfigFormat, Facade, UrlStyle};
 use serde_json::{Map, Value};
 
 /// A slot that already held something the user put there.
@@ -128,11 +128,28 @@ pub fn detected(agent: &AgentEntry, home: &Path, on_path: &dyn Fn(&str) -> bool)
     agent.detect.iter().any(|name| on_path(name))
 }
 
-/// Whether this tool's config already points at IronWire.
+/// Whether this tool's config already points at IronWire, in the form the entry
+/// currently asks for.
 ///
 /// Every setting has to be ours. A tool with the base URL set but a second key
 /// still the user's is half-wired, and reporting it as connected would explain
 /// away the very symptom someone opened the menu to understand.
+///
+/// "Ours" is not sufficient on its own, because [`points_at_us`] deliberately
+/// accepts every façade and both spellings — that width is what lets `connect`
+/// recognise its own earlier value instead of mistaking it for somebody else's.
+/// Recognising a value and being *done* are different questions. When a catalog
+/// corrects an entry from [`UrlStyle::Origin`] to [`UrlStyle::Versioned`], the
+/// value already in the file is still ours, but it names a path the façade does
+/// not serve. Reporting that as wired is what would strand it: `tools::all`
+/// hands this answer to the menu, whose onboarding banner offers only tools that
+/// are *not* wired and whose per-tool toggle is already showing a checkmark, so
+/// nothing would ever call `connect` to make the change the catalog asked for.
+///
+/// So recognition stays wide and this stays narrow: the value has to be the
+/// address this setting asks for today — same façade, same spelling. The port
+/// is still not part of the comparison, for the same reason `connect` follows
+/// itself across one.
 #[must_use]
 pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
     let Ok(format) = usable(agent) else {
@@ -148,7 +165,7 @@ pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
             };
             agent.settings.iter().all(|setting| {
                 let path: Vec<&str> = setting.key.split('.').collect();
-                matches!(json_slot(&root, &path), Slot::Ours(_))
+                matches!(json_slot(&root, &path), Slot::Ours(value) if points_where_asked(&value, setting))
             })
         }
         ConfigFormat::Toml => {
@@ -158,7 +175,9 @@ pub fn is_wired(agent: &AgentEntry, existing: &str) -> bool {
             agent
                 .settings
                 .iter()
-                .all(|setting| matches!(toml_slot(&table, &setting.key), Slot::Ours(_)))
+                .all(|setting| {
+                    matches!(toml_slot(&table, &setting.key), Slot::Ours(value) if points_where_asked(&value, setting))
+                })
         }
     }
 }
@@ -177,6 +196,20 @@ fn usable(agent: &AgentEntry) -> Result<ConfigFormat, Error> {
         .ok_or_else(|| Error::Unusable("no format".to_string()))
 }
 
+/// The value this setting asks us to write.
+///
+/// `usable` has already refused an entry naming a style this build cannot
+/// write, so this only fires if the two ever disagree — and refusing is the
+/// half of that disagreement we can stand behind.
+fn value_for(setting: &AgentSetting, port: u16) -> Result<String, Error> {
+    setting.url(port).ok_or_else(|| {
+        Error::Unusable(format!(
+            "`{}` asks for a URL style this build does not implement",
+            setting.key
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------- JSON
 
 fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
@@ -185,7 +218,7 @@ fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
     let mut occupied = Vec::new();
 
     for setting in &agent.settings {
-        let url = setting.facade.url(port);
+        let url = value_for(setting, port)?;
         let path: Vec<&str> = setting.key.split('.').collect();
         match json_slot(&root, &path) {
             Slot::Blocked(current) => occupied.push(Occupied {
@@ -267,22 +300,52 @@ fn json_slot(root: &Map<String, Value>, path: &[&str]) -> Slot {
 
 /// Whether a URL is one of ours.
 ///
-/// Loopback and one of our own façade paths. A port change still counts as
-/// ours, which is what lets `connect` follow the daemon to a new port instead
-/// of treating its own previous value as somebody else's.
+/// Loopback and one of our own façade paths, in any spelling we write. A port
+/// change still counts as ours, which is what lets `connect` follow the daemon
+/// to a new port instead of treating its own previous value as somebody else's
+/// — and so does a change of [`UrlStyle`], so an entry corrected from the
+/// origin form to the versioned one is rewritten rather than reported as
+/// occupied.
 fn points_at_us(url: &str) -> bool {
+    our_facade_path(url).is_some()
+}
+
+/// Which of our façade paths a URL names, or `None` when it is not one of ours.
+///
+/// The port is not part of the answer: a daemon that moved to a new port still
+/// wrote the value, and treating it as somebody else's is what would stop
+/// `connect` following itself.
+fn our_facade_path(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("http://127.0.0.1:")
-        .or_else(|| url.strip_prefix("http://localhost:"));
-    rest.is_some_and(|rest| {
-        let trimmed = rest.trim_end_matches('/');
-        trimmed.split_once('/').is_some_and(|(port, path)| {
-            port.chars().all(|c| c.is_ascii_digit())
-                && Facade::ALL
-                    .iter()
-                    .any(|facade| facade.path() == format!("/{path}"))
+        .or_else(|| url.strip_prefix("http://localhost:"))?;
+    let (port, path) = rest.trim_end_matches('/').split_once('/')?;
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let path = format!("/{path}");
+    Facade::ALL
+        .iter()
+        .any(|facade| {
+            UrlStyle::ALL
+                .iter()
+                .filter_map(|style| style.suffix())
+                .any(|suffix| format!("{}{suffix}", facade.path()) == path)
         })
-    })
+        .then_some(path)
+}
+
+/// Whether a value already in the file is the address this setting asks for.
+///
+/// Narrower than [`points_at_us`] on purpose — see [`is_wired`]. A style this
+/// build cannot write has no address to compare against, so it is never
+/// satisfied; `usable` has already refused such an entry, and answering "not
+/// wired" is the safe half of the disagreement if the two ever part.
+fn points_where_asked(url: &str, setting: &AgentSetting) -> bool {
+    let Some(suffix) = setting.style.suffix() else {
+        return false;
+    };
+    our_facade_path(url).is_some_and(|path| path == format!("{}{suffix}", setting.facade.path()))
 }
 
 fn json_insert(root: &mut Map<String, Value>, path: &[&str], value: &str) {
@@ -392,7 +455,7 @@ fn toml_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
     let mut written: Vec<(String, String)> = Vec::new();
 
     for setting in &agent.settings {
-        let url = setting.facade.url(port);
+        let url = value_for(setting, port)?;
         let table = toml_parse(&out)?;
         match toml_slot(&table, &setting.key) {
             Slot::Blocked(current) => {
@@ -673,7 +736,7 @@ fn joined(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironwire_catalog::schema::{AgentSetting, ConfigLocation};
+    use ironwire_catalog::schema::ConfigLocation;
 
     fn agent(key: &str) -> AgentEntry {
         AgentEntry {
@@ -688,6 +751,7 @@ mod tests {
             settings: vec![AgentSetting {
                 key: key.to_string(),
                 facade: Facade::Anthropic,
+                style: UrlStyle::Origin,
             }],
         }
     }
@@ -955,5 +1019,160 @@ mod tests {
     fn an_absent_file_starts_from_an_empty_object() {
         let edit = connect(&agent("env.ANTHROPIC_BASE_URL"), "", 8463).expect("edits");
         assert!(edit.contents.contains("127.0.0.1:8463/anthropic"));
+    }
+
+    // ------------------------------------------------------------ URL styles
+
+    /// The proof that the gap is closed, stated as the thing that measures it:
+    /// the base URL `codex_config` writes by hand is now something a catalog
+    /// entry can ask for. Compared against that module's own output rather than
+    /// a copy of the string, so the two cannot drift apart silently.
+    #[test]
+    fn the_built_in_codex_base_url_is_expressible_through_the_catalog() {
+        let built_in = crate::codex_config::connect("", 8463).expect("edits");
+        let built_in: toml::Table = built_in.contents.parse().expect("valid TOML");
+        let expected = built_in["model_providers"]["ironwire"]["base_url"]
+            .as_str()
+            .expect("a base_url")
+            .to_string();
+
+        let mut entry = toml_agent("model_providers.ironwire.base_url");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let edit = connect(&entry, "", 8463).expect("edits");
+        let parsed: toml::Table = edit.contents.parse().expect("valid TOML");
+        assert_eq!(
+            parsed["model_providers"]["ironwire"]["base_url"].as_str(),
+            Some(expected.as_str()),
+            "{}",
+            edit.contents
+        );
+        assert_eq!(expected, "http://127.0.0.1:8463/openai/v1");
+    }
+
+    /// A tool that wants the versioned form and is holding the origin form is
+    /// holding a value we wrote, not somebody else's — so it is corrected
+    /// rather than reported as occupied. Otherwise a catalog fixing a tool's
+    /// entry would leave every existing install pointed at a 404.
+    #[test]
+    fn our_own_value_is_corrected_to_the_spelling_the_tool_wants() {
+        let mut entry = agent("provider.openai.options.baseURL");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let existing = r#"{"provider":{"openai":{"options":
+                          {"baseURL":"http://127.0.0.1:8463/openai"}}}}"#;
+        let edit = connect(&entry, existing, 8463).expect("edits");
+        assert!(edit.occupied.is_empty(), "{:?}", edit.occupied);
+        assert!(
+            edit.contents.contains("http://127.0.0.1:8463/openai/v1"),
+            "{}",
+            edit.contents
+        );
+    }
+
+    /// And it is still only ours that we remove.
+    #[test]
+    fn disconnect_removes_a_versioned_value_we_wrote() {
+        let mut entry = agent("provider.openai.options.baseURL");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let existing = r#"{"provider":{"openai":{"options":
+                          {"baseURL":"http://127.0.0.1:8463/openai/v1"}}}}"#;
+        let edit = disconnect(&entry, existing).expect("edits");
+        assert_eq!(edit.changes.len(), 1);
+        assert!(!edit.contents.contains("baseURL"), "{}", edit.contents);
+    }
+
+    /// Someone else's `/v1` base URL is still someone else's.
+    #[test]
+    fn a_versioned_url_that_is_not_loopback_is_not_ours() {
+        assert!(!points_at_us("https://api.openai.com/v1"));
+        assert!(!points_at_us("http://127.0.0.1:8463/openai/v2"));
+        assert!(points_at_us("http://127.0.0.1:8463/openai/v1"));
+        assert!(points_at_us("http://127.0.0.1:8463/anthropic/v1"));
+    }
+
+    /// The state the whole `style` field exists to reach: a catalog corrects an
+    /// entry to the spelling the tool actually needs, and the machine it lands
+    /// on already has our older value in that key.
+    ///
+    /// If this reports wired, nothing ever calls `connect`: the menu's
+    /// onboarding banner offers only unwired tools and its toggle is already
+    /// checked, so the correction can never take effect and the tool keeps
+    /// requesting a path the façade does not serve.
+    #[test]
+    fn a_value_in_the_old_spelling_is_not_wired_once_the_entry_asks_for_the_new_one() {
+        let mut entry = agent("provider.openai.options.baseURL");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let existing = r#"{"provider":{"openai":{"options":
+                          {"baseURL":"http://127.0.0.1:8463/openai"}}}}"#;
+        assert!(
+            !is_wired(&entry, existing),
+            "the origin spelling satisfied an entry asking for the versioned one"
+        );
+
+        // And the value it asks for does satisfy it, so the correction settles
+        // rather than being offered again every time the menu opens.
+        let corrected = connect(&entry, existing, 8463).expect("edits").contents;
+        assert!(is_wired(&entry, &corrected), "{corrected}");
+    }
+
+    /// The same for TOML, which is the format the tools that want `/v1`
+    /// actually use — Codex's `config.toml` is the case in hand.
+    #[test]
+    fn the_toml_reader_asks_the_same_question() {
+        let mut entry = toml_agent("model_providers.ironwire.base_url");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let origin = "[model_providers.ironwire]\nbase_url = \"http://127.0.0.1:8463/openai\"\n";
+        assert!(!is_wired(&entry, origin));
+
+        let corrected = connect(&entry, origin, 8463).expect("edits").contents;
+        assert!(is_wired(&entry, &corrected), "{corrected}");
+    }
+
+    /// The narrowing is about the spelling, not about the port. A daemon that
+    /// moved is still wired — `connect` follows itself across a port, and a
+    /// menu that called that "not routed" would be answering a question nobody
+    /// asked.
+    #[test]
+    fn a_port_we_have_since_moved_off_is_still_wired() {
+        let entry = agent("env.ANTHROPIC_BASE_URL");
+        let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9999/anthropic"}}"#;
+        assert!(is_wired(&entry, existing));
+    }
+
+    /// Our own value for the *other* façade is ours, and still not what this
+    /// entry asked for. Same defect as the style mismatch, and the same answer:
+    /// recognised, so `connect` will rewrite it; not wired, so something will.
+    #[test]
+    fn our_own_value_for_another_facade_does_not_satisfy_this_one() {
+        let entry = agent("env.ANTHROPIC_BASE_URL");
+        let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8463/openai"}}"#;
+        assert!(points_at_us("http://127.0.0.1:8463/openai"));
+        assert!(!is_wired(&entry, existing));
+    }
+
+    /// Two settings, one already correct and one still in the old spelling.
+    /// Half-wired is not wired — the rule this function already had for a key
+    /// the user was using, applied to a key that is ours but stale.
+    #[test]
+    fn one_stale_setting_is_enough_to_be_unwired() {
+        let mut entry = agent("env.ANTHROPIC_BASE_URL");
+        entry.settings.push(AgentSetting {
+            key: "env.OPENAI_BASE_URL".to_string(),
+            facade: Facade::OpenAi,
+            style: UrlStyle::Versioned,
+        });
+
+        let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8463/anthropic",
+                                 "OPENAI_BASE_URL":"http://127.0.0.1:8463/openai"}}"#;
+        assert!(!is_wired(&entry, existing));
     }
 }

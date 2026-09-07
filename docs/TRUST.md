@@ -307,9 +307,13 @@ replaced it is narrower in what it forbids and stricter about what matters:
 
 - **A value for a location is unrepresentable.** A catalog entry points a tool's
   config key at one of *our* façades by naming it — `anthropic` or `open_ai` —
-  and the scheme, host and port come from the running daemon. There is no
-  variant that carries a string, so "point Claude Code at evil.example" cannot
-  be written down, let alone signed.
+  and the scheme, host and port come from the running daemon. It also picks
+  which spelling of that façade's address the tool is handed — the origin form
+  `…/anthropic` or the versioned form `…/openai/v1`, because both conventions
+  are in use among the tools worth describing — but that suffix is compiled in
+  beside the façade path and the set of spellings is closed. There is no variant
+  that carries a string, so "point Claude Code at evil.example" cannot be
+  written down, let alone signed.
 - **A location is constrained, not free.** A tool's config is a dotdir under the
   user's home plus a `.json` or `.toml` file. `.` and `..` are refused,
   separators are outside the permitted charset, and the extension requirement is

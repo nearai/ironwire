@@ -277,6 +277,58 @@ mod tests {
         ));
     }
 
+    /// Bumping the number is not a break. Every document above declares `1`,
+    /// and a publisher who is not using `style` should go on declaring it — a
+    /// document that says `1` reaches every build ever shipped, which is the
+    /// whole reason not to raise it for its own sake.
+    #[test]
+    fn the_schema_this_build_replaces_is_still_accepted() {
+        let (signing, verifying) = keypair();
+        let mut store = CatalogStore::new(verifying);
+        store
+            .apply(&sign(&signing, &document(1, "oauth-2026-09-01")))
+            .expect("a document declaring the previous schema still applies");
+        assert_eq!(store.current().anthropic.oauth_beta, "oauth-2026-09-01");
+    }
+
+    /// And the version a document must declare to use `style` is one this build
+    /// accepts. That pairing is the point: the build that understands the field
+    /// is the first that will take a document announcing it, so every earlier
+    /// build refuses the document rather than writing the origin spelling into
+    /// a tool that needs `/v1`.
+    #[test]
+    fn a_document_using_a_url_style_is_applied_at_the_schema_it_must_declare() {
+        let (signing, verifying) = keypair();
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "serial": 1,
+            "issued_at": "2026-08-08T00:00:00Z",
+            "agents": [{
+                "id": "tool",
+                "name": "A Tool",
+                "config": {"dir": [".tool"], "file": "config.toml"},
+                "settings": [{
+                    "key": "model_providers.ironwire.base_url",
+                    "facade": "open_ai",
+                    "style": "versioned",
+                }],
+            }],
+        })
+        .to_string();
+
+        let mut store = CatalogStore::new(verifying);
+        store.apply(&sign(&signing, &document)).expect("applies");
+
+        let current = store.current();
+        let agents = current.agents();
+        let setting = &agents.first().expect("the entry survived").settings[0];
+        assert_eq!(setting.style, crate::schema::UrlStyle::Versioned);
+        assert_eq!(
+            setting.url(8463).as_deref(),
+            Some("http://127.0.0.1:8463/openai/v1")
+        );
+    }
+
     #[test]
     fn a_newer_schema_is_refused_rather_than_half_applied() {
         // Half-understanding a provider workaround is worse than using the
