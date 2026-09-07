@@ -282,12 +282,16 @@ pub(crate) fn wire_claude(port: u16, dry_run: bool) -> Result<()> {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let command = format!("{} statusline", our_binary()?);
     let url = anthropic_url(port);
-    let edit = claude_settings::connect(&existing, &command, Some(&url)).with_context(|| {
-        format!(
-            "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
-            path.display()
-        )
-    })?;
+    // Always `Some` here: this is the `ironwire` binary, and it implements
+    // `ironwire statusline`. A host embedding the library may not, and passes
+    // `None` — see `ironwire_agents::tools::StatusLine`.
+    let edit =
+        claude_settings::connect(&existing, Some(&command), Some(&url)).with_context(|| {
+            format!(
+                "{} is not valid JSON — IronWire will not rewrite a file it cannot read",
+                path.display()
+            )
+        })?;
 
     if !edit.is_noop() {
         // TRUST.md: name the file before touching it, every time.

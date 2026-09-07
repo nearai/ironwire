@@ -15,6 +15,11 @@
 //!
 //! So, for both: we fill the slot when it is empty, we leave it alone when it
 //! is not, and we remove only what we put there.
+//!
+//! And either slot may be skipped, because not every caller can fill both. The
+//! status-line command names the calling binary, which is `ironwire` only when
+//! the CLI is calling; a host embedding this crate that has no `statusline`
+//! subcommand asks for the routing alone. See [`connect`].
 
 use serde_json::{Map, Value};
 
@@ -66,8 +71,20 @@ impl Edit {
 
 /// Point Claude Code at IronWire, and add our status line, in one edit.
 ///
+/// Both slots are optional, and for the same reason: this file is touched for
+/// more than one reason and by more than one caller.
+///
 /// `base_url` is `None` for a caller that wants only the status line — the
-/// daemon is not the only reason to touch this file.
+/// daemon is not the only reason to touch this file. `command` is `None` for
+/// the inverse: a caller that wants only the routing, because it cannot honour
+/// a status line. The command written here is a binary plus a `statusline`
+/// subcommand, and the binary is whichever one called — which is the `ironwire`
+/// CLI for the CLI and this crate's embedding host for anyone else. A host that
+/// implements no such subcommand declines the slot rather than filling it with
+/// a command that prints nothing.
+///
+/// Declining does not report `statusLine` as [`Occupied`]: a slot we never
+/// wanted is not one the user took from us.
 ///
 /// # Errors
 ///
@@ -76,13 +93,35 @@ impl Edit {
 /// then look like ours.
 pub fn connect(
     existing: &str,
-    command: &str,
+    command: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<Edit, serde_json::Error> {
     let mut root = parse(existing)?;
     let mut changes = Vec::new();
     let mut occupied = Vec::new();
 
+    if let Some(command) = command {
+        set_status_line(&mut root, command, &mut changes, &mut occupied);
+    }
+
+    if let Some(url) = base_url {
+        set_base_url(&mut root, url, &mut changes, &mut occupied);
+    }
+
+    Ok(Edit {
+        contents: render(&root),
+        changes,
+        occupied,
+    })
+}
+
+/// Fill `statusLine`, unless someone else is using it.
+fn set_status_line(
+    root: &mut Map<String, Value>,
+    command: &str,
+    changes: &mut Vec<String>,
+    occupied: &mut Vec<Occupied>,
+) {
     match root.get("statusLine") {
         Some(current) if is_ours(current) => {
             // Ours already, but the path may have moved between installs.
@@ -104,16 +143,6 @@ pub fn connect(
             changes.push(format!("statusLine: `{command}` (added)"));
         }
     }
-
-    if let Some(url) = base_url {
-        set_base_url(&mut root, url, &mut changes, &mut occupied);
-    }
-
-    Ok(Edit {
-        contents: render(&root),
-        changes,
-        occupied,
-    })
 }
 
 /// Fill `env.ANTHROPIC_BASE_URL`, unless someone else is using it.
@@ -287,7 +316,7 @@ mod tests {
 
     #[test]
     fn an_empty_file_gains_a_status_line() {
-        let edit = connect("", COMMAND, None).expect("valid");
+        let edit = connect("", Some(COMMAND), None).expect("valid");
         assert!(edit.contents.contains("statusLine"));
         assert!(edit.contents.contains(COMMAND));
         assert!(edit.occupied.is_empty());
@@ -296,7 +325,7 @@ mod tests {
     #[test]
     fn every_other_setting_survives_the_edit() {
         let existing = r#"{"model":"opus","permissions":{"allow":["Bash(ls:*)"]}}"#;
-        let edit = connect(existing, COMMAND, Some(URL)).expect("valid");
+        let edit = connect(existing, Some(COMMAND), Some(URL)).expect("valid");
         let parsed = parsed(&edit);
         assert_eq!(parsed["model"], "opus");
         assert_eq!(parsed["permissions"]["allow"][0], "Bash(ls:*)");
@@ -307,37 +336,88 @@ mod tests {
     #[test]
     fn a_status_line_of_their_own_is_never_replaced() {
         let existing = r#"{"statusLine":{"type":"command","command":"~/bin/my-prompt.sh"}}"#;
-        let edit = connect(existing, COMMAND, None).expect("valid");
+        let edit = connect(existing, Some(COMMAND), None).expect("valid");
         assert!(edit.is_noop(), "changed: {:?}", edit.changes);
         assert_eq!(edit.occupied_slot("statusLine"), Some("~/bin/my-prompt.sh"));
         assert_eq!(parsed(&edit)["statusLine"]["command"], "~/bin/my-prompt.sh");
     }
 
+    /// The case an embedding host needs. The command written into `statusLine`
+    /// is the calling binary plus a subcommand, and a host that implements no
+    /// such subcommand would be pointing Claude Code at something that prints
+    /// nothing. It still wants the routing.
+    #[test]
+    fn a_caller_that_cannot_run_a_status_line_still_gets_the_routing() {
+        let edit = connect("", None, Some(URL)).expect("valid");
+        let parsed = parsed(&edit);
+        assert_eq!(parsed["env"][BASE_URL], URL);
+        assert!(parsed.get("statusLine").is_none(), "{}", edit.contents);
+        assert_eq!(edit.changes.len(), 1, "changed: {:?}", edit.changes);
+        assert!(edit.occupied.is_empty());
+    }
+
+    /// Declining is not the same as being refused. A slot we never asked for
+    /// is not one the user took from us, so it is not reported back as theirs.
+    #[test]
+    fn declining_the_status_line_leaves_theirs_alone_without_calling_it_occupied() {
+        let existing = r#"{"statusLine":{"type":"command","command":"~/bin/my-prompt.sh"}}"#;
+        let edit = connect(existing, None, Some(URL)).expect("valid");
+        assert_eq!(parsed(&edit)["statusLine"]["command"], "~/bin/my-prompt.sh");
+        assert_eq!(edit.occupied_slot("statusLine"), None);
+    }
+
+    /// Declining the status line is not a licence over the other slot: a base
+    /// URL the user set is still theirs, and still reported.
+    #[test]
+    fn declining_the_status_line_still_leaves_a_base_url_of_their_own() {
+        let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"https://proxy.corp.internal"}}"#;
+        let edit = connect(existing, None, Some(URL)).expect("valid");
+        assert!(edit.is_noop(), "changed: {:?}", edit.changes);
+        assert_eq!(
+            edit.occupied_slot(BASE_URL),
+            Some("https://proxy.corp.internal")
+        );
+        assert_eq!(
+            parsed(&edit)["env"][BASE_URL],
+            "https://proxy.corp.internal"
+        );
+    }
+
+    /// A host that declined once and connects again must not accumulate an
+    /// empty edit, and must still not acquire a status line.
+    #[test]
+    fn declining_twice_changes_nothing_the_second_time() {
+        let first = connect("", None, Some(URL)).expect("valid");
+        let second = connect(&first.contents, None, Some(URL)).expect("valid");
+        assert!(second.is_noop(), "changed: {:?}", second.changes);
+        assert!(parsed(&second).get("statusLine").is_none());
+    }
+
     #[test]
     fn installing_twice_changes_nothing_the_second_time() {
-        let first = connect("", COMMAND, Some(URL)).expect("valid");
-        let second = connect(&first.contents, COMMAND, Some(URL)).expect("valid");
+        let first = connect("", Some(COMMAND), Some(URL)).expect("valid");
+        let second = connect(&first.contents, Some(COMMAND), Some(URL)).expect("valid");
         assert!(second.is_noop(), "changed: {:?}", second.changes);
     }
 
     #[test]
     fn a_moved_binary_updates_the_command() {
-        let first = connect("", "/old/path/ironwire statusline", None).expect("valid");
-        let second = connect(&first.contents, COMMAND, None).expect("valid");
+        let first = connect("", Some("/old/path/ironwire statusline"), None).expect("valid");
+        let second = connect(&first.contents, Some(COMMAND), None).expect("valid");
         assert!(!second.is_noop());
         assert!(second.contents.contains(COMMAND));
     }
 
     #[test]
     fn an_empty_file_gains_the_base_url() {
-        let edit = connect("", COMMAND, Some(URL)).expect("valid");
+        let edit = connect("", Some(COMMAND), Some(URL)).expect("valid");
         assert_eq!(parsed(&edit)["env"][BASE_URL], URL);
     }
 
     #[test]
     fn an_existing_env_block_keeps_its_other_variables() {
         let existing = r#"{"env":{"FOO":"bar"}}"#;
-        let edit = connect(existing, COMMAND, Some(URL)).expect("valid");
+        let edit = connect(existing, Some(COMMAND), Some(URL)).expect("valid");
         let parsed = parsed(&edit);
         assert_eq!(parsed["env"]["FOO"], "bar");
         assert_eq!(parsed["env"][BASE_URL], URL);
@@ -348,7 +428,7 @@ mod tests {
     #[test]
     fn a_base_url_of_their_own_is_never_replaced() {
         let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"https://proxy.corp.internal"}}"#;
-        let edit = connect(existing, COMMAND, Some(URL)).expect("valid");
+        let edit = connect(existing, Some(COMMAND), Some(URL)).expect("valid");
         assert_eq!(
             edit.occupied_slot(BASE_URL),
             Some("https://proxy.corp.internal")
@@ -362,7 +442,7 @@ mod tests {
     #[test]
     fn a_port_change_moves_our_own_base_url() {
         let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9999/anthropic"}}"#;
-        let edit = connect(existing, COMMAND, Some(URL)).expect("valid");
+        let edit = connect(existing, Some(COMMAND), Some(URL)).expect("valid");
         assert!(!edit.is_noop());
         assert_eq!(parsed(&edit)["env"][BASE_URL], URL);
     }
@@ -384,14 +464,14 @@ mod tests {
     #[test]
     fn an_env_that_is_not_an_object_is_left_alone() {
         let existing = r#"{"env":"inherit"}"#;
-        let edit = connect(existing, COMMAND, Some(URL)).expect("valid");
+        let edit = connect(existing, Some(COMMAND), Some(URL)).expect("valid");
         assert!(edit.occupied_slot(BASE_URL).is_some());
         assert_eq!(parsed(&edit)["env"], "inherit");
     }
 
     #[test]
     fn disconnect_removes_ours_and_leaves_the_rest() {
-        let existing = connect(r#"{"model":"opus"}"#, COMMAND, Some(URL)).expect("valid");
+        let existing = connect(r#"{"model":"opus"}"#, Some(COMMAND), Some(URL)).expect("valid");
         let removed = disconnect(&existing.contents).expect("valid");
         let parsed = parsed(&removed);
         assert!(parsed.get("statusLine").is_none());
@@ -402,7 +482,8 @@ mod tests {
 
     #[test]
     fn disconnect_keeps_an_env_block_that_holds_more_than_ours() {
-        let existing = connect(r#"{"env":{"FOO":"bar"}}"#, COMMAND, Some(URL)).expect("valid");
+        let existing =
+            connect(r#"{"env":{"FOO":"bar"}}"#, Some(COMMAND), Some(URL)).expect("valid");
         let removed = disconnect(&existing.contents).expect("valid");
         let parsed = parsed(&removed);
         assert_eq!(parsed["env"]["FOO"], "bar");
@@ -422,7 +503,7 @@ mod tests {
 
     #[test]
     fn invalid_json_is_refused_rather_than_rewritten() {
-        assert!(connect("{ not json", COMMAND, Some(URL)).is_err());
+        assert!(connect("{ not json", Some(COMMAND), Some(URL)).is_err());
         assert!(disconnect("{ not json").is_err());
     }
 }
