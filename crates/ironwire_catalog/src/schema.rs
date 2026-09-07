@@ -16,10 +16,12 @@
 //! describe where a tool keeps its config. The rule that replaced it is stricter
 //! about the thing that actually matters:
 //!
-//! - **Values are unrepresentable.** [`AgentSetting`] carries a [`Facade`], not
-//!   a string. The scheme, host and port come from this binary. There is no
-//!   variant that takes a literal, so "point Claude Code at evil.example" cannot
-//!   be written down, let alone signed.
+//! - **Values are unrepresentable.** [`AgentSetting`] carries a [`Facade`] and
+//!   a [`UrlStyle`], not a string. Both are closed sets of this binary's own
+//!   addresses: the scheme, host, port, façade path and version suffix are all
+//!   compiled in, and the document only chooses among them. There is no variant
+//!   that takes a literal, so "point Claude Code at evil.example" cannot be
+//!   written down, let alone signed.
 //! - **Locations are constrained, not free.** [`ConfigLocation`] is a dotdir
 //!   under the user's home plus a `.json` or `.toml` file, with `.` and `..`
 //!   refused and separators outside the charset. The worst a compromised key
@@ -202,6 +204,73 @@ impl Facade {
     pub fn url(self, port: u16) -> String {
         format!("http://127.0.0.1:{port}{}", self.path())
     }
+
+    /// The same address, in the form a particular tool expects to be given.
+    ///
+    /// `None` for a style this build does not implement: the address is only
+    /// ever composed from parts compiled in here, so a style we do not
+    /// recognise has no value to compose and the caller must refuse rather
+    /// than guess at one.
+    #[must_use]
+    pub fn url_in(self, port: u16, style: UrlStyle) -> Option<String> {
+        style
+            .suffix()
+            .map(|suffix| format!("{}{suffix}", self.url(port)))
+    }
+}
+
+/// How much of a façade's address a tool expects to be handed.
+///
+/// Both forms are the *same* façade on the *same* loopback port, differing only
+/// by a suffix that is compiled in here exactly as [`Facade::path`] is. The
+/// document picks between spellings this binary ships; it still cannot write
+/// one.
+///
+/// The variant exists because both conventions are genuinely in use, and a
+/// catalog that can only express one of them can only describe half the tools.
+/// Claude Code reads `ANTHROPIC_BASE_URL` as an origin and appends
+/// `/v1/messages`; most OpenAI-compatible clients take a base URL that already
+/// ends in `/v1`. `codex_config.rs` writes that second form by hand for the
+/// built-in Codex support, and until this field existed no catalog entry could
+/// say the same thing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlStyle {
+    /// Origin plus the façade path: `http://127.0.0.1:8463/anthropic`. What
+    /// Claude Code's `ANTHROPIC_BASE_URL` wants, and the default because it is
+    /// what every entry written before this field existed already meant.
+    #[default]
+    Origin,
+    /// The same, plus the version segment the façade is served under:
+    /// `http://127.0.0.1:8463/openai/v1`. What an OpenAI-compatible client's
+    /// `base_url` or `baseURL` wants.
+    Versioned,
+    /// A style a newer document named and this binary does not implement.
+    ///
+    /// Present so that one unknown spelling costs the entry that used it and
+    /// not the whole document: without it serde would refuse the catalog
+    /// outright and take the provider constants — the values that stop the
+    /// proxy working at all — down with an agent row. An entry carrying it is
+    /// dropped by [`AgentEntry::problem`], which is the failure this schema
+    /// already has for a malformed row.
+    #[serde(other)]
+    Unrecognised,
+}
+
+impl UrlStyle {
+    /// Every style this build can actually write.
+    pub const ALL: [Self; 2] = [Self::Origin, Self::Versioned];
+
+    /// What this style appends to the façade path, or `None` when it is not a
+    /// style this build implements.
+    #[must_use]
+    pub const fn suffix(self) -> Option<&'static str> {
+        match self {
+            Self::Origin => Some(""),
+            Self::Versioned => Some("/v1"),
+            Self::Unrecognised => None,
+        }
+    }
 }
 
 /// One key in a tool's config file, and which façade it points at.
@@ -212,15 +281,31 @@ impl Facade {
 /// exists to close. Naming a façade is the entire vocabulary: the worst a
 /// compromised signing key can do is point a tool at the user's own proxy, or
 /// at the wrong key of their own config.
+///
+/// [`UrlStyle`] does not weaken that. It chooses between two spellings of the
+/// same loopback address, both compiled in here; no string in this type reaches
+/// the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSetting {
     /// Dotted key path inside the config file, e.g. `env.ANTHROPIC_BASE_URL`.
     pub key: String,
     /// Which façade the key is set to.
     pub facade: Facade,
+    /// Which spelling of that façade's address the tool expects. Defaults to
+    /// [`UrlStyle::Origin`], so a document written before this field existed
+    /// keeps meaning what it meant.
+    #[serde(default)]
+    pub style: UrlStyle,
 }
 
 impl AgentSetting {
+    /// The value to write for this setting, or `None` when the style is one
+    /// this build does not implement.
+    #[must_use]
+    pub fn url(&self, port: u16) -> Option<String> {
+        self.facade.url_in(port, self.style)
+    }
+
     /// Whether the key path is one we are willing to write.
     fn key_is_safe(&self) -> bool {
         !self.key.is_empty()
@@ -392,6 +477,12 @@ impl AgentEntry {
             if !setting.key_is_safe() {
                 return Some(format!("`{}` is not a usable key path", setting.key));
             }
+            if setting.style.suffix().is_none() {
+                return Some(format!(
+                    "`{}` asks for a URL style this build does not implement",
+                    setting.key
+                ));
+            }
         }
         None
     }
@@ -471,6 +562,7 @@ mod tests {
             settings: vec![AgentSetting {
                 key: "env.ANTHROPIC_BASE_URL".to_string(),
                 facade: Facade::Anthropic,
+                style: UrlStyle::Origin,
             }],
         }
     }
@@ -522,19 +614,29 @@ mod tests {
         let setting = AgentSetting {
             key: "env.ANTHROPIC_BASE_URL".to_string(),
             facade: Facade::Anthropic,
+            style: UrlStyle::Origin,
         };
         let serialised = serde_json::to_value(&setting).expect("serialises");
         let object = serialised.as_object().expect("an object");
-        // Exactly two fields, and neither is free-form enough to hold a host.
-        assert_eq!(object.len(), 2, "{serialised}");
+        // Exactly three fields; only `key` is a string, and it names a slot in
+        // the user's own file rather than anywhere to send to.
+        assert_eq!(object.len(), 3, "{serialised}");
         assert_eq!(object["facade"], "anthropic");
+        assert_eq!(object["style"], "origin");
 
-        // And a value that does exist is loopback, on our own port.
+        // And a value that does exist is loopback, on our own port — in either
+        // spelling, because both halves of the address are ours.
         assert_eq!(
             Facade::Anthropic.url(8463),
             "http://127.0.0.1:8463/anthropic"
         );
         assert!(Facade::OpenAi.url(1).starts_with("http://127.0.0.1:1/"));
+        for facade in Facade::ALL {
+            for style in UrlStyle::ALL {
+                let url = facade.url_in(8463, style).expect("a style we implement");
+                assert!(url.starts_with("http://127.0.0.1:8463/"), "{url}");
+            }
+        }
     }
 
     /// A document that could name a literal value would reopen exactly the hole
@@ -563,6 +665,67 @@ mod tests {
         });
         let parsed: AgentSetting = serde_json::from_value(smuggled).expect("tolerates extras");
         assert_eq!(parsed.facade.url(8463), "http://127.0.0.1:8463/anthropic");
+        assert_eq!(parsed.style, UrlStyle::Origin);
+        assert_eq!(
+            parsed.url(8463).as_deref(),
+            Some("http://127.0.0.1:8463/anthropic")
+        );
+    }
+
+    /// The gap this field closes. Most OpenAI-compatible clients want a base
+    /// URL that already ends in `/v1` — which is what `codex_config.rs` writes
+    /// by hand for the built-in Codex support, and what no catalog entry could
+    /// previously ask for. Both spellings are still our own loopback address.
+    #[test]
+    fn a_setting_can_ask_for_the_versioned_spelling_of_the_same_facade() {
+        let setting = AgentSetting {
+            key: "model_providers.ironwire.base_url".to_string(),
+            facade: Facade::OpenAi,
+            style: UrlStyle::Versioned,
+        };
+        assert_eq!(
+            setting.url(8463).as_deref(),
+            Some("http://127.0.0.1:8463/openai/v1")
+        );
+
+        // The suffix is not the document's either: it is picked from a closed
+        // set, so widening a style to a host would take a release.
+        let round_tripped: AgentSetting = serde_json::from_value(serde_json::json!({
+            "key": "model_providers.ironwire.base_url",
+            "facade": "open_ai",
+            "style": "versioned",
+        }))
+        .expect("parses");
+        assert_eq!(round_tripped, setting);
+    }
+
+    /// A style a newer document names must cost the row that used it, not the
+    /// document: the provider constants beside it are what keep the proxy
+    /// working at all.
+    #[test]
+    fn an_unrecognised_url_style_drops_the_entry_and_not_the_document() {
+        let document = serde_json::json!({
+            "schema_version": 1, "serial": 3, "issued_at": "2026-09-06T00:00:00Z",
+            "anthropic": {"api_version": "2023-06-01", "oauth_beta": "oauth-2026-01-01"},
+            "agents": [{
+                "id": "tool",
+                "name": "A Tool",
+                "detect": ["tool"],
+                "config": {"dir": [".tool"], "file": "config.json"},
+                "settings": [{
+                    "key": "base_url",
+                    "facade": "open_ai",
+                    "style": "some_future_spelling",
+                }],
+            }],
+        });
+        let catalog: Catalog = serde_json::from_value(document).expect("still parses");
+        assert_eq!(catalog.anthropic.oauth_beta, "oauth-2026-01-01");
+        assert!(catalog.agents().is_empty());
+        assert_eq!(catalog.rejected_agents().len(), 1);
+
+        // And nothing composes an address out of a style we do not implement.
+        assert_eq!(Facade::OpenAi.url_in(8463, UrlStyle::Unrecognised), None);
     }
 
     #[test]
@@ -644,6 +807,7 @@ mod tests {
             entry.settings = vec![AgentSetting {
                 key: key.to_string(),
                 facade: Facade::Anthropic,
+                style: UrlStyle::Origin,
             }];
             assert!(entry.problem().is_some(), "`{key}` was accepted");
         }

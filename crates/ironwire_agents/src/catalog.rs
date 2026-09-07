@@ -22,7 +22,7 @@
 
 use std::path::Path;
 
-use ironwire_catalog::schema::{AgentEntry, ConfigFormat, Facade};
+use ironwire_catalog::schema::{AgentEntry, AgentSetting, ConfigFormat, Facade, UrlStyle};
 use serde_json::{Map, Value};
 
 /// A slot that already held something the user put there.
@@ -177,6 +177,20 @@ fn usable(agent: &AgentEntry) -> Result<ConfigFormat, Error> {
         .ok_or_else(|| Error::Unusable("no format".to_string()))
 }
 
+/// The value this setting asks us to write.
+///
+/// `usable` has already refused an entry naming a style this build cannot
+/// write, so this only fires if the two ever disagree — and refusing is the
+/// half of that disagreement we can stand behind.
+fn value_for(setting: &AgentSetting, port: u16) -> Result<String, Error> {
+    setting.url(port).ok_or_else(|| {
+        Error::Unusable(format!(
+            "`{}` asks for a URL style this build does not implement",
+            setting.key
+        ))
+    })
+}
+
 // ---------------------------------------------------------------------- JSON
 
 fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, Error> {
@@ -185,7 +199,7 @@ fn json_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
     let mut occupied = Vec::new();
 
     for setting in &agent.settings {
-        let url = setting.facade.url(port);
+        let url = value_for(setting, port)?;
         let path: Vec<&str> = setting.key.split('.').collect();
         match json_slot(&root, &path) {
             Slot::Blocked(current) => occupied.push(Occupied {
@@ -267,9 +281,12 @@ fn json_slot(root: &Map<String, Value>, path: &[&str]) -> Slot {
 
 /// Whether a URL is one of ours.
 ///
-/// Loopback and one of our own façade paths. A port change still counts as
-/// ours, which is what lets `connect` follow the daemon to a new port instead
-/// of treating its own previous value as somebody else's.
+/// Loopback and one of our own façade paths, in any spelling we write. A port
+/// change still counts as ours, which is what lets `connect` follow the daemon
+/// to a new port instead of treating its own previous value as somebody else's
+/// — and so does a change of [`UrlStyle`], so an entry corrected from the
+/// origin form to the versioned one is rewritten rather than reported as
+/// occupied.
 fn points_at_us(url: &str) -> bool {
     let rest = url
         .strip_prefix("http://127.0.0.1:")
@@ -278,9 +295,12 @@ fn points_at_us(url: &str) -> bool {
         let trimmed = rest.trim_end_matches('/');
         trimmed.split_once('/').is_some_and(|(port, path)| {
             port.chars().all(|c| c.is_ascii_digit())
-                && Facade::ALL
-                    .iter()
-                    .any(|facade| facade.path() == format!("/{path}"))
+                && Facade::ALL.iter().any(|facade| {
+                    UrlStyle::ALL
+                        .iter()
+                        .filter_map(|style| style.suffix())
+                        .any(|suffix| format!("{}{suffix}", facade.path()) == format!("/{path}"))
+                })
         })
     })
 }
@@ -392,7 +412,7 @@ fn toml_connect(agent: &AgentEntry, existing: &str, port: u16) -> Result<Edit, E
     let mut written: Vec<(String, String)> = Vec::new();
 
     for setting in &agent.settings {
-        let url = setting.facade.url(port);
+        let url = value_for(setting, port)?;
         let table = toml_parse(&out)?;
         match toml_slot(&table, &setting.key) {
             Slot::Blocked(current) => {
@@ -673,7 +693,7 @@ fn joined(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironwire_catalog::schema::{AgentSetting, ConfigLocation};
+    use ironwire_catalog::schema::ConfigLocation;
 
     fn agent(key: &str) -> AgentEntry {
         AgentEntry {
@@ -688,6 +708,7 @@ mod tests {
             settings: vec![AgentSetting {
                 key: key.to_string(),
                 facade: Facade::Anthropic,
+                style: UrlStyle::Origin,
             }],
         }
     }
@@ -955,5 +976,79 @@ mod tests {
     fn an_absent_file_starts_from_an_empty_object() {
         let edit = connect(&agent("env.ANTHROPIC_BASE_URL"), "", 8463).expect("edits");
         assert!(edit.contents.contains("127.0.0.1:8463/anthropic"));
+    }
+
+    // ------------------------------------------------------------ URL styles
+
+    /// The proof that the gap is closed, stated as the thing that measures it:
+    /// the base URL `codex_config` writes by hand is now something a catalog
+    /// entry can ask for. Compared against that module's own output rather than
+    /// a copy of the string, so the two cannot drift apart silently.
+    #[test]
+    fn the_built_in_codex_base_url_is_expressible_through_the_catalog() {
+        let built_in = crate::codex_config::connect("", 8463).expect("edits");
+        let built_in: toml::Table = built_in.contents.parse().expect("valid TOML");
+        let expected = built_in["model_providers"]["ironwire"]["base_url"]
+            .as_str()
+            .expect("a base_url")
+            .to_string();
+
+        let mut entry = toml_agent("model_providers.ironwire.base_url");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let edit = connect(&entry, "", 8463).expect("edits");
+        let parsed: toml::Table = edit.contents.parse().expect("valid TOML");
+        assert_eq!(
+            parsed["model_providers"]["ironwire"]["base_url"].as_str(),
+            Some(expected.as_str()),
+            "{}",
+            edit.contents
+        );
+        assert_eq!(expected, "http://127.0.0.1:8463/openai/v1");
+    }
+
+    /// A tool that wants the versioned form and is holding the origin form is
+    /// holding a value we wrote, not somebody else's — so it is corrected
+    /// rather than reported as occupied. Otherwise a catalog fixing a tool's
+    /// entry would leave every existing install pointed at a 404.
+    #[test]
+    fn our_own_value_is_corrected_to_the_spelling_the_tool_wants() {
+        let mut entry = agent("provider.openai.options.baseURL");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let existing = r#"{"provider":{"openai":{"options":
+                          {"baseURL":"http://127.0.0.1:8463/openai"}}}}"#;
+        let edit = connect(&entry, existing, 8463).expect("edits");
+        assert!(edit.occupied.is_empty(), "{:?}", edit.occupied);
+        assert!(
+            edit.contents.contains("http://127.0.0.1:8463/openai/v1"),
+            "{}",
+            edit.contents
+        );
+    }
+
+    /// And it is still only ours that we remove.
+    #[test]
+    fn disconnect_removes_a_versioned_value_we_wrote() {
+        let mut entry = agent("provider.openai.options.baseURL");
+        entry.settings[0].facade = Facade::OpenAi;
+        entry.settings[0].style = UrlStyle::Versioned;
+
+        let existing = r#"{"provider":{"openai":{"options":
+                          {"baseURL":"http://127.0.0.1:8463/openai/v1"}}}}"#;
+        let edit = disconnect(&entry, existing).expect("edits");
+        assert_eq!(edit.changes.len(), 1);
+        assert!(!edit.contents.contains("baseURL"), "{}", edit.contents);
+    }
+
+    /// Someone else's `/v1` base URL is still someone else's.
+    #[test]
+    fn a_versioned_url_that_is_not_loopback_is_not_ours() {
+        assert!(!points_at_us("https://api.openai.com/v1"));
+        assert!(!points_at_us("http://127.0.0.1:8463/openai/v2"));
+        assert!(points_at_us("http://127.0.0.1:8463/openai/v1"));
+        assert!(points_at_us("http://127.0.0.1:8463/anthropic/v1"));
     }
 }
