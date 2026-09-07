@@ -704,3 +704,206 @@ fn a_backend_no_configuration_names_is_not_probed() {
         "and the same start does probe it under the default, so the zero means something"
     );
 }
+
+/// The backend list a running daemon reports.
+async fn backends_reported_by(home: &std::path::Path, port: u16) -> Vec<serde_json::Value> {
+    let paths = ironwire_core::config::PathsConfig::rooted_at(home.to_owned());
+    let token = std::fs::read_to_string(paths.control_token_file()).unwrap();
+    let status: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/_ironwire/status"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    status["backends"]
+        .as_array()
+        .expect("a backend list")
+        .clone()
+}
+
+/// A host with a credential it will not put in the process environment.
+///
+/// The whole point is that this never runs `set_var`: the key exists only in
+/// this test's own memory, and the daemon still finds it. `api_key_env` names a
+/// variable that is deliberately absent from the process, so a backend built at
+/// all is a backend built from the host's answer.
+#[tokio::test]
+async fn a_host_supplies_a_backend_credential_without_the_process_environment() {
+    use ironwire_proxy::embed::{EmbedOptions, StartupProbes, start_with_options};
+    use secrecy::SecretString;
+
+    const NAME: &str = "IRONWIRE_TEST_VENDOR_KEY";
+    assert!(
+        std::env::var_os(NAME).is_none(),
+        "the point of the test is a name the environment cannot answer"
+    );
+
+    for supplied in [false, true] {
+        let home = home();
+        let config_path = home.path().join("config.toml");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str(&format!(
+            "[[backends]]\nid = 'vendor'\nkind = 'openai-compatible'\nbase_url = 'http://127.0.0.1:1/v1'\napi_key_env = '{NAME}'\n"
+        ));
+        std::fs::write(&config_path, &config).unwrap();
+
+        let options = EmbedOptions::default().with_startup_probes(StartupProbes::Off);
+        let options = if supplied {
+            options.with_credentials(|name: &str| {
+                (name == NAME).then(|| SecretString::from("sk-from-host".to_string()))
+            })
+        } else {
+            options
+        };
+        let proxy = start_with_options(home.path(), Some(0), options, |_, _| {})
+            .await
+            .expect("starts");
+
+        let vendor = backends_reported_by(home.path(), proxy.port())
+            .await
+            .into_iter()
+            .find(|backend| backend["id"] == "vendor");
+        proxy.shutdown().await;
+
+        match supplied {
+            true => assert_eq!(
+                vendor.expect("the host's credential built the backend")["authenticated"],
+                serde_json::json!(true)
+            ),
+            false => assert!(
+                vendor.is_none(),
+                "with no host source and no variable, there is no credential and no backend"
+            ),
+        }
+    }
+}
+
+/// A host that owns credentials owns all of them, including the ones that come
+/// from files rather than variables.
+///
+/// This home does not switch the subscription backends off, so on a developer
+/// machine logged into Claude Code or Codex the default start registers them.
+/// A host-owned start must register neither: a fresh user's request going to a
+/// subscription they never chose, because the daemon found a login on disk, is
+/// the failure this option exists to prevent.
+#[tokio::test]
+async fn a_host_that_owns_credentials_registers_no_file_discovered_backend() {
+    use ironwire_proxy::embed::{
+        EmbedOptions, HostSecret, StartupProbes, UpdateChecks, start_with_options,
+    };
+
+    let home = tempfile::tempdir().unwrap();
+    // Only NEAR AI is switched off, so that the registry can be empty; the
+    // subscription entries are deliberately left alone.
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[updates]\ncheck = false\n[[backends]]\nid = 'nearai'\nkind = 'nearai'\nenabled = false\n",
+    )
+    .unwrap();
+
+    let proxy = start_with_options(
+        home.path(),
+        Some(0),
+        EmbedOptions::default()
+            .with_update_checks(UpdateChecks::Off)
+            .with_startup_probes(StartupProbes::Off)
+            .with_credentials(|_: &str| None::<HostSecret>),
+        |_, _| {},
+    )
+    .await
+    .expect("starts");
+
+    let backends = backends_reported_by(home.path(), proxy.port()).await;
+    assert!(
+        backends.is_empty(),
+        "a host that answers nothing has no backends, not the ones IronWire found for itself"
+    );
+    assert!(
+        proxy.startup_report().no_backends,
+        "and the report says so, which is what that field is for"
+    );
+    proxy.shutdown().await;
+}
+
+/// The credential that is neither a variable nor a subscription: the key Codex
+/// stores after `codex login --api-key`, read from `auth.json` and reached
+/// through an `.or_else` behind the environment lookup.
+///
+/// Run in a child process with `CODEX_HOME` planted, because that is the only
+/// honest way to have a stored key without mutating this process's environment
+/// while other tests read it — the same device the empty-home test uses.
+#[test]
+fn a_host_that_owns_credentials_is_not_offered_the_codex_stored_key() {
+    const CHILD: &str = "IRONWIRE_CODEX_STORED_KEY_TEST";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use ironwire_proxy::embed::{
+                    EmbedOptions, HostSecret, StartupProbes, UpdateChecks, start_with_options,
+                };
+                let options = || {
+                    EmbedOptions::default()
+                        .with_update_checks(UpdateChecks::Off)
+                        .with_startup_probes(StartupProbes::Off)
+                };
+                for host_owned in [false, true] {
+                    let home = tempfile::tempdir().unwrap();
+                    let options = if host_owned {
+                        options().with_credentials(|_: &str| None::<HostSecret>)
+                    } else {
+                        options()
+                    };
+                    let proxy = start_with_options(home.path(), Some(0), options, |_, _| {})
+                        .await
+                        .expect("starts");
+                    let openai = backends_reported_by(home.path(), proxy.port())
+                        .await
+                        .into_iter()
+                        .find(|backend| backend["id"] == "openai-key");
+                    proxy.shutdown().await;
+                    match host_owned {
+                        false => assert_eq!(
+                            openai.expect("the stored key is found by default")["authenticated"],
+                            serde_json::json!(true),
+                        ),
+                        true => assert!(
+                            openai.is_none(),
+                            "a host that owns credentials is not handed a key off Codex's disk"
+                        ),
+                    }
+                }
+            });
+        return;
+    }
+
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        r#"{"auth_mode": "apiKey", "OPENAI_API_KEY": "sk-proj-EXAMPLE"}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_host_that_owns_credentials_is_not_offered_the_codex_stored_key",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("CODEX_HOME", codex_home.path())
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

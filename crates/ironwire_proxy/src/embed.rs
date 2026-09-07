@@ -125,6 +125,35 @@ pub enum StartupProbes {
     Off,
 }
 
+/// Where every backend credential comes from, for a host that owns them.
+///
+/// Called with the name of the variable IronWire would otherwise read —
+/// `NEARAI_API_KEY`, or whatever `api_key_env` names for a configured backend —
+/// so a host answers per backend without knowing IronWire's internals. The name
+/// is the only thing that crosses in that direction; nothing about the host's
+/// answer is logged, reported, or rendered.
+///
+/// **Supplying one of these replaces credential discovery, it does not extend
+/// it.** `None` means there is no credential for that name: the process
+/// environment is not consulted afterwards, and neither are the credential
+/// files Claude Code and Codex write. An empty answer is the same as no answer.
+///
+/// The alternative — answer where the host can, environment where it cannot —
+/// was rejected. Under it a stray `ANTHROPIC_API_KEY` in the host's environment
+/// registers a backend the host never authorized, which is the same surprise
+/// [`StartupProbes::Configured`] exists to prevent, and it leaves a host that
+/// must state which destinations are possible unable to state it. Either the
+/// host manages credentials or IronWire does; never half of each.
+///
+/// [`SecretString`] rather than `String` so the value has no `Debug` rendering
+/// and is zeroized on drop; it is also what the registry wants, so the host's
+/// secret is never widened back into a plain `String` on the way through.
+pub type CredentialSource = Arc<dyn Fn(&str) -> Option<SecretString> + Send + Sync>;
+
+/// Re-exported so a host names the same type this crate does, rather than
+/// depending on `secrecy` and discovering the mismatch as a type error.
+pub use secrecy::SecretString as HostSecret;
+
 /// Everything an embedding host chooses about a start, other than the home,
 /// the port, and the announcement hook.
 ///
@@ -135,7 +164,11 @@ pub enum StartupProbes {
 /// use ironwire_proxy::embed::{EmbedOptions, UpdateChecks};
 /// let options = EmbedOptions::default().with_update_checks(UpdateChecks::Off);
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Carrying a host's credential source costs this type `Copy`, `PartialEq` and
+/// `Eq`: a closure has none of them. `Clone` and `Default` remain, and the
+/// builder form above never needed the others.
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct EmbedOptions {
     /// Who owns upgrading the running proxy implementation.
@@ -144,6 +177,27 @@ pub struct EmbedOptions {
     pub update_checks: UpdateChecks,
     /// Which backends are probed for their catalogue at startup.
     pub startup_probes: StartupProbes,
+    /// Where backend credentials come from, before the process environment.
+    pub credentials: Option<CredentialSource>,
+}
+
+/// Renders whether a host supplied a credential source, never anything it
+/// answered and never a name it could be asked for.
+impl std::fmt::Debug for EmbedOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedOptions")
+            .field("update_policy", &self.update_policy)
+            .field("update_checks", &self.update_checks)
+            .field("startup_probes", &self.startup_probes)
+            .field(
+                "credentials",
+                match self.credentials {
+                    Some(_) => &"host-owned",
+                    None => &"discovered",
+                },
+            )
+            .finish()
+    }
 }
 
 impl EmbedOptions {
@@ -174,8 +228,44 @@ impl EmbedOptions {
         self
     }
 
+    /// Take over backend credentials entirely.
+    ///
+    /// The environment is the only channel an embedding host has had for a
+    /// backend key, and reaching it after startup means `std::env::set_var`,
+    /// which is `unsafe` in Rust 2024 because mutating the environment once
+    /// threads exist is a data race. It is also the wrong place for a secret in
+    /// a shared process: every other library in that process can read it, and a
+    /// host does not necessarily trust all of them with a credential it holds.
+    ///
+    /// This is a transfer of ownership, not an additional source. With one
+    /// supplied, nothing else is consulted: not the process environment, and
+    /// not the credential files Claude Code and Codex write. A host that
+    /// answers only `NEARAI_API_KEY` gets NEAR AI and nothing else — no
+    /// subscription backend registered from a login it never asked about, and
+    /// no API backend registered from a variable that happened to be set.
+    /// [`StartupReport::no_backends`] becomes genuinely reachable as a result.
+    ///
+    /// A host that supplies nothing is exactly where it was: the process
+    /// environment and the same credential files, read the same way, at the
+    /// same points.
+    ///
+    /// ```
+    /// use ironwire_proxy::embed::EmbedOptions;
+    /// use secrecy::SecretString;
+    /// # fn vault(_name: &str) -> Option<SecretString> { None }
+    /// let options = EmbedOptions::default().with_credentials(vault);
+    /// ```
+    #[must_use]
+    pub fn with_credentials(
+        mut self,
+        credentials: impl Fn(&str) -> Option<SecretString> + Send + Sync + 'static,
+    ) -> Self {
+        self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
     /// Resolve `updates.check` against the host's choice.
-    fn checks_enabled(self, configured: bool) -> bool {
+    fn checks_enabled(&self, configured: bool) -> bool {
         match self.update_checks {
             UpdateChecks::FromConfig => configured,
             UpdateChecks::Off => false,
@@ -439,7 +529,11 @@ pub async fn start_with_options(
     let mut lock = Some(lock::acquire(&paths.lock_file(), port).await?);
     let token = files::control_token(&paths).map_err(|_| EmbedError::Paths)?;
     let consent = ConsentLedger::load(&paths.consent_file());
-    let registry = build_registry(&config).map_err(|error| EmbedError::Registry {
+    let credentials = match options.credentials.as_ref() {
+        Some(host) => Credentials::HostOwned(host),
+        None => Credentials::Discovered(&real_env),
+    };
+    let registry = build_registry(&config, &credentials).map_err(|error| EmbedError::Registry {
         label: error
             .downcast_ref::<RegistryLabel>()
             .map_or("backend construction", |label| label.0),
@@ -779,7 +873,11 @@ fn sweep_bodies(ledger: &Option<Ledger>, bodies: Option<&BodyStore>) {
 /// A backend that cannot find a credential is still registered: `status` should
 /// be able to say "Claude subscription — not logged in" rather than silently
 /// omitting it, which reads as though IronWire never heard of it.
-fn build_registry(config: &Config) -> Result<BackendRegistry> {
+///
+/// `credentials` is where every credential comes from — variables and files
+/// both. It is a parameter rather than a set of direct calls so that an
+/// embedding host can take the whole question over; see [`CredentialSource`].
+fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<BackendRegistry> {
     let timeout = config.server.upstream_timeout_secs;
     let mut registry = BackendRegistry::new();
 
@@ -795,7 +893,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         registry.push(backend);
     };
 
-    if ClaudeCodeCredentials::discover().is_ok() {
+    if credentials.discovers_files() && ClaudeCodeCredentials::discover().is_ok() {
         push(Arc::new(
             AnthropicBackend::subscription(
                 base_url_for(config, "claude-sub", "IRONWIRE_ANTHROPIC_BASE_URL"),
@@ -805,7 +903,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         ));
     }
 
-    if let Some(key) = api_key_for(config, "anthropic-key", "ANTHROPIC_API_KEY", &real_env) {
+    if let Some(key) = api_key_for(config, "anthropic-key", "ANTHROPIC_API_KEY", credentials) {
         push(Arc::new(
             AnthropicBackend::api_key(
                 key,
@@ -819,7 +917,9 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     // The ChatGPT subscription. Same wire as the metered OpenAI key below, so
     // the two are rungs of one ladder and falling between them costs nothing
     // but money (`docs/DESIGN.md` §3).
-    if CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt) {
+    if credentials.discovers_files()
+        && CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt)
+    {
         push(Arc::new(
             ResponsesBackend::codex_subscription(
                 base_url_for(config, "codex-sub", "IRONWIRE_CODEX_BASE_URL"),
@@ -831,8 +931,8 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
 
     // A key from the environment, or the one Codex itself stored — a user who
     // ran `codex login --api-key` has exactly one place they expect it to live.
-    if let Some(key) =
-        api_key_for(config, "openai-key", "OPENAI_API_KEY", &real_env).or_else(codex_stored_key)
+    if let Some(key) = api_key_for(config, "openai-key", "OPENAI_API_KEY", credentials)
+        .or_else(|| codex_stored_key(credentials))
     {
         push(Arc::new(
             ResponsesBackend::openai_api_key(
@@ -854,7 +954,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
     // Without one it reports `authenticated: false` and names what to set.
     push(Arc::new(
         ChatCompletionsBackend::nearai(
-            api_key_for(config, "nearai", "NEARAI_API_KEY", &real_env),
+            api_key_for(config, "nearai", "NEARAI_API_KEY", credentials),
             base_url_for(config, "nearai", "IRONWIRE_NEARAI_BASE_URL"),
             models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
             timeout,
@@ -870,7 +970,7 @@ fn build_registry(config: &Config) -> Result<BackendRegistry> {
         if !entry.enabled || DISCOVERED_IDS.contains(&entry.id.as_str()) {
             continue;
         }
-        if let Some(backend) = backend_from_config(entry, timeout, &real_env)? {
+        if let Some(backend) = backend_from_config(entry, timeout, credentials)? {
             push(backend);
         }
     }
@@ -907,22 +1007,22 @@ struct RegistryLabel(&'static str);
 fn backend_from_config(
     entry: &ironwire_core::config::BackendConfig,
     timeout: u64,
-    env: EnvLookup<'_>,
+    credentials: &Credentials<'_>,
 ) -> Result<Option<Arc<dyn ironwire_upstream::backend::Backend>>> {
     use ironwire_core::config::BackendImpl;
 
-    let key = |default: &str| entry_key(entry, default, env);
+    let key = |default: &str| entry_key(entry, default, credentials);
     let backend: Option<Arc<dyn ironwire_upstream::backend::Backend>> =
         match BackendImpl::parse(&entry.kind) {
-            Some(BackendImpl::ClaudeSubscription) => ClaudeCodeCredentials::discover()
-                .is_ok()
-                .then(|| {
-                    AnthropicBackend::subscription(entry.base_url.clone(), timeout).context(
-                        RegistryLabel("building a configured Claude subscription backend"),
-                    )
-                })
-                .transpose()?
-                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendImpl::ClaudeSubscription) => (credentials.discovers_files()
+                && ClaudeCodeCredentials::discover().is_ok())
+            .then(|| {
+                AnthropicBackend::subscription(entry.base_url.clone(), timeout).context(
+                    RegistryLabel("building a configured Claude subscription backend"),
+                )
+            })
+            .transpose()?
+            .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
             Some(BackendImpl::AnthropicApi) => key("ANTHROPIC_API_KEY")
                 .map(|key| {
                     AnthropicBackend::api_key(key, entry.base_url.clone(), timeout)
@@ -930,17 +1030,17 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendImpl::CodexSubscription) => CodexCredentials::discover()
-                .is_ok_and(|c| c.mode == CodexMode::ChatGpt)
-                .then(|| {
-                    ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout).context(
-                        RegistryLabel("building a configured ChatGPT subscription backend"),
-                    )
-                })
-                .transpose()?
-                .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            Some(BackendImpl::CodexSubscription) => (credentials.discovers_files()
+                && CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt))
+            .then(|| {
+                ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout).context(
+                    RegistryLabel("building a configured ChatGPT subscription backend"),
+                )
+            })
+            .transpose()?
+            .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
             Some(BackendImpl::OpenAiApi) => key("OPENAI_API_KEY")
-                .or_else(codex_stored_key)
+                .or_else(|| codex_stored_key(credentials))
                 .map(|key| {
                     ResponsesBackend::openai_api_key(key, entry.base_url.clone(), timeout)
                         .context(RegistryLabel("building a configured OpenAI API backend"))
@@ -975,11 +1075,10 @@ fn backend_from_config(
                         BackendId::from(entry.id.as_str()),
                         &entry.id,
                         base_url,
-                        entry.api_key_env.as_deref().and_then(|name| {
-                            env(name)
-                                .filter(|key| !key.is_empty())
-                                .map(SecretString::from)
-                        }),
+                        entry
+                            .api_key_env
+                            .as_deref()
+                            .and_then(|name| credentials.key(name)),
                         entry
                             .models
                             .as_ref()
@@ -1022,28 +1121,75 @@ fn backend_from_config(
     Ok(backend)
 }
 
-/// Reading an environment variable, as a value so tests need not mutate a
+/// Reading a credential by variable name, as a value so tests need not mutate a
 /// global that every other test in the process shares.
-type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+///
+/// [`SecretString`] rather than `String` because every caller wants one, and a
+/// value that spends part of its life as a plain `String` is a value with a
+/// `Debug` rendering and no zeroize on drop for that stretch.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<SecretString>;
 
 /// The real environment.
-fn real_env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+fn real_env(name: &str) -> Option<SecretString> {
+    std::env::var(name).ok().map(SecretString::from)
+}
+
+/// Who answers for a credential while the registry is built.
+///
+/// The two variants are exclusive on purpose. Credential discovery is not one
+/// lookup but four — environment variables, the file Claude Code writes, the
+/// file Codex writes, and the key Codex stores after `codex login --api-key` —
+/// and a host that supplies a source can only speak for the first. Letting the
+/// other three run anyway would register subscription backends behind the back
+/// of a host that had just declared it owns credentials, which is precisely the
+/// surprise it was declaring in order to avoid.
+enum Credentials<'a> {
+    /// Everything IronWire can find for itself: the process environment and the
+    /// credential files those two products write. What the CLI does, and what
+    /// every caller that supplies no source gets.
+    Discovered(EnvLookup<'a>),
+    /// Only what the host answers. No environment, no credential files.
+    HostOwned(&'a CredentialSource),
+}
+
+impl Credentials<'_> {
+    /// The credential for a variable name, from whichever source is in charge.
+    ///
+    /// An empty answer is no answer, the rule an empty environment variable has
+    /// always followed here.
+    fn key(&self, name: &str) -> Option<SecretString> {
+        match self {
+            Self::Discovered(env) => env(name),
+            Self::HostOwned(host) => host(name),
+        }
+        .filter(non_empty)
+    }
+
+    /// Whether the credential files Claude Code and Codex write may be read.
+    ///
+    /// Checked before `discover()` rather than after, so a host-owned start
+    /// does not go looking at a real user's home at all.
+    fn discovers_files(&self) -> bool {
+        matches!(self, Self::Discovered(_))
+    }
+}
+
+/// An empty credential is an absent credential.
+fn non_empty(key: &SecretString) -> bool {
+    !secrecy::ExposeSecret::expose_secret(key).is_empty()
 }
 
 /// The key for a config entry: the variable it names, or the default name.
 fn entry_key(
     entry: &ironwire_core::config::BackendConfig,
     default_env: &str,
-    env: EnvLookup<'_>,
+    credentials: &Credentials<'_>,
 ) -> Option<SecretString> {
     let name = entry.api_key_env.as_deref().unwrap_or(default_env);
     if name.is_empty() {
         return None;
     }
-    env(name)
-        .filter(|key| !key.is_empty())
-        .map(SecretString::from)
+    credentials.key(name)
 }
 
 /// The key for a discovered backend, honouring an `api_key_env` override.
@@ -1054,7 +1200,7 @@ fn api_key_for(
     config: &Config,
     id: &str,
     default_env: &str,
-    env: EnvLookup<'_>,
+    credentials: &Credentials<'_>,
 ) -> Option<SecretString> {
     let name = config
         .backends
@@ -1062,9 +1208,7 @@ fn api_key_for(
         .find(|entry| entry.id == id)
         .and_then(|entry| entry.api_key_env.as_deref())
         .unwrap_or(default_env);
-    env(name)
-        .filter(|key| !key.is_empty())
-        .map(SecretString::from)
+    credentials.key(name)
 }
 
 /// Whether the user switched this backend off.
@@ -1081,7 +1225,14 @@ fn is_disabled(config: &Config, id: &str) -> bool {
 
 /// The metered OpenAI key Codex itself stored, for a user who ran
 /// `codex login --api-key` and expects it to be found there.
-fn codex_stored_key() -> Option<SecretString> {
+///
+/// A file, not a variable, so a host that owns credentials is not offered it:
+/// the whole point of owning them is that no key arrives from somewhere the
+/// host did not name.
+fn codex_stored_key(credentials: &Credentials<'_>) -> Option<SecretString> {
+    if !credentials.discovers_files() {
+        return None;
+    }
     let creds = CodexCredentials::discover().ok()?;
     (creds.mode == CodexMode::ApiKey).then(|| creds.bearer().token)
 }
@@ -1149,7 +1300,7 @@ mod tests {
         }
     }
 
-    fn env_with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+    fn env_with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<SecretString> + use<> {
         let owned: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1158,8 +1309,17 @@ mod tests {
             owned
                 .iter()
                 .find(|(key, _)| key == name)
-                .map(|(_, value)| value.clone())
+                .map(|(_, value)| SecretString::from(value.clone()))
         }
+    }
+
+    /// A host source over a fixed table, in the shape a host would supply one.
+    fn host_with(pairs: &[(&str, &str)]) -> CredentialSource {
+        Arc::new(env_with(pairs))
+    }
+
+    fn exposed(key: &SecretString) -> &str {
+        secrecy::ExposeSecret::expose_secret(key)
     }
 
     /// The field existed and was never read, so a key that did not live under
@@ -1172,8 +1332,13 @@ mod tests {
         declared.api_key_env = Some("WORK_KEY".to_string());
         config.backends.push(declared);
 
-        let key = api_key_for(&config, "anthropic-key", "ANTHROPIC_API_KEY", &env)
-            .expect("a key was configured");
+        let key = api_key_for(
+            &config,
+            "anthropic-key",
+            "ANTHROPIC_API_KEY",
+            &Credentials::Discovered(&env),
+        )
+        .expect("a key was configured");
         assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-work");
     }
 
@@ -1184,7 +1349,7 @@ mod tests {
             &Config::default(),
             "anthropic-key",
             "ANTHROPIC_API_KEY",
-            &env,
+            &Credentials::Discovered(&env),
         )
         .expect("a key was configured");
         assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-default");
@@ -1199,7 +1364,8 @@ mod tests {
         declared.api_key_env = Some("LOCAL_KEY".to_string());
         declared.models = Some(vec![ModelEntry::Name("qwen3-coder".to_string())]);
 
-        let built = backend_from_config(&declared, 60, &env_with(&[("LOCAL_KEY", "sk-local")]))
+        let env = env_with(&[("LOCAL_KEY", "sk-local")]);
+        let built = backend_from_config(&declared, 60, &Credentials::Discovered(&env))
             .expect("builds")
             .expect("a credential was available");
         assert_eq!(built.id().as_str(), "local");
@@ -1217,7 +1383,9 @@ mod tests {
         declared.base_url = Some("http://127.0.0.1:11434/v1".to_string());
         declared.api_key_env = Some("LOCAL_KEY".to_string());
 
-        let built = backend_from_config(&declared, 60, &env_with(&[])).expect("no error");
+        let env = env_with(&[]);
+        let built =
+            backend_from_config(&declared, 60, &Credentials::Discovered(&env)).expect("no error");
         assert!(built.is_none());
     }
 
@@ -1257,6 +1425,176 @@ mod tests {
             models_for(&config, "nearai", BackendKind::Credits),
             None,
             "nothing configured is not the same as an empty catalogue"
+        );
+    }
+
+    /// The point of the option: a credential that never touched the process
+    /// environment, and so never needed `set_var` and was never readable by
+    /// anything else sharing the process.
+    #[test]
+    fn a_host_source_answers_a_name_the_environment_cannot() {
+        let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
+
+        let key = Credentials::HostOwned(&host)
+            .key("NEARAI_API_KEY")
+            .expect("the host answered");
+        assert_eq!(exposed(&key), "sk-from-host");
+    }
+
+    /// Replacement, not precedence. A stray variable in the host's environment
+    /// must not register a backend the host never authorized — the same
+    /// surprise `StartupProbes::Configured` exists to prevent.
+    #[test]
+    fn a_host_owned_start_does_not_read_the_environment_at_all() {
+        let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
+        let credentials = Credentials::HostOwned(&host);
+
+        assert!(
+            credentials.key("ANTHROPIC_API_KEY").is_none(),
+            "a name the host does not answer has no credential, wherever else it may be set"
+        );
+        // `PATH` stands in for a variable that is genuinely set in this
+        // process, so this asserts the environment was not consulted rather
+        // than that it happened to be empty.
+        assert!(std::env::var_os("PATH").is_some(), "PATH is set");
+        assert!(credentials.key("PATH").is_none());
+        assert_eq!(
+            exposed(&credentials.key("NEARAI_API_KEY").expect("a key")),
+            "sk-from-host",
+            "and the one it does answer is the host's own"
+        );
+    }
+
+    /// An empty answer is no answer, the rule an empty environment variable has
+    /// always followed here — and under replacement it means no credential,
+    /// rather than a reason to go looking elsewhere.
+    #[test]
+    fn an_empty_host_answer_is_no_credential() {
+        let host = host_with(&[("NEARAI_API_KEY", "")]);
+
+        assert!(
+            Credentials::HostOwned(&host)
+                .key("NEARAI_API_KEY")
+                .is_none()
+        );
+    }
+
+    /// The non-negotiable: a host that supplies nothing is exactly where it
+    /// was, name for name, including names the environment does not have.
+    #[test]
+    fn discovery_reads_the_environment_unchanged() {
+        let env = env_with(&[("NEARAI_API_KEY", "sk-from-env"), ("EMPTY_KEY", "")]);
+        let credentials = Credentials::Discovered(&env);
+
+        for name in ["NEARAI_API_KEY", "EMPTY_KEY", "UNSET_KEY"] {
+            let through = credentials.key(name).map(|key| exposed(&key).to_string());
+            let direct = env(name)
+                .filter(non_empty)
+                .map(|key| exposed(&key).to_string());
+            assert_eq!(through, direct, "{name} must read the same either way");
+        }
+        assert!(
+            EmbedOptions::default().credentials.is_none(),
+            "the default supplies no host source"
+        );
+    }
+
+    /// End to end through the seam the host is actually buying: the registry
+    /// authenticates a backend from a credential the environment never held.
+    #[tokio::test]
+    async fn a_host_key_authenticates_the_backend_the_registry_builds() {
+        let config = Config::default();
+        let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
+        let empty = env_with(&[]);
+
+        let with_host = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
+        let without = build_registry(&config, &Credentials::Discovered(&empty)).expect("builds");
+
+        assert!(status_of(&with_host, "nearai").await.authenticated);
+        assert!(
+            !status_of(&without, "nearai").await.authenticated,
+            "registered but unauthenticated is still the no-credential state"
+        );
+    }
+
+    /// The half a variable lookup cannot reach. Claude Code and Codex
+    /// credentials come from files, so exposing the environment alone would
+    /// leave a host that declared it owns credentials still routing through a
+    /// subscription login it never asked about — the exact failure this is for.
+    ///
+    /// Asserted in the direction that holds on any machine: under host
+    /// ownership these backends are absent whether or not the developer running
+    /// the suite happens to be logged in. The converse is only observable where
+    /// a real credential exists, so it is asserted where one does.
+    #[tokio::test]
+    async fn a_host_that_owns_credentials_gets_no_file_discovered_backend() {
+        let config = Config::default();
+        let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
+        let empty = env_with(&[]);
+
+        let owned = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
+        for id in ["claude-sub", "codex-sub"] {
+            assert!(
+                owned.get(&BackendId::from(id)).is_none(),
+                "{id} was registered from a file the host never named"
+            );
+        }
+
+        let discovered = build_registry(&config, &Credentials::Discovered(&empty)).expect("builds");
+        if ClaudeCodeCredentials::discover().is_ok() {
+            assert!(
+                discovered.get(&BackendId::from("claude-sub")).is_some(),
+                "a logged-in user must still get their subscription by default"
+            );
+        }
+        if CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt) {
+            assert!(discovered.get(&BackendId::from("codex-sub")).is_some());
+        }
+    }
+
+    /// The consequence worth stating: with the host answering nothing and the
+    /// unconditional NEAR AI entry switched off, a proxy legitimately has no
+    /// backends at all. `StartupReport::no_backends` already models this state;
+    /// until now almost nothing could reach it.
+    #[test]
+    fn a_host_that_answers_nothing_can_leave_the_registry_empty() {
+        let mut config = Config::default();
+        config.backends.push({
+            let mut nearai = entry("nearai", "nearai");
+            nearai.enabled = false;
+            nearai
+        });
+        let host = host_with(&[]);
+
+        let registry = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
+        assert!(registry.is_empty());
+    }
+
+    async fn status_of(
+        registry: &BackendRegistry,
+        id: &str,
+    ) -> ironwire_upstream::backend::BackendStatus {
+        registry
+            .get(&BackendId::from(id))
+            .expect("the backend is registered whether or not a key was found")
+            .status()
+            .await
+    }
+
+    /// A credential must not reach a log through a host's own `{:?}` of the
+    /// options it built, and neither must a variable name that carries one.
+    #[test]
+    fn options_do_not_render_a_credential_or_a_name_that_carries_one() {
+        let options = EmbedOptions::default()
+            .with_credentials(|_| Some(SecretString::from("sk-from-host".to_string())));
+
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains("sk-from-host"), "no credential");
+        assert!(!rendered.contains("NEARAI"), "no variable name");
+        assert!(rendered.contains("host-owned"), "presence is reportable");
+        assert!(
+            format!("{:?}", EmbedOptions::default()).contains("discovered"),
+            "and so is its absence"
         );
     }
 }
