@@ -125,14 +125,62 @@ fn read(path: Option<&PathBuf>) -> String {
 }
 
 /// Why a tool could not be wired.
+///
+/// The refusals are separate variants because they are separate answers to
+/// "what do I do now". A file we cannot read is the user's file and needs a
+/// person; a catalog entry that failed validation is *our* description being
+/// wrong, and nothing done to the file will change it. Both used to arrive as
+/// one formatted string, which left a caller — the control API, and through it
+/// any GUI — matching on prose to tell them apart.
 #[derive(Debug)]
 pub enum Error {
     /// No tool by that id, built-in or catalog-described.
     UnknownTool(String),
     /// The tool's config could not be located.
     NoPath(String),
-    /// The edit itself was refused — most often a file we cannot parse.
-    Edit(String),
+    /// The file on disk is not valid for its format, so it will not be
+    /// rewritten. The tool description is fine; the file needs a person.
+    Unparseable {
+        /// The file that was read.
+        path: PathBuf,
+        /// What the parser said.
+        detail: String,
+    },
+    /// The file is JSON with comments or trailing commas. Legal for the tool
+    /// that wrote it, refused here because writing the file back would delete
+    /// the comments. One key, set by hand, is all it takes.
+    Jsonc {
+        /// The file that was read.
+        path: PathBuf,
+        /// Which construct was found, and on which line.
+        detail: String,
+    },
+    /// The catalog entry describing this tool did not survive validation.
+    /// Nothing the user does to their config changes the answer.
+    UnusableEntry {
+        /// The tool the entry claims to describe.
+        id: String,
+        /// What is wrong with the entry.
+        detail: String,
+    },
+}
+
+impl Error {
+    /// A stable slug for this refusal, for a caller that has to branch on it.
+    ///
+    /// Separate from [`Display`](std::fmt::Display) on purpose: the sentence is
+    /// for a person and is expected to be rewritten, the slug is for a client
+    /// and is not.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::UnknownTool(_) => "unknown-tool",
+            Self::NoPath(_) => "no-path",
+            Self::Unparseable { .. } => "unparseable",
+            Self::Jsonc { .. } => "jsonc",
+            Self::UnusableEntry { .. } => "unusable-entry",
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -140,12 +188,50 @@ impl std::fmt::Display for Error {
         match self {
             Self::UnknownTool(id) => write!(f, "no tool called `{id}`"),
             Self::NoPath(id) => write!(f, "could not work out where `{id}` keeps its config"),
-            Self::Edit(detail) => write!(f, "{detail}"),
+            Self::Unparseable { path, detail } => write!(
+                f,
+                "{} is not valid for its format — IronWire will not rewrite a \
+                 file it cannot read: {detail}. Fix the file, then run this again",
+                path.display()
+            ),
+            Self::Jsonc { path, detail } => write!(
+                f,
+                "{} is JSONC — JSON with comments and trailing commas — which \
+                 the tool that wrote it accepts and IronWire does not edit, \
+                 because writing the file back would delete the comments: \
+                 {detail}. Set the key by hand, or take the comments out and \
+                 run this again",
+                path.display()
+            ),
+            Self::UnusableEntry { id, detail } => write!(
+                f,
+                "the catalog entry for `{id}` is not usable: {detail}. Nothing \
+                 done to the config file changes this — the description of the \
+                 tool is wrong, not the file"
+            ),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Attach the file to a refusal the catalog module raised about it.
+fn from_catalog(error: catalog::Error, path: &std::path::Path, id: &str) -> Error {
+    match error {
+        catalog::Error::Unparseable(detail) => Error::Unparseable {
+            path: path.to_path_buf(),
+            detail,
+        },
+        catalog::Error::Jsonc(detail) => Error::Jsonc {
+            path: path.to_path_buf(),
+            detail,
+        },
+        catalog::Error::Unusable(detail) => Error::UnusableEntry {
+            id: id.to_string(),
+            detail,
+        },
+    }
+}
 
 /// An edit that has been worked out but not made.
 ///
@@ -277,7 +363,9 @@ impl ConnectOptions {
 /// # Errors
 ///
 /// [`Error::UnknownTool`] for an id nothing knows, [`Error::NoPath`] when the
-/// config cannot be located, [`Error::Edit`] when the file cannot be read.
+/// config cannot be located, [`Error::Unparseable`] or [`Error::Jsonc`] when the
+/// file cannot be read, [`Error::UnusableEntry`] when the catalog entry
+/// describing the tool did not survive validation.
 pub fn plan_connect(id: &str, port: u16, catalog_document: &Catalog) -> Result<Planned, Error> {
     plan_connect_with(id, port, catalog_document, ConnectOptions::default())
 }
@@ -304,7 +392,10 @@ pub fn plan_connect_with(
                 StatusLine::Decline => None,
             };
             let edit = claude_settings::connect(&existing, command.as_deref(), Some(&url))
-                .map_err(|error| Error::Edit(error.to_string()))?;
+                .map_err(|error| Error::Unparseable {
+                    path: path.clone(),
+                    detail: error.to_string(),
+                })?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -320,8 +411,11 @@ pub fn plan_connect_with(
         "codex" => {
             let path = codex_config::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
-            let edit = codex_config::connect(&existing, port)
-                .map_err(|error| Error::Edit(error.to_string()))?;
+            let edit =
+                codex_config::connect(&existing, port).map_err(|error| Error::Unparseable {
+                    path: path.clone(),
+                    detail: error.to_string(),
+                })?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -340,7 +434,7 @@ pub fn plan_connect_with(
             let path = agent.config.resolve(&home);
             let existing = read(Some(&path));
             let edit = catalog::connect(agent, &existing, port)
-                .map_err(|error| Error::Edit(error.to_string()))?;
+                .map_err(|error| from_catalog(error, &path, other))?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -373,8 +467,11 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
         "claude" => {
             let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
-            let edit = claude_settings::disconnect(&existing)
-                .map_err(|error| Error::Edit(error.to_string()))?;
+            let edit =
+                claude_settings::disconnect(&existing).map_err(|error| Error::Unparseable {
+                    path: path.clone(),
+                    detail: error.to_string(),
+                })?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -386,8 +483,10 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
         "codex" => {
             let path = codex_config::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
-            let edit = codex_config::disconnect(&existing)
-                .map_err(|error| Error::Edit(error.to_string()))?;
+            let edit = codex_config::disconnect(&existing).map_err(|error| Error::Unparseable {
+                path: path.clone(),
+                detail: error.to_string(),
+            })?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -402,7 +501,7 @@ pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, 
             let path = agent.config.resolve(&home);
             let existing = read(Some(&path));
             let edit = catalog::disconnect(agent, &existing)
-                .map_err(|error| Error::Edit(error.to_string()))?;
+                .map_err(|error| from_catalog(error, &path, other))?;
             Ok(Planned {
                 path,
                 changes: edit.changes,
@@ -647,6 +746,80 @@ mod tests {
             "SOMEBODY ELSE",
             "a stale plan overwrote the edit it never saw"
         );
+    }
+
+    /// The whole point of splitting the variants: a caller deciding what to
+    /// tell somebody must not have to look at the sentence to know which of
+    /// these two happened. They ask for different things — one for a person to
+    /// fix a file, one for us to fix a catalog entry.
+    #[test]
+    fn a_broken_file_and_a_broken_catalog_entry_are_different_refusals() {
+        assert_eq!(
+            Error::Unparseable {
+                path: PathBuf::from("/home/u/.tool/config.json"),
+                detail: "expected `,`".to_string(),
+            }
+            .reason(),
+            "unparseable"
+        );
+        assert_eq!(
+            Error::UnusableEntry {
+                id: "tool".to_string(),
+                detail: "no format".to_string(),
+            }
+            .reason(),
+            "unusable-entry"
+        );
+        assert_eq!(
+            Error::Jsonc {
+                path: PathBuf::from("/home/u/.config/zed/settings.json"),
+                detail: "a `//` comment on line 1".to_string(),
+            }
+            .reason(),
+            "jsonc"
+        );
+    }
+
+    /// Every refusal names the file or the tool it is about, because "could not
+    /// be edited" with nothing after it is the message this change exists to
+    /// stop producing.
+    #[test]
+    fn every_refusal_names_what_it_is_about() {
+        let unparseable = Error::Unparseable {
+            path: PathBuf::from("/home/u/.tool/config.json"),
+            detail: "expected `,`".to_string(),
+        }
+        .to_string();
+        assert!(
+            unparseable.contains("/home/u/.tool/config.json"),
+            "{unparseable}"
+        );
+
+        let unusable = Error::UnusableEntry {
+            id: "tool".to_string(),
+            detail: "no format".to_string(),
+        }
+        .to_string();
+        assert!(unusable.contains("`tool`"), "{unusable}");
+        assert!(unusable.contains("not the file"), "{unusable}");
+
+        let jsonc = Error::Jsonc {
+            path: PathBuf::from("/home/u/.config/zed/settings.json"),
+            detail: "a `//` comment on line 1".to_string(),
+        }
+        .to_string();
+        assert!(
+            jsonc.contains("/home/u/.config/zed/settings.json"),
+            "{jsonc}"
+        );
+        assert!(jsonc.contains("Set the key by hand"), "{jsonc}");
+    }
+
+    #[test]
+    fn an_id_nothing_knows_is_refused_before_any_file_is_read() {
+        let error =
+            plan_connect("nothing-by-that-name", 8463, &Catalog::default()).expect_err("refuses");
+        assert_eq!(error.reason(), "unknown-tool");
     }
 
     /// The first backup is the only one holding the file as it was before
