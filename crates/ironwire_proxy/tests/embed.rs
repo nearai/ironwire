@@ -521,3 +521,186 @@ async fn declining_update_checks_does_not_stop_the_startup_backend_probe() {
         "the startup probe is outside this switch; say so rather than implying otherwise"
     );
 }
+
+/// A home whose only registered backend is NEAR AI, pointed at `base_url` by an
+/// entry that names it.
+fn home_naming_nearai(base_url: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[updates]\ncheck = false\n\
+             [[backends]]\nid = 'nearai'\nkind = 'nearai'\nbase_url = '{base_url}'\n\
+             [[backends]]\nid = 'claude-sub'\nkind = 'claude-subscription'\nenabled = false\n\
+             [[backends]]\nid = 'codex-sub'\nkind = 'codex-subscription'\nenabled = false\n\
+             [[backends]]\nid = 'anthropic-key'\nkind = 'anthropic-api'\nenabled = false\n\
+             [[backends]]\nid = 'openai-key'\nkind = 'openai-api'\nenabled = false\n"
+        ),
+    )
+    .unwrap();
+    home
+}
+
+/// Start, give a probe that was going to happen time to happen, and stop.
+async fn start_and_settle(
+    home: &std::path::Path,
+    probes: ironwire_proxy::embed::StartupProbes,
+    seen: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use ironwire_proxy::embed::{EmbedOptions, start_with_options};
+    let proxy = start_with_options(
+        home,
+        Some(0),
+        EmbedOptions::default().with_startup_probes(probes),
+        |_, _| {},
+    )
+    .await
+    .expect("starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    proxy.shutdown().await;
+}
+
+/// A host can start without IronWire asking a provider anything.
+///
+/// `All` runs first as the control: same recorder, same wait, so the zero that
+/// follows is an absence rather than an impatient test.
+#[tokio::test]
+async fn a_host_can_decline_the_startup_probe_entirely() {
+    use ironwire_proxy::embed::StartupProbes;
+    let (base_url, probed) = spawn_probe_recorder().await;
+
+    let probing = home_naming_nearai(&base_url);
+    start_and_settle(probing.path(), StartupProbes::All, &probed).await;
+    assert_eq!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the default still probes, and the recorder sees it"
+    );
+
+    probed.store(0, std::sync::atomic::Ordering::SeqCst);
+    let declining = home_naming_nearai(&base_url);
+    start_and_settle(declining.path(), StartupProbes::Off, &probed).await;
+    assert_eq!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "declining means no request, not a later one"
+    );
+}
+
+/// The middle position keeps the answer for a backend the host declared.
+#[tokio::test]
+async fn a_backend_the_configuration_names_is_still_probed() {
+    use ironwire_proxy::embed::StartupProbes;
+    let (base_url, probed) = spawn_probe_recorder().await;
+    let home = home_naming_nearai(&base_url);
+    start_and_settle(home.path(), StartupProbes::Configured, &probed).await;
+    assert_eq!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a host that declared this backend keeps the startup answer for it"
+    );
+}
+
+/// The case the option exists for. NEAR AI is registered whether or not any
+/// entry names it, so in a home that does not name it this probe is one the
+/// host never asked for.
+///
+/// In a child process because the unnamed backend can only be pointed at the
+/// recorder through the environment, which is process-global. The child runs
+/// twice: once declining and once not, so the zero is measured against a one
+/// from the same wiring.
+#[test]
+fn a_backend_no_configuration_names_is_not_probed() {
+    const CHILD: &str = "IRONWIRE_UNNAMED_PROBE_TEST";
+    if let Some(mode) = std::env::var_os(CHILD) {
+        use ironwire_proxy::embed::{EmbedOptions, StartupProbes, start_with_options};
+        let probes = if mode == "configured" {
+            StartupProbes::Configured
+        } else {
+            StartupProbes::All
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let home = tempfile::tempdir().unwrap();
+                // Every backend discovery could produce is off. NEAR AI has no
+                // entry at all - and is registered regardless, which is the
+                // point.
+                std::fs::write(
+                    home.path().join("config.toml"),
+                    "[updates]\ncheck = false\n\
+                     [[backends]]\nid = 'claude-sub'\nkind = 'claude-subscription'\nenabled = false\n\
+                     [[backends]]\nid = 'codex-sub'\nkind = 'codex-subscription'\nenabled = false\n\
+                     [[backends]]\nid = 'anthropic-key'\nkind = 'anthropic-api'\nenabled = false\n\
+                     [[backends]]\nid = 'openai-key'\nkind = 'openai-api'\nenabled = false\n",
+                )
+                .unwrap();
+                let proxy = start_with_options(
+                    home.path(),
+                    Some(0),
+                    EmbedOptions::default().with_startup_probes(probes),
+                    |_, _| {},
+                )
+                .await
+                .expect("starts");
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                proxy.shutdown().await;
+            });
+        return;
+    }
+
+    // The recorder must outlive both children, so the runtime that owns it is
+    // held for the whole test rather than block_on'd and dropped.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (base_url, probed) = runtime.block_on(spawn_probe_recorder());
+
+    let run = |mode: &str| {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_backend_no_configuration_names_is_not_probed",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, mode)
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("CODEX_HOME", home.path())
+            .env("PATH", "")
+            .env("IRONWIRE_NEARAI_BASE_URL", &base_url)
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "127.0.0.1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        probed.swap(0, std::sync::atomic::Ordering::SeqCst)
+    };
+
+    assert_eq!(
+        run("configured"),
+        0,
+        "a backend no entry names is one the host never asked us to probe"
+    );
+    assert_eq!(
+        run("all"),
+        1,
+        "and the same start does probe it under the default, so the zero means something"
+    );
+}
