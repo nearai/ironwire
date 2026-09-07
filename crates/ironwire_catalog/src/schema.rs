@@ -72,7 +72,16 @@ use serde::{Deserialize, Serialize};
 /// into it later, so a release that understands `style` without accepting `2`
 /// leaves a publisher no way to use the field safely for as long as that
 /// release is in the field.
-pub const SCHEMA_VERSION: u32 = 2;
+/// # 3: [`AgentSetting::requires`]
+///
+/// The same trap in the same shape, and worse in its consequence. A build from
+/// before that field existed reads an entry that says "set this key only where
+/// the file already shows the tool using this provider", ignores the condition,
+/// and sets the key unconditionally. For the tool the field was added for that
+/// is not a 404 — it is a working tool that stops working, because writing the
+/// key is what changes which provider it chose. An old build must refuse the
+/// document rather than apply the half of the entry it understands.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Provider values that move faster than our release cadence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +314,52 @@ impl UrlStyle {
 /// [`UrlStyle`] does not weaken that. It chooses between two spellings of the
 /// same loopback address, both compiled in here; no string in this type reaches
 /// the value.
+///
+/// # Why a setting can carry a precondition
+///
+/// [`requires`](Self::requires) exists because a correct URL in a correct key
+/// can still break the tool. opencode takes `provider.anthropic.options.baseURL`
+/// — a base URL, no API key, no model name, exactly the shape this type is for
+/// — and it does redirect. But the *presence* of a `provider.anthropic` block is
+/// itself a statement: it promotes Anthropic into opencode's configured provider
+/// set and reorders which model it picks by default. A user with an OpenAI key
+/// and no Anthropic one goes from a working `gpt-5.3-chat-latest` to
+/// `claude-sonnet-4-6` and "Anthropic API key is missing" — before any request
+/// leaves the machine. The same edit is right for a user who already uses
+/// Anthropic there and wrong for one who does not, and until this field existed
+/// nothing in an entry could tell them apart. `detect` answers "is the tool
+/// installed", which is true for both.
+///
+/// So this is one more step along the rule the writer already follows. "Fill an
+/// empty slot; leave a full one alone" already lets the contents of the file
+/// decide what happens. This adds: *fill this slot only where the file shows the
+/// tool already uses this provider.*
+///
+/// # Why it is a presence check and not more
+///
+/// A predicate language in a signed document is a much larger surface than the
+/// problem needs. Presence of a key answers the case above, is decidable by
+/// reading, and has no evaluation order, no operators and no way to be subtly
+/// wrong. Value matching was considered and left out: it would let a document
+/// describe the *contents* of a user's config rather than only its shape, and
+/// nothing here needs it.
+///
+/// It is on the setting rather than the entry because that is where the evidence
+/// puts it. The condition is per-provider, and one tool has one config file with
+/// several provider blocks in it: an opencode entry that set both an Anthropic
+/// and an OpenAI base URL would want each key gated on its own block. "The whole
+/// tool is inapplicable" is also already sayable — `detect` and `enabled` — so
+/// an entry-level predicate would be the less useful of the two placements as
+/// well as the less precise one.
+///
+/// # What it cannot do
+///
+/// It gains the document no reading power whatsoever. The path is walked in the
+/// one file the entry already names — the file `connect` opens anyway — and is
+/// held to the same character rule as the key being written, so it cannot
+/// contain a separator, cannot spell `..`, and cannot become a path on disk.
+/// Reading `provider.anthropic` in that file is strictly less than writing
+/// `provider.anthropic.options.baseURL` in it, which the entry could already do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSetting {
     /// Dotted key path inside the config file, e.g. `env.ANTHROPIC_BASE_URL`.
@@ -320,6 +375,38 @@ pub struct AgentSetting {
     /// it, and writes the origin spelling. See [`SCHEMA_VERSION`].
     #[serde(default)]
     pub style: UrlStyle,
+    /// A key that must already be present in this tool's config before this
+    /// setting is written. `None` — the default, and what every entry written
+    /// before this field existed means — writes it unconditionally.
+    ///
+    /// This is a *presence* check and nothing more: the key exists, whatever
+    /// its value. See [`AgentEntry`] for why the check is here at all and why
+    /// it is this small.
+    ///
+    /// A document that sets this must declare `schema_version` 3, and for a
+    /// sharper reason than `style` had. An older build tolerates the unknown
+    /// field, ignores it, and writes the key unconditionally — which is exactly
+    /// the edit the field exists to prevent. See [`SCHEMA_VERSION`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<String>,
+}
+
+/// Whether a dotted key path is one this crate is willing to walk.
+///
+/// One rule for the key a setting writes and for the key a precondition reads,
+/// because they are the same kind of thing and a second rule would eventually
+/// disagree with the first. A segment is alphanumerics, `_` and `-`; nothing
+/// else. That is what makes a key path unable to become a path on disk — no
+/// separator of either slash, no `.` inside a segment, and `..` cannot be
+/// spelled because an empty segment is refused.
+fn key_path_is_safe(key: &str) -> bool {
+    !key.is_empty()
+        && key.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
 }
 
 impl AgentSetting {
@@ -332,13 +419,19 @@ impl AgentSetting {
 
     /// Whether the key path is one we are willing to write.
     fn key_is_safe(&self) -> bool {
-        !self.key.is_empty()
-            && self.key.split('.').all(|segment| {
-                !segment.is_empty()
-                    && segment
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            })
+        key_path_is_safe(&self.key)
+    }
+
+    /// Whether the precondition, if there is one, is a key path we are willing
+    /// to *read*.
+    ///
+    /// Held to the identical rule as the key we write, because it is the
+    /// identical kind of thing: a dotted path into the one file this entry
+    /// already names. `key_path_is_safe` admits only alphanumerics, `_` and `-`
+    /// within a segment, so a separator, a drive letter and `..` are all
+    /// unrepresentable — this cannot become a path, and cannot leave the file.
+    fn requires_is_safe(&self) -> bool {
+        self.requires.as_deref().is_none_or(key_path_is_safe)
     }
 }
 
@@ -468,6 +561,10 @@ pub struct AgentEntry {
     /// Where its config lives.
     pub config: ConfigLocation,
     /// What to set in it.
+    ///
+    /// A setting may carry a precondition — [`AgentSetting::requires`] — that
+    /// decides whether it is written at all. See the type docs for why that
+    /// lives on the setting and not here.
     #[serde(default)]
     pub settings: Vec<AgentSetting>,
 }
@@ -505,6 +602,12 @@ impl AgentEntry {
                 return Some(format!(
                     "`{}` asks for a URL style this build does not implement",
                     setting.key
+                ));
+            }
+            if !setting.requires_is_safe() {
+                return Some(format!(
+                    "`{}` is not a usable key path",
+                    setting.requires.as_deref().unwrap_or_default()
                 ));
             }
         }
@@ -587,6 +690,7 @@ mod tests {
                 key: "env.ANTHROPIC_BASE_URL".to_string(),
                 facade: Facade::Anthropic,
                 style: UrlStyle::Origin,
+                requires: None,
             }],
         }
     }
@@ -630,6 +734,70 @@ mod tests {
         walk(&document, "catalog");
     }
 
+    /// `requires` is the only new string a document can carry, so it gets the
+    /// same treatment the key it sits beside gets: a dotted path into the one
+    /// file this entry already names, and nothing that could become a path on
+    /// disk. Every rejected form here is a way someone would try to widen it.
+    #[test]
+    fn a_precondition_cannot_be_spelled_as_a_path() {
+        let mut entry = agent(
+            "tool",
+            ConfigLocation {
+                dir: vec![".tool".to_string()],
+                file: "config.json".to_string(),
+            },
+        );
+        for bad in [
+            "../../.ssh/config",
+            "/etc/passwd",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "",
+            "a..b",
+            "a.",
+            "~",
+            "$HOME",
+            "http://example.com",
+        ] {
+            entry.settings[0].requires = Some(bad.to_string());
+            assert!(
+                entry.problem().is_some(),
+                "`{bad}` must not be a usable precondition"
+            );
+        }
+    }
+
+    /// And the shape it is actually for is accepted.
+    #[test]
+    fn a_precondition_naming_a_key_in_the_same_file_is_usable() {
+        let mut entry = agent(
+            "tool",
+            ConfigLocation {
+                dir: vec![".tool".to_string()],
+                file: "config.json".to_string(),
+            },
+        );
+        entry.settings[0].requires = Some("provider.anthropic".to_string());
+        assert_eq!(entry.problem(), None);
+    }
+
+    /// The default is what every entry written before this field existed
+    /// meant: write the key, no questions asked.
+    #[test]
+    fn an_entry_without_a_precondition_still_deserialises_and_is_unconditional() {
+        let entry: AgentEntry = serde_json::from_value(serde_json::json!({
+            "id": "tool",
+            "name": "A Tool",
+            "config": {"dir": [".tool"], "file": "config.json"},
+            "settings": [{"key": "env.BASE", "facade": "anthropic"}],
+        }))
+        .expect("deserialises");
+        assert_eq!(entry.problem(), None);
+        assert_eq!(entry.settings[0].requires, None);
+    }
+
     /// The property that replaced it. A signed document picks a façade; the
     /// address is this binary's, so there is no string anywhere in the schema
     /// that could carry someone else's host.
@@ -639,6 +807,7 @@ mod tests {
             key: "env.ANTHROPIC_BASE_URL".to_string(),
             facade: Facade::Anthropic,
             style: UrlStyle::Origin,
+            requires: None,
         };
         let serialised = serde_json::to_value(&setting).expect("serialises");
         let object = serialised.as_object().expect("an object");
@@ -706,6 +875,7 @@ mod tests {
             key: "model_providers.ironwire.base_url".to_string(),
             facade: Facade::OpenAi,
             style: UrlStyle::Versioned,
+            requires: None,
         };
         assert_eq!(
             setting.url(8463).as_deref(),
@@ -832,6 +1002,7 @@ mod tests {
                 key: key.to_string(),
                 facade: Facade::Anthropic,
                 style: UrlStyle::Origin,
+                requires: None,
             }];
             assert!(entry.problem().is_some(), "`{key}` was accepted");
         }
