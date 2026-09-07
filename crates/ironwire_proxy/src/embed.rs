@@ -89,6 +89,42 @@ pub enum UpdateChecks {
     Off,
 }
 
+/// Which backends are probed at startup, and what a host gives up by declining.
+///
+/// Startup discovery calls `Backend::probe` on registered backends: a live
+/// request that both proves the backend works right now and learns the model
+/// catalogue the provider actually serves. It is real work, so declining is a
+/// trade, not a free saving. A host that declines starts without that answer:
+/// the daemon runs on configured or compiled-in catalogue values, and an
+/// expired credential is discovered by the first real request rather than at
+/// startup. `ironwire doctor` probes on demand and is unaffected.
+///
+/// The reason a host may want to decline is that registered is not the same as
+/// configured. `build_registry` registers the Claude subscription, the Codex
+/// subscription, and the Anthropic/OpenAI key backends from credentials found
+/// in the environment with no entry naming them, and registers NEAR AI
+/// unconditionally. So an embedded start probes providers the host never named,
+/// and today its only way to prevent that is `enabled = false` entries in
+/// `$IRONWIRE_HOME/config.toml` — a file it may not own.
+///
+/// Hosts must allow future values rather than exhaustively matching today's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartupProbes {
+    /// Probe every registered backend. The default, and what the CLI does.
+    #[default]
+    All,
+    /// Probe only backends an entry in `config.toml` names.
+    ///
+    /// The middle position, and the one most embedding hosts want: a host that
+    /// declared its backends deliberately keeps the startup answer for those,
+    /// and makes no request on behalf of a backend IronWire found on its own.
+    Configured,
+    /// Probe nothing. The only value under which an embedded start makes no
+    /// outbound request of its own accord.
+    Off,
+}
+
 /// Everything an embedding host chooses about a start, other than the home,
 /// the port, and the announcement hook.
 ///
@@ -106,6 +142,8 @@ pub struct EmbedOptions {
     pub update_policy: UpdatePolicy,
     /// Whether the release check and catalog refresh may run at all.
     pub update_checks: UpdateChecks,
+    /// Which backends are probed for their catalogue at startup.
+    pub startup_probes: StartupProbes,
 }
 
 impl EmbedOptions {
@@ -124,6 +162,15 @@ impl EmbedOptions {
     #[must_use]
     pub fn with_update_checks(mut self, update_checks: UpdateChecks) -> Self {
         self.update_checks = update_checks;
+        self
+    }
+
+    /// Choose which backends are probed at startup.
+    ///
+    /// See [`StartupProbes`] for what a host gives up by narrowing this.
+    #[must_use]
+    pub fn with_startup_probes(mut self, startup_probes: StartupProbes) -> Self {
+        self.startup_probes = startup_probes;
         self
     }
 
@@ -453,7 +500,9 @@ pub async fn start_with_options(
     if let Some(task) = catalog::spawn_refresh(state.clone(), &paths, checks) {
         background.0.push(task);
     }
-    background.0.push(spawn_catalogue_discovery(state.clone()));
+    if let Some(task) = spawn_catalogue_discovery(state.clone(), options.startup_probes) {
+        background.0.push(task);
+    }
     let quota = QuotaWriter::new(paths.quota_file());
     background.0.push(quota.spawn(state.clone()));
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -621,7 +670,10 @@ fn seed_spend(state: &crate::state::AppState) {
     }
 }
 
-/// Learn every backend's catalogue in the background, once, at startup.
+/// Learn each backend's catalogue in the background, once, at startup.
+///
+/// Which backends, and whether at all, is [`StartupProbes`]. `All` keeps the
+/// behaviour every caller had before that existed.
 ///
 /// In the background because a probe is a network round trip per backend and
 /// the daemon must be answering requests immediately; a request that arrives
@@ -629,14 +681,43 @@ fn seed_spend(state: &crate::state::AppState) {
 /// Failures are logged at debug and otherwise ignored — this is an
 /// optimisation of what we know, not a health check, and `ironwire doctor`
 /// remains the place that reports whether a backend actually works.
-fn spawn_catalogue_discovery(state: crate::state::AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_catalogue_discovery(
+    state: crate::state::AppState,
+    probes: StartupProbes,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if probes == StartupProbes::Off {
+        return None;
+    }
+    Some(tokio::spawn(async move {
         for backend in state.backends.all() {
+            // `Configured` is about who asked for the request, not about
+            // whether the backend works: an entry naming it is the host saying
+            // "this one is mine". Discovery's own registrations, which no entry
+            // names, are the ones a host cannot otherwise decline.
+            if probes == StartupProbes::Configured && !is_named_in_config(&state, backend.id()) {
+                tracing::debug!(
+                    backend = %backend.id(),
+                    "not probing a backend no configuration entry names"
+                );
+                continue;
+            }
             if let Err(error) = backend.probe().await {
                 tracing::debug!(backend = %backend.id(), %error, "could not learn this backend's catalogue at startup");
             }
         }
-    })
+    }))
+}
+
+/// Whether an entry in `config.toml` names this backend.
+///
+/// An entry that switched the backend off never reaches registration, so this
+/// only ever sees entries that named it and left it on.
+fn is_named_in_config(state: &crate::state::AppState, id: &BackendId) -> bool {
+    state
+        .config
+        .backends
+        .iter()
+        .any(|entry| entry.id == id.as_str())
 }
 
 /// Open the trace ledger, or explain why we are running without one.
