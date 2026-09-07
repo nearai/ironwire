@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use ironwire_catalog::schema::Catalog;
+use sha2::{Digest, Sha256};
 
 use crate::{catalog, claude_settings, codex_config};
 
@@ -168,6 +169,24 @@ impl Planned {
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
+    }
+
+    /// The file this plan was worked out against, as a hash.
+    ///
+    /// A plan cannot be handed to a caller and handed back — `contents` is the
+    /// whole file, and sending somebody's config out over the control API to
+    /// get it returned is a worse trade than the confirmation is worth. So a
+    /// caller that has been shown a plan gets this instead, and passes it back
+    /// when it asks for the edit; a file that has moved since produces a
+    /// different one, and the write is refused rather than being a change
+    /// nobody was shown.
+    ///
+    /// A file that is not there hashes as empty, which is what it reads as
+    /// everywhere else in this module.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let digest = <Sha256 as Digest>::digest(self.existing.as_bytes());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 
@@ -392,6 +411,36 @@ mod tests {
     fn a_codex_provider_block_alone_is_not_wired() {
         let existing = "[model_providers.ironwire]\nbase_url = \"http://127.0.0.1:8463/openai\"\n";
         assert!(!codex_config::is_wired(existing));
+    }
+
+    /// A caller shown a plan sends its digest back to commit the change it was
+    /// shown. That is only worth anything if a file edited in between produces
+    /// a different one, and if the answer does not depend on what the edit
+    /// would be: a connect and a disconnect worked out against the same file
+    /// describe the same file.
+    #[test]
+    fn a_plan_is_digested_by_the_file_it_was_worked_out_against() {
+        let planned = |existing: &str, contents: &str| Planned {
+            path: PathBuf::from("config.toml"),
+            changes: vec!["something".to_string()],
+            occupied: Vec::new(),
+            existing: existing.to_string(),
+            contents: contents.to_string(),
+        };
+
+        assert_eq!(
+            planned("ORIGINAL", "EDITED").digest(),
+            planned("ORIGINAL", "EDITED SOME OTHER WAY").digest(),
+        );
+        assert_ne!(
+            planned("ORIGINAL", "EDITED").digest(),
+            planned("ORIGINAL, THEN CHANGED", "EDITED").digest(),
+        );
+        // sha256(""), which is what a file that is not there hashes as.
+        assert_eq!(
+            planned("", "EDITED").digest(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
     }
 
     /// The first backup is the only one holding the file as it was before

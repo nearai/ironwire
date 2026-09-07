@@ -557,6 +557,21 @@ pub struct ToolRequest {
     pub id: String,
     /// `true` to point it here, `false` to take it back off.
     pub connect: bool,
+    /// `true` to work the change out and report it without making it.
+    ///
+    /// Defaults to `false`, which is what the endpoint has always done. A
+    /// client that asks a user before editing their config asks with this, and
+    /// then sends the same request again with `if_unchanged` set to the
+    /// `digest` it was answered with.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The `digest` from the preview the user was actually shown.
+    ///
+    /// When present, the edit is made only if the file still hashes to this.
+    /// Absent, the edit is made against whatever is there now — the behaviour
+    /// every existing caller gets.
+    #[serde(default)]
+    pub if_unchanged: Option<String>,
 }
 
 /// Point a coding agent at IronWire, or take it back off.
@@ -566,11 +581,22 @@ pub struct ToolRequest {
 /// can only recite a command about it — is a worse answer to "why is nothing
 /// routing" than doing the edit.
 ///
-/// The ceremony survives the move. Every other path that touches somebody's
-/// agent config works out the change, shows it, and only then writes; the CLI
-/// prints it, and this hands `changes` and `occupied` back so a GUI can show
-/// exactly the same thing. A slot the user is already using is still reported
-/// and still left alone — a GUI is not a licence to take one.
+/// The ceremony survives the move, and `dry_run` is what carries it. Every
+/// other path that touches somebody's agent config works out the change, shows
+/// it, and only then writes; the CLI prints the plan and waits for an answer.
+/// Reporting `changes` and `occupied` alongside the write is the same
+/// information after the fact, which is a receipt rather than a question — so
+/// `dry_run: true` works the change out, reports it, and writes nothing, and a
+/// client can put the question to somebody before anything moves.
+///
+/// What the preview does not do is let the caller supply the edit. The request
+/// names a tool and a direction, never a file or its contents; the daemon works
+/// out both, on both calls. A caller that was shown a plan sends its `digest`
+/// back as `if_unchanged` and the write is refused if the file has moved since,
+/// so what lands is the change that was shown and not a later one nobody saw.
+///
+/// A slot the user is already using is still reported and still left alone — a
+/// GUI is not a licence to take one.
 async fn tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -596,8 +622,20 @@ async fn tools(
         Err(error) => return bad_request(error.to_string()),
     };
 
+    let digest = planned.digest();
+    if let Some(shown) = &request.if_unchanged
+        && !request.dry_run
+        && shown != &digest
+    {
+        return conflict(format!(
+            "{} has changed since it was previewed, so the edit you were shown is not the \
+             edit that would be made. Preview it again.",
+            planned.path.display()
+        ));
+    }
+
     let mut backup = None;
-    if !planned.is_noop() {
+    if !request.dry_run && !planned.is_noop() {
         match ironwire_agents::tools::commit(&planned) {
             Ok(written) => backup = written,
             Err(error) => {
@@ -611,6 +649,10 @@ async fn tools(
 
     axum::Json(serde_json::json!({
         "ok": true,
+        // Whether the file on disk changed. False for a preview, and false for
+        // a request that had nothing to do — a tool already wired is not an
+        // error, and reporting it as a write would be a lie.
+        "applied": !request.dry_run && !planned.is_noop(),
         "path": planned.path.display().to_string(),
         "changes": planned.changes,
         "occupied": planned
@@ -618,6 +660,9 @@ async fn tools(
             .iter()
             .map(|(slot, current)| serde_json::json!({"slot": slot, "current": current}))
             .collect::<Vec<_>>(),
+        // The file as this plan found it. Send it back as `if_unchanged` to
+        // commit exactly what the preview described.
+        "digest": digest,
         "backup": backup.map(|path| path.display().to_string()),
     }))
     .into_response()
@@ -901,6 +946,15 @@ fn parse_mode(name: &str) -> Option<PrivacyMode> {
 fn server_error(message: String) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+/// The file moved between the preview and the edit.
+fn conflict(message: String) -> Response {
+    (
+        StatusCode::CONFLICT,
         axum::Json(serde_json::json!({ "error": message })),
     )
         .into_response()
