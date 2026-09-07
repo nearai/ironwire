@@ -907,3 +907,208 @@ fn a_host_that_owns_credentials_is_not_offered_the_codex_stored_key() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A host that owns the names can now leave the credential files readable, and
+/// the two answers do not move together.
+///
+/// Run in a child process with `CODEX_HOME` and `ANTHROPIC_API_KEY` planted,
+/// because both halves of this need a credential that actually exists and
+/// neither may depend on how the developer running the suite happens to be
+/// logged in. A test that asserted "the subscription is registered" against a
+/// real login would pass on one machine and be vacuous on the next; this one
+/// plants a ChatGPT-mode `auth.json` and so means the same thing everywhere.
+/// The planted variable is the other half: it proves the environment is still
+/// not read behind a host, rather than that it happened to be empty.
+#[test]
+fn a_host_can_own_credentials_and_still_permit_the_credential_files() {
+    const CHILD: &str = "IRONWIRE_CREDENTIAL_FILES_TEST";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(child());
+        return;
+    }
+
+    // A ChatGPT-mode login, which is a file and not a key: no name-keyed
+    // source, host or environment, can supply it.
+    let codex_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        r#"{"auth_mode": "chatgpt", "tokens": {"access_token": "eyJACCESS", "refresh_token": "rt.1.EXAMPLE", "account_id": "36afe797-0000"}}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_host_can_own_credentials_and_still_permit_the_credential_files",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("CODEX_HOME", codex_home.path())
+        .env("ANTHROPIC_API_KEY", "sk-ant-from-the-environment")
+        .env_remove("NEARAI_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    async fn child() {
+        use ironwire_proxy::embed::{
+            CredentialFiles, EmbedOptions, HostSecret, StartupProbes, UpdateChecks,
+            start_with_options,
+        };
+
+        // Every case: no outbound request, and a home that leaves every
+        // discovered backend alone so registration is the thing under test.
+        let base = || {
+            EmbedOptions::default()
+                .with_update_checks(UpdateChecks::Off)
+                .with_startup_probes(StartupProbes::Off)
+        };
+        let host = |name: &str| {
+            (name == "NEARAI_API_KEY").then(|| HostSecret::from("sk-nearai-from-host"))
+        };
+
+        // What each case expects: the subscription that lives in a file, the
+        // key that lives in the process environment, and the name only the
+        // host answers for.
+        struct Case {
+            what: &'static str,
+            options: EmbedOptions,
+            subscription: bool,
+            from_environment: bool,
+            from_host: bool,
+        }
+        let cases = vec![
+            Case {
+                what: "a host that owns credentials and says nothing about files",
+                options: base().with_credentials(host),
+                subscription: false,
+                from_environment: false,
+                from_host: true,
+            },
+            Case {
+                what: "a host that owns credentials and opts into the files",
+                options: base()
+                    .with_credentials(host)
+                    .with_credential_files(CredentialFiles::Discover),
+                subscription: true,
+                from_environment: false,
+                from_host: true,
+            },
+            Case {
+                what: "no host source at all",
+                options: base(),
+                subscription: true,
+                from_environment: true,
+                from_host: false,
+            },
+            Case {
+                what: "no host source, files declined",
+                options: base().with_credential_files(CredentialFiles::Off),
+                subscription: false,
+                from_environment: true,
+                from_host: false,
+            },
+        ];
+
+        for Case {
+            what,
+            options,
+            subscription,
+            from_environment,
+            from_host,
+        } in cases
+        {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                home.path().join("config.toml"),
+                "[updates]\ncheck = false\n",
+            )
+            .unwrap();
+            let proxy = start_with_options(home.path(), Some(0), options, |_, _| {})
+                .await
+                .expect("starts");
+            let backends = backends_reported_by(home.path(), proxy.port()).await;
+            proxy.shutdown().await;
+            let registered = |id: &str| backends.iter().any(|backend| backend["id"] == id);
+            let authenticated = |id: &str| {
+                backends
+                    .iter()
+                    .find(|backend| backend["id"] == id)
+                    .is_some_and(|backend| backend["authenticated"] == serde_json::json!(true))
+            };
+
+            assert_eq!(
+                registered("codex-sub"),
+                subscription,
+                "{what}: the ChatGPT subscription on disk"
+            );
+            assert_eq!(
+                registered("anthropic-key"),
+                from_environment,
+                "{what}: the key in the process environment"
+            );
+            assert_eq!(
+                authenticated("nearai"),
+                from_host,
+                "{what}: the name the host answers for"
+            );
+        }
+    }
+}
+
+/// An embedded start must be `tokio::spawn`-able, which is to say its future
+/// must be `Send`.
+///
+/// Nothing else in this repository spawns one — the CLI and every other test
+/// `.await` a start directly on the thread that made it, and a non-`Send`
+/// future is perfectly happy that way. So the bounds that make it `Send` (on
+/// `CredentialSource`, and on the internal environment lookup a `Credentials`
+/// is built from) can be dropped without a single failure here, and the first
+/// thing to notice would be an embedding host's build breaking. This test is
+/// the thing that notices: it is a compile-time assertion wearing a runtime
+/// test's clothes, and the runtime half is only there to prove the spawn was
+/// real.
+///
+/// A host source is supplied deliberately, because that closure is the part
+/// held across an await, and the credential-files knob with it, so the future
+/// under test is the one a real embedder spawns rather than the simplest one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_embedded_start_can_be_spawned_onto_a_multi_thread_runtime() {
+    use ironwire_proxy::embed::{
+        CredentialFiles, EmbedOptions, HostSecret, StartupProbes, UpdateChecks, start_with_options,
+    };
+
+    let home = home();
+    let started = tokio::spawn(async move {
+        let proxy = start_with_options(
+            home.path(),
+            Some(0),
+            EmbedOptions::default()
+                .with_update_checks(UpdateChecks::Off)
+                .with_startup_probes(StartupProbes::Off)
+                .with_credentials(|_: &str| None::<HostSecret>)
+                .with_credential_files(CredentialFiles::Off),
+            |_, _| {},
+        )
+        .await
+        .expect("starts");
+        let port = proxy.port();
+        proxy.shutdown().await;
+        // The home outlives the proxy, and is dropped here rather than on the
+        // thread that spawned this.
+        drop(home);
+        port
+    })
+    .await
+    .expect("the spawned start did not panic");
+
+    assert_ne!(started, 0, "the spawned start bound a real port");
+}
