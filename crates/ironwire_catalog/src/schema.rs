@@ -52,7 +52,27 @@ use serde::{Deserialize, Serialize};
 /// A document declaring a *newer* major schema is refused rather than
 /// partially applied — half-understanding a provider workaround is worse than
 /// using the compiled-in defaults.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// # 2: [`AgentSetting::style`]
+///
+/// Unknown *fields* are tolerated, so a build from before that field existed
+/// reads an entry asking for [`UrlStyle::Versioned`], ignores the field, and
+/// writes the origin spelling into a tool that needs `/v1` — a 404 in the
+/// user's editor, arrived at by following the document correctly. This number
+/// is the only way to say "not this build": a publisher stamps `2` on a
+/// document that uses `style`, and every earlier build refuses the whole
+/// document instead of applying half of it.
+///
+/// The refusal is document-wide, which is the cost: an old build that rejects
+/// the document also stops receiving `anthropic` and `client_identity`, the
+/// constants this channel exists to refresh. That is a publishing decision, not
+/// a code one — a document that uses no `style` should keep declaring `1` and
+/// keep reaching every build. What the bump buys is the *option*, and it has to
+/// ship with the field: a build that does not accept `2` can never be talked
+/// into it later, so a release that understands `style` without accepting `2`
+/// leaves a publisher no way to use the field safely for as long as that
+/// release is in the field.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Provider values that move faster than our release cadence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +314,10 @@ pub struct AgentSetting {
     /// Which spelling of that façade's address the tool expects. Defaults to
     /// [`UrlStyle::Origin`], so a document written before this field existed
     /// keeps meaning what it meant.
+    ///
+    /// A document that sets this to anything else must declare
+    /// `schema_version` 2: an older build tolerates the unknown field, ignores
+    /// it, and writes the origin spelling. See [`SCHEMA_VERSION`].
     #[serde(default)]
     pub style: UrlStyle,
 }
