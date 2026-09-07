@@ -138,6 +138,33 @@ implementation relies on the user's profile-directory permissions. No new
 package or package version is added: `anyhow`, `reqwest`, and `getrandom 0.2`
 become direct uses of packages already in the proxy's dependency tree.
 
+## Pointing a coding tool at an embedded instance
+
+`ironwire_agents::tools::plan_connect` works out the edit; the host shows it and
+`commit`s it. For Claude Code the edit fills two slots, and the second one names
+a binary:
+
+```rust
+use ironwire_agents::tools::{ConnectOptions, StatusLine};
+let options = ConnectOptions::default().with_status_line(StatusLine::Decline);
+```
+
+`statusLine` is written as `std::env::current_exe()` plus a `statusline`
+subcommand. Under the CLI that is `ironwire statusline`, which exists. Under a
+host it is the host's own executable, which may not implement the subcommand at
+all, or may be a GUI bundle with no command-line surface. Claude Code renders
+the command's stdout, so a binary that rejects the argument produces a blank
+line rather than a visible failure. A host in that position declines the slot
+with `plan_connect_with` and `StatusLine::Decline`; the routing edit is
+unchanged, and a status line the user wrote themselves is left alone either way.
+
+Declining also removes a status line IronWire installed on an earlier connect,
+so a host that shipped `plan_connect` before adopting this fixes the
+installations it already made rather than only the next one. The `installedBy`
+marker names IronWire and not a particular binary, so in a home shared with the
+`ironwire` CLI this removes the CLI's line as well; `ironwire connect claude`
+puts it back.
+
 ## Implementation checkpoint
 
 This completes upstream Task 1 of the [Trace Commons private-inference

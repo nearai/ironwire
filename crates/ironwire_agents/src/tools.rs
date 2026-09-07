@@ -171,19 +171,95 @@ impl Planned {
     }
 }
 
+/// Whether this caller can honour the status line IronWire would install.
+///
+/// The command written into Claude Code's `statusLine` is the calling binary
+/// plus a `statusline` subcommand — [`statusline_command`]. That is right for
+/// the `ironwire` CLI, which implements it. It is not right for a host that
+/// embeds this crate and has no such subcommand: Claude Code reads the
+/// command's stdout, so a binary that rejects the argument shows the user a
+/// blank line rather than an error they can act on.
+///
+/// Callers must allow future values rather than exhaustively matching today's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StatusLine {
+    /// Offer IronWire's status line, in the slot, if the user is not using it.
+    /// What every caller got before this existed, and what the CLI, the daemon
+    /// and the control API still get.
+    #[default]
+    Offer,
+    /// Install no status line, and take out one IronWire installed on an
+    /// earlier connect — that command names an executable that cannot serve
+    /// it, and leaving it would keep the tool invoking it. A status line the
+    /// user wrote themselves is left alone, as everywhere else here. For a host
+    /// whose executable cannot serve one. Routing is unaffected: the tool is
+    /// still pointed at IronWire.
+    Decline,
+}
+
+/// What a caller chooses about an edit, beyond which tool and which port.
+///
+/// Construct from [`ConnectOptions::default`] and set what differs, so a future
+/// choice does not break existing callers.
+///
+/// ```
+/// use ironwire_agents::tools::{ConnectOptions, StatusLine};
+/// let options = ConnectOptions::default().with_status_line(StatusLine::Decline);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnectOptions {
+    /// Whether to offer IronWire's own status line. Only Claude Code has a
+    /// slot for one today; the other tools ignore this.
+    pub status_line: StatusLine,
+}
+
+impl ConnectOptions {
+    /// Say whether this caller can honour a status line.
+    #[must_use]
+    pub fn with_status_line(mut self, status_line: StatusLine) -> Self {
+        self.status_line = status_line;
+        self
+    }
+}
+
 /// Work out how to point a tool at IronWire.
+///
+/// [`ConnectOptions::default`]: the status line is offered, which is what the
+/// CLI and the control API want. A host that cannot serve one uses
+/// [`plan_connect_with`].
 ///
 /// # Errors
 ///
 /// [`Error::UnknownTool`] for an id nothing knows, [`Error::NoPath`] when the
 /// config cannot be located, [`Error::Edit`] when the file cannot be read.
 pub fn plan_connect(id: &str, port: u16, catalog_document: &Catalog) -> Result<Planned, Error> {
+    plan_connect_with(id, port, catalog_document, ConnectOptions::default())
+}
+
+/// Work out how to point a tool at IronWire, with every caller-owned choice
+/// stated.
+///
+/// # Errors
+///
+/// As [`plan_connect`].
+pub fn plan_connect_with(
+    id: &str,
+    port: u16,
+    catalog_document: &Catalog,
+    options: ConnectOptions,
+) -> Result<Planned, Error> {
     match id {
         "claude" => {
             let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
             let url = format!("http://127.0.0.1:{port}/anthropic");
-            let edit = claude_settings::connect(&existing, &statusline_command(), Some(&url))
+            let command = match options.status_line {
+                StatusLine::Offer => Some(statusline_command()),
+                StatusLine::Decline => None,
+            };
+            let edit = claude_settings::connect(&existing, command.as_deref(), Some(&url))
                 .map_err(|error| Error::Edit(error.to_string()))?;
             Ok(Planned {
                 path,
@@ -360,6 +436,13 @@ mod tests {
                 "{tool:?}"
             );
         }
+    }
+
+    /// The CLI, the daemon and the control API all reach `plan_connect`, and
+    /// none of them passes options. The status line has to stay on for them.
+    #[test]
+    fn the_default_still_offers_the_status_line() {
+        assert_eq!(ConnectOptions::default().status_line, StatusLine::Offer);
     }
 
     #[test]
