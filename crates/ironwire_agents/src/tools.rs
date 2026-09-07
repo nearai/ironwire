@@ -171,22 +171,47 @@ impl Planned {
         self.changes.is_empty()
     }
 
-    /// The file this plan was worked out against, as a hash.
+    /// This plan, as a hash: the file it would edit, the bytes it found
+    /// there, and the bytes it would leave.
     ///
     /// A plan cannot be handed to a caller and handed back — `contents` is the
     /// whole file, and sending somebody's config out over the control API to
     /// get it returned is a worse trade than the confirmation is worth. So a
     /// caller that has been shown a plan gets this instead, and passes it back
-    /// when it asks for the edit; a file that has moved since produces a
-    /// different one, and the write is refused rather than being a change
-    /// nobody was shown.
+    /// when it asks for the edit.
     ///
-    /// A file that is not there hashes as empty, which is what it reads as
+    /// All three parts are in it because the caller picks the tool and the
+    /// direction on both calls, and only the file being the same does not make
+    /// the *edit* the same. A partly wired config has a non-empty connect and a
+    /// non-empty disconnect worked out from identical bytes; hashing the file
+    /// alone would let a client that was shown additions commit the removal
+    /// instead. Two tools that both have no config yet hash identically for the
+    /// same reason, which is why the path is in here too.
+    ///
+    /// `changes` is not: it is prose describing `contents`, and the same
+    /// resulting file is the same edit whatever we called it.
+    ///
+    /// A file that is not there takes part as empty, which is what it reads as
     /// everywhere else in this module.
     #[must_use]
     pub fn digest(&self) -> String {
-        let digest = <Sha256 as Digest>::digest(self.existing.as_bytes());
-        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        let mut hasher = Sha256::new();
+        // Length-prefixed so the parts cannot be slid into one another: a path
+        // ending in bytes a file could begin with must not hash as some other
+        // path and file.
+        for part in [
+            self.path.to_string_lossy().as_bytes(),
+            self.existing.as_bytes(),
+            self.contents.as_bytes(),
+        ] {
+            Digest::update(&mut hasher, (part.len() as u64).to_be_bytes());
+            Digest::update(&mut hasher, part);
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -350,6 +375,52 @@ pub fn commit(planned: &Planned) -> std::io::Result<Option<PathBuf>> {
     Ok(backup)
 }
 
+/// Why a confirmed edit was not made.
+#[derive(Debug)]
+pub enum CommitError {
+    /// The file is no longer the one the plan was worked out against.
+    Changed,
+    /// The write itself failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed => write!(f, "the file changed after the plan was worked out"),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CommitError {}
+
+/// Make the edit, but only while the file is still what the plan was worked out
+/// against.
+///
+/// [`commit`] writes what it is given. A caller confirming a plan somebody was
+/// shown wants more than that: the file is read again here, immediately before
+/// the write, and an edit that landed in between — another request, or the
+/// agent itself — refuses rather than being overwritten by a plan that never
+/// saw it.
+///
+/// This is a check and then a write, not one atomic operation. A write that
+/// lands between the two is still lost, and closing that needs a conditional
+/// write the filesystem does not offer portably. What it does close is the
+/// whole span from working the plan out to committing it, which is where a
+/// second request and a round trip to a user live.
+///
+/// # Errors
+///
+/// [`CommitError::Changed`] when the file moved since, [`CommitError::Io`] from
+/// the write.
+pub fn commit_if_unchanged(planned: &Planned) -> Result<Option<PathBuf>, CommitError> {
+    if read(Some(&planned.path)) != planned.existing {
+        return Err(CommitError::Changed);
+    }
+    commit(planned).map_err(CommitError::Io)
+}
+
 /// The status line command, which is this binary plus a subcommand.
 fn statusline_command() -> String {
     std::env::current_exe().map_or_else(
@@ -413,33 +484,74 @@ mod tests {
         assert!(!codex_config::is_wired(existing));
     }
 
-    /// A caller shown a plan sends its digest back to commit the change it was
-    /// shown. That is only worth anything if a file edited in between produces
-    /// a different one, and if the answer does not depend on what the edit
-    /// would be: a connect and a disconnect worked out against the same file
-    /// describe the same file.
+    /// A caller shown a plan sends its digest back to commit the edit it was
+    /// shown, and it picks the tool and the direction again when it does. So
+    /// the digest has to name the edit, not the file: a partly wired config has
+    /// a real connect *and* a real disconnect worked out from identical bytes,
+    /// and a digest over the file alone would let a client that was shown the
+    /// additions commit the removal instead.
     #[test]
-    fn a_plan_is_digested_by_the_file_it_was_worked_out_against() {
-        let planned = |existing: &str, contents: &str| Planned {
-            path: PathBuf::from("config.toml"),
+    fn a_digest_names_the_edit_and_not_only_the_file() {
+        let planned = |path: &str, existing: &str, contents: &str| Planned {
+            path: PathBuf::from(path),
             changes: vec!["something".to_string()],
             occupied: Vec::new(),
             existing: existing.to_string(),
             contents: contents.to_string(),
         };
 
+        // The same edit, worked out twice.
         assert_eq!(
-            planned("ORIGINAL", "EDITED").digest(),
-            planned("ORIGINAL", "EDITED SOME OTHER WAY").digest(),
+            planned("config.toml", "ORIGINAL", "EDITED").digest(),
+            planned("config.toml", "ORIGINAL", "EDITED").digest(),
         );
+        // Two edits to the same file: the connect and the disconnect.
         assert_ne!(
-            planned("ORIGINAL", "EDITED").digest(),
-            planned("ORIGINAL, THEN CHANGED", "EDITED").digest(),
+            planned("config.toml", "ORIGINAL", "WIRED").digest(),
+            planned("config.toml", "ORIGINAL", "UNWIRED").digest(),
         );
-        // sha256(""), which is what a file that is not there hashes as.
+        // The file moved between the preview and the commit.
+        assert_ne!(
+            planned("config.toml", "ORIGINAL", "EDITED").digest(),
+            planned("config.toml", "ORIGINAL, THEN CHANGED", "EDITED").digest(),
+        );
+        // Two tools that both have no config yet: same empty bytes, and the
+        // preview for one must not authorise the edit to the other.
+        assert_ne!(
+            planned("a/config.toml", "", "EDITED").digest(),
+            planned("b/config.toml", "", "EDITED").digest(),
+        );
+    }
+
+    /// The plan holds the file as it was read. Confirming one has to look
+    /// again, or an edit that landed in between is overwritten by a plan that
+    /// never saw it.
+    #[test]
+    fn a_confirmed_edit_refuses_a_file_that_moved_since() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "ORIGINAL").expect("write");
+
+        let planned = Planned {
+            path: path.clone(),
+            changes: vec!["something".to_string()],
+            occupied: Vec::new(),
+            existing: "ORIGINAL".to_string(),
+            contents: "EDITED".to_string(),
+        };
+        assert!(commit_if_unchanged(&planned).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "EDITED");
+
+        // Somebody else got there first, so this plan is stale.
+        std::fs::write(&path, "SOMEBODY ELSE").expect("write");
+        assert!(matches!(
+            commit_if_unchanged(&planned),
+            Err(CommitError::Changed)
+        ));
         assert_eq!(
-            planned("", "EDITED").digest(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            std::fs::read_to_string(&path).expect("read"),
+            "SOMEBODY ELSE",
+            "a stale plan overwrote the edit it never saw"
         );
     }
 

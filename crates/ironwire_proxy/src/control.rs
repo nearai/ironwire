@@ -561,17 +561,22 @@ pub struct ToolRequest {
     ///
     /// Defaults to `false`, which is what the endpoint has always done. A
     /// client that asks a user before editing their config asks with this, and
-    /// then sends the same request again with `if_unchanged` set to the
+    /// then sends the same request again with `as_previewed` set to the
     /// `digest` it was answered with.
     #[serde(default)]
     pub dry_run: bool,
     /// The `digest` from the preview the user was actually shown.
     ///
-    /// When present, the edit is made only if the file still hashes to this.
+    /// When present, the edit is made only if it is still that same edit — the
+    /// same file, the same bytes in it, and the same bytes it would leave. It
+    /// is not only "has the file changed": `id` and `connect` are supplied
+    /// again on this call, and a partly wired config has a real connect and a
+    /// real disconnect worked out from identical bytes.
+    ///
     /// Absent, the edit is made against whatever is there now — the behaviour
     /// every existing caller gets.
     #[serde(default)]
-    pub if_unchanged: Option<String>,
+    pub as_previewed: Option<String>,
 }
 
 /// Point a coding agent at IronWire, or take it back off.
@@ -592,8 +597,18 @@ pub struct ToolRequest {
 /// What the preview does not do is let the caller supply the edit. The request
 /// names a tool and a direction, never a file or its contents; the daemon works
 /// out both, on both calls. A caller that was shown a plan sends its `digest`
-/// back as `if_unchanged` and the write is refused if the file has moved since,
-/// so what lands is the change that was shown and not a later one nobody saw.
+/// back as `as_previewed`, and the write happens only while that is still the
+/// edit it describes — the same file, found in the same state, ending in the
+/// same state. The direction is in there because the caller picks it again: a
+/// half-wired config yields a real connect and a real disconnect from the same
+/// bytes, and a client shown the additions must not be able to commit the
+/// removal.
+///
+/// The file is read once more inside the commit, immediately before the write,
+/// so an edit that landed while the user was being asked refuses rather than
+/// being overwritten. That is a check and then a write rather than one atomic
+/// step; the remaining window is documented on
+/// [`ironwire_agents::tools::commit_if_unchanged`].
 ///
 /// A slot the user is already using is still reported and still left alone — a
 /// GUI is not a licence to take one.
@@ -623,20 +638,31 @@ async fn tools(
     };
 
     let digest = planned.digest();
-    if let Some(shown) = &request.if_unchanged
+    let confirming = request.as_previewed.is_some() && !request.dry_run;
+    if let Some(shown) = &request.as_previewed
         && !request.dry_run
         && shown != &digest
     {
-        return conflict(format!(
-            "{} has changed since it was previewed, so the edit you were shown is not the \
-             edit that would be made. Preview it again.",
-            planned.path.display()
-        ));
+        return conflict(stale_preview(&planned.path));
     }
 
     let mut backup = None;
     if !request.dry_run && !planned.is_noop() {
-        match ironwire_agents::tools::commit(&planned) {
+        // A confirmed edit looks at the file once more before writing; an
+        // unconfirmed one is the endpoint as it always was, and writing what it
+        // just planned is all it ever promised.
+        let written = if confirming {
+            match ironwire_agents::tools::commit_if_unchanged(&planned) {
+                Ok(written) => Ok(written),
+                Err(ironwire_agents::tools::CommitError::Changed) => {
+                    return conflict(stale_preview(&planned.path));
+                }
+                Err(ironwire_agents::tools::CommitError::Io(error)) => Err(error),
+            }
+        } else {
+            ironwire_agents::tools::commit(&planned)
+        };
+        match written {
             Ok(written) => backup = written,
             Err(error) => {
                 return server_error(format!(
@@ -660,8 +686,9 @@ async fn tools(
             .iter()
             .map(|(slot, current)| serde_json::json!({"slot": slot, "current": current}))
             .collect::<Vec<_>>(),
-        // The file as this plan found it. Send it back as `if_unchanged` to
-        // commit exactly what the preview described.
+        // This edit: the file, the state it was found in, and the state it
+        // would leave. Send it back as `as_previewed` to commit exactly what
+        // this described and nothing else.
         "digest": digest,
         "backup": backup.map(|path| path.display().to_string()),
     }))
@@ -951,7 +978,16 @@ fn server_error(message: String) -> Response {
         .into_response()
 }
 
-/// The file moved between the preview and the edit.
+/// What a caller is told when the edit it confirmed is not the edit that would
+/// be made now — the file moved, or it asked for a different one.
+fn stale_preview(path: &std::path::Path) -> String {
+    format!(
+        "the edit you were shown is not the edit that would be made to {} now. Preview it again.",
+        path.display()
+    )
+}
+
+/// The plan a caller confirmed is no longer the plan.
 fn conflict(message: String) -> Response {
     (
         StatusCode::CONFLICT,

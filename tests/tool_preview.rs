@@ -124,7 +124,7 @@ async fn a_preview_reports_the_change_without_making_it() {
     let stale = "0".repeat(64);
     let (status, refusal) = post_tools(
         &daemon,
-        serde_json::json!({"id": "codex", "connect": true, "if_unchanged": stale}),
+        serde_json::json!({"id": "codex", "connect": true, "as_previewed": stale}),
     )
     .await;
     assert_eq!(status, 409, "{refusal}");
@@ -147,7 +147,7 @@ async fn a_preview_reports_the_change_without_making_it() {
         serde_json::json!({
             "id": "codex",
             "connect": true,
-            "if_unchanged": preview["digest"].as_str().unwrap(),
+            "as_previewed": preview["digest"].as_str().unwrap(),
         }),
     )
     .await;
@@ -161,4 +161,88 @@ async fn a_preview_reports_the_change_without_making_it() {
         "the user's own key survived"
     );
     assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+}
+
+/// The direction is part of what was previewed, not just the file.
+///
+/// A half-wired config — our status line in place, the base URL never set — has
+/// a real connect *and* a real disconnect worked out from the same bytes. A
+/// client shown the additions must not be able to commit the removal with the
+/// digest it was answered with, which is what a digest over the file alone
+/// would have allowed.
+#[tokio::test]
+async fn a_digest_confirms_the_direction_it_was_shown() {
+    let home = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let settings = claude.join("settings.json");
+    let original = r#"{"statusLine":{"type":"command","command":"ironwire statusline","installedBy":"ironwire"}}"#;
+    std::fs::write(&settings, original).unwrap();
+
+    let daemon = start(home.path(), codex_home.path()).await;
+
+    let (status, connect) = post_tools(
+        &daemon,
+        serde_json::json!({"id": "claude", "connect": true, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{connect}");
+    let adds_the_url = connect["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|change| change.as_str().unwrap().contains("ANTHROPIC_BASE_URL"));
+    assert!(
+        adds_the_url,
+        "not the additions this test is about: {connect}"
+    );
+
+    let (status, disconnect) = post_tools(
+        &daemon,
+        serde_json::json!({"id": "claude", "connect": false, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{disconnect}");
+    assert!(
+        !disconnect["changes"].as_array().unwrap().is_empty(),
+        "the same bytes have to yield a real disconnect too, or this proves nothing: {disconnect}"
+    );
+
+    // The client was shown the connect. Sending its digest with the other
+    // direction is a different edit, and must be refused.
+    let (status, refusal) = post_tools(
+        &daemon,
+        serde_json::json!({
+            "id": "claude",
+            "connect": false,
+            "as_previewed": connect["digest"].as_str().unwrap(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a preview of the additions committed the removal: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        original,
+        "the status line was removed by a plan nobody was shown"
+    );
+
+    // The direction it was actually shown still commits.
+    let (status, written) = post_tools(
+        &daemon,
+        serde_json::json!({
+            "id": "claude",
+            "connect": true,
+            "as_previewed": connect["digest"].as_str().unwrap(),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{written}");
+    assert_eq!(written["applied"], true);
+    let after = std::fs::read_to_string(&settings).unwrap();
+    assert!(after.contains("ANTHROPIC_BASE_URL"), "{after}");
+    assert!(after.contains("statusLine"), "{after}");
 }

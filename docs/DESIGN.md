@@ -344,8 +344,8 @@ POST /_ironwire/privacy         { mode }
 POST /_ironwire/consent         { backend, granted, prompt_version }
 POST /_ironwire/tools           { id, connect } — point a coding agent here,
                                 also { dry_run } to be told the change without
-                                making it, and { if_unchanged } to make only
-                                the change a preview described
+                                making it, and { as_previewed } to make only
+                                the edit a preview described
 POST /_ironwire/probe           hit every backend for real
 ```
 
@@ -375,10 +375,18 @@ that touches somebody's agent config shows the change first; the CLI prints the
 plan and waits. `dry_run` is that half of the split reaching the API, so a GUI
 can ask the question rather than report the answer. The plan itself never
 leaves the daemon — it holds the whole file — so a preview hands back a
-`digest` of the file it was worked out against, and a caller sends that back as
-`if_unchanged` to be sure the edit that lands is the one it showed. Neither
-call lets the caller name a file or supply contents: the request is a tool and
-a direction, and the daemon works the rest out both times.
+`digest` of the edit it worked out, and a caller sends that back as
+`as_previewed` to be sure the edit that lands is the one it showed. The digest
+covers the file, the state it was found in and the state it would leave,
+because the caller picks the tool and the direction again on the second call: a
+half-wired config yields a real connect *and* a real disconnect from identical
+bytes, so a digest over the file alone would let a client that was shown the
+additions commit the removal. Neither call lets the caller name a file or
+supply contents: the request is a tool and a direction, and the daemon works
+the rest out both times. The confirmed write re-reads the file immediately
+before writing, so an edit that landed while the user was being asked refuses
+rather than being overwritten; that is a check and then a write, and the window
+it does not close is documented on `commit_if_unchanged`.
 
 The two writes follow from the same principle. `POST /privacy` changes the
 running daemon *and* `config.toml`, because a change that only applied at the
