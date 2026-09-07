@@ -57,17 +57,57 @@ is what every existing entry point does, so a standalone install is unaffected.
 `StartupReport::update_checks` reports the decision that was actually applied, so
 a host can confirm it declined rather than assume it.
 
-**This is not a general outbound kill switch.** Startup catalogue discovery probes
-every registered backend over the network under either value, and a registered
-backend is not the same as a configured one: `build_registry` registers the Claude
-subscription, Codex subscription, and Anthropic/OpenAI key backends from
-credentials found in the environment with no config entry naming them, and the
-NEAR AI backend is registered unconditionally so that `privacy.mode = "full"` has
-a visible destination. A bare embedded start against a home with no `config.toml`
-therefore still asks a provider for its model catalogue, whatever a host chooses
-here. A host that must make no outbound request at all cannot express that today;
-the levers that exist are `enabled = false` entries for the backends it does not
-want, which is again a config file it may not own.
+**This is not a general outbound kill switch**, and it is not the startup probe.
+Startup catalogue discovery probes registered backends over the network under
+either value, and a registered backend is not the same as a configured one:
+`build_registry` registers the Claude subscription, Codex subscription, and
+Anthropic/OpenAI key backends from credentials found in the environment with no
+config entry naming them, and the NEAR AI backend is registered unconditionally so
+that `privacy.mode = "full"` has a visible destination. Which backends are probed
+is `StartupProbes`, below.
+
+## The startup probe
+
+At startup IronWire calls `Backend::probe` on each registered backend: a live
+request that proves the backend works right now and learns the model catalogue the
+provider actually serves. It is real work, and a host that declines it is making a
+trade, not a saving. Declining means the daemon runs on configured or compiled-in
+catalogue values, and an expired credential surfaces on the first real request
+rather than at startup. `ironwire doctor` probes on demand and is unaffected.
+
+The reason a host may want to decline is that it did not ask for all of these
+requests. A bare embedded start against a home with no `config.toml` still asks
+NEAR AI for its model catalogue, because that backend is registered whether or not
+anything names it, and a host whose user happens to be logged into Claude Code or
+Codex probes those providers too.
+
+```rust,no_run
+# async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
+use ironwire_proxy::embed::{EmbedOptions, StartupProbes, start_with_options};
+let home = std::path::Path::new("/path/to/.ironwire");
+let proxy = start_with_options(
+    home,
+    None,
+    EmbedOptions::default().with_startup_probes(StartupProbes::Configured),
+    |_, _| {},
+)
+.await?;
+# proxy.shutdown().await;
+# Ok(())
+# }
+```
+
+- `StartupProbes::All` is the default and what the CLI does: probe everything
+  registered. Nothing changes for a standalone install.
+- `StartupProbes::Configured` probes only backends an entry in `config.toml`
+  names. A host that declared its backends deliberately keeps the startup answer
+  for those, and makes no request on behalf of one IronWire found on its own.
+- `StartupProbes::Off` probes nothing. With `UpdateChecks::Off`, this is the only
+  combination under which an embedded start makes no outbound request of its own
+  accord.
+
+The alternative for a host that wants none of this remains `enabled = false`
+entries for each backend, which is again a configuration file it may not own.
 
 Run this inside a Tokio runtime and keep that runtime alive through shutdown.
 The application owns the choice to start and stop; no signal handler, tracing
