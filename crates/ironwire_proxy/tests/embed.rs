@@ -385,3 +385,57 @@ async fn embedded_hosts_ignore_standalone_upgrade_commands_even_with_checks_enab
         );
     }
 }
+
+#[tokio::test]
+async fn a_host_can_decline_update_checks_without_writing_the_home_configuration() {
+    use ironwire_proxy::embed::{EmbedOptions, UpdateChecks, start_with_options};
+    let home = home();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("check = false", "check = true");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let mut observed = None;
+    let proxy = start_with_options(
+        home.path(),
+        Some(0),
+        EmbedOptions::default().with_update_checks(UpdateChecks::Off),
+        |_, report| observed = Some(report.update_checks),
+    )
+    .await
+    .expect("starts");
+    assert_eq!(
+        observed,
+        Some(false),
+        "a declining host makes no release or catalog request"
+    );
+    assert!(!proxy.startup_report().update_checks);
+    proxy.shutdown().await;
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        config,
+        "declining is expressed in code, never by editing the host's home"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_does_not_decline_still_follows_the_configuration() {
+    use ironwire_proxy::embed::{EmbedOptions, start_with_options};
+    let home = home();
+    let config_path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("check = false", "check = true");
+    std::fs::write(&config_path, &config).unwrap();
+
+    let proxy = start_with_options(home.path(), Some(0), EmbedOptions::default(), |_, _| {})
+        .await
+        .expect("starts");
+    assert!(
+        proxy.startup_report().update_checks,
+        "the default must stay transparent for standalone users"
+    );
+    proxy.shutdown().await;
+}

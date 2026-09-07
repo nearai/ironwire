@@ -27,6 +27,37 @@ present its own application update UI. The CLI explicitly selects
 release checks and cached notifications. Signed provider-catalog refresh still
 honors `updates.check`, and provider model discovery is unchanged for both hosts.
 
+`UpdatePolicy` says who owns upgrading the binary; it does not say whether this
+process may reach out at all. That remains `updates.check`, whose only home is
+`$IRONWIRE_HOME/config.toml` — a file an embedding host may not own, because the
+home can be a real user's and shared with the CLI. `start_with_options` takes the
+same switch in code:
+
+```rust,no_run
+# async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
+use ironwire_proxy::embed::{EmbedOptions, UpdateChecks, start_with_options};
+let home = std::path::Path::new("/path/to/.ironwire");
+let proxy = start_with_options(
+    home,
+    None,
+    EmbedOptions::default().with_update_checks(UpdateChecks::Off),
+    |_, _| {},
+)
+.await?;
+# proxy.shutdown().await;
+# Ok(())
+# }
+```
+
+`UpdateChecks::Off` suppresses the release check and the catalog refresh, the two
+requests IronWire makes that are not the user's own work; someone who declines one
+means both. There is deliberately no value that turns them back on over a
+configured `updates.check = false`. `UpdateChecks::FromConfig` is the default and
+is what every existing entry point does, so a standalone install is unaffected.
+Provider model discovery, which only queries backends the host configured, is not
+covered by this switch. `StartupReport::update_checks` reports the decision that
+was actually applied, so a host can confirm it declined rather than assume it.
+
 Run this inside a Tokio runtime and keep that runtime alive through shutdown.
 The application owns the choice to start and stop; no signal handler, tracing
 subscriber, or process exit handler is installed by the library. The CLI keeps

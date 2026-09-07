@@ -47,7 +47,8 @@ work, so it is bounded (`TRUST.md` §7):
   an OS name in the user agent, and nothing else.
 - **Kill switch**: `updates.check = false` in `config.toml`. It is honoured
   before the first check, so switching it off means no request is ever made —
-  not "one last one".
+  not "one last one". An embedding host that does not own that file says the
+  same thing in code with `UpdateChecks::Off` (`docs/EMBEDDING.md`).
 
 ### `minimum_supported`
 
