@@ -281,7 +281,11 @@ pub fn plan_connect_with(
             Ok(Planned {
                 path,
                 changes: edit.changes,
-                occupied: Vec::new(),
+                occupied: edit
+                    .occupied
+                    .into_iter()
+                    .map(|o| (o.slot.to_string(), o.current))
+                    .collect(),
                 existing,
                 contents: edit.contents,
             })
@@ -309,6 +313,13 @@ pub fn plan_connect_with(
 }
 
 /// Work out how to take a tool back off IronWire.
+///
+/// Every arm here reports no occupied slots, and that is a property of undoing
+/// rather than a gap in the reporting: an undo fills nothing, so it never finds
+/// a slot full and steps around it. Each module removes only what IronWire
+/// wrote and leaves everything else exactly as it is — which is the same
+/// promise `occupied` exists to make on the way in, kept without needing to say
+/// anything.
 ///
 /// # Errors
 ///

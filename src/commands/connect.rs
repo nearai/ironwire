@@ -413,6 +413,10 @@ pub(crate) fn unwire_catalog_agent(
 }
 
 /// Point Codex at IronWire, in the config file Codex already reads.
+///
+/// The `model_provider` line is not taken from a user already using it — see
+/// [`ironwire_agents::codex_config`] — which is why the occupied slot is said
+/// even when there was nothing to write.
 pub(crate) fn wire_codex(port: u16, dry_run: bool) -> Result<()> {
     let path = codex_config_path()?;
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -422,34 +426,41 @@ pub(crate) fn wire_codex(port: u16, dry_run: bool) -> Result<()> {
             path.display()
         )
     })?;
-    if edit.is_noop() {
-        return Ok(());
+
+    if !edit.is_noop() {
+        println!("Writing {}:", path.display());
+        for change in &edit.changes {
+            println!("  · {change}");
+        }
+        // Said before the edit, like every other change in this file. This one
+        // is not IronWire's limitation, but IronWire is what makes the user meet
+        // it, and finding out afterwards — with a thread stuck on a model and no
+        // UI to change it — is the worst way to learn.
+        println!();
+        println!("  One consequence worth knowing: Codex has no UI for changing the");
+        println!("  model on a custom provider (openai/codex#15364). A desktop thread");
+        println!("  keeps whatever model it was created with, and the CLI needs `-m`");
+        println!("  or `model =` in config.toml. `ironwire disconnect codex` puts it");
+        println!("  all back.");
+        println!();
+        if dry_run {
+            println!("  [dry run] nothing was written.");
+        } else {
+            write_with_backup(&path, &existing, &edit.contents, "toml")?;
+            // One file drives both clients, and "restart" means different things
+            // to each.
+            println!("  CLI: start a new `codex` session.");
+            println!("  Desktop: quit the app and relaunch it — reopening a window is not");
+            println!("  enough, it keeps the old config.");
+        }
     }
 
-    println!("Writing {}:", path.display());
-    for change in &edit.changes {
-        println!("  · {change}");
+    // A provider of their own is not a failure, but it does mean the thing we
+    // promised did not happen — so say what would make it happen by hand.
+    if let Some(theirs) = edit.occupied_slot("model_provider") {
+        println!("  model_provider is already set to `{theirs}`, so IronWire left it.");
+        println!("  To route Codex here instead, set it to: model_provider = \"ironwire\"");
     }
-    // Said before the edit, like every other change in this file. This one is
-    // not IronWire's limitation, but IronWire is what makes the user meet it,
-    // and finding out afterwards — with a thread stuck on a model and no UI to
-    // change it — is the worst way to learn.
-    println!();
-    println!("  One consequence worth knowing: Codex has no UI for changing the");
-    println!("  model on a custom provider (openai/codex#15364). A desktop thread");
-    println!("  keeps whatever model it was created with, and the CLI needs `-m`");
-    println!("  or `model =` in config.toml. `ironwire disconnect codex` puts it");
-    println!("  all back.");
-    println!();
-    if dry_run {
-        println!("  [dry run] nothing was written.");
-        return Ok(());
-    }
-    write_with_backup(&path, &existing, &edit.contents, "toml")?;
-    // One file drives both clients, and "restart" means different things to each.
-    println!("  CLI: start a new `codex` session.");
-    println!("  Desktop: quit the app and relaunch it — reopening a window is not");
-    println!("  enough, it keeps the old config.");
     Ok(())
 }
 
