@@ -27,11 +27,11 @@ present its own application update UI. The CLI explicitly selects
 release checks and cached notifications. Signed provider-catalog refresh still
 honors `updates.check`, and provider model discovery is unchanged for both hosts.
 
-`UpdatePolicy` says who owns upgrading the binary; it does not say whether this
-process may reach out at all. That remains `updates.check`, whose only home is
-`$IRONWIRE_HOME/config.toml` — a file an embedding host may not own, because the
-home can be a real user's and shared with the CLI. `start_with_options` takes the
-same switch in code:
+`UpdatePolicy` says who owns upgrading the binary; it does not say whether the
+release check and the catalog refresh happen. That remains `updates.check`, whose
+only home is `$IRONWIRE_HOME/config.toml` — a file an embedding host may not own,
+because the home can be a real user's and shared with the CLI.
+`start_with_options` takes the same switch in code:
 
 ```rust,no_run
 # async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
@@ -54,9 +54,20 @@ requests IronWire makes that are not the user's own work; someone who declines o
 means both. There is deliberately no value that turns them back on over a
 configured `updates.check = false`. `UpdateChecks::FromConfig` is the default and
 is what every existing entry point does, so a standalone install is unaffected.
-Provider model discovery, which only queries backends the host configured, is not
-covered by this switch. `StartupReport::update_checks` reports the decision that
-was actually applied, so a host can confirm it declined rather than assume it.
+`StartupReport::update_checks` reports the decision that was actually applied, so
+a host can confirm it declined rather than assume it.
+
+**This is not a general outbound kill switch.** Startup catalogue discovery probes
+every registered backend over the network under either value, and a registered
+backend is not the same as a configured one: `build_registry` registers the Claude
+subscription, Codex subscription, and Anthropic/OpenAI key backends from
+credentials found in the environment with no config entry naming them, and the
+NEAR AI backend is registered unconditionally so that `privacy.mode = "full"` has
+a visible destination. A bare embedded start against a home with no `config.toml`
+therefore still asks a provider for its model catalogue, whatever a host chooses
+here. A host that must make no outbound request at all cannot express that today;
+the levers that exist are `enabled = false` entries for the backends it does not
+want, which is again a config file it may not own.
 
 Run this inside a Tokio runtime and keep that runtime alive through shutdown.
 The application owns the choice to start and stop; no signal handler, tracing

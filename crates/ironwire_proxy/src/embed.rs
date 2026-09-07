@@ -53,15 +53,27 @@ pub enum UpdatePolicy {
     Standalone,
 }
 
-/// Whether this process may make the requests IronWire makes on its own
-/// behalf: the release check and the signed provider-catalog refresh.
+/// Whether this process may make the two requests IronWire makes on its own
+/// behalf: the release check, and the signed provider-catalog refresh from
+/// `ironwire.dev`.
 ///
 /// [`UpdatePolicy`] answers who owns upgrading the binary; this answers whether
-/// the daemon reaches out at all. They are separate questions, and an embedding
-/// host can only answer the second one through `updates.check` in
+/// those two requests happen. They are separate questions, and an embedding host
+/// could previously only answer the second through `updates.check` in
 /// `$IRONWIRE_HOME/config.toml` — a file it may not own, because the home can
 /// be a real user's, shared with the CLI. This is the same switch, expressed in
-/// code.
+/// code, and it covers exactly what that switch covers.
+///
+/// **It is not a general network kill switch, and must not be described as
+/// one.** Startup catalogue discovery still probes every registered backend
+/// over the network (`spawn_catalogue_discovery`, calling `Backend::probe`),
+/// under either value. Two things make that reach further than "only what the
+/// host configured": `build_registry` registers Claude, Codex, and API-key
+/// backends from credentials it discovers in the environment with no config
+/// entry naming them, and the NEAR AI backend is registered unconditionally.
+/// So a bare embedded start does make a request, whatever is chosen here. A
+/// host that must make no outbound request at all cannot get that from this
+/// option today; see `docs/EMBEDDING.md`.
 ///
 /// Hosts must allow future values rather than exhaustively matching today's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,8 +83,9 @@ pub enum UpdateChecks {
     /// when there is no file. What every caller got before this existed.
     #[default]
     FromConfig,
-    /// Make neither request, whatever the configuration says. For a host that
-    /// owns its process's outbound behavior and cannot write the home's config.
+    /// Make neither of those two requests, whatever the configuration says. For
+    /// a host that would set `updates.check = false` but cannot write the home's
+    /// config. Startup backend probes are unaffected.
     Off,
 }
 
@@ -170,10 +183,11 @@ pub struct StartupReport {
     pub bodies_warning: Option<String>,
     /// The home discovery pointer could not be published.
     pub pointer_warning: bool,
-    /// This start will make the requests IronWire makes on its own behalf: the
-    /// release check and the catalog refresh. `updates.check` from the home's
-    /// configuration, after the host's [`UpdateChecks`] choice. A host that
-    /// declined can confirm here that it declined.
+    /// This start will make the two requests IronWire makes on its own behalf:
+    /// the release check and the catalog refresh. `updates.check` from the
+    /// home's configuration, after the host's [`UpdateChecks`] choice. A host
+    /// that declined can confirm here that it declined. Says nothing about
+    /// startup backend probes, which this switch does not govern.
     pub update_checks: bool,
 }
 
@@ -350,9 +364,10 @@ pub async fn start_with_policy(
 ///
 /// [`EmbedOptions::default`] is what [`start`] uses: the host owns upgrading
 /// this library, and `updates.check` in the home's configuration still governs
-/// the release check and the catalog refresh. A host whose process must not
-/// make requests of its own selects [`UpdateChecks::Off`], which suppresses
-/// both without writing to a configuration file it may not own.
+/// the release check and the catalog refresh. A host that wants neither of
+/// those two requests selects [`UpdateChecks::Off`], which suppresses both
+/// without writing to a configuration file it may not own. It does not
+/// suppress startup backend probes; see [`UpdateChecks`].
 /// The announcement has the same ordering and restrictions as [`start_with`].
 ///
 /// # Errors
