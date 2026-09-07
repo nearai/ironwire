@@ -634,7 +634,19 @@ async fn tools(
 
     let planned = match planned {
         Ok(planned) => planned,
-        Err(error) => return bad_request(error.to_string()),
+        // `reason` alongside `error` because these are different answers to
+        // "what do I do now" — a file only a person can fix, versus a catalog
+        // entry no amount of editing the file will make right — and a client
+        // that has to tell them apart should not be reading our prose to do it.
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(
+                    serde_json::json!({ "error": error.to_string(), "reason": error.reason() }),
+                ),
+            )
+                .into_response();
+        }
     };
 
     let digest = planned.digest();

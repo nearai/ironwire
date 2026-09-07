@@ -345,7 +345,9 @@ POST /_ironwire/consent         { backend, granted, prompt_version }
 POST /_ironwire/tools           { id, connect } — point a coding agent here,
                                 also { dry_run } to be told the change without
                                 making it, and { as_previewed } to make only
-                                the edit a preview described
+                                the edit a preview described. A refusal
+                                carries `reason` beside `error`: unknown-tool,
+                                no-path, unparseable, jsonc, unusable-entry
 POST /_ironwire/probe           hit every backend for real
 ```
 
