@@ -171,6 +171,59 @@ host that answers nothing, with the unconditional NEAR AI entry disabled, gets
 an empty registry: `StartupReport::no_backends` is the field for that state,
 and until now almost nothing could reach it. Check it.
 
+### Whose answer counts, and whether the files are read
+
+Those are two questions, and until recently one value answered both.
+`CredentialSource` settles whose answer counts for a *name*; the credential
+files are a different matter, because the subscription backends are key-less by
+construction. A Claude Code or Codex login is a token in a file, not a value any
+name-keyed source can supply. So a host that answers `NEARAI_API_KEY` cannot
+answer for those two, and deriving one question from the other left it unable to
+say "the answer for this name is mine, and the user's own logins are still
+fine": it had to give up every subscription the user already had in exchange for
+supplying one key of its own.
+
+`EmbedOptions::with_credential_files` answers the second question on its own:
+
+```rust,no_run
+# async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
+use ironwire_proxy::embed::{CredentialFiles, EmbedOptions, HostSecret, start_with_options};
+# fn key_from_the_hosts_own_vault(_name: &str) -> Option<HostSecret> { None }
+let home = std::path::Path::new("/path/to/.ironwire");
+let proxy = start_with_options(
+    home,
+    None,
+    EmbedOptions::default()
+        .with_credentials(key_from_the_hosts_own_vault)
+        // The host answers for its own key; the user's Claude Code or Codex
+        // login goes on answering for itself.
+        .with_credential_files(CredentialFiles::Discover),
+    |_, _| {},
+)
+.await?;
+# proxy.shutdown().await;
+# Ok(())
+# }
+```
+
+- `CredentialFiles::FollowCredentialOwner` is the default and changes nothing:
+  the files are read when IronWire owns the names and not when a host does. A
+  host that calls `with_credentials` and says nothing about files still reads
+  none of them, exactly as above.
+- `CredentialFiles::Discover` reads them whoever owns the names. Everything the
+  replacement rule promises about *names* still holds — the process environment
+  is not consulted, and a stray `ANTHROPIC_API_KEY` still registers nothing —
+  but a subscription backend can now be registered from a login the host never
+  named, and a request can go to it. That is the point of the value, and a host
+  that must be able to state every possible destination should not select it.
+- `CredentialFiles::Off` reads none of them even though IronWire owns the names.
+  For a host content with the environment it started the process with, but not
+  with a real user's home being read for logins it never asked about.
+
+The metered key Codex stores after `codex login --api-key` is a file, so it
+follows this switch rather than the source: it is the one credential that is
+both a file and a key.
+
 Supplying no source is the default and discovers credentials exactly as before,
 from the same places, at the same points, so the CLI and every existing
 embedder are unaffected. Carrying a host's closure costs `EmbedOptions` its

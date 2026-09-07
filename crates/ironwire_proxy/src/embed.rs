@@ -154,6 +154,57 @@ pub type CredentialSource = Arc<dyn Fn(&str) -> Option<SecretString> + Send + Sy
 /// depending on `secrecy` and discovering the mismatch as a type error.
 pub use secrecy::SecretString as HostSecret;
 
+/// Whether the credential files Claude Code and Codex write may be read.
+///
+/// This is the second of two questions about credentials, and it used to be
+/// answered by the first. [`CredentialSource`] settles *whose answer counts for
+/// a name* — the host's, or the process environment's. This settles *whether
+/// the files on disk are read at all*. They are separate questions because the
+/// subscription backends are key-less by construction: a Claude Code or Codex
+/// login is a token in a file, not a value any name-keyed source can supply.
+/// So a host that answers `NEARAI_API_KEY` cannot answer for those two, and
+/// deriving one question from the other left it unable to say "the answer for
+/// this name is mine, and the user's own logins are still fine". It had to give
+/// up every subscription backend the user already had in exchange for supplying
+/// one key of its own.
+///
+/// Nothing here weakens what [`CredentialSource`] decides. A host that owns
+/// credentials still owns every name; a file discovered under
+/// [`CredentialFiles::Discover`] registers a subscription backend and supplies
+/// no key for any name the host answers. The metered key Codex stores after
+/// `codex login --api-key` is a file, so it follows this switch too — it is the
+/// one credential that is both a file and a key.
+///
+/// Hosts must allow future values rather than exhaustively matching today's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialFiles {
+    /// Read them when IronWire owns credential lookup, and not when a host
+    /// does. The default, and exactly what every caller got before this
+    /// existed: a host that supplies nothing still gets the files, and a host
+    /// that supplies a [`CredentialSource`] and says nothing about files still
+    /// gets none of them. Changing either of those silently would be its own
+    /// surprise, so neither changes.
+    #[default]
+    FollowCredentialOwner,
+    /// Read them whoever owns the names. The case the API could not express:
+    /// the host answers for the keys it holds, and a contributor's existing
+    /// Claude or ChatGPT subscription goes on answering for itself.
+    ///
+    /// A host selecting this is accepting what it declines under
+    /// [`FollowCredentialOwner`][Self::FollowCredentialOwner]: a backend can be
+    /// registered from a login the host never named, and a request can go to a
+    /// subscription the user set up rather than to a destination the host
+    /// chose. That is the point — but a host that must be able to state every
+    /// possible destination should not select it.
+    Discover,
+    /// Read none of them, whoever owns the names. For a host that leaves
+    /// name-keyed discovery to IronWire — the process environment it was
+    /// started with is fine — but does not want a real user's home read for
+    /// logins it never asked about.
+    Off,
+}
+
 /// Everything an embedding host chooses about a start, other than the home,
 /// the port, and the announcement hook.
 ///
@@ -179,6 +230,8 @@ pub struct EmbedOptions {
     pub startup_probes: StartupProbes,
     /// Where backend credentials come from, before the process environment.
     pub credentials: Option<CredentialSource>,
+    /// Whether the credential files Claude Code and Codex write may be read.
+    pub credential_files: CredentialFiles,
 }
 
 /// Renders whether a host supplied a credential source, never anything it
@@ -196,6 +249,7 @@ impl std::fmt::Debug for EmbedOptions {
                     None => &"discovered",
                 },
             )
+            .field("credential_files", &self.credential_files)
             .finish()
     }
 }
@@ -249,6 +303,12 @@ impl EmbedOptions {
     /// environment and the same credential files, read the same way, at the
     /// same points.
     ///
+    /// The credential files are a separate question, and a host that wants to
+    /// own the names *and* leave a user's existing subscriptions answering says
+    /// so with [`EmbedOptions::with_credential_files`]. What this method
+    /// decides on its own — whose answer counts for a name — is unchanged
+    /// either way.
+    ///
     /// ```
     /// use ironwire_proxy::embed::EmbedOptions;
     /// use secrecy::SecretString;
@@ -261,6 +321,30 @@ impl EmbedOptions {
         credentials: impl Fn(&str) -> Option<SecretString> + Send + Sync + 'static,
     ) -> Self {
         self.credentials = Some(Arc::new(credentials));
+        self
+    }
+
+    /// Say whether the credential files Claude Code and Codex write may be
+    /// read, separately from who owns name-keyed credentials.
+    ///
+    /// Both questions default to what they have always answered, so a call to
+    /// [`with_credentials`][Self::with_credentials] alone still reads no file
+    /// and a start with neither call still reads every one. See
+    /// [`CredentialFiles`] for what a host takes on by widening it.
+    ///
+    /// ```
+    /// use ironwire_proxy::embed::{CredentialFiles, EmbedOptions};
+    /// use secrecy::SecretString;
+    /// # fn vault(_name: &str) -> Option<SecretString> { None }
+    /// // The host answers for its own key; the user's Claude Code or Codex
+    /// // login goes on answering for itself.
+    /// let options = EmbedOptions::default()
+    ///     .with_credentials(vault)
+    ///     .with_credential_files(CredentialFiles::Discover);
+    /// ```
+    #[must_use]
+    pub fn with_credential_files(mut self, credential_files: CredentialFiles) -> Self {
+        self.credential_files = credential_files;
         self
     }
 
@@ -530,9 +614,10 @@ pub async fn start_with_options(
     let token = files::control_token(&paths).map_err(|_| EmbedError::Paths)?;
     let consent = ConsentLedger::load(&paths.consent_file());
     let credentials = match options.credentials.as_ref() {
-        Some(host) => Credentials::HostOwned(host),
-        None => Credentials::Discovered(&real_env),
-    };
+        Some(host) => Credentials::host_owned(host),
+        None => Credentials::discovered(&real_env),
+    }
+    .with_files(options.credential_files);
     let registry = build_registry(&config, &credentials).map_err(|error| EmbedError::Registry {
         label: error
             .downcast_ref::<RegistryLabel>()
@@ -1140,43 +1225,84 @@ fn real_env(name: &str) -> Option<SecretString> {
     std::env::var(name).ok().map(SecretString::from)
 }
 
-/// Who answers for a credential while the registry is built.
+/// What answers for a credential while the registry is built.
 ///
-/// The two variants are exclusive on purpose. Credential discovery is not one
-/// lookup but four — environment variables, the file Claude Code writes, the
-/// file Codex writes, and the key Codex stores after `codex login --api-key` —
-/// and a host that supplies a source can only speak for the first. Letting the
-/// other three run anyway would register subscription backends behind the back
-/// of a host that had just declared it owns credentials, which is precisely the
-/// surprise it was declaring in order to avoid.
-enum Credentials<'a> {
-    /// Everything IronWire can find for itself: the process environment and the
-    /// credential files those two products write. What the CLI does, and what
-    /// every caller that supplies no source gets.
+/// Credential discovery is not one lookup but four — environment variables, the
+/// file Claude Code writes, the file Codex writes, and the key Codex stores
+/// after `codex login --api-key` — and a host that supplies a source can only
+/// speak for the first. That used to mean the other three were switched off
+/// with it, because one value answered both questions.
+///
+/// Two fields rather than one variant, so the two questions are answered
+/// independently at the point each is asked: `key` for the names, `files` for
+/// the disk. Their defaults still move together — a host source implies no
+/// files — which is what keeps every existing caller where it was.
+struct Credentials<'a> {
+    /// Who answers for a name.
+    keys: Keys<'a>,
+    /// Whether the credential files those two products write may be read.
+    files: bool,
+}
+
+/// Whose answer counts for a credential name.
+///
+/// Exclusive on purpose: letting the environment fill in behind a host would
+/// register a backend from a variable the host never authorized, which is the
+/// surprise a host declares ownership in order to avoid.
+enum Keys<'a> {
+    /// The process environment. What the CLI does, and what every caller that
+    /// supplies no source gets.
     Discovered(EnvLookup<'a>),
-    /// Only what the host answers. No environment, no credential files.
+    /// Only what the host answers.
     HostOwned(&'a CredentialSource),
 }
 
-impl Credentials<'_> {
+impl<'a> Credentials<'a> {
+    /// IronWire owns both questions: the environment for names, and the files.
+    fn discovered(env: EnvLookup<'a>) -> Self {
+        Self {
+            keys: Keys::Discovered(env),
+            files: true,
+        }
+    }
+
+    /// The host owns the names. Files stay off unless it says otherwise, which
+    /// is what [`CredentialSource`] has always promised.
+    fn host_owned(host: &'a CredentialSource) -> Self {
+        Self {
+            keys: Keys::HostOwned(host),
+            files: false,
+        }
+    }
+
+    /// Apply the host's answer to the second question, leaving the first alone.
+    fn with_files(mut self, files: CredentialFiles) -> Self {
+        self.files = match files {
+            CredentialFiles::FollowCredentialOwner => self.files,
+            CredentialFiles::Discover => true,
+            CredentialFiles::Off => false,
+        };
+        self
+    }
+
     /// The credential for a variable name, from whichever source is in charge.
     ///
     /// An empty answer is no answer, the rule an empty environment variable has
     /// always followed here.
     fn key(&self, name: &str) -> Option<SecretString> {
-        match self {
-            Self::Discovered(env) => env(name),
-            Self::HostOwned(host) => host(name),
+        match &self.keys {
+            Keys::Discovered(env) => env(name),
+            Keys::HostOwned(host) => host(name),
         }
         .filter(non_empty)
     }
 
     /// Whether the credential files Claude Code and Codex write may be read.
     ///
-    /// Checked before `discover()` rather than after, so a host-owned start
-    /// does not go looking at a real user's home at all.
+    /// Checked before `discover()` rather than after, so a start that may not
+    /// read them does not go looking at a real user's home at all.
     fn discovers_files(&self) -> bool {
-        matches!(self, Self::Discovered(_))
+        self.files
     }
 }
 
@@ -1232,9 +1358,12 @@ fn is_disabled(config: &Config, id: &str) -> bool {
 /// The metered OpenAI key Codex itself stored, for a user who ran
 /// `codex login --api-key` and expects it to be found there.
 ///
-/// A file, not a variable, so a host that owns credentials is not offered it:
-/// the whole point of owning them is that no key arrives from somewhere the
-/// host did not name.
+/// A file, not a variable, so it follows [`CredentialFiles`] rather than
+/// [`CredentialSource`]: it is offered exactly when the credential files may be
+/// read. A host that owns credentials and leaves the files alone is not handed
+/// it, because the whole point of owning them is that no key arrives from
+/// somewhere the host did not name — and a host that opts the files back in has
+/// asked for what is on that disk, this key included.
 fn codex_stored_key(credentials: &Credentials<'_>) -> Option<SecretString> {
     if !credentials.discovers_files() {
         return None;
@@ -1342,7 +1471,7 @@ mod tests {
             &config,
             "anthropic-key",
             "ANTHROPIC_API_KEY",
-            &Credentials::Discovered(&env),
+            &Credentials::discovered(&env),
         )
         .expect("a key was configured");
         assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-work");
@@ -1355,7 +1484,7 @@ mod tests {
             &Config::default(),
             "anthropic-key",
             "ANTHROPIC_API_KEY",
-            &Credentials::Discovered(&env),
+            &Credentials::discovered(&env),
         )
         .expect("a key was configured");
         assert_eq!(secrecy::ExposeSecret::expose_secret(&key), "sk-default");
@@ -1371,7 +1500,7 @@ mod tests {
         declared.models = Some(vec![ModelEntry::Name("qwen3-coder".to_string())]);
 
         let env = env_with(&[("LOCAL_KEY", "sk-local")]);
-        let built = backend_from_config(&declared, 60, &Credentials::Discovered(&env))
+        let built = backend_from_config(&declared, 60, &Credentials::discovered(&env))
             .expect("builds")
             .expect("a credential was available");
         assert_eq!(built.id().as_str(), "local");
@@ -1391,7 +1520,7 @@ mod tests {
 
         let env = env_with(&[]);
         let built =
-            backend_from_config(&declared, 60, &Credentials::Discovered(&env)).expect("no error");
+            backend_from_config(&declared, 60, &Credentials::discovered(&env)).expect("no error");
         assert!(built.is_none());
     }
 
@@ -1441,7 +1570,7 @@ mod tests {
     fn a_host_source_answers_a_name_the_environment_cannot() {
         let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
 
-        let key = Credentials::HostOwned(&host)
+        let key = Credentials::host_owned(&host)
             .key("NEARAI_API_KEY")
             .expect("the host answered");
         assert_eq!(exposed(&key), "sk-from-host");
@@ -1453,7 +1582,7 @@ mod tests {
     #[test]
     fn a_host_owned_start_does_not_read_the_environment_at_all() {
         let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
-        let credentials = Credentials::HostOwned(&host);
+        let credentials = Credentials::host_owned(&host);
 
         assert!(
             credentials.key("ANTHROPIC_API_KEY").is_none(),
@@ -1479,7 +1608,7 @@ mod tests {
         let host = host_with(&[("NEARAI_API_KEY", "")]);
 
         assert!(
-            Credentials::HostOwned(&host)
+            Credentials::host_owned(&host)
                 .key("NEARAI_API_KEY")
                 .is_none()
         );
@@ -1490,7 +1619,7 @@ mod tests {
     #[test]
     fn discovery_reads_the_environment_unchanged() {
         let env = env_with(&[("NEARAI_API_KEY", "sk-from-env"), ("EMPTY_KEY", "")]);
-        let credentials = Credentials::Discovered(&env);
+        let credentials = Credentials::discovered(&env);
 
         for name in ["NEARAI_API_KEY", "EMPTY_KEY", "UNSET_KEY"] {
             let through = credentials.key(name).map(|key| exposed(&key).to_string());
@@ -1513,8 +1642,8 @@ mod tests {
         let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
         let empty = env_with(&[]);
 
-        let with_host = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
-        let without = build_registry(&config, &Credentials::Discovered(&empty)).expect("builds");
+        let with_host = build_registry(&config, &Credentials::host_owned(&host)).expect("builds");
+        let without = build_registry(&config, &Credentials::discovered(&empty)).expect("builds");
 
         assert!(status_of(&with_host, "nearai").await.authenticated);
         assert!(
@@ -1538,7 +1667,7 @@ mod tests {
         let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
         let empty = env_with(&[]);
 
-        let owned = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
+        let owned = build_registry(&config, &Credentials::host_owned(&host)).expect("builds");
         for id in ["claude-sub", "codex-sub"] {
             assert!(
                 owned.get(&BackendId::from(id)).is_none(),
@@ -1546,7 +1675,7 @@ mod tests {
             );
         }
 
-        let discovered = build_registry(&config, &Credentials::Discovered(&empty)).expect("builds");
+        let discovered = build_registry(&config, &Credentials::discovered(&empty)).expect("builds");
         if ClaudeCodeCredentials::discover().is_ok() {
             assert!(
                 discovered.get(&BackendId::from("claude-sub")).is_some(),
@@ -1556,6 +1685,79 @@ mod tests {
         if CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt) {
             assert!(discovered.get(&BackendId::from("codex-sub")).is_some());
         }
+    }
+
+    /// Neither question moves on its own. The whole risk of adding a second
+    /// knob is that it silently changes what the first one answered, so this
+    /// pins both defaults: IronWire owns the files when it owns the names, and
+    /// a host that says nothing about files still gets none of them.
+    #[test]
+    fn both_questions_default_to_what_they_have_always_answered() {
+        let env = env_with(&[]);
+        let host = host_with(&[]);
+
+        assert!(
+            Credentials::discovered(&env)
+                .with_files(CredentialFiles::default())
+                .discovers_files(),
+            "a start with no host source reads the credential files, as it always has"
+        );
+        assert!(
+            !Credentials::host_owned(&host)
+                .with_files(CredentialFiles::default())
+                .discovers_files(),
+            "and a host that owns credentials and says nothing about files reads none"
+        );
+        assert_eq!(
+            EmbedOptions::default().credential_files,
+            CredentialFiles::FollowCredentialOwner,
+            "which is what the default option value selects"
+        );
+    }
+
+    /// The case the API could not express, and the reason for the change: the
+    /// host answers for its own key while a contributor's existing subscription
+    /// goes on answering for itself.
+    ///
+    /// The name half must not move with it. A host that opts into files has
+    /// asked for what is on that disk, not for the process environment to start
+    /// registering backends again.
+    #[test]
+    fn a_host_can_own_the_names_and_still_permit_the_files() {
+        let host = host_with(&[("NEARAI_API_KEY", "sk-from-host")]);
+        let credentials = Credentials::host_owned(&host).with_files(CredentialFiles::Discover);
+
+        assert!(credentials.discovers_files(), "the files are readable");
+        assert_eq!(
+            exposed(&credentials.key("NEARAI_API_KEY").expect("a key")),
+            "sk-from-host",
+            "and the host still answers for the names it holds"
+        );
+        assert!(std::env::var_os("PATH").is_some(), "PATH is set");
+        assert!(
+            credentials.key("PATH").is_none(),
+            "replacement survives: the environment is still not consulted"
+        );
+    }
+
+    /// The other direction, which the one-bit form could not express either: a
+    /// host content to let IronWire read the environment it started the process
+    /// with, but not a real user's home for logins it never asked about.
+    #[test]
+    fn the_files_can_be_declined_while_ironwire_still_owns_the_names() {
+        let env = env_with(&[("NEARAI_API_KEY", "sk-from-env")]);
+        let credentials = Credentials::discovered(&env).with_files(CredentialFiles::Off);
+
+        assert!(!credentials.discovers_files());
+        assert_eq!(
+            exposed(&credentials.key("NEARAI_API_KEY").expect("a key")),
+            "sk-from-env",
+            "the environment answers exactly as it did"
+        );
+        assert!(
+            codex_stored_key(&credentials).is_none(),
+            "including the one credential that is both a file and a key"
+        );
     }
 
     /// The consequence worth stating: with the host answering nothing and the
@@ -1572,7 +1774,7 @@ mod tests {
         });
         let host = host_with(&[]);
 
-        let registry = build_registry(&config, &Credentials::HostOwned(&host)).expect("builds");
+        let registry = build_registry(&config, &Credentials::host_owned(&host)).expect("builds");
         assert!(registry.is_empty());
     }
 
