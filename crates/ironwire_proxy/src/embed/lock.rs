@@ -200,9 +200,21 @@ impl Drop for Guard {
                 tracing::warn!(path = %self.port_file.display(), %error, "could not remove owned legacy port");
             }
         }
-        // Explicitly close before automatic field destruction unlocks the home,
-        // even if someone later reorders Guard's fields.
+        // Explicitly close before releasing the home, even if someone later
+        // reorders Guard's fields.
         drop(self.published.take());
+        // Release the home rather than merely closing our descriptor.
+        //
+        // `flock` ownership belongs to the open file description, not to the
+        // descriptor and not to the process. `fork` duplicates every
+        // descriptor and `O_CLOEXEC` only takes effect at the following
+        // `exec`, so while any thread in an embedder is between `fork` and
+        // `exec`, that child carries a copy of this descriptor and keeps the
+        // home held after we close ours. `flock(LOCK_UN)` releases the
+        // description's lock itself, which a concurrent fork cannot defeat.
+        if let Err(error) = self._file.unlock() {
+            tracing::warn!(%error, "could not release the home lock");
+        }
     }
 }
 
@@ -282,6 +294,29 @@ mod tests {
         drop(guard);
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "8463\n");
         assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+    }
+
+    /// A descriptor a concurrent `fork` copied must not retain the home.
+    ///
+    /// `dup` and `fork` both leave a second descriptor on the same open file
+    /// description, and `flock` ownership lives on the description rather than
+    /// on the descriptor -- so closing ours is not a release while any copy is
+    /// open. An embedder is multi-threaded and spawns children, and
+    /// `O_CLOEXEC` only takes effect at the following `exec`, so this window
+    /// is reached in practice and the next `acquire` sees `WouldBlock` with no
+    /// owner at all. Dropping without `unlock` fails this test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_copied_descriptor_cannot_retain_the_home_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let guard = acquire(&path, 0).await.unwrap();
+        let inherited = guard._file.try_clone().unwrap();
+        drop(guard);
+        acquire(&path, 0)
+            .await
+            .expect("a released home is free even while a forked copy is open");
+        drop(inherited);
     }
 
     #[cfg(unix)]
