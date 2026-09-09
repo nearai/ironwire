@@ -272,6 +272,8 @@ impl Refusal {
             requested_model: self.requested_model,
             served_model: None,
             upstream_id: None,
+            // No response reached us, so there were no headers to read it from.
+            model_alias_resolved: None,
             request_sha256: None,
             response_sha256: None,
             body_ref: None,
@@ -1399,6 +1401,7 @@ impl LedgerContext {
             requested_model: self.requested_model,
             served_model: observation.served_model.clone(),
             upstream_id: observation.upstream_id.clone(),
+            model_alias_resolved: observation.model_alias_resolved.clone(),
             request_sha256,
             response_sha256,
             body_ref,

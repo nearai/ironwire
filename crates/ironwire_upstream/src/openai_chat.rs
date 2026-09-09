@@ -22,6 +22,29 @@ use crate::observe::{Observation, retry_after};
 /// NEAR AI's OpenAI-compatible inference endpoint.
 pub const NEARAI_DEFAULT_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// Ask NEAR AI's gateway to refuse an aliased model rather than substitute one.
+///
+/// **Off by default, and deliberately so.** This does not make the gateway
+/// serve the model that was named; it makes the gateway answer 400 when the
+/// name turns out to be an alias. Most requests through this proxy are somebody
+/// getting work done, not somebody collecting evidence, and turning their
+/// working inference call into a hard failure is not a trade IronWire gets to
+/// make on their behalf. The default is to *observe* the substitution instead
+/// ([`crate::observe::MODEL_ALIAS_RESOLVED_HEADER`]), which costs the caller
+/// nothing and still records the fact.
+///
+/// What it is for: an operator who would rather have no answer than an
+/// unverifiable one. An aliased response is served by a different model than
+/// the request named, and cloud-api rewrites the body to add a `warning` field
+/// -- stated on `inject_warning_field` in `crates/api/src/routes/common.rs`:
+/// "rewriting the body means it no longer byte-matches what the backend TD
+/// signed, so response-hash verification will not pass for aliased responses
+/// ... strict clients can avoid it entirely with `x-no-aliasing`". For a caller
+/// binding payloads to a model TD's signing key that is worth a 400.
+///
+/// Set `refuse_model_aliases = true` on the backend to turn it on.
+pub const NO_ALIASING_HEADER: &str = "x-no-aliasing";
+
 /// Capability profile for a modern OSS model served over Chat Completions.
 ///
 /// `reasoning` and `prompt_cache` are false, and that is now only a *quality*
@@ -75,6 +98,11 @@ pub struct ChatCompletionsBackend {
     base_url: String,
     client: reqwest::Client,
     capabilities: Capabilities,
+    /// Headers this backend adds to every request it sends, whatever the
+    /// client sent. Provider-specific opt-ins, not credentials — a credential
+    /// goes through [`Self::authorize`]. Empty for a generic OpenAI-compatible
+    /// endpoint, which is somebody else's server and gets nothing invented.
+    extra_headers: Vec<(String, String)>,
     /// Configured catalogue, used until a probe learns better.
     models: Vec<(String, ModelTier)>,
     /// What the endpoint itself reported.
@@ -183,6 +211,7 @@ impl ChatCompletionsBackend {
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .build()?,
             capabilities: chat_capabilities(128_000),
+            extra_headers: Vec::new(),
             models,
             discovered: Arc::new(Mutex::new(None)),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
@@ -194,6 +223,29 @@ impl ChatCompletionsBackend {
     pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
         self
+    }
+
+    /// Set the headers this backend adds to every request.
+    #[must_use]
+    fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Refuse an aliased model rather than accept a substituted one.
+    ///
+    /// See [`NO_ALIASING_HEADER`] for why this is off unless an operator asks.
+    /// It covers both wires at once because `nearai_capabilities` speaks Chat
+    /// Completions and Responses at the same base URL and both arrive at the
+    /// same `send`; setting it per-wire would leave whichever agent landed on
+    /// the other lane unprotected, which is a mistake this repo has already
+    /// made once (`ironwire_core::policy`, the Codex fallback).
+    #[must_use]
+    pub fn refusing_model_aliases(self, refuse: bool) -> Self {
+        if !refuse {
+            return self;
+        }
+        self.with_extra_headers(vec![(NO_ALIASING_HEADER.to_string(), "true".to_string())])
     }
 
     fn bearer(&self) -> Option<Bearer> {
@@ -292,6 +344,19 @@ impl Backend for ChatCompletionsBackend {
             if name.starts_with("anthropic-") || name == "content-type" {
                 continue;
             }
+            // Set below from this backend's own configuration. Forwarding the
+            // client's copy would either duplicate the header or let a client
+            // turn the guarantee off, and neither is its call to make.
+            if self
+                .extra_headers
+                .iter()
+                .any(|(ours, _)| ours.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            builder = builder.header(name, value);
+        }
+        for (name, value) in &self.extra_headers {
             builder = builder.header(name, value);
         }
 

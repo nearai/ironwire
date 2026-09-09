@@ -31,6 +31,7 @@ fn at(offset: i64) -> DateTime<Utc> {
 fn exchange(started_at: DateTime<Utc>) -> Exchange {
     Exchange {
         id: None,
+        model_alias_resolved: None,
         started_at,
         ttfb_ms: None,
         total_ms: Some(10),

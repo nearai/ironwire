@@ -92,6 +92,23 @@ pub struct Observation {
     /// the id that receipt is unreachable the moment the response is gone.
     /// Recording it costs one string and keeps that door open.
     pub upstream_id: Option<String>,
+    /// The gateway's own statement that it served a *different* model than the
+    /// one the request named, verbatim: `<requested> -> <canonical>`.
+    ///
+    /// NEAR AI resolves a requested name against every catalogue entry's alias
+    /// list, and on a hit serves the canonical model and rewrites the response
+    /// body to add a top-level `warning` field. That rewrite is deliberate on
+    /// their side and stated on `inject_warning_field` in cloud-api: the body
+    /// "no longer byte-matches what the backend TD signed, so response-hash
+    /// verification will not pass for aliased responses".
+    ///
+    /// Which makes this row the difference between an exchange whose receipt
+    /// can be verified and one whose receipt cannot. [`Self::served_model`]
+    /// does not answer it: that is read from the response body and names the
+    /// canonical model either way, so a legitimately-served model and a
+    /// substituted one look identical. This is the provider asserting the
+    /// substitution happened.
+    pub model_alias_resolved: Option<String>,
 }
 
 impl Observation {
@@ -104,7 +121,32 @@ impl Observation {
             && self.retry_after_secs.is_none()
             && self.served_model.is_none()
             && self.upstream_id.is_none()
+            && self.model_alias_resolved.is_none()
     }
+}
+
+/// The header a gateway sets when it resolved a model alias.
+///
+/// cloud-api emits it on *every* aliased request, "so the substitution is never
+/// silent, even for clients that don't parse the body"
+/// (`HEADER_MODEL_ALIAS_RESOLVED`). Reading a response header invents nothing
+/// and refuses nothing, so this runs for any OpenAI-compatible endpoint rather
+/// than being keyed to one backend id -- a proxy in front of NEAR AI passes it
+/// through, and a row that quietly lost the fact would be worse than no row.
+pub const MODEL_ALIAS_RESOLVED_HEADER: &str = "x-model-alias-resolved";
+
+/// Read the alias-resolution header, if the gateway set one.
+///
+/// Stored verbatim rather than split into requested/canonical: it is the
+/// provider's sentence about its own substitution, and the shape of it is
+/// theirs to change.
+#[must_use]
+pub fn model_alias_resolved(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(MODEL_ALIAS_RESOLVED_HEADER))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Read Anthropic's rate-limit headers.

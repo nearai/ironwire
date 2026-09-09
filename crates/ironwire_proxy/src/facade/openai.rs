@@ -266,11 +266,18 @@ async fn forward(
         bodies: state.bodies.clone(),
     };
     let streaming = pipeline::is_event_stream(&response.headers);
+    // The gateway announces a model substitution in a response *header*, and
+    // the observation the ledger gets is folded out of the response *body*, so
+    // the fact has to be carried across. Read here rather than in the backend:
+    // the backend's own observation feeds quota state and never reaches a row.
+    let model_alias_resolved = ironwire_upstream::observe::model_alias_resolved(&response.headers);
     let observed = pipeline::observe_boxed(
         response.body,
         dialect_for(protocol),
         streaming,
         move |obs| {
+            let mut obs = obs;
+            obs.model_alias_resolved = model_alias_resolved.clone();
             pipeline::record(&backend, &obs);
             if let Some(ledger) = ledger.as_ref() {
                 entry.write(ledger, &spend, &obs);

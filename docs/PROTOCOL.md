@@ -69,7 +69,18 @@ For a native-lane request, IronWire performs exactly these mutations:
    own accepted list and goes through untouched, because dropping a tool the
    provider would have taken is a capability the user silently loses. The
    removal is logged with what went and how much.
-8. **Nothing else.** The body is otherwise the bytes the client sent.
+8. **Provider opt-ins**: a backend may carry request headers of its own,
+   declared once where that backend is built rather than in the shared request
+   path. There is exactly one today, and it is **off unless an operator turns
+   it on**. With `refuse_model_aliases = true` the NEAR AI backend sends
+   `x-no-aliasing`, on both wires it speaks, and the gateway then answers 400
+   for a model name that is an alias rather than serving the canonical model
+   under it. A client's own copy of such a header is dropped rather than
+   forwarded, so it is sent once and with our value -- cloud-api reads an
+   explicit `false` or `0` as "alias away", and that is the operator's decision
+   to make, not the caller's. No other backend sends it, and by default no
+   backend sends it at all: see §3 for what happens instead.
+9. **Nothing else.** The body is otherwise the bytes the client sent.
 
 `GET /_ironwire/admission-binding` requires the control bearer and returns
 capability/limits only, never registered session or challenge values.
@@ -132,6 +143,29 @@ Usage and quota come off the wire, never from a model of our own (DESIGN §4).
 
 An exchange whose usage could not be observed is recorded with
 `usage: unknown`, not with an estimate.
+
+### Model substitution
+
+A gateway may serve a model other than the one the request named. NEAR AI does
+this for catalogue aliases, and announces it in a response header --
+`x-model-alias-resolved: <requested> -> <canonical>` -- on every aliased
+response, alongside a top-level `warning` field it inserts into the body.
+
+That header is read on both facades and recorded verbatim on the exchange as
+`model_alias_resolved`. `served_model` cannot answer the same question: it comes
+out of the response body and names the canonical model whether that model was
+asked for or reached through an alias, so the substituted case and the ordinary
+one are indistinguishable there.
+
+It is worth its own column because of what the body rewrite costs. By
+cloud-api's own account (`inject_warning_field`) the rewritten body "no longer
+byte-matches what the backend TD signed, so response-hash verification will not
+pass for aliased responses". A row carrying a value here is therefore a row
+whose `response_sha256` will not verify against the provider's receipt for
+`upstream_id` -- better learned from the row than from a failed verification.
+
+Observing costs the caller nothing and refuses nothing, so it is unconditional.
+Refusing is the separate, opt-in decision in §2.8.
 
 ### The client's session id, and what it is safe to join on
 
