@@ -55,6 +55,51 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - run: pip install pyyaml
+      # The runner image preinstalls apt sources for software this job never
+      # touches -- Google Chrome and Microsoft today, whatever the next image
+      # adds tomorrow. `apt-get update` consults all of them, so when one of
+      # them publishes a bad index the whole command exits 100 and every step
+      # below is skipped: a red lint job that linted nothing. That is not
+      # hypothetical, it is this repo on 2026-09-09:
+      #
+      #   Err:24 https://dl.google.com/linux/chrome-stable/deb stable/main
+      #     Hash Sum mismatch
+      #   E: Some index files failed to download.
+      #
+      # shellcheck, dash and zip all come from the Ubuntu archive, so the fix
+      # is to stop consulting sources we never install from. Sources are
+      # selected by what they point at rather than by filename, because the
+      # filenames are the image's business and change without notice.
+      #
+      # Deliberately not `|| true`: that turns a broken index into a silent
+      # install off a stale cache, and the job goes green having installed
+      # something other than what it asked for. Deliberately not
+      # `Acquire::Retries`: a hash-sum mismatch is a corrupt index, not a flaky
+      # socket, so a retry re-fetches the same bad file. If `apt-get update`
+      # still fails after this, it is the Ubuntu archive itself and this job
+      # should say so loudly.
+      - name: Install from the Ubuntu archive alone
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          removed=0
+          for source in /etc/apt/sources.list.d/*.list \
+                        /etc/apt/sources.list.d/*.sources; do
+            if grep -qE 'ubuntu\.com|apt-mirrors\.txt' "$source"; then
+              echo "keeping   $source"
+              continue
+            fi
+            echo "disabling $source"
+            sudo rm -f "$source"
+            removed=$((removed + 1))
+          done
+          # An `rm` of a path that is not there succeeds silently, which looks
+          # exactly like a fix until the next bad index proves it was not one.
+          if [ "$removed" -eq 0 ]; then
+            echo "::error::no third-party apt source was found to disable;" \
+                 "the runner image changed shape and this guard is now inert" >&2
+            exit 1
+          fi
       - run: sudo apt-get update && sudo apt-get install -y shellcheck dash zip
       - name: Lint shell
         run: shellcheck -S warning scripts/*.sh
