@@ -551,6 +551,17 @@ pub struct BackendConfig {
     /// outright.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<ModelEntry>>,
+    /// Refuse a model name the provider would serve under an alias, rather
+    /// than accept the substitution.
+    ///
+    /// NEAR AI only. Off by default: turning it on means an aliased name is
+    /// answered 400 instead of served by the canonical model, which is the
+    /// right trade for a caller binding payloads to a model TD's signing key
+    /// and the wrong one for a caller who just wants an answer. Either way the
+    /// substitution is recorded on the exchange -- this only decides whether it
+    /// is also refused.
+    #[serde(default)]
+    pub refuse_model_aliases: bool,
 }
 
 /// A configured model: a slug, and optionally the tier it should count as.
@@ -1299,6 +1310,7 @@ mod tests {
                 enabled: true,
                 base_url: None,
                 api_key_env: None,
+                refuse_model_aliases: false,
                 models: None,
             }],
             limits: LimitsConfig {

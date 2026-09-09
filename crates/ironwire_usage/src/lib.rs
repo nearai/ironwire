@@ -305,6 +305,7 @@ pub(crate) mod test_support {
     pub(crate) fn exchange(backend: &str, started_at: DateTime<Utc>) -> Exchange {
         Exchange {
             id: None,
+            model_alias_resolved: None,
             started_at,
             ttfb_ms: Some(400),
             total_ms: Some(9_100),

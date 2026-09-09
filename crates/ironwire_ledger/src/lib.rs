@@ -101,6 +101,25 @@ pub struct Exchange {
     /// like everything else here.
     #[serde(default)]
     pub upstream_id: Option<String>,
+    /// The gateway's statement that it substituted a model, verbatim:
+    /// `<requested> -> <canonical>`.
+    ///
+    /// `served_model` cannot answer this. It is read from the response body and
+    /// names the canonical model whether that model was asked for or reached
+    /// through an alias, so the two cases are indistinguishable in the row that
+    /// matters. This is the provider asserting the substitution happened.
+    ///
+    /// Load-bearing for the receipt story: cloud-api rewrites an aliased
+    /// response body to add a `warning` field, which by its own account leaves
+    /// the body no longer byte-matching what the backend TD signed. So a row
+    /// with a value here is one whose `response_sha256` will not verify against
+    /// `GET /v1/signature/{upstream_id}`, and it is better to know that from
+    /// the row than to discover it from a failed verification.
+    ///
+    /// `None` on every provider that does not alias, which is all of them
+    /// except NEAR AI today.
+    #[serde(default)]
+    pub model_alias_resolved: Option<String>,
     /// SHA-256 of the request body **exactly as it went upstream**, hex.
     ///
     /// Half of what a NEAR AI receipt signs (`bodies`). The bytes hashed are
@@ -295,6 +314,7 @@ CREATE TABLE IF NOT EXISTS exchanges (
     backend            TEXT    NOT NULL,
     requested_model    TEXT,
     served_model       TEXT,
+    model_alias_resolved TEXT,
     rung               TEXT    NOT NULL,
     attempts           INTEGER NOT NULL,
     input_tokens       INTEGER,
@@ -365,9 +385,10 @@ impl Ledger {
                 request_sha256, response_sha256, body_ref, rung, attempts,
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error,
-                mean_confidence, confidence_variability, confidence_bucket, confidence_tokens
+                mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
+                model_alias_resolved
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-                       ?21,?22,?23,?24,?25,?26,?27,?28)",
+                       ?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -399,6 +420,7 @@ impl Ledger {
                 exchange
                     .confidence
                     .and_then(|c| i64::try_from(c.token_count).ok()),
+                exchange.model_alias_resolved,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -725,6 +747,7 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("confidence_variability", "REAL"),
     ("confidence_bucket", "TEXT"),
     ("confidence_tokens", "INTEGER"),
+    ("model_alias_resolved", "TEXT"),
 ];
 
 /// Add any column in [`ADDED_COLUMNS`] the open ledger does not have.
@@ -757,7 +780,8 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
             request_sha256, response_sha256, body_ref, rung, attempts,
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error,
-            mean_confidence, confidence_variability, confidence_bucket, confidence_tokens";
+            mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
+            model_alias_resolved";
 
 /// Rebuild the confidence aggregate from its four columns.
 ///
@@ -820,6 +844,8 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         status: row.get(23)?,
         error: row.get(24)?,
         confidence: read_confidence(row)?,
+        // Index 29, after the four confidence columns `read_confidence` takes.
+        model_alias_resolved: row.get(29)?,
     })
 }
 
@@ -843,6 +869,7 @@ mod tests {
     fn exchange(backend: &str, at_secs: i64) -> Exchange {
         Exchange {
             id: None,
+            model_alias_resolved: None,
             started_at: at(at_secs),
             ttfb_ms: Some(420),
             total_ms: Some(9_100),
@@ -1457,6 +1484,58 @@ mod tests {
         let back = ledger.recent(1).expect("read back");
         assert_eq!(back.len(), 1, "an upgraded ledger still reads");
         assert!(back[0].client_session_id.is_none());
+    }
+
+    /// A *new* reader opening an *old* file, which is the direction a consumer
+    /// hits: a pinned `ironwire_ledger` reads a ledger written by whatever
+    /// IronWire the user has installed, which is usually older.
+    ///
+    /// The distinguishing detail is that the row is inserted *before* the
+    /// migration runs, so it genuinely predates the column rather than being
+    /// written through the new schema. `COLUMNS` names `model_alias_resolved`
+    /// in its `SELECT`, so without the `ALTER` this is not a degraded row, it
+    /// is every query failing against an existing install.
+    #[test]
+    fn a_row_written_before_the_alias_column_reads_back_through_the_new_reader() {
+        let dir =
+            std::env::temp_dir().join(format!("ironwire-alias-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ledger.sqlite3");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let conn = rusqlite::Connection::open(&path).expect("sqlite");
+            conn.execute_batch(
+                "CREATE TABLE exchanges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL, ttfb_ms INTEGER, total_ms INTEGER,
+                    facade TEXT NOT NULL, path TEXT NOT NULL, conversation TEXT NOT NULL,
+                    backend TEXT NOT NULL, requested_model TEXT, served_model TEXT,
+                    rung TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    input_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, output_tokens INTEGER,
+                    cost_usd REAL, substitutions INTEGER, status INTEGER NOT NULL, error TEXT
+                );
+                INSERT INTO exchanges
+                    (started_at, facade, path, conversation, backend, requested_model,
+                     served_model, rung, attempts, status)
+                 VALUES
+                    ('2026-09-09T12:00:00+00:00', 'openai', '/v1/chat/completions',
+                     'conv-1', 'nearai', 'qwen3-coder', 'qwen3-coder', 'primary', 1, 200);",
+            )
+            .expect("a ledger from before the column");
+        }
+
+        let ledger = Ledger::open(&path).expect("the new reader opens an old file");
+        let back = ledger.recent(1).expect("the new SELECT runs against it");
+        assert_eq!(back.len(), 1, "the pre-existing row is still readable");
+        assert_eq!(back[0].backend, "nearai", "the old row read back intact");
+        assert_eq!(
+            back[0].model_alias_resolved, None,
+            "a row that predates the column has no substitution to report"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

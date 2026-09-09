@@ -238,6 +238,15 @@ async fn only_the_enumerated_headers_are_mutated() {
         None,
         "a header addressed to IronWire must not announce the proxy upstream"
     );
+
+    // Not added: §2.8's provider opt-in belongs to NEAR AI, and is off unless
+    // an operator asks for it even there. Anthropic never asked for it, and the
+    // enumeration is exhaustive for every other backend.
+    assert_eq!(
+        header("x-no-aliasing"),
+        None,
+        "a provider-specific header must not leak onto another provider"
+    );
 }
 
 #[tokio::test]

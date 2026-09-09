@@ -1144,6 +1144,7 @@ fn backend_from_config(
                             .unwrap_or_default(),
                         timeout,
                     )
+                    .map(|backend| backend.refusing_model_aliases(entry.refuse_model_aliases))
                     .context(RegistryLabel("building a configured NEAR AI backend"))
                 })
                 .transpose()?
@@ -1424,7 +1425,7 @@ mod tests {
     use super::*;
     use ironwire_core::config::BackendConfig;
 
-    fn entry(id: &str, kind: &str) -> BackendConfig {
+    pub(super) fn entry(id: &str, kind: &str) -> BackendConfig {
         BackendConfig {
             id: id.to_string(),
             kind: kind.to_string(),
@@ -1432,10 +1433,13 @@ mod tests {
             base_url: None,
             api_key_env: None,
             models: None,
+            refuse_model_aliases: false,
         }
     }
 
-    fn env_with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<SecretString> + use<> {
+    pub(super) fn env_with(
+        pairs: &[(&str, &str)],
+    ) -> impl Fn(&str) -> Option<SecretString> + use<> {
         let owned: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1946,5 +1950,93 @@ mod update_check_tests {
             catalog::spawn_refresh(state_in(&paths), &paths, default.checks_enabled(configured))
                 .expect("a host that has not declined still refreshes");
         task.abort();
+    }
+}
+
+/// The config switch that decides whether NEAR AI is told to refuse an aliased
+/// model, end to end from a `BackendConfig` to the bytes on the wire.
+///
+/// `backend_from_config` is one line away from silently dropping
+/// `refuse_model_aliases` on the floor -- the flag would still parse, the
+/// backend would still build, every other test would still pass, and an
+/// operator who asked for a fail-closed guarantee would quietly not have one.
+/// Nothing else crosses that seam, so this does.
+#[cfg(test)]
+mod refuse_model_aliases_wiring {
+    use super::tests::{entry, env_with};
+    use super::*;
+    use ironwire_upstream::backend::UpstreamRequest;
+
+    /// A listener that records one request head and answers with an empty
+    /// non-streaming body.
+    async fn spawn() -> (String, Arc<std::sync::Mutex<Option<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = socket.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *sink.lock().expect("lock") = Some(String::from_utf8_lossy(&buf).to_string());
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\n{}")
+                .await;
+            let _ = socket.flush().await;
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    async fn head_sent_with(refuse: bool) -> String {
+        let (base, seen) = spawn().await;
+        let mut declared = entry("nearai", "nearai");
+        declared.base_url = Some(base);
+        declared.refuse_model_aliases = refuse;
+        let env = env_with(&[("NEARAI_API_KEY", "sk-near")]);
+        let credentials = Credentials::discovered(&env);
+
+        let backend = backend_from_config(&declared, 30, &credentials)
+            .expect("the backend builds")
+            .expect("a key was configured, so there is a backend");
+        let _ = backend
+            .send(UpstreamRequest {
+                path: "/v1/chat/completions".to_string(),
+                body: bytes::Bytes::from_static(b"{}"),
+                headers: Vec::new(),
+                stream: false,
+            })
+            .await;
+        let head = seen.lock().expect("lock").clone().expect("upstream saw it");
+        head.to_ascii_lowercase()
+    }
+
+    #[tokio::test]
+    async fn the_flag_reaches_the_wire_when_an_operator_sets_it() {
+        assert!(
+            head_sent_with(true).await.contains("x-no-aliasing"),
+            "refuse_model_aliases was configured and never left the config file"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_when_the_operator_does_not_ask() {
+        assert!(
+            !head_sent_with(false).await.contains("x-no-aliasing"),
+            "a caller was fail-closed without asking to be"
+        );
     }
 }
