@@ -850,3 +850,80 @@ async fn authenticated_session_status_reports_expiry_and_explicit_revocation() {
         "inactive"
     );
 }
+
+#[tokio::test]
+async fn explicit_token_capture_preserves_wire_bytes_and_leases_exact_evidence() {
+    use ironwire_core::config::{TokenCaptureConfig, TokenCaptureTarget};
+    let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+    let home = tempfile::tempdir().unwrap();
+    let spool = Arc::new(
+        ironwire_ledger::token_spool::TokenSpool::open(home.path(), 1024 * 1024, 86400).unwrap(),
+    );
+    let model: serde_json::Value = serde_json::from_str(ADMISSION_REQUEST).unwrap();
+    let mut config = Config::default();
+    config.capture.token_capture = Some(TokenCaptureConfig {
+        targets: vec![TokenCaptureTarget {
+            backend: "nearai".into(),
+            model: model["model"].as_str().unwrap().into(),
+        }],
+        ..Default::default()
+    });
+    let state = admission_state_with(&[("nearai", &base)], config)
+        .with_ledger(Some(ironwire_ledger::Ledger::in_memory().unwrap()))
+        .with_token_spool(Some(spool.clone()));
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("session-id", "capture-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+        ADMISSION_SSE
+    );
+    let sent = received.lock().unwrap().clone().unwrap().body;
+    assert_eq!(
+        sent.as_bytes(),
+        ironwire_core::token_capture::augment_chat(ADMISSION_REQUEST.as_bytes(), 20).unwrap()
+    );
+    let now = chrono::Utc::now().timestamp();
+    let captures = spool.list("capture-session", now).unwrap();
+    assert_eq!(captures.len(), 1);
+    let lease = spool
+        .acquire(
+            "capture-session",
+            &[captures[0].capture_id.clone()],
+            "commons",
+            now,
+            300,
+        )
+        .unwrap();
+    let (request, response) = spool
+        .read(&lease.lease_id, &lease.owner, &captures[0].capture_id, now)
+        .unwrap();
+    assert_eq!(request, sent.as_bytes());
+    assert_eq!(response, ADMISSION_SSE.as_bytes());
+    let unauthenticated = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_ironwire/token-captures")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"operation":"list","session":"capture-session"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+}

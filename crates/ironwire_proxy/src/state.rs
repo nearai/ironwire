@@ -195,6 +195,8 @@ pub struct AppState {
     /// `capture.bodies = true` -- bodies are the user's source code
     /// (`docs/TRUST.md` §4).
     pub bodies: Option<Arc<ironwire_ledger::bodies::BodyStore>>,
+    /// Independently opted-in detailed evidence with durable leases.
+    pub token_spool: Option<Arc<ironwire_ledger::token_spool::TokenSpool>>,
     /// Provider values refreshed through the signed catalog channel
     /// (`docs/UPDATES.md`).
     ///
@@ -306,6 +308,7 @@ impl AppState {
             consent: Arc::new(Mutex::new(consent)),
             ledger: None,
             bodies: None,
+            token_spool: None,
             catalog: Arc::new(Mutex::new(Arc::new(CatalogStore::new(
                 ironwire_catalog::CATALOG_PUBLIC_KEY,
             )))),
@@ -486,6 +489,16 @@ impl AppState {
     #[must_use]
     pub fn with_bodies(mut self, bodies: Option<Arc<ironwire_ledger::bodies::BodyStore>>) -> Self {
         self.bodies = bodies;
+        self
+    }
+
+    /// Attach the independently bounded detailed-evidence store.
+    #[must_use]
+    pub fn with_token_spool(
+        mut self,
+        spool: Option<Arc<ironwire_ledger::token_spool::TokenSpool>>,
+    ) -> Self {
+        self.token_spool = spool;
         self
     }
 

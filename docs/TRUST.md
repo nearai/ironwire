@@ -397,3 +397,16 @@ control bearer and returns only that session's active/expired/inactive status
 and expiry; it does not list session identifiers or return binding values.
 Register again to renew, or DELETE that exact session to revoke. State is
 memory-only and a proxy restart clears registrations and tombstones.
+
+## Token-distribution evidence capture
+
+`capture.token_capture` is a separate, off-by-default opt-in for explicitly
+named backend/model pairs. It records verbatim evidence in a separate bounded
+spool; it does not change the rolling retention of ordinary body capture.
+Default limits are 512 MiB and three days; leases can retain a selected snapshot
+for at most seven days from capture. A full spool stops new capture, not inference.
+Only authenticated control clients can acquire/read/release exact snapshots.
+One destination releasing its lease does not release another destination's lease
+or a later exchange. No lease names a user filesystem path. Contribution approval
+and durable server acknowledgment are responsibilities of the consuming client;
+local capture itself never grants upload consent.

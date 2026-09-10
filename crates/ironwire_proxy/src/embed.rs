@@ -643,11 +643,31 @@ pub async fn start_with_options(
     report.catalog_serial = catalog.serial();
     let bodies = open_bodies(&paths, &config, &mut report);
     sweep_bodies(&ledger, bodies.as_deref());
+    // Open even when capture has subsequently been disabled: pending leases
+    // and deletion work must remain accessible to their owners.
+    let spool_dir = paths.home.join("token-captures");
+    let token_spool = if config.capture.token_capture.is_some() || spool_dir.exists() {
+        let limits = config.capture.token_capture.clone().unwrap_or_default();
+        match ironwire_ledger::token_spool::TokenSpool::open(
+            &spool_dir,
+            limits.max_bytes,
+            limits.retain_seconds,
+        ) {
+            Ok(spool) => Some(std::sync::Arc::new(spool)),
+            Err(error) => {
+                tracing::warn!(%error, "detailed capture unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
         .with_paths(paths.clone())
         .with_ledger(ledger)
         .with_bodies(bodies)
+        .with_token_spool(token_spool)
         .with_catalog(catalog);
     seed_spend(&state);
     let endpoint = ironwire_core::discovery::Endpoint::new(port, paths.control_token_file());
@@ -668,6 +688,21 @@ pub async fn start_with_options(
         state.bodies.clone(),
     ) {
         background.0.push(task);
+    }
+    if let Some(spool) = state.token_spool.clone() {
+        background.0.push(tokio::spawn(async move {
+            loop {
+                let store = spool.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.prune(chrono::Utc::now().timestamp())
+                })
+                .await;
+                if !matches!(result, Ok(Ok(_))) {
+                    tracing::warn!("detailed capture cleanup pending");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        }));
     }
     // Standalone cache entries can contain installer commands for a different
     // executable. Skip hydration as well as fetching when the host owns updates.

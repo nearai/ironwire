@@ -80,7 +80,12 @@ For a native-lane request, IronWire performs exactly these mutations:
    explicit `false` or `0` as "alias away", and that is the operator's decision
    to make, not the caller's. No other backend sends it, and by default no
    backend sends it at all: see §3 for what happens instead.
-9. **Nothing else.** The body is otherwise the bytes the client sent.
+9. **Explicit token-distribution capture**: only for an opted-in, exact
+   backend/model pair, add missing Chat Completions `logprobs`/`top_logprobs`
+   fields before body capture. Existing caller fields win, including false.
+   No unrelated bytes are reserialized. Ambiguous JSON is not augmented.
+   Responses and other protocols are not augmented by this initial adapter.
+10. **Nothing else.** The body is otherwise the bytes the client sent.
 
 `GET /_ironwire/admission-binding` requires the control bearer and returns
 capability/limits only, never registered session or challenge values.
