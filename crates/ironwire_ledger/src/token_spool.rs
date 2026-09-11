@@ -29,6 +29,9 @@ pub enum SpoolError {
     /// Persistence failed; callers must retain their pending material.
     #[error("token-capture-storage")]
     Storage,
+    /// Windows ACL installation failed with a content-free exit code.
+    #[error("token-capture-permissions-{0}")]
+    Permissions(i32),
 }
 impl From<rusqlite::Error> for SpoolError {
     fn from(_: rusqlite::Error) -> Self {
@@ -132,9 +135,11 @@ pub fn secure_windows_path(path: &Path) -> Result<()> {
         const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $p = $env:IRONWIRE_PRIVATE_PATH
-$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User
 $old = Get-Acl -LiteralPath $p
-if ($old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 2 }
+$owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -ne $sid.Value -and $owner -ne $identity.Owner.Value) { exit 2 }
 if ([System.IO.Directory]::Exists($p)) {
   $acl = New-Object System.Security.AccessControl.DirectorySecurity
   $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
@@ -161,7 +166,7 @@ foreach ($r in $check.GetAccessRules($true, $true, [System.Security.Principal.Se
             .stderr(std::process::Stdio::null())
             .status()?;
         if !status.success() {
-            return Err(SpoolError::Storage);
+            return Err(SpoolError::Permissions(status.code().unwrap_or(-1)));
         }
     }
     #[cfg(not(windows))]
@@ -478,6 +483,7 @@ impl TokenSpool {
             SpoolError::Invalid => "invalid",
             SpoolError::Unavailable => "unavailable",
             SpoolError::Storage => "storage",
+            SpoolError::Permissions(_) => "permissions",
         };
         let mut conn = self.conn.lock().map_err(|_| SpoolError::Storage)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
