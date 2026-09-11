@@ -205,3 +205,116 @@ fn renewal_preserves_snapshot_and_has_a_hard_lifetime() {
         )
         .unwrap();
 }
+
+#[test]
+fn final_exchange_remains_discoverable_after_128_retained_turns() {
+    use ironwire_ledger::token_spool::TokenSpool;
+    let dir = tempfile::tempdir().unwrap();
+    let spool = TokenSpool::open(&dir.path().join("spool"), 1024 * 1024, 86400).unwrap();
+    let mut last = None;
+    for i in 1..=150 {
+        let body = format!("turn-{i}");
+        last = Some(
+            spool
+                .record(
+                    "session",
+                    i,
+                    "openai.chat",
+                    false,
+                    (body.as_bytes(), b"reply"),
+                    i,
+                )
+                .unwrap(),
+        );
+    }
+    let last = last.unwrap();
+    assert_eq!(spool.list("session", 200).unwrap().len(), 128);
+    let found = spool
+        .find("session", &last.request_digest, &last.response_digest, 200)
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].capture_id, last.capture_id);
+    assert!(
+        spool
+            .find("other", &last.request_digest, &last.response_digest, 200)
+            .unwrap()
+            .is_empty()
+    );
+    spool
+        .record(
+            "session",
+            151,
+            "openai.chat",
+            false,
+            (b"turn-150", b"reply"),
+            151,
+        )
+        .unwrap();
+    assert_eq!(
+        spool
+            .find("session", &last.request_digest, &last.response_digest, 200)
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_session_cannot_fill_the_global_spool() {
+    use ironwire_ledger::token_spool::TokenSpool;
+    let dir = tempfile::tempdir().unwrap();
+    let spool = TokenSpool::open(&dir.path().join("spool"), 128 * 1024 * 1024, 86400).unwrap();
+    let body = vec![b'x'; 32 * 1024 * 1024];
+    spool
+        .record("busy", 1, "openai.chat", false, (&body, &body), 1)
+        .unwrap();
+    assert!(
+        spool
+            .record("busy", 2, "openai.chat", false, (b"a", b"b"), 2)
+            .is_err()
+    );
+    assert!(
+        spool
+            .record("other", 3, "openai.chat", false, (b"a", b"b"), 3)
+            .is_ok()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn raw_spool_has_a_protected_user_only_acl() {
+    use ironwire_ledger::token_spool::TokenSpool;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("spool");
+    let spool = TokenSpool::open(&root, 1024 * 1024, 86400).unwrap();
+    spool
+        .record(
+            "session",
+            1,
+            "openai.chat",
+            false,
+            (b"private-request", b"private-response"),
+            1,
+        )
+        .unwrap();
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$paths = @((Get-Item -LiteralPath $env:IRONWIRE_TEST_ROOT)) + @(Get-ChildItem -LiteralPath $env:IRONWIRE_TEST_ROOT)
+foreach ($item in $paths) {
+  $acl = Get-Acl -LiteralPath $item.FullName
+  foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+    if ($rule.IdentityReference.Value -ne $sid) { exit 2 }
+  }
+}
+if (!(Get-Acl -LiteralPath $env:IRONWIRE_TEST_ROOT).AreAccessRulesProtected) { exit 3 }
+"#;
+    assert!(
+        std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("IRONWIRE_TEST_ROOT", &root)
+            .status()
+            .unwrap()
+            .success()
+    );
+}

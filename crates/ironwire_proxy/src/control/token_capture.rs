@@ -10,8 +10,16 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
+    Status {
+        session: String,
+    },
     List {
         session: String,
+    },
+    Find {
+        session: String,
+        request_digest: String,
+        response_digest: String,
     },
     Acquire {
         session: String,
@@ -52,8 +60,12 @@ pub(super) async fn handle(
         use ironwire_ledger::token_spool::SpoolError;
         let now = chrono::Utc::now().timestamp();
         match request {
+            Request::Status { session } => spool.status(&session, now),
             Request::List { session } => {
                 serde_json::to_value(spool.list(&session, now)?).map_err(|_| SpoolError::Invalid)
+            }
+            Request::Find { session, request_digest, response_digest } => {
+                serde_json::to_value(spool.find(&session, &request_digest, &response_digest, now)?).map_err(|_| SpoolError::Invalid)
             }
             Request::Acquire {
                 session,

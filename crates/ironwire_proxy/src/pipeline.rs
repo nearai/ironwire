@@ -1508,6 +1508,7 @@ impl LedgerContext {
                 chrono::Utc::now().timestamp(),
             )
         {
+            let _ = spool.note_absence(session, &error, chrono::Utc::now().timestamp());
             tracing::debug!(%error,"detailed capture unavailable for completed exchange");
         }
         // The rolling window. Only ever rotates rows that are already in the

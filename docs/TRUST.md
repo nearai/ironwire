@@ -410,3 +410,14 @@ One destination releasing its lease does not release another destination's lease
 or a later exchange. No lease names a user filesystem path. Contribution approval
 and durable server acknowledgment are responsibilities of the consuming client;
 local capture itself never grants upload consent.
+
+The detailed spool also enforces a 64 MiB per-session ceiling (or the smaller
+configured global ceiling). Exact request/response digest lookup searches all
+retained captures and refuses ambiguous matches; the bounded display listing
+is not used as a complete session index. Missing-capture counters are persisted
+as bounded reason labels, separately from raw evidence.
+
+On Windows, owned state and the detailed spool receive protected current-user
+ACLs. Foreign-owned paths and reparse ancestors are refused. Fresh payloads
+inherit the verified spool ACL; status and control never depend on a broadly
+readable custom home. The Windows spool CI leg checks raw-file ACLs.

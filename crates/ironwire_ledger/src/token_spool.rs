@@ -60,6 +60,12 @@ pub struct CaptureDescriptor {
     pub protocol: String,
     /// Whether response bytes contain SSE.
     pub streaming: bool,
+    /// Exact retained request size, without reading the payload.
+    #[serde(default)]
+    pub request_bytes: u64,
+    /// Exact retained response size, without reading the payload.
+    #[serde(default)]
+    pub response_bytes: u64,
 }
 /// A lease grants access to an exact immutable snapshot, not a whole session.
 #[derive(Clone, Serialize, Deserialize)]
@@ -99,8 +105,73 @@ fn label(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_./:".contains(&c))
 }
+/// Reject Windows junctions as well as symbolic links before creating or
+/// opening sensitive state. Existing custom homes must be owned by this user.
+fn reject_reparse_ancestors(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        for ancestor in path.ancestors() {
+            if let Ok(meta) = std::fs::symlink_metadata(ancestor) {
+                if meta.file_attributes() & 0x400 != 0 {
+                    return Err(SpoolError::Invalid);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+/// Install an owner-only protected Windows ACL; refuse foreign ownership.
+pub fn secure_windows_path(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        // Use the OS-shipped ACL implementation without adding an unsafe FFI
+        // boundary. The path is an environment value, never script source.
+        const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$p = $env:IRONWIRE_PRIVATE_PATH
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$old = Get-Acl -LiteralPath $p
+if ($old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { exit 2 }
+if ([System.IO.Directory]::Exists($p)) {
+  $acl = New-Object System.Security.AccessControl.DirectorySecurity
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+} else {
+  $acl = New-Object System.Security.AccessControl.FileSecurity
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+}
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $p -AclObject $acl
+$check = Get-Acl -LiteralPath $p
+if (!$check.AreAccessRulesProtected) { exit 3 }
+foreach ($r in $check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+  if ($r.IdentityReference.Value -ne $sid.Value -or $r.AccessControlType -ne 'Allow') { exit 4 }
+}
+"#;
+        reject_reparse_ancestors(path)?;
+        let status = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+            .env("IRONWIRE_PRIVATE_PATH", path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(SpoolError::Storage);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
 fn private_dir(path: &Path) -> Result<()> {
+    reject_reparse_ancestors(path)?;
     std::fs::create_dir_all(path)?;
+    secure_windows_path(path)?;
     let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err(SpoolError::Invalid);
@@ -121,7 +192,7 @@ fn sync_dir(path: &Path) -> Result<()> {
 }
 impl TokenSpool {
     /// Open a private store. The parent must be the daemon's owned home.
-    /// Windows inherits that home's user-only ACL.
+    /// Windows validates ownership and installs a protected user-only ACL.
     pub fn open(dir: &Path, budget: u64, retention: i64) -> Result<Self> {
         if budget == 0
             || budget > 512 * 1024 * 1024
@@ -135,6 +206,13 @@ impl TokenSpool {
         {
             return Err(SpoolError::Invalid);
         }
+        if !db.exists() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&db)?;
+        }
+        secure_windows_path(&db)?;
         let conn = Connection::open(&db)?;
         #[cfg(unix)]
         {
@@ -147,7 +225,8 @@ impl TokenSpool {
             INSERT INTO identity SELECT lower(hex(randomblob(16))) WHERE NOT EXISTS(SELECT 1 FROM identity);
             CREATE TABLE IF NOT EXISTS captures(id TEXT PRIMARY KEY, session_hash TEXT NOT NULL, descriptor TEXT NOT NULL, created INTEGER NOT NULL, expires INTEGER NOT NULL, deleting INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY, owner TEXT NOT NULL, digest TEXT NOT NULL, expires INTEGER NOT NULL, released INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS members(lease TEXT NOT NULL, capture TEXT NOT NULL, PRIMARY KEY(lease,capture));")?;
+            CREATE TABLE IF NOT EXISTS members(lease TEXT NOT NULL, capture TEXT NOT NULL, PRIMARY KEY(lease,capture));
+            CREATE TABLE IF NOT EXISTS capture_absence(session_hash TEXT NOT NULL,reason TEXT NOT NULL,count INTEGER NOT NULL,last_at INTEGER NOT NULL,PRIMARY KEY(session_hash,reason));")?;
         sync_dir(dir)?;
         Ok(Self {
             dir: dir.into(),
@@ -178,7 +257,10 @@ impl TokenSpool {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(self.file(id, suffix)?)?;
+        let path = self.file(id, suffix)?;
+        // A newly created file inherits the protected ACL of the verified
+        // spool directory; never spawn an ACL process on the response path.
+        let mut file = options.open(&path)?;
         file.write_all(body)?;
         file.sync_all()?;
         Ok(())
@@ -234,6 +316,16 @@ impl TokenSpool {
         {
             return Err(SpoolError::Capacity);
         }
+        let session_bytes: i64 = tx.query_row(
+            "SELECT COALESCE(sum(COALESCE(json_extract(descriptor,'$.request_bytes'),33554432) + COALESCE(json_extract(descriptor,'$.response_bytes'),33554432)),0) FROM captures WHERE session_hash=?1",
+            [digest(session.as_bytes())], |r| r.get(0),
+        )?;
+        // One session must leave room for other sessions in the global spool.
+        if (session_bytes as u64).saturating_add((request.len() + response.len()) as u64)
+            > self.budget.min(64 * 1024 * 1024)
+        {
+            return Err(SpoolError::Capacity);
+        }
         let descriptor = CaptureDescriptor {
             store_id: tx.query_row("SELECT id FROM identity", [], |r| r.get(0))?,
             capture_id: tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?,
@@ -242,6 +334,8 @@ impl TokenSpool {
             response_digest: digest(response),
             protocol: protocol.into(),
             streaming,
+            request_bytes: request.len() as u64,
+            response_bytes: response.len() as u64,
         };
         // Publish metadata only after both files are synced. Crashes leave
         // unreferenced files, counted against the budget and swept by maintenance.
@@ -377,6 +471,66 @@ impl TokenSpool {
             .map(|s| serde_json::from_str(&s).map_err(|_| SpoolError::Invalid))
             .collect()
     }
+    /// Persist bounded absence counters, never raw content or diagnostic text.
+    pub fn note_absence(&self, session: &str, error: &SpoolError, now: i64) -> Result<()> {
+        let reason = match error {
+            SpoolError::Capacity => "capacity",
+            SpoolError::Invalid => "invalid",
+            SpoolError::Unavailable => "unavailable",
+            SpoolError::Storage => "storage",
+        };
+        let mut conn = self.conn.lock().map_err(|_| SpoolError::Storage)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM capture_absence WHERE rowid IN (SELECT rowid FROM capture_absence ORDER BY last_at DESC LIMIT -1 OFFSET 4095)",[])?;
+        tx.execute("INSERT INTO capture_absence VALUES(?1,?2,1,?3) ON CONFLICT(session_hash,reason) DO UPDATE SET count=min(count+1,2147483647),last_at=excluded.last_at",params![digest(session.as_bytes()),reason,now])?;
+        tx.commit()?;
+        Ok(())
+    }
+    /// Authenticated metadata-only status for an explicitly selected session.
+    pub fn status(&self, session: &str, now: i64) -> Result<serde_json::Value> {
+        let conn = self.conn.lock().map_err(|_| SpoolError::Storage)?;
+        let hash = digest(session.as_bytes());
+        let (count,bytes):(i64,i64) = conn.query_row("SELECT count(*),COALESCE(sum(COALESCE(json_extract(descriptor,'$.request_bytes'),0)+COALESCE(json_extract(descriptor,'$.response_bytes'),0)),0) FROM captures WHERE session_hash=?1",[&hash],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (leases,expiry):(i64,Option<i64>) = conn.query_row("SELECT count(DISTINCT l.id),min(l.expires) FROM leases l JOIN members m ON m.lease=l.id JOIN captures c ON c.id=m.capture WHERE c.session_hash=?1 AND l.released=0 AND l.expires>?2",params![&hash,now],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let mut q =
+            conn.prepare("SELECT reason,count FROM capture_absence WHERE session_hash=?1")?;
+        let missing = q
+            .query_map([&hash], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+        Ok(
+            serde_json::json!({"captures":count,"retained_bytes":bytes,"active_leases":leases,"earliest_lease_expiry":expiry,"missing":missing}),
+        )
+    }
+    /// Find the exact exchange across the full retained session. Return at
+    /// most two matches so the caller can refuse ambiguous duplicate evidence.
+    pub fn find(
+        &self,
+        session: &str,
+        request: &str,
+        response: &str,
+        now: i64,
+    ) -> Result<Vec<CaptureDescriptor>> {
+        if [request, response]
+            .iter()
+            .any(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(SpoolError::Invalid);
+        }
+        let conn = self.conn.lock().map_err(|_| SpoolError::Storage)?;
+        let mut statement = conn.prepare("SELECT descriptor FROM captures WHERE session_hash=?1 AND deleting=0 AND expires>?2 AND json_extract(descriptor,'$.request_digest')=?3 AND json_extract(descriptor,'$.response_digest')=?4 LIMIT 2")?;
+        let encoded = statement
+            .query_map(
+                params![digest(session.as_bytes()), now, request, response],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        encoded
+            .into_iter()
+            .map(|s| serde_json::from_str(&s).map_err(|_| SpoolError::Invalid))
+            .collect()
+    }
     /// Read an immutable capture while holding the same lock as pruning.
     pub fn read(
         &self,
@@ -487,6 +641,10 @@ impl TokenSpool {
             [now],
         )?;
         tx.execute("DELETE FROM leases WHERE expires<=?1", [now])?;
+        tx.execute(
+            "DELETE FROM capture_absence WHERE last_at<?1",
+            [now.saturating_sub(self.retention)],
+        )?;
         sync_dir(&self.dir)?;
         tx.commit()?;
         Ok(ids.len())
