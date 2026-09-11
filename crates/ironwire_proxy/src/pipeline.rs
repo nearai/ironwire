@@ -556,6 +556,20 @@ async fn dispatch_inner(
             })
             .zip(state.token_spool.as_ref())
             .and_then(|(config, store)| {
+                if store
+                    .can_accept_capture(session.as_deref().unwrap_or(""), request.body.len() as u64)
+                    .ok()
+                    != Some(true)
+                {
+                    if let Some(session) = session.as_ref() {
+                        let _ = store.note_absence(
+                            session,
+                            &ironwire_ledger::token_spool::SpoolError::Capacity,
+                            Utc::now().timestamp(),
+                        );
+                    }
+                    return None;
+                }
                 match ironwire_core::token_capture::augment_chat(&request.body, config.top_k) {
                     Some(bytes) => {
                         request.body = Bytes::from(bytes);
@@ -591,7 +605,7 @@ async fn dispatch_inner(
         // Cloned before the request moves into the backend, because these are
         // the bytes the upstream will hash: `send` puts `request.body` on the
         // wire unchanged. Cheap -- `Bytes` is refcounted.
-        let capture = if state.bodies.is_some() || token_target.is_some() {
+        let mut capture = if state.bodies.is_some() || token_target.is_some() {
             let mut capture = Capture::of_request(request.body.clone());
             capture.token_target = token_target;
             Some(capture)
@@ -604,7 +618,10 @@ async fn dispatch_inner(
                 // Teed before translation, for the same reason. On a translated
                 // route the bytes the client eventually sees are ours, not the
                 // provider's, and only the provider's are in its receipt.
-                if let Some(capture) = capture.as_ref() {
+                if let Some(capture) = capture.as_mut() {
+                    if let Some((_, _, streaming)) = capture.token_target.as_mut() {
+                        *streaming = is_event_stream(&response.headers);
+                    }
                     response.body = capture_stream(response.body, capture).boxed();
                 }
                 let response = if decision.translated {

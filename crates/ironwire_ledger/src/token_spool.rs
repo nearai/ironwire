@@ -296,6 +296,25 @@ impl TokenSpool {
         }
         Ok(total)
     }
+    /// Avoid requesting additional provider work when current storage cannot
+    /// accept even the request and a minimal response. Record remains the
+    /// authoritative check when concurrent or unexpectedly large calls finish.
+    pub fn can_accept_capture(&self, session: &str, request_bytes: u64) -> Result<bool> {
+        if session.is_empty() || session.len() > 4096 {
+            return Err(SpoolError::Invalid);
+        }
+        let conn = self.conn.lock().map_err(|_| SpoolError::Storage)?;
+        let count: i64 = conn.query_row("SELECT count(*) FROM captures", [], |r| r.get(0))?;
+        let session_bytes: i64 = conn.query_row("SELECT COALESCE(sum(COALESCE(json_extract(descriptor,'$.request_bytes'),33554432)+COALESCE(json_extract(descriptor,'$.response_bytes'),33554432)),0) FROM captures WHERE session_hash=?1", [digest(session.as_bytes())], |r|r.get(0))?;
+        if request_bytes > MAX_BODY_BYTES as u64 {
+            return Ok(false);
+        }
+        let minimum = request_bytes.saturating_add(256);
+        Ok(count < 4096
+            && self.disk_usage()?.saturating_add(minimum) <= self.budget
+            && (session_bytes as u64).saturating_add(minimum) <= self.budget.min(64 * 1024 * 1024))
+    }
+
     /// Persist exact bodies after a completed exchange. Failure never fails inference.
     pub fn record(
         &self,
