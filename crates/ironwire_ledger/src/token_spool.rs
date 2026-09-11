@@ -140,7 +140,8 @@ $p = $env:IRONWIRE_PRIVATE_PATH
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User
 $stage = 11
-$old = Get-Acl -LiteralPath $p
+$item = Get-Item -LiteralPath $p -Force
+$old = $item.GetAccessControl()
 $owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 if ($owner -ne $sid.Value -and $owner -ne $identity.Owner.Value) { exit 2 }
 if ([System.IO.Directory]::Exists($p)) {
@@ -154,9 +155,9 @@ $acl.SetOwner($sid)
 $acl.SetAccessRuleProtection($true, $false)
 $acl.AddAccessRule($rule)
 $stage = 12
-Set-Acl -LiteralPath $p -AclObject $acl
+$item.SetAccessControl($acl)
 $stage = 13
-$check = Get-Acl -LiteralPath $p
+$check = $item.GetAccessControl()
 if (!$check.AreAccessRulesProtected) { exit 3 }
 foreach ($r in $check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
   if ($r.IdentityReference.Value -ne $sid.Value -or $r.AccessControlType -ne 'Allow') { exit 4 }
