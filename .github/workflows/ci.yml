@@ -27,6 +27,30 @@ jobs:
           & powershell.exe -NoProfile -NonInteractive -Command $script
           if ($LASTEXITCODE -ne 0) { throw "ACL fixture failed" }
       - run: cargo test -p ironwire_ledger --test token_spool
+      - name: A second local user cannot read raw capture files
+        shell: pwsh
+        run: |
+          $name = "iw" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
+          $password = ConvertTo-SecureString ([Guid]::NewGuid().ToString("N") + "!aA7") -AsPlainText -Force
+          $fixture = Join-Path $env:PUBLIC ($name + ".raw")
+          try {
+            New-LocalUser -Name $name -Password $password -AccountNeverExpires | Out-Null
+            [IO.File]::WriteAllText($fixture, "synthetic-private-capture")
+            $source = Get-Content crates/ironwire_ledger/src/token_spool.rs -Raw
+            $script = [regex]::Match($source, 'const SCRIPT: &str = r#"(.*?)"#;', 'Singleline').Groups[1].Value
+            $env:IRONWIRE_PRIVATE_PATH = $fixture
+            & powershell.exe -NoProfile -NonInteractive -Command $script
+            if ($LASTEXITCODE -ne 0) { throw "Private ACL installation failed" }
+            $probe = "try { [IO.File]::ReadAllBytes('$fixture') | Out-Null; exit 21 } catch [UnauthorizedAccessException] { exit 0 } catch { exit 22 }"
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+            $credential = [PSCredential]::new("$env:COMPUTERNAME\$name", $password)
+            $process = Start-Process powershell.exe -Credential $credential -WorkingDirectory $env:PUBLIC -ArgumentList @("-NoProfile", "-NonInteractive", "-EncodedCommand", $encoded) -PassThru -Wait
+            if ($process.ExitCode -ne 0) { throw "Second-user raw capture access was not refused: $($process.ExitCode)" }
+          } finally {
+            Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name $name -ErrorAction SilentlyContinue
+          }
+
 
   test:
     strategy:
