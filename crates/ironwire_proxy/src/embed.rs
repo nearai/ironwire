@@ -607,19 +607,7 @@ pub async fn start_with_options(
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
     let mut config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
-    match options.token_capture_enabled {
-        Some(true)
-            if config
-                .capture
-                .token_capture
-                .as_ref()
-                .is_none_or(|c| c.targets.is_empty()) =>
-        {
-            return Err(EmbedError::Config);
-        }
-        Some(false) => config.capture.token_capture = None,
-        _ => {}
-    }
+    apply_token_capture_override(&mut config, options.token_capture_enabled)?;
     let checks = options.checks_enabled(config.updates.check);
     let port = port_override.unwrap_or(config.server.port);
     if config.limits.any_cap() && !config.capture.enabled {
@@ -1471,8 +1459,50 @@ fn base_url_for(config: &Config, id: &str, env_key: &str) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+fn apply_token_capture_override(
+    config: &mut Config,
+    enabled: Option<bool>,
+) -> Result<(), EmbedError> {
+    match enabled {
+        Some(true)
+            if config
+                .capture
+                .token_capture
+                .as_ref()
+                .is_none_or(|c| c.targets.is_empty()) =>
+        {
+            return Err(EmbedError::Config);
+        }
+        Some(false) => config.capture.token_capture = None,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_capture_override_preserves_targets_and_requires_explicit_configuration() {
+        use ironwire_core::config::{Config, TokenCaptureConfig, TokenCaptureTarget};
+        let mut config = Config::default();
+        assert!(super::apply_token_capture_override(&mut config, Some(true)).is_err());
+        config.capture.token_capture = Some(TokenCaptureConfig {
+            targets: vec![TokenCaptureTarget {
+                backend: "fixture".into(),
+                model: "qualified".into(),
+            }],
+            ..Default::default()
+        });
+        super::apply_token_capture_override(&mut config, None).unwrap();
+        super::apply_token_capture_override(&mut config, Some(true)).unwrap();
+        assert_eq!(
+            config.capture.token_capture.as_ref().unwrap().targets[0].model,
+            "qualified"
+        );
+        super::apply_token_capture_override(&mut config, Some(false)).unwrap();
+        assert!(config.capture.token_capture.is_none());
+    }
+
     use super::*;
     use ironwire_core::config::BackendConfig;
 

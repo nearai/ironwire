@@ -363,3 +363,12 @@ fn exclusive_file_handles_fail_closed_without_replacing_the_database() {
         id
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn canonical_windows_paths_support_the_embedded_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(dir.path()).unwrap();
+    let spool = TokenSpool::open(&canonical.join("spool"), 1024, 100).unwrap();
+    assert!(spool.store_id().is_ok());
+}
