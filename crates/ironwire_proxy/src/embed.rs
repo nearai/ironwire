@@ -222,6 +222,9 @@ pub enum CredentialFiles {
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct EmbedOptions {
+    /// Optional host consent override. Enabling requires explicitly configured
+    /// qualified targets; disabling preserves cleanup of existing captures.
+    pub token_capture_enabled: Option<bool>,
     /// Who owns upgrading the running proxy implementation.
     pub update_policy: UpdatePolicy,
     /// Whether the release check and catalog refresh may run at all.
@@ -603,7 +606,20 @@ pub async fn start_with_options(
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
-    let config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    let mut config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    match options.token_capture_enabled {
+        Some(true)
+            if config
+                .capture
+                .token_capture
+                .as_ref()
+                .is_none_or(|c| c.targets.is_empty()) =>
+        {
+            return Err(EmbedError::Config);
+        }
+        Some(false) => config.capture.token_capture = None,
+        _ => {}
+    }
     let checks = options.checks_enabled(config.updates.check);
     let port = port_override.unwrap_or(config.server.port);
     if config.limits.any_cap() && !config.capture.enabled {

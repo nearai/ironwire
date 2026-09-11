@@ -16,6 +16,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Protect a custom state directory
+        shell: pwsh
+        run: |
+          $source = Get-Content crates/ironwire_ledger/src/token_spool.rs -Raw
+          $script = [regex]::Match($source, 'const SCRIPT: &str = r#"(.*?)"#;', 'Singleline').Groups[1].Value
+          if (!$script) { throw "ACL script unavailable" }
+          $env:IRONWIRE_PRIVATE_PATH = Join-Path $env:RUNNER_TEMP "ironwire-acl-fixture"
+          New-Item -ItemType Directory -Path $env:IRONWIRE_PRIVATE_PATH -Force | Out-Null
+          & powershell.exe -NoProfile -NonInteractive -Command $script
+          if ($LASTEXITCODE -ne 0) { throw "ACL fixture failed" }
       - run: cargo test -p ironwire_ledger --test token_spool
 
   test:

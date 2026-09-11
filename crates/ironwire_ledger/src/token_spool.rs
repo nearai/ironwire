@@ -141,11 +141,11 @@ $old = Get-Acl -LiteralPath $p
 $owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 if ($owner -ne $sid.Value -and $owner -ne $identity.Owner.Value) { exit 2 }
 if ([System.IO.Directory]::Exists($p)) {
-  $acl = New-Object System.Security.AccessControl.DirectorySecurity
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
 } else {
-  $acl = New-Object System.Security.AccessControl.FileSecurity
-  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+  $acl = [System.Security.AccessControl.FileSecurity]::new()
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
 }
 $acl.SetOwner($sid)
 $acl.SetAccessRuleProtection($true, $false)
