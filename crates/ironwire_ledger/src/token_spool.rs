@@ -134,9 +134,12 @@ pub fn secure_windows_path(path: &Path) -> Result<()> {
         // boundary. The path is an environment value, never script source.
         const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
+$stage = 10
+try {
 $p = $env:IRONWIRE_PRIVATE_PATH
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $sid = $identity.User
+$stage = 11
 $old = Get-Acl -LiteralPath $p
 $owner = $old.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
 if ($owner -ne $sid.Value -and $owner -ne $identity.Owner.Value) { exit 2 }
@@ -150,12 +153,16 @@ if ([System.IO.Directory]::Exists($p)) {
 $acl.SetOwner($sid)
 $acl.SetAccessRuleProtection($true, $false)
 $acl.AddAccessRule($rule)
+$stage = 12
 Set-Acl -LiteralPath $p -AclObject $acl
+$stage = 13
 $check = Get-Acl -LiteralPath $p
 if (!$check.AreAccessRulesProtected) { exit 3 }
 foreach ($r in $check.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
   if ($r.IdentityReference.Value -ne $sid.Value -or $r.AccessControlType -ne 'Allow') { exit 4 }
 }
+exit 0
+} catch { exit $stage }
 "#;
         reject_reparse_ancestors(path)?;
         let status = std::process::Command::new("powershell.exe")
