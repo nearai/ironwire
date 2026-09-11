@@ -162,6 +162,9 @@ pub struct CaptureConfig {
     /// by this setting, and a request that is not translated is never modified
     /// to carry it.
     pub logprobs: bool,
+    /// Detailed evidence capture. Separate consent from aggregate logprobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_capture: Option<TokenCaptureConfig>,
 }
 
 impl Default for CaptureConfig {
@@ -171,7 +174,50 @@ impl Default for CaptureConfig {
             bodies: false,
             retain_days: 90,
             logprobs: false,
+            token_capture: None,
         }
+    }
+}
+
+/// Explicitly selected backend/model pair; no routing fallback is added.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenCaptureTarget {
+    /// Registered backend identity.
+    pub backend: String,
+    /// Exact selected model identity.
+    pub model: String,
+}
+/// Local detailed evidence capture, with independent bounded retention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenCaptureConfig {
+    /// Models whose provider support the operator has qualified.
+    pub targets: Vec<TokenCaptureTarget>,
+    /// Requested alternatives; zero requests only chosen-token probabilities.
+    pub top_k: u8,
+    /// Global raw evidence byte budget.
+    pub max_bytes: u64,
+    /// Unleased evidence lifetime in seconds.
+    pub retain_seconds: i64,
+}
+impl Default for TokenCaptureConfig {
+    fn default() -> Self {
+        Self {
+            targets: Vec::new(),
+            top_k: 20,
+            max_bytes: 512 * 1024 * 1024,
+            retain_seconds: 3 * 86400,
+        }
+    }
+}
+impl TokenCaptureConfig {
+    /// True only for an explicitly selected pair. Never guesses capabilities.
+    #[must_use]
+    pub fn selects(&self, backend: &str, model: &str) -> bool {
+        self.targets
+            .iter()
+            .any(|target| target.backend == backend && target.model == model)
     }
 }
 
@@ -768,6 +814,23 @@ impl Config {
             detail,
         };
 
+        if let Some(capture) = &self.capture.token_capture
+            && (!self.capture.enabled
+                || capture.top_k > 20
+                || capture.max_bytes == 0
+                || capture.max_bytes > 512 * 1024 * 1024
+                || !(1..=7 * 86400).contains(&capture.retain_seconds)
+                || capture.targets.len() > 32
+                || capture.targets.iter().any(|t| {
+                    t.backend.is_empty()
+                        || t.model.is_empty()
+                        || t.backend.len() > 256
+                        || t.model.len() > 256
+                }))
+        {
+            return Err(invalid("capture.token_capture", "Enable capture and select top_k 0..20, at most 512 MiB, and retention 1..604800 seconds".into()));
+        }
+
         if self.privacy.mode() == PrivacyMode::Full && self.privacy.trusted_backends.is_empty() {
             return Err(Error::ConfigInvalid {
                 path: path.to_path_buf(),
@@ -1294,6 +1357,7 @@ mod tests {
                 bodies: true,
                 retain_days: 30,
                 logprobs: true,
+                token_capture: None,
             },
             usage: UsageConfig {
                 enabled: true,

@@ -222,6 +222,9 @@ pub enum CredentialFiles {
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct EmbedOptions {
+    /// Optional host consent override. Enabling requires explicitly configured
+    /// qualified targets; disabling preserves cleanup of existing captures.
+    pub token_capture_enabled: Option<bool>,
     /// Who owns upgrading the running proxy implementation.
     pub update_policy: UpdatePolicy,
     /// Whether the release check and catalog refresh may run at all.
@@ -603,7 +606,8 @@ pub async fn start_with_options(
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
-    let config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    let mut config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    apply_token_capture_override(&mut config, options.token_capture_enabled)?;
     let checks = options.checks_enabled(config.updates.check);
     let port = port_override.unwrap_or(config.server.port);
     if config.limits.any_cap() && !config.capture.enabled {
@@ -643,11 +647,31 @@ pub async fn start_with_options(
     report.catalog_serial = catalog.serial();
     let bodies = open_bodies(&paths, &config, &mut report);
     sweep_bodies(&ledger, bodies.as_deref());
+    // Open even when capture has subsequently been disabled: pending leases
+    // and deletion work must remain accessible to their owners.
+    let spool_dir = paths.home.join("token-captures");
+    let token_spool = if config.capture.token_capture.is_some() || spool_dir.exists() {
+        let limits = config.capture.token_capture.clone().unwrap_or_default();
+        match ironwire_ledger::token_spool::TokenSpool::open(
+            &spool_dir,
+            limits.max_bytes,
+            limits.retain_seconds,
+        ) {
+            Ok(spool) => Some(std::sync::Arc::new(spool)),
+            Err(error) => {
+                tracing::warn!(%error, "detailed capture unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let state = AppState::new(registry, config, consent, token)
         .with_port(port)
         .with_paths(paths.clone())
         .with_ledger(ledger)
         .with_bodies(bodies)
+        .with_token_spool(token_spool)
         .with_catalog(catalog);
     seed_spend(&state);
     let endpoint = ironwire_core::discovery::Endpoint::new(port, paths.control_token_file());
@@ -668,6 +692,21 @@ pub async fn start_with_options(
         state.bodies.clone(),
     ) {
         background.0.push(task);
+    }
+    if let Some(spool) = state.token_spool.clone() {
+        background.0.push(tokio::spawn(async move {
+            loop {
+                let store = spool.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    store.prune(chrono::Utc::now().timestamp())
+                })
+                .await;
+                if !matches!(result, Ok(Ok(_))) {
+                    tracing::warn!("detailed capture cleanup pending");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        }));
     }
     // Standalone cache entries can contain installer commands for a different
     // executable. Skip hydration as well as fetching when the host owns updates.
@@ -1420,8 +1459,50 @@ fn base_url_for(config: &Config, id: &str, env_key: &str) -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
+fn apply_token_capture_override(
+    config: &mut Config,
+    enabled: Option<bool>,
+) -> Result<(), EmbedError> {
+    match enabled {
+        Some(true)
+            if config
+                .capture
+                .token_capture
+                .as_ref()
+                .is_none_or(|c| c.targets.is_empty()) =>
+        {
+            return Err(EmbedError::Config);
+        }
+        Some(false) => config.capture.token_capture = None,
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_capture_override_preserves_targets_and_requires_explicit_configuration() {
+        use ironwire_core::config::{Config, TokenCaptureConfig, TokenCaptureTarget};
+        let mut config = Config::default();
+        assert!(super::apply_token_capture_override(&mut config, Some(true)).is_err());
+        config.capture.token_capture = Some(TokenCaptureConfig {
+            targets: vec![TokenCaptureTarget {
+                backend: "fixture".into(),
+                model: "qualified".into(),
+            }],
+            ..Default::default()
+        });
+        super::apply_token_capture_override(&mut config, None).unwrap();
+        super::apply_token_capture_override(&mut config, Some(true)).unwrap();
+        assert_eq!(
+            config.capture.token_capture.as_ref().unwrap().targets[0].model,
+            "qualified"
+        );
+        super::apply_token_capture_override(&mut config, Some(false)).unwrap();
+        assert!(config.capture.token_capture.is_none());
+    }
+
     use super::*;
     use ironwire_core::config::BackendConfig;
 

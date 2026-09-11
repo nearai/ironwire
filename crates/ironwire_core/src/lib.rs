@@ -37,3 +37,6 @@ pub use quota::{Headroom, QuotaSnapshot};
 /// Default loopback port. Chosen to be memorable and outside the common
 /// dev-server range; the daemon binds `127.0.0.1` only (`docs/TRUST.md` I1).
 pub const DEFAULT_PORT: u16 = 8463;
+
+/// Opt-in, byte-preserving token capture request augmentation.
+pub mod token_capture;

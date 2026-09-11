@@ -55,6 +55,13 @@ async fn spawn_mock() -> (String, Arc<Mutex<Option<Received>>>) {
 }
 
 async fn spawn_mock_response(sse: &'static str) -> (String, Arc<Mutex<Option<Received>>>) {
+    spawn_mock_content(sse, "text/event-stream").await
+}
+
+async fn spawn_mock_content(
+    sse: &'static str,
+    content_type: &'static str,
+) -> (String, Arc<Mutex<Option<Received>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -99,7 +106,7 @@ async fn spawn_mock_response(sse: &'static str) -> (String, Arc<Mutex<Option<Rec
 
         let head = format!(
             "HTTP/1.1 200 OK\r\n\
-             content-type: text/event-stream\r\n\
+             content-type: {content_type}\r\n\
              anthropic-ratelimit-unified-limit: 1000\r\n\
              anthropic-ratelimit-unified-remaining: 180\r\n\
              content-length: {}\r\n\r\n",
@@ -849,4 +856,153 @@ async fn authenticated_session_status_reports_expiry_and_explicit_revocation() {
         serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
         "inactive"
     );
+}
+
+#[tokio::test]
+async fn explicit_token_capture_preserves_wire_bytes_and_leases_exact_evidence() {
+    use ironwire_core::config::{TokenCaptureConfig, TokenCaptureTarget};
+    let (base, received) = spawn_mock_response(ADMISSION_SSE).await;
+    let home = tempfile::tempdir().unwrap();
+    let spool = Arc::new(
+        ironwire_ledger::token_spool::TokenSpool::open(home.path(), 1024 * 1024, 86400).unwrap(),
+    );
+    let model: serde_json::Value = serde_json::from_str(ADMISSION_REQUEST).unwrap();
+    let mut config = Config::default();
+    config.capture.token_capture = Some(TokenCaptureConfig {
+        targets: vec![TokenCaptureTarget {
+            backend: "nearai".into(),
+            model: model["model"].as_str().unwrap().into(),
+        }],
+        ..Default::default()
+    });
+    let state = admission_state_with(&[("nearai", &base)], config)
+        .with_ledger(Some(ironwire_ledger::Ledger::in_memory().unwrap()))
+        .with_token_spool(Some(spool.clone()));
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("session-id", "capture-session")
+                .body(Body::from(ADMISSION_REQUEST))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+        ADMISSION_SSE
+    );
+    let sent = received.lock().unwrap().clone().unwrap().body;
+    assert_eq!(
+        sent.as_bytes(),
+        ironwire_core::token_capture::augment_chat(ADMISSION_REQUEST.as_bytes(), 20).unwrap()
+    );
+    let now = chrono::Utc::now().timestamp();
+    let captures = spool.list("capture-session", now).unwrap();
+    assert_eq!(captures.len(), 1);
+    let lease = spool
+        .acquire(
+            "capture-session",
+            &[captures[0].capture_id.clone()],
+            "commons",
+            now,
+            300,
+        )
+        .unwrap();
+    let (request, response) = spool
+        .read(&lease.lease_id, &lease.owner, &captures[0].capture_id, now)
+        .unwrap();
+    assert_eq!(request, sent.as_bytes());
+    assert_eq!(response, ADMISSION_SSE.as_bytes());
+    let unauthenticated = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/_ironwire/token-captures")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"operation":"list","session":"capture-session"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn token_capture_uses_response_format_and_stops_augmenting_a_full_spool() {
+    use ironwire_core::config::{TokenCaptureConfig, TokenCaptureTarget};
+    const JSON: &str = r#"{"id":"json-fixture","choices":[{"index":0,"message":{"content":"blue"},"finish_reason":"stop","logprobs":{"content":[{"bytes":[98,108,117,101],"logprob":-1.0,"top_logprobs":[]}]}}]}"#;
+    for full in [false, true] {
+        let (base, received) = spawn_mock_content(JSON, "application/json").await;
+        let home = tempfile::tempdir().unwrap();
+        let spool = Arc::new(
+            ironwire_ledger::token_spool::TokenSpool::open(home.path(), 1024, 86400).unwrap(),
+        );
+        let now = chrono::Utc::now().timestamp();
+        if full {
+            spool
+                .record(
+                    "other",
+                    1,
+                    "openai.chat",
+                    false,
+                    (&vec![0; 512], &vec![1; 512]),
+                    now,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            spool.can_accept_capture("capture-session", 100).unwrap(),
+            !full
+        );
+        let model: serde_json::Value = serde_json::from_str(ADMISSION_REQUEST).unwrap();
+        let mut config = Config::default();
+        config.capture.token_capture = Some(TokenCaptureConfig {
+            targets: vec![TokenCaptureTarget {
+                backend: "nearai".into(),
+                model: model["model"].as_str().unwrap().into(),
+            }],
+            ..Default::default()
+        });
+        let state = admission_state_with(&[("nearai", &base)], config)
+            .with_ledger(Some(ironwire_ledger::Ledger::in_memory().unwrap()))
+            .with_token_spool(Some(spool.clone()));
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/openai/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("session-id", "capture-session")
+                    .body(Body::from(ADMISSION_REQUEST))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+            JSON
+        );
+        let sent: serde_json::Value =
+            serde_json::from_str(&received.lock().unwrap().as_ref().unwrap().body).unwrap();
+        let captures = spool.list("capture-session", now).unwrap();
+        if full {
+            assert!(sent.get("logprobs").is_none());
+            assert!(captures.is_empty());
+        } else {
+            assert_eq!(sent["logprobs"], true);
+            assert_eq!(captures.len(), 1);
+            assert!(!captures[0].streaming);
+        }
+    }
 }
