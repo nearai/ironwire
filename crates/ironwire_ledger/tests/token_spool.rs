@@ -346,7 +346,7 @@ fn exclusive_file_handles_fail_closed_without_replacing_the_database() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("spool");
     let spool = TokenSpool::open(&root, 1024, 100).unwrap();
-    let id = spool.store_id().to_owned();
+    let id = spool.store_id().unwrap();
     drop(spool);
     let held = std::fs::OpenOptions::new()
         .read(true)
@@ -355,5 +355,11 @@ fn exclusive_file_handles_fail_closed_without_replacing_the_database() {
         .unwrap();
     assert!(TokenSpool::open(&root, 1024, 100).is_err());
     drop(held);
-    assert_eq!(TokenSpool::open(&root, 1024, 100).unwrap().store_id(), id);
+    assert_eq!(
+        TokenSpool::open(&root, 1024, 100)
+            .unwrap()
+            .store_id()
+            .unwrap(),
+        id
+    );
 }
