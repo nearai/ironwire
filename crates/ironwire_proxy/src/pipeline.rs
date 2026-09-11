@@ -556,12 +556,22 @@ async fn dispatch_inner(
             })
             .zip(state.token_spool.as_ref())
             .and_then(|(config, store)| {
-                ironwire_core::token_capture::augment_chat(&request.body, config.top_k).map(
-                    |bytes| {
+                match ironwire_core::token_capture::augment_chat(&request.body, config.top_k) {
+                    Some(bytes) => {
                         request.body = Bytes::from(bytes);
-                        (store.clone(), upstream_protocol.to_string(), peek.stream)
-                    },
-                )
+                        Some((store.clone(), upstream_protocol.to_string(), peek.stream))
+                    }
+                    None => {
+                        if let Some(session) = session.as_ref() {
+                            let _ = store.note_absence(
+                                session,
+                                &ironwire_ledger::token_spool::SpoolError::Invalid,
+                                Utc::now().timestamp(),
+                            );
+                        }
+                        None
+                    }
+                }
             });
 
         if binding
@@ -1493,23 +1503,27 @@ impl LedgerContext {
                 None
             }
         };
-        if let (Some(id), Some(capture), Some(session), Some((request, response))) = (
-            recorded,
-            self.capture.as_ref(),
-            exchange.client_session_id.as_ref(),
-            captured.as_ref(),
-        ) && let Some((spool, protocol, streaming)) = &capture.token_target
-            && let Err(error) = spool.record(
-                session,
-                id,
-                protocol,
-                *streaming,
-                (request, response),
-                chrono::Utc::now().timestamp(),
-            )
+        if let (Some(capture), Some(session)) =
+            (self.capture.as_ref(), exchange.client_session_id.as_ref())
+            && let Some((spool, protocol, streaming)) = &capture.token_target
         {
-            let _ = spool.note_absence(session, &error, chrono::Utc::now().timestamp());
-            tracing::debug!(%error,"detailed capture unavailable for completed exchange");
+            let result = match (recorded, captured.as_ref()) {
+                (Some(id), Some((request, response))) => spool
+                    .record(
+                        session,
+                        id,
+                        protocol,
+                        *streaming,
+                        (request, response),
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .map(|_| ()),
+                _ => Err(ironwire_ledger::token_spool::SpoolError::Unavailable),
+            };
+            if let Err(error) = result {
+                let _ = spool.note_absence(session, &error, chrono::Utc::now().timestamp());
+                tracing::debug!(%error,"detailed capture unavailable for completed exchange");
+            }
         }
         // The rolling window. Only ever rotates rows that are already in the
         // ledger, which means exchanges whose response finished -- an in-flight
