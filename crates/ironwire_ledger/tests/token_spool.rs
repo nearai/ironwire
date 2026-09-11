@@ -302,12 +302,12 @@ $ErrorActionPreference = 'Stop'
 $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $paths = @((Get-Item -LiteralPath $env:IRONWIRE_TEST_ROOT)) + @(Get-ChildItem -LiteralPath $env:IRONWIRE_TEST_ROOT)
 foreach ($item in $paths) {
-  $acl = Get-Acl -LiteralPath $item.FullName
+  $acl = $item.GetAccessControl()
   foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
     if ($rule.IdentityReference.Value -ne $sid) { exit 2 }
   }
 }
-if (!(Get-Acl -LiteralPath $env:IRONWIRE_TEST_ROOT).AreAccessRulesProtected) { exit 3 }
+if (!(Get-Item -LiteralPath $env:IRONWIRE_TEST_ROOT -Force).GetAccessControl().AreAccessRulesProtected) { exit 3 }
 "#;
     assert!(
         std::process::Command::new("powershell.exe")
@@ -317,4 +317,43 @@ if (!(Get-Acl -LiteralPath $env:IRONWIRE_TEST_ROOT).AreAccessRulesProtected) { e
             .unwrap()
             .success()
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn raw_spool_refuses_directory_junctions() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("link");
+    std::fs::create_dir(&target).unwrap();
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(TokenSpool::open(&link, 1024, 100).is_err());
+    assert!(TokenSpool::open(&link.join("nested"), 1024, 100).is_err());
+    assert!(!target.join("spool.sqlite").exists());
+    std::fs::remove_dir(link).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn exclusive_file_handles_fail_closed_without_replacing_the_database() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("spool");
+    let spool = TokenSpool::open(&root, 1024, 100).unwrap();
+    let id = spool.store_id().to_owned();
+    drop(spool);
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(root.join("spool.sqlite"))
+        .unwrap();
+    assert!(TokenSpool::open(&root, 1024, 100).is_err());
+    drop(held);
+    assert_eq!(TokenSpool::open(&root, 1024, 100).unwrap().store_id(), id);
 }
