@@ -490,6 +490,39 @@ pub struct LogView {
     pub last_24h: Summary,
 }
 
+/// Query for `GET /_ironwire/summary`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SummaryQuery {
+    /// Start of the window, RFC 3339 (the `Z` form, or a percent-encoded
+    /// offset -- see [`LogQuery::since`]). Defaults to 24 hours ago.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// What `GET /_ironwire/summary` returns: calls, cost and proof status per
+/// model and backend, and the routed/outside split.
+///
+/// "Routed" means served by a backend that signs its answers (NEAR AI), where
+/// a proof can exist; "outside" means anything else. Only
+/// `proof.verified` counts as proof -- see `ironwire_ledger::proof`.
+///
+/// There is no kind-of-work breakdown: nothing in IronWire classifies work,
+/// so every group's `work_kind` is `null` rather than a guess.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryView {
+    /// Whether local capture is on at all. When it is off everything below is
+    /// empty, which is not the same as "no calls".
+    pub enabled: bool,
+    /// Whether receipt checks are on (`capture.receipts`). When off, routed
+    /// calls stay `pending`.
+    pub receipts: bool,
+    /// The window's start, as applied.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// The rollup.
+    #[serde(flatten)]
+    pub summary: ironwire_ledger::ProofSummary,
+}
+
 /// Routes for the control API.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -510,6 +543,7 @@ pub fn router() -> Router<AppState> {
         .route("/tools", post(tools))
         .route("/probe", post(probe))
         .route("/log", get(log))
+        .route("/summary", get(summary))
         .route("/events", get(events))
         .route("/health", get(health))
 }
@@ -1571,6 +1605,41 @@ async fn log(
         last_24h,
     })
     .into_response()
+}
+
+async fn summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SummaryQuery>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let since = query
+        .since
+        .unwrap_or_else(|| ironwire_ledger::proof::default_window_start(chrono::Utc::now()));
+    let receipts = state.config.capture.receipts;
+    let Some(ledger) = state.ledger.as_ref() else {
+        return axum::Json(SummaryView {
+            enabled: false,
+            receipts,
+            since,
+            summary: ironwire_ledger::ProofSummary::default(),
+        })
+        .into_response();
+    };
+    match ledger.proof_summary(since) {
+        Ok(summary) => axum::Json(SummaryView {
+            enabled: true,
+            receipts,
+            since,
+            summary,
+        })
+        .into_response(),
+        // A failed read is not an empty window. Saying "no calls" here would
+        // be an invented number.
+        Err(error) => server_error(error.to_string()),
+    }
 }
 
 /// Constant-time-ish token check. The token is a local file, so this is a guard

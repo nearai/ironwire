@@ -165,6 +165,21 @@ pub struct CaptureConfig {
     /// Detailed evidence capture. Separate consent from aggregate logprobs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_capture: Option<TokenCaptureConfig>,
+    /// Look up each NEAR AI exchange's receipt after it completes, and record
+    /// whether it proves which model answered (`ironwire_proxy::proof`).
+    /// `false` -- the default -- leaves those rows `pending`.
+    ///
+    /// Off by default because it makes a network call the exchange itself did
+    /// not: a `GET` per NEAR AI exchange, to NEAR AI, with the user's NEAR AI
+    /// key, naming the response id. The provider already served the call, so
+    /// it learns that the call is being checked and nothing else. It runs off
+    /// the response path and cannot delay or change an answer.
+    ///
+    /// Needs `enabled`, and in practice `bodies`: a receipt is checked against
+    /// the digests of the bytes that crossed the wire, and those are only
+    /// taken while bodies are captured. Without them every row settles
+    /// `unavailable`.
+    pub receipts: bool,
 }
 
 impl Default for CaptureConfig {
@@ -175,6 +190,7 @@ impl Default for CaptureConfig {
             retain_days: 90,
             logprobs: false,
             token_capture: None,
+            receipts: false,
         }
     }
 }
@@ -1345,6 +1361,15 @@ mod tests {
         assert!(!cfg.capture.bodies, "bodies contain user source code");
     }
 
+    /// Checking receipts is a network call the exchange itself did not make,
+    /// so it is something a user turns on, not something they find on.
+    #[test]
+    fn receipt_checks_are_off_by_default() {
+        assert!(!Config::default().capture.receipts);
+        let cfg = load("[capture]\nreceipts = true\n").expect("parses");
+        assert!(cfg.capture.receipts);
+    }
+
     #[test]
     fn config_round_trips() {
         let cfg = Config {
@@ -1358,6 +1383,7 @@ mod tests {
                 retain_days: 30,
                 logprobs: true,
                 token_capture: None,
+                receipts: true,
             },
             usage: UsageConfig {
                 enabled: true,

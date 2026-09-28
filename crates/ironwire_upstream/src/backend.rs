@@ -327,6 +327,31 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Whether this backend signs its answers, so that an exchange it served
+    /// can later be checked against a receipt ([`Self::fetch_receipt`]).
+    ///
+    /// Decides whether a ledger row starts `pending` or `outside`. Default
+    /// `false`.
+    fn offers_receipts(&self) -> bool {
+        false
+    }
+
+    /// Fetch the provider's receipt for the response it identified as
+    /// `upstream_id`, served by `model`.
+    ///
+    /// Default [`crate::receipt::ReceiptFetch::NotOffered`]: only a provider
+    /// that signs its answers has anything to fetch. Never called on the
+    /// response path -- a receipt is looked up after the exchange is recorded
+    /// (`ironwire_proxy::proof`) -- and the credential goes only to this
+    /// backend's own host, exactly as for [`Self::send`].
+    async fn fetch_receipt(
+        &self,
+        _upstream_id: &str,
+        _model: &str,
+    ) -> crate::receipt::ReceiptFetch {
+        crate::receipt::ReceiptFetch::NotOffered
+    }
+
     /// Verify this backend actually works, right now, over the network.
     ///
     /// `ironwire doctor` calls this because a config that parses and a

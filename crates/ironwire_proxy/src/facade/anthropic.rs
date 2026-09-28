@@ -184,6 +184,7 @@ async fn forward(
     // capacity gets a longer stall timeout and no price.
     let backend_is_local = backend.kind() == ironwire_core::protocol::BackendKind::Local;
     let backend_is_metered = backend.kind().is_metered();
+    let backend_offers_receipts = backend.offers_receipts();
 
     // The observation closure runs when the stream ends *or is dropped*, so
     // both quota accounting and the ledger entry survive a cancelled request.
@@ -199,6 +200,7 @@ async fn forward(
         backend: routed.decision.backend.to_string(),
         backend_is_local,
         backend_is_metered,
+        backend_offers_receipts,
         requested_model: peek.requested_model.clone(),
         rung: format!("{:?}", routed.decision.rung).to_lowercase(),
         attempts: routed.attempts,
