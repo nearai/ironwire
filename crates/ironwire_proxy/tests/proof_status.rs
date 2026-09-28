@@ -54,6 +54,9 @@ struct Seen {
     digests: Option<(String, String)>,
     /// Every signature request: (id, query, authorization header).
     lookups: Vec<(String, std::collections::HashMap<String, String>, String)>,
+    /// Answer 404 for this many hosted lookups first, as a provider that has
+    /// not written its record yet would.
+    lag: usize,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -75,12 +78,15 @@ async fn signature(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let digests = {
+    let (digests, lagging) = {
         let mut seen = seen.lock().expect("lock");
         seen.lookups.push((id.clone(), query, auth));
-        seen.digests.clone()
+        let lagging = seen.lag > 0;
+        seen.lag = seen.lag.saturating_sub(1);
+        (seen.digests.clone(), lagging)
     };
     match id.as_str() {
+        HOSTED_ID if lagging => StatusCode::NOT_FOUND.into_response(),
         HOSTED_ID => {
             let (request, response) = digests.expect("a completion was served first");
             let text = format!("{MODEL}:{request}:{response}");
@@ -116,6 +122,7 @@ async fn fake_near() -> (String, Shared) {
 
 struct Vouches(Vec<String>);
 
+#[async_trait::async_trait]
 impl SignerAttestor for Vouches {
     async fn model_keys(&self, _backend: &str, _model: &str) -> Attestation {
         Attestation::Keys(self.0.clone())
@@ -337,17 +344,17 @@ async fn retries_are_bounded_and_no_receipt_is_not_a_failure() {
     let flaky = ledger
         .record(&row("nearai", FLAKY_ID, ProofStatus::Pending))
         .expect("records");
-    let settings = ProofSettings {
-        max_attempts: 3,
-        ..ProofSettings::default()
-    };
+    let settings = ProofSettings::default().with_max_attempts(3);
     let vouches = Vouches(vec![enclave_public()]);
 
-    let first = run_once(&ledger, &registry, &vouches, &settings).await;
-    assert_eq!(first.settled, vec![(brokered, ProofStatus::Unavailable)]);
-    assert_eq!(first.deferred, vec![flaky]);
+    // A 404 is looked at once more, a round later, before it is believed.
+    let mut first = run_once(&ledger, &registry, &vouches, &settings).await;
+    first.deferred.sort_unstable();
+    assert!(first.settled.is_empty());
+    assert_eq!(first.deferred, vec![brokered, flaky]);
 
     let second = run_once(&ledger, &registry, &vouches, &settings).await;
+    assert_eq!(second.settled, vec![(brokered, ProofStatus::Unavailable)]);
     assert_eq!(second.deferred, vec![flaky]);
     let third = run_once(&ledger, &registry, &vouches, &settings).await;
     assert_eq!(third.settled, vec![(flaky, ProofStatus::Unavailable)]);
@@ -363,6 +370,14 @@ async fn retries_are_bounded_and_no_receipt_is_not_a_failure() {
         .filter(|(id, ..)| id == FLAKY_ID)
         .count();
     assert_eq!(flaky_lookups, 3, "exactly the retry budget, no more");
+    let brokered_lookups = seen
+        .lock()
+        .expect("lock")
+        .lookups
+        .iter()
+        .filter(|(id, ..)| id == BROKERED_ID)
+        .count();
+    assert_eq!(brokered_lookups, 2, "one grace look at a 404, no more");
 }
 
 /// A backend that signs nothing is never asked, whatever its rows say.
@@ -488,4 +503,197 @@ async fn the_summary_needs_the_control_token() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = control(seeded(), "/_ironwire/summary", Some("wrong")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---- digests without bodies ---------------------------------------------
+
+/// The request and response bodies of a real NEAR AI exchange, captured on
+/// 2026-09-01 from `qwen3-6-27b.completions.near.ai`, with the `text` of the
+/// receipt the enclave returned for them. The newer ed25519 captures carry a
+/// receipt but not the bodies, so this is the one capture that pins what the
+/// two hashes are *of*: the raw request bytes as sent and the raw response
+/// bytes as received -- not `message.content`, which here is `null`.
+const LIVE_REQUEST_B64: &str = "eyJtb2RlbCI6IlF3ZW4vUXdlbjMuNi0yN0ItRlA4IiwibWVzc2FnZXMiOlt7InJvbGUiOiJ1c2VyIiwiY29udGVudCI6ImhpIn1dLCJtYXhfdG9rZW5zIjoxNiwic3RyZWFtIjpmYWxzZX0=";
+const LIVE_RESPONSE_B64: &str = "eyJjaG9pY2VzIjpbeyJmaW5pc2hfcmVhc29uIjoibGVuZ3RoIiwiaW5kZXgiOjAsImxvZ3Byb2JzIjpudWxsLCJtZXNzYWdlIjp7ImNvbnRlbnQiOm51bGwsInJlYXNvbmluZ19jb250ZW50IjoiSGVyZSdzIGEgdGhpbmtpbmcgcHJvY2VzczpcblxuMS4gICoqQW5hbHl6ZSBVc2VyIElucHV0OioqIiwicm9sZSI6ImFzc2lzdGFudCJ9fV0sImNyZWF0ZWQiOjE3ODgyOTI2MTcsImlkIjoiYzU0OTYxYWIxZDU5NGNmNTkxZTU1NjZjYWEyMTE5NmIiLCJtb2RlbCI6IlF3ZW4vUXdlbjMuNi0yN0ItRlA4Iiwib2JqZWN0IjoiY2hhdC5jb21wbGV0aW9uIiwidXNhZ2UiOnsiY29tcGxldGlvbl90b2tlbnMiOjE2LCJwcm9tcHRfdG9rZW5zIjoxMSwicHJvbXB0X3Rva2Vuc19kZXRhaWxzIjpudWxsLCJyZWFzb25pbmdfdG9rZW5zIjoxNiwidG90YWxfdG9rZW5zIjoyN319";
+const LIVE_RECEIPT_TEXT: &str = "Qwen/Qwen3.6-27B-FP8:92a1a2fd9a1b5e9138e7a99f741f0b7ec9e457a7874b429df9b5c64b2f49eafd:52d2225b7a0004e880b701419b28a89e7df956a32918c76fb53a89e0c39de675";
+
+/// Both capture modes, fed the live bytes in awkward chunks, produce exactly
+/// the digests the enclave signed.
+#[tokio::test]
+async fn the_digests_are_the_ones_a_live_receipt_signs() {
+    use base64::Engine as _;
+    use futures_util::StreamExt as _;
+    use ironwire_proxy::pipeline::{Capture, capture_stream};
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let request = engine.decode(LIVE_REQUEST_B64).expect("request");
+    let response = engine.decode(LIVE_RESPONSE_B64).expect("response");
+    let mut parts = LIVE_RECEIPT_TEXT.split(':').skip(1);
+    let (signed_request, signed_response) = (
+        parts.next().expect("request hash"),
+        parts.next().expect("response hash"),
+    );
+
+    for capture in [
+        Capture::digest_only(&request),
+        Capture::of_request(bytes::Bytes::from(request.clone())),
+    ] {
+        let chunks: Vec<Result<bytes::Bytes, ironwire_upstream::backend::UpstreamError>> = response
+            .chunks(7)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let mut streamed = Box::pin(capture_stream(futures_util::stream::iter(chunks), &capture));
+        let mut forwarded = Vec::new();
+        while let Some(chunk) = streamed.next().await {
+            forwarded.extend_from_slice(&chunk.expect("chunk"));
+        }
+        assert_eq!(forwarded, response, "the tee forwards every byte untouched");
+        assert_eq!(capture.request_sha256(), signed_request);
+        assert_eq!(capture.response_sha256().as_deref(), Some(signed_response));
+    }
+    // Digest-only keeps nothing.
+    let capture = Capture::digest_only(&request);
+    assert!(capture.request().is_none());
+}
+
+/// `capture.receipts` with bodies off: the row gets both digests, no body
+/// reference, and still settles `verified`.
+#[tokio::test]
+async fn receipts_without_body_capture_still_reach_verified() {
+    let (base, _seen) = fake_near().await;
+    let ledger = Ledger::in_memory().expect("ledger");
+    let registry = registry(&base);
+    let mut config = Config::default();
+    config.capture.receipts = true;
+    let state = AppState::new(
+        registry.clone(),
+        config,
+        ConsentLedger::default(),
+        "test-token".to_string(),
+    )
+    .with_ledger(Some(ledger.clone()));
+    assert!(state.bodies.is_none());
+
+    let response = app(state).oneshot(chat_request()).await.expect("answers");
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+    let recorded = first_row(&ledger).await;
+    assert!(recorded.request_sha256.is_some() && recorded.response_sha256.is_some());
+    assert_eq!(recorded.body_ref, None, "no body was kept");
+
+    run_once(
+        &ledger,
+        &registry,
+        &Vouches(vec![enclave_public()]),
+        &ProofSettings::default(),
+    )
+    .await;
+    assert_eq!(
+        ledger.recent(1).expect("reads")[0].proof,
+        Some(ProofStatus::Verified)
+    );
+}
+
+/// A receipt that is not there yet on the first look is found on the second.
+#[tokio::test]
+async fn a_receipt_that_lags_the_answer_is_still_found() {
+    let (base, seen) = fake_near().await;
+    seen.lock().expect("lock").lag = 1;
+    let ledger = Ledger::in_memory().expect("ledger");
+    let registry = registry(&base);
+    let mut config = Config::default();
+    config.capture.receipts = true;
+    let state = AppState::new(
+        registry.clone(),
+        config,
+        ConsentLedger::default(),
+        "test-token".to_string(),
+    )
+    .with_ledger(Some(ledger.clone()));
+    let response = app(state).oneshot(chat_request()).await.expect("answers");
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+    first_row(&ledger).await;
+
+    let vouches = Vouches(vec![enclave_public()]);
+    let first = run_once(&ledger, &registry, &vouches, &ProofSettings::default()).await;
+    assert!(first.settled.is_empty(), "a first 404 is not believed");
+    run_once(&ledger, &registry, &vouches, &ProofSettings::default()).await;
+    assert_eq!(
+        ledger.recent(1).expect("reads")[0].proof,
+        Some(ProofStatus::Verified)
+    );
+}
+
+/// The embedding path end to end: a host supplies the attestor and nothing
+/// else, bodies stay off, and the row reaches `verified` while no body file is
+/// ever written under the home.
+#[tokio::test]
+async fn an_embedding_host_supplies_the_attestor_and_no_body_is_written() {
+    use ironwire_proxy::embed::{EmbedOptions, StartupProbes, UpdateChecks, start_with_options};
+
+    let (base, _seen) = fake_near().await;
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[updates]\ncheck = false\n[[backends]]\nid = 'nearai'\nkind = 'nearai'\n\
+             base_url = '{base}'\nmodels = ['{MODEL}']\n"
+        ),
+    )
+    .expect("config");
+    let options = EmbedOptions::default()
+        .with_startup_probes(StartupProbes::Off)
+        .with_update_checks(UpdateChecks::Off)
+        .with_credentials(|name: &str| {
+            (name == "NEARAI_API_KEY").then(|| SecretString::from("near-key".to_string()))
+        })
+        .with_signer_attestor(Arc::new(Vouches(vec![enclave_public()])))
+        .with_proof_settings(
+            ProofSettings::default().with_period(std::time::Duration::from_millis(50)),
+        );
+    let proxy = start_with_options(home.path(), Some(0), options, |_, _| {})
+        .await
+        .expect("starts");
+    let port = proxy.port();
+    let token = std::fs::read_to_string(home.path().join("control.token")).expect("token");
+    let client = reqwest::Client::new();
+
+    let answer = client
+        .post(format!(
+            "http://127.0.0.1:{port}/openai/v1/chat/completions"
+        ))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"model":"{MODEL}","messages":[{{"role":"user","content":"hi"}}]}}"#
+        ))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(answer.status(), 200);
+    assert_eq!(answer.text().await.expect("body"), response_body());
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let label = loop {
+        let view: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/_ironwire/log?limit=1"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .expect("log")
+            .json()
+            .await
+            .expect("json");
+        let label = view["exchanges"][0]["proof"].as_str().map(str::to_string);
+        if label.as_deref() == Some("verified") || tokio::time::Instant::now() > deadline {
+            break label;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    proxy.shutdown().await;
+    assert_eq!(label.as_deref(), Some("verified"));
+
+    let bodies = home.path().join("bodies");
+    let written = std::fs::read_dir(&bodies)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(written, 0, "bodies are off, so nothing is written");
 }

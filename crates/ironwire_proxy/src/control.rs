@@ -492,6 +492,7 @@ pub struct LogView {
 
 /// Query for `GET /_ironwire/summary`.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct SummaryQuery {
     /// Start of the window, RFC 3339 (the `Z` form, or a percent-encoded
     /// offset -- see [`LogQuery::since`]). Defaults to 24 hours ago.
@@ -509,6 +510,7 @@ pub struct SummaryQuery {
 /// There is no kind-of-work breakdown: nothing in IronWire classifies work,
 /// so every group's `work_kind` is `null` rather than a guess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SummaryView {
     /// Whether local capture is on at all. When it is off everything below is
     /// empty, which is not the same as "no calls".

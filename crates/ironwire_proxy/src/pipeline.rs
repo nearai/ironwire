@@ -610,10 +610,19 @@ async fn dispatch_inner(
         // Cloned before the request moves into the backend, because these are
         // the bytes the upstream will hash: `send` puts `request.body` on the
         // wire unchanged. Cheap -- `Bytes` is refcounted.
+        //
+        // With `capture.receipts` on and bodies off, only the digests are
+        // taken -- and only for a backend that signs its answers, since a
+        // digest is worth nothing without a receipt to check it against.
         let mut capture = if state.bodies.is_some() || token_target.is_some() {
             let mut capture = Capture::of_request(request.body.clone());
             capture.token_target = token_target;
             Some(capture)
+        } else if state.ledger.is_some()
+            && state.config.capture.receipts
+            && backend.offers_receipts()
+        {
+            Some(Capture::digest_only(&request.body))
         } else {
             None
         };
@@ -1110,15 +1119,16 @@ pub fn strip_unsupported_tools(
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
 }
 
-/// Largest body we will hold in memory to capture it.
+/// Largest body we will hold in memory to keep it.
 ///
-/// Above this we capture nothing rather than a prefix: the whole value of a
-/// captured body is that its digest matches the one a provider signed, and the
-/// digest of the first 32 MiB of a body is not a smaller answer, it is a wrong
-/// one that reads as tampering.
+/// Above this we keep nothing rather than a prefix: a stored body is only
+/// worth having whole. The *digest* is not bounded by this -- it is taken as
+/// the bytes stream past, so an oversized body still gets an honest digest and
+/// simply has no stored copy.
 const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 
-/// The bodies one exchange put on the wire, held for the ledger.
+/// The bodies one exchange put on the wire, held -- or only hashed -- for the
+/// ledger.
 ///
 /// Both halves are the *upstream* bytes, which is the only pair a receipt is
 /// about: the request after any model override, privacy substitution or
@@ -1126,45 +1136,105 @@ const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 /// privacy reverser. On a translated route the client's own bytes are a
 /// different document entirely, and hashing those would fail against every
 /// receipt while looking exactly like tampering.
+///
+/// The digest is SHA-256 over exactly those bytes, lowercase hex -- for a
+/// streamed response, over the raw concatenated event stream. That is the
+/// definition a NEAR AI receipt's `text` uses, pinned against a live capture in
+/// `tests/proof_status.rs`.
+///
+/// Two modes. [`Self::of_request`] keeps the bytes as well, for
+/// `capture.bodies` and token capture. [`Self::digest_only`] keeps nothing but
+/// the two digests, for `capture.receipts` with bodies off: the response is
+/// hashed as it streams and never accumulated, so nothing of the user's
+/// content outlives the exchange in this process or on disk.
 #[derive(Clone)]
 pub struct Capture {
-    /// Exactly the bytes handed to the backend.
-    pub request: Bytes,
-    /// Exactly the bytes the backend returned -- `None` until the response
-    /// stream has been read to its end, and still `None` if it never was.
+    /// Exactly the bytes handed to the backend, when bodies are kept.
+    request: Option<Bytes>,
+    /// Digest of those bytes, taken up front.
+    request_sha256: String,
+    /// Whether the response bytes are accumulated as well as hashed.
+    keep_bodies: bool,
+    /// The response, once its stream has been read cleanly to its end.
     ///
-    /// A cancelled, restarted or oversized response leaves this empty on
+    /// A cancelled, restarted or failed response leaves this empty on
     /// purpose. There is no honest digest of a response that did not finish.
-    response: Arc<std::sync::Mutex<Option<Bytes>>>,
+    response: Arc<std::sync::Mutex<Option<CapturedResponse>>>,
     token_target: Option<(Arc<ironwire_ledger::token_spool::TokenSpool>, String, bool)>,
 }
 
 impl std::fmt::Debug for Capture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Capture")
-            .field("complete", &self.response().is_some())
+            .field("complete", &self.response_sha256().is_some())
             .finish_non_exhaustive()
     }
 }
 
+#[derive(Clone)]
+struct CapturedResponse {
+    sha256: String,
+    /// `None` in digest-only mode, and when the body outgrew
+    /// [`MAX_CAPTURE_BYTES`].
+    bytes: Option<Bytes>,
+}
+
 impl Capture {
-    /// Start capturing, given the request bytes about to be sent.
+    /// Keep the bodies and their digests, given the request bytes about to be
+    /// sent.
     #[must_use]
     pub fn of_request(request: Bytes) -> Self {
         Self {
-            request,
+            request_sha256: ironwire_ledger::bodies::sha256_hex(&request),
+            request: Some(request),
+            keep_bodies: true,
             response: Arc::new(std::sync::Mutex::new(None)),
             token_target: None,
         }
     }
 
-    /// The response bytes, once the stream finished cleanly.
+    /// Keep only the digests. The request bytes are hashed here and not held.
     #[must_use]
-    pub fn response(&self) -> Option<Bytes> {
+    pub fn digest_only(request: &[u8]) -> Self {
+        Self {
+            request_sha256: ironwire_ledger::bodies::sha256_hex(request),
+            request: None,
+            keep_bodies: false,
+            response: Arc::new(std::sync::Mutex::new(None)),
+            token_target: None,
+        }
+    }
+
+    /// The request bytes, when this capture keeps bodies.
+    #[must_use]
+    pub fn request(&self) -> Option<&Bytes> {
+        self.request.as_ref()
+    }
+
+    /// Digest of the request bytes.
+    #[must_use]
+    pub fn request_sha256(&self) -> &str {
+        &self.request_sha256
+    }
+
+    fn finished(&self) -> Option<CapturedResponse> {
         match self.response.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// The response bytes, once the stream finished cleanly and when they
+    /// were kept.
+    #[must_use]
+    pub fn response(&self) -> Option<Bytes> {
+        self.finished()?.bytes
+    }
+
+    /// Digest of the response bytes, once the stream finished cleanly.
+    #[must_use]
+    pub fn response_sha256(&self) -> Option<String> {
+        Some(self.finished()?.sha256)
     }
 }
 
@@ -1184,17 +1254,17 @@ where
 {
     struct Tee<S> {
         inner: S,
-        buffer: Vec<u8>,
-        /// Set once the body outgrew `MAX_CAPTURE_BYTES`, or the stream
-        /// yielded an error; from then on nothing is accumulated and nothing
-        /// will be recorded.
+        digest: ironwire_ledger::bodies::StreamingSha256,
+        /// The bytes so far, while they are being kept at all.
+        buffer: Option<Vec<u8>>,
+        /// Set once the stream yielded an error; from then on nothing will be
+        /// recorded.
         ///
-        /// The error case needs its own latch because a failed stream still
-        /// ends in `Ready(None)` afterwards, which would otherwise look
-        /// exactly like a clean finish and put the digest of half a response
-        /// on the row.
+        /// Needs its own latch because a failed stream still ends in
+        /// `Ready(None)` afterwards, which would otherwise look exactly like a
+        /// clean finish and put the digest of half a response on the row.
         spoiled: bool,
-        sink: Arc<std::sync::Mutex<Option<Bytes>>>,
+        sink: Arc<std::sync::Mutex<Option<CapturedResponse>>>,
     }
 
     impl<S> Stream for Tee<S>
@@ -1210,27 +1280,34 @@ where
             let this = self.get_mut();
             let polled = std::pin::Pin::new(&mut this.inner).poll_next(cx);
             match &polled {
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    if !this.spoiled {
-                        if this.buffer.len().saturating_add(chunk.len()) > MAX_CAPTURE_BYTES {
-                            this.spoiled = true;
-                            this.buffer = Vec::new();
+                std::task::Poll::Ready(Some(Ok(chunk))) if !this.spoiled => {
+                    this.digest.update(chunk);
+                    if let Some(buffer) = this.buffer.as_mut() {
+                        if buffer.len().saturating_add(chunk.len()) > MAX_CAPTURE_BYTES {
+                            // Too big to keep; still hashed.
+                            this.buffer = None;
                         } else {
-                            this.buffer.extend_from_slice(chunk);
+                            buffer.extend_from_slice(chunk);
                         }
                     }
                 }
                 std::task::Poll::Ready(Some(Err(_))) => {
                     this.spoiled = true;
-                    this.buffer = Vec::new();
+                    this.buffer = None;
                 }
                 // A clean end, and only a clean end. An error mid-stream leaves
                 // the capture empty for the same reason a drop does.
                 std::task::Poll::Ready(None) if !this.spoiled => {
-                    let body = Bytes::from(std::mem::take(&mut this.buffer));
+                    // Latch, so a stream polled again after its end cannot
+                    // record a second, different answer.
+                    this.spoiled = true;
+                    let finished = CapturedResponse {
+                        sha256: std::mem::take(&mut this.digest).finish_hex(),
+                        bytes: this.buffer.take().map(Bytes::from),
+                    };
                     match this.sink.lock() {
-                        Ok(mut guard) => *guard = Some(body),
-                        Err(poisoned) => *poisoned.into_inner() = Some(body),
+                        Ok(mut guard) => *guard = Some(finished),
+                        Err(poisoned) => *poisoned.into_inner() = Some(finished),
                     }
                 }
                 _ => {}
@@ -1241,7 +1318,8 @@ where
 
     Tee {
         inner,
-        buffer: Vec::new(),
+        digest: ironwire_ledger::bodies::StreamingSha256::new(),
+        buffer: capture.keep_bodies.then(Vec::new),
         spoiled: false,
         sink: Arc::clone(&capture.response),
     }
@@ -1348,6 +1426,7 @@ pub fn record(backend: &Arc<dyn Backend>, observation: &Observation) {
 /// when the client disconnects early, so an abandoned request is still on the
 /// record with whatever the provider had already reported.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LedgerContext {
     /// When the request arrived.
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -1443,13 +1522,21 @@ impl LedgerContext {
         // Both halves or neither. A request digest on a row with no response
         // digest invites the reader to check half a receipt against a body
         // that finished somewhere we did not see.
-        let captured = self
+        let digests = self.capture.as_ref().and_then(|capture| {
+            Some((
+                capture.request_sha256().to_string(),
+                capture.response_sha256()?,
+            ))
+        });
+        // Bodies only when both halves were kept and there is a store to put
+        // them in. A digest-only capture has neither, by design.
+        let kept = self
             .capture
             .as_ref()
-            .and_then(|capture| Some((capture.request.clone(), capture.response()?)));
-        let (request_sha256, response_sha256, body_ref) = match (&captured, &self.bodies) {
-            (Some((request, response)), Some(store)) => {
-                let body_ref = match store.store(request, response) {
+            .and_then(|capture| Some((capture.request()?.clone(), capture.response()?)));
+        let body_ref = match (&digests, &kept, &self.bodies) {
+            (Some(_), Some((request, response)), Some(store)) => {
+                match store.store(request, response) {
                     Ok(reference) => Some(reference),
                     Err(error) => {
                         // The digests are still true, and are what a receipt is
@@ -1458,14 +1545,13 @@ impl LedgerContext {
                         tracing::debug!(%error, "could not write the captured bodies");
                         None
                     }
-                };
-                (
-                    Some(ironwire_ledger::bodies::sha256_hex(request)),
-                    Some(ironwire_ledger::bodies::sha256_hex(response)),
-                    body_ref,
-                )
+                }
             }
-            _ => (None, None, None),
+            _ => None,
+        };
+        let (request_sha256, response_sha256) = match digests {
+            Some((request, response)) => (Some(request), Some(response)),
+            None => (None, None),
         };
         let exchange = Exchange {
             // Assigned by SQLite on insert; an exchange on its way in has none.
@@ -1538,7 +1624,7 @@ impl LedgerContext {
             (self.capture.as_ref(), exchange.client_session_id.as_ref())
             && let Some((spool, protocol, streaming)) = &capture.token_target
         {
-            let result = match (recorded, captured.as_ref()) {
+            let result = match (recorded, kept.as_ref()) {
                 (Some(id), Some((request, response))) => spool
                     .record(
                         session,

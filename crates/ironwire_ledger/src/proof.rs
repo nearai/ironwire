@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Serialised as the lowercase label (`"verified"`, `"gateway_only"`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum ProofStatus {
     /// Not a NEAR AI backend: a call that went outside, to a provider that
@@ -146,6 +147,7 @@ pub struct ProofCandidate {
 
 /// Which side of the routed/outside line an exchange fell on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum Route {
     /// Served by a NEAR AI backend, where a receipt can exist.
@@ -162,6 +164,7 @@ pub enum Route {
 /// Fields rather than a map so that a consumer reading a label this version
 /// never wrote sees a zero, not a missing key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProofCounts {
     /// See [`ProofStatus::Verified`].
     pub verified: i64,
@@ -202,6 +205,7 @@ impl ProofCounts {
 /// One line of the rollup: every exchange in the window for one model on one
 /// backend, on one side of the routed/outside line.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProofRollup {
     /// The model that served, or the one requested when the provider named
     /// none (an error before any response, typically). `None` when neither is
@@ -230,6 +234,7 @@ pub struct ProofRollup {
 
 /// Calls and cost on one side of the line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RouteTotal {
     /// Exchanges.
     pub calls: i64,
@@ -243,6 +248,7 @@ pub struct RouteTotal {
 
 /// The whole rollup for a window.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProofSummary {
     /// Per model, backend and route, most calls first.
     pub groups: Vec<ProofRollup>,

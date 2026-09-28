@@ -37,6 +37,7 @@
 //! key or a signature.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -67,6 +68,7 @@ impl ReceiptSource for crate::state::BackendRegistry {
 
 /// What an attestor knows about a model's signing keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Attestation {
     /// The ed25519 keys (64 lowercase hex characters each) that verified TDX
     /// quotes bind for this model, right now. Only keys whose quote passed
@@ -82,9 +84,20 @@ pub enum Attestation {
 }
 
 /// Which keys a verified quote binds for a model.
+///
+/// Object-safe, because the implementation usually comes from outside this
+/// crate: an embedding host that already verifies TDX quotes hands one in
+/// through `EmbedOptions::with_signer_attestor`, and IronWire itself carries
+/// no DCAP verifier.
+///
+/// An implementation must return only **per-model** keys (the report's
+/// model attestations), never the gateway's: a gateway key signs `gateway`
+/// receipts, which prove nothing about the model, and letting it into this
+/// set would let a relabelled gateway receipt pass as proof.
+#[async_trait::async_trait]
 pub trait SignerAttestor: Send + Sync {
     /// The attested keys for `model` on `backend`.
-    fn model_keys(&self, backend: &str, model: &str) -> impl Future<Output = Attestation> + Send;
+    async fn model_keys(&self, backend: &str, model: &str) -> Attestation;
 }
 
 /// The attestor this build ships with: none.
@@ -96,6 +109,7 @@ pub trait SignerAttestor: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoQuoteVerification;
 
+#[async_trait::async_trait]
 impl SignerAttestor for NoQuoteVerification {
     async fn model_keys(&self, _backend: &str, _model: &str) -> Attestation {
         Attestation::Unsupported
@@ -218,11 +232,15 @@ pub enum Outcome {
     },
 }
 
+/// How many times a 404 is looked at again before it is believed. See
+/// [`check`].
+pub const NOT_FOUND_RETRIES: u32 = 1;
+
 /// Decide one row.
-pub async fn check<S: ReceiptSource, A: SignerAttestor>(
+pub async fn check<S: ReceiptSource>(
     candidate: &ProofCandidate,
     source: &S,
-    attestor: &A,
+    attestor: &dyn SignerAttestor,
 ) -> Outcome {
     // The provider rewrote this body to carry a warning, and by its own
     // account the rewritten bytes no longer match what the enclave signed. A
@@ -241,6 +259,16 @@ pub async fn check<S: ReceiptSource, A: SignerAttestor>(
         return Outcome::Settle(ProofStatus::Unavailable);
     };
     let receipt = match source.fetch(&candidate.backend, upstream_id, model).await {
+        // A 404 is usually permanent -- a brokered model never has a receipt --
+        // but a hosted call checked moments after it finished could be ahead
+        // of the provider writing its record. One more look, a round later,
+        // costs a single extra `GET` per brokered call and turns that race
+        // from a wrong `unavailable` into a right answer.
+        ReceiptFetch::NotFound if candidate.attempts < NOT_FOUND_RETRIES => {
+            return Outcome::Defer {
+                then: ProofStatus::Unavailable,
+            };
+        }
         ReceiptFetch::NotOffered | ReceiptFetch::NotFound => {
             return Outcome::Settle(ProofStatus::Unavailable);
         }
@@ -281,7 +309,11 @@ pub async fn check<S: ReceiptSource, A: SignerAttestor>(
 }
 
 /// How hard the background check works.
+///
+/// Built from [`ProofSettings::default`] and the `with_` methods, so a later
+/// knob does not break a caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProofSettings {
     /// Rows read per round.
     pub batch: usize,
@@ -304,8 +336,39 @@ impl Default for ProofSettings {
     }
 }
 
+impl ProofSettings {
+    /// Rows read per round.
+    #[must_use]
+    pub fn with_batch(mut self, batch: usize) -> Self {
+        self.batch = batch;
+        self
+    }
+
+    /// Checks in flight at once. Zero is read as one.
+    #[must_use]
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
+
+    /// Deferrals before a row settles on its fallback label.
+    #[must_use]
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = max_attempts;
+        self
+    }
+
+    /// Time between rounds.
+    #[must_use]
+    pub fn with_period(mut self, period: Duration) -> Self {
+        self.period = period;
+        self
+    }
+}
+
 /// What one round did, for tests and the debug log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Round {
     /// Rows settled, by label.
     pub settled: Vec<(i64, ProofStatus)>,
@@ -314,10 +377,10 @@ pub struct Round {
 }
 
 /// Check one batch of pending rows.
-pub async fn run_once<S: ReceiptSource, A: SignerAttestor>(
+pub async fn run_once<S: ReceiptSource>(
     ledger: &Ledger,
     source: &S,
-    attestor: &A,
+    attestor: &dyn SignerAttestor,
     settings: &ProofSettings,
 ) -> Round {
     let candidates = match ledger.proof_candidates(settings.batch, settings.max_attempts) {
@@ -374,22 +437,21 @@ pub async fn run_once<S: ReceiptSource, A: SignerAttestor>(
 }
 
 /// Run [`run_once`] on a timer, forever.
-pub fn spawn<S, A>(
+pub fn spawn<S>(
     ledger: Ledger,
     source: S,
-    attestor: A,
+    attestor: Arc<dyn SignerAttestor>,
     settings: ProofSettings,
 ) -> tokio::task::JoinHandle<()>
 where
     S: ReceiptSource + 'static,
-    A: SignerAttestor + 'static,
 {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(settings.period);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            run_once(&ledger, &source, &attestor, &settings).await;
+            run_once(&ledger, &source, attestor.as_ref(), &settings).await;
         }
     })
 }
@@ -563,6 +625,7 @@ mod tests {
     }
 
     struct Attests(Attestation);
+    #[async_trait::async_trait]
     impl SignerAttestor for Attests {
         async fn model_keys(&self, _: &str, _: &str) -> Attestation {
             self.0.clone()
@@ -642,12 +705,31 @@ mod tests {
     /// A brokered model has no receipt, permanently. That is not a failure.
     #[tokio::test]
     async fn no_receipt_is_unavailable_not_failed() {
-        for fetch in [ReceiptFetch::NotFound, ReceiptFetch::NotOffered] {
-            assert_eq!(
-                outcome(fetch, Attestation::Unsupported).await,
-                Outcome::Settle(ProofStatus::Unavailable)
-            );
-        }
+        assert_eq!(
+            outcome(ReceiptFetch::NotOffered, Attestation::Unsupported).await,
+            Outcome::Settle(ProofStatus::Unavailable)
+        );
+        // A 404 is looked at once more before it is believed...
+        assert_eq!(
+            outcome(ReceiptFetch::NotFound, Attestation::Unsupported).await,
+            Outcome::Defer {
+                then: ProofStatus::Unavailable
+            }
+        );
+        // ...and then it is.
+        let retried = ProofCandidate {
+            attempts: NOT_FOUND_RETRIES,
+            ..candidate()
+        };
+        assert_eq!(
+            check(
+                &retried,
+                &Fixed(ReceiptFetch::NotFound),
+                &Attests(Attestation::Unsupported)
+            )
+            .await,
+            Outcome::Settle(ProofStatus::Unavailable)
+        );
         assert_eq!(
             outcome(ReceiptFetch::Unavailable, Attestation::Unsupported).await,
             Outcome::Defer {
