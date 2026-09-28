@@ -42,6 +42,9 @@ pub struct RawReceipt {
 }
 
 /// What a receipt fetch came back with.
+///
+/// Deliberately exhaustive: a new outcome must make every consumer decide
+/// what it means for proof, not fall into a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptFetch {
     /// This backend issues no receipts at all.

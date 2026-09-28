@@ -516,10 +516,22 @@ receipt for each `pending` row's `upstream_id` and settles it on exactly one of:
 
 The task never runs on the response path -- it reads rows that are already
 written -- and it can only move a row *out* of `pending`, so a verdict is never
-overwritten. Retries and concurrency are bounded (`ironwire_proxy::proof`).
-Quote verification is not implemented yet, so today a receipt that checks out
-settles `unattested`, never `verified`. Receipts are checked against the body
-digests, which are only taken under `capture.bodies = true`.
+overwritten. Retries and concurrency are bounded (`ironwire_proxy::proof`). A
+404 is looked at once more, a round later, before it is believed: a brokered
+model's 404 is permanent, but a hosted call checked moments after it finished
+can be ahead of the provider writing its record, and one extra `GET` per
+brokered call is cheaper than a wrong `unavailable`.
+
+IronWire has no DCAP quote verifier of its own, so standalone, a receipt that
+checks out settles `unattested`, never `verified`. An embedding host that
+verifies quotes supplies the attestor (`docs/EMBEDDING.md`).
+
+Receipts are checked against the digests of the upstream bytes. With
+`capture.receipts` on those are taken as the bytes stream past whether or not
+`capture.bodies` is on; with bodies off nothing is accumulated or written, only
+hashed. The digest is SHA-256 over the request exactly as sent and the response
+exactly as received (for a stream, the raw concatenated events), pinned against
+a live NEAR AI capture in `crates/ironwire_proxy/tests/proof_status.rs`.
 
 `GET /_ironwire/summary` rolls the same rows up per model and backend. There is
 no kind-of-work breakdown: nothing classifies work, so `work_kind` is `null`.

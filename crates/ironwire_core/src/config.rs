@@ -172,10 +172,10 @@ pub struct CaptureConfig {
     /// it learns that the call is being checked and nothing else. It runs off
     /// the response path and cannot delay or change an answer.
     ///
-    /// Needs `enabled`, and in practice `bodies`: a receipt is checked against
-    /// the digests of the bytes that crossed the wire, and those are only
-    /// taken while bodies are captured. Without them every row settles
-    /// `unavailable`.
+    /// Needs `enabled`. A receipt is checked against the digests of the bytes
+    /// that crossed the wire; with this on they are taken for every NEAR AI
+    /// exchange as the bytes stream past, whether or not `bodies` is on. With
+    /// bodies off nothing is accumulated or written -- only hashed.
     pub receipts: bool,
 }
 
