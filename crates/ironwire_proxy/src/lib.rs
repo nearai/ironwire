@@ -9,6 +9,7 @@ pub mod events;
 pub mod facade;
 pub mod pipeline;
 pub mod privacy;
+pub mod proof;
 pub mod resilience;
 pub mod server;
 pub mod shutdown;

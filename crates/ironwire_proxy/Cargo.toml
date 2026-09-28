@@ -27,6 +27,11 @@ ironwire_translate.workspace = true
 ironwire_upstream.workspace = true
 
 async-stream = "0.3"
+# Receipt signatures (`proof`). Both already in the workspace graph through
+# `ironwire_catalog`, which verifies its signed documents the same way, so
+# these lines add no packages -- they make an existing edge a direct one.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+hex = "0.4"
 axum.workspace = true
 bytes.workspace = true
 chrono.workspace = true

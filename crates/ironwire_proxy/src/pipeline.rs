@@ -288,6 +288,11 @@ impl Refusal {
             status: i64::from(self.status),
             error: Some(error.to_string()),
             confidence: None,
+            // No backend answered, so there is no answer to prove -- and no
+            // backend kind in hand to say which side of the routed/outside line
+            // it would have fallen on. Absent, not `outside`: the rollup keeps
+            // these with the rows it cannot place rather than guessing.
+            proof: None,
         };
         if let Err(error) = ledger.record(&exchange) {
             tracing::debug!(%error, "could not write the refusal to the trace ledger");
@@ -1295,6 +1300,9 @@ pub struct LedgerContext {
     /// user-supplied. It decides one thing: whether this exchange gets a price
     /// at all (see [`Self::write`]).
     pub backend_is_local: bool,
+    /// Whether that backend signs its answers, so the row starts `pending` a
+    /// proof check rather than `outside` (`crate::proof`).
+    pub backend_offers_receipts: bool,
     /// Model the client asked for.
     pub requested_model: Option<String>,
     /// Fidelity rung, lowercased.
@@ -1422,6 +1430,12 @@ impl LedgerContext {
             // translated. `None` on every native-lane row, and on every
             // cross-family one where nothing asked for log-probabilities.
             confidence: self.confidence.get(),
+            // Settled later, off this path, by `crate::proof`.
+            proof: Some(if self.backend_offers_receipts {
+                ironwire_ledger::ProofStatus::Pending
+            } else {
+                ironwire_ledger::ProofStatus::Outside
+            }),
         };
         // Metered spend only, and recorded even when the exchange failed:
         // tokens burned by a request that 500'd were still billed.
@@ -1580,6 +1594,22 @@ mod tests {
         assert!(ledger.recent(1).expect("reads")[0].confidence.is_none());
     }
 
+    /// A backend that signs nothing is outside from the moment it is
+    /// recorded; one that does starts `pending`, never anything stronger.
+    #[test]
+    fn the_first_proof_label_is_decided_by_whether_the_backend_signs() {
+        let ledger = ironwire_ledger::Ledger::in_memory().expect("ledger");
+        let spend = Mutex::new(crate::spend::SpendTracker::default());
+        ledger_context(ConfidenceSink::default()).write(&ledger, &spend, &Observation::default());
+        let mut signing = ledger_context(ConfidenceSink::default());
+        signing.backend_offers_receipts = true;
+        signing.write(&ledger, &spend, &Observation::default());
+
+        let rows = ledger.recent(2).expect("reads");
+        assert_eq!(rows[0].proof, Some(ironwire_ledger::ProofStatus::Pending));
+        assert_eq!(rows[1].proof, Some(ironwire_ledger::ProofStatus::Outside));
+    }
+
     fn ledger_context(confidence: ConfidenceSink) -> LedgerContext {
         LedgerContext {
             started_at: Utc::now(),
@@ -1591,6 +1621,7 @@ mod tests {
             backend: "near-ai".to_string(),
             backend_is_metered: false,
             backend_is_local: false,
+            backend_offers_receipts: false,
             requested_model: Some("claude-opus-4-6".to_string()),
             rung: "translated".to_string(),
             attempts: 1,

@@ -682,6 +682,18 @@ pub async fn start_with_options(
     if let Some(task) = spawn_catalogue_discovery(state.clone(), options.startup_probes) {
         background.0.push(task);
     }
+    // Receipt checks: opt-in, and only with a ledger to settle rows in. Off
+    // the response path by construction -- it reads rows already written.
+    if state.config.capture.receipts
+        && let Some(ledger) = state.ledger.clone()
+    {
+        background.0.push(crate::proof::spawn(
+            ledger,
+            state.backends.clone(),
+            crate::proof::NoQuoteVerification,
+            crate::proof::ProofSettings::default(),
+        ));
+    }
     let quota = QuotaWriter::new(paths.quota_file());
     background.0.push(quota.spawn(state.clone()));
     let (tx, rx) = tokio::sync::oneshot::channel();

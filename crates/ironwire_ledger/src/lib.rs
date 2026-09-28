@@ -17,6 +17,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub mod bodies;
+pub mod proof;
+
+pub use proof::{ProofCandidate, ProofCounts, ProofRollup, ProofStatus, ProofSummary, Route};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -186,6 +189,14 @@ pub struct Exchange {
     /// here; they are reduced in the proxy and discarded (`docs/DESIGN.md` §8).
     #[serde(default)]
     pub confidence: Option<ConfidenceAggregates>,
+    /// Whether this exchange carries a provider proof. See [`proof`].
+    ///
+    /// Written as `pending` or `outside` when the exchange is recorded and
+    /// settled later, off the response path. `None` on a row written before
+    /// the column existed -- which is not the same as `outside`, and is kept
+    /// apart from it everywhere it is counted.
+    #[serde(default, deserialize_with = "proof::lenient")]
+    pub proof: Option<ProofStatus>,
 }
 
 impl Exchange {
@@ -386,9 +397,9 @@ impl Ledger {
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error,
                 mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
-                model_alias_resolved
+                model_alias_resolved, proof, proof_attempts
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-                       ?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+                       ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,0)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -421,6 +432,7 @@ impl Ledger {
                     .confidence
                     .and_then(|c| i64::try_from(c.token_count).ok()),
                 exchange.model_alias_resolved,
+                exchange.proof.map(ProofStatus::as_str),
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -688,6 +700,133 @@ impl Ledger {
         Ok(summary)
     }
 
+    /// Up to `limit` exchanges still waiting for a proof check, oldest first.
+    ///
+    /// Only rows deferred fewer than `max_attempts` times: the retry budget is
+    /// enforced here, in the query, so a row that keeps failing stops being
+    /// read at all rather than being read and skipped forever.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn proof_candidates(&self, limit: usize, max_attempts: u32) -> Result<Vec<ProofCandidate>> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT id, backend, served_model, requested_model, upstream_id,
+                    request_sha256, response_sha256, model_alias_resolved,
+                    COALESCE(proof_attempts, 0)
+             FROM exchanges
+             WHERE proof = 'pending' AND COALESCE(proof_attempts, 0) < ?1
+             ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                i64::from(max_attempts),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                Ok(ProofCandidate {
+                    id: row.get(0)?,
+                    backend: row.get(1)?,
+                    served_model: row.get(2)?,
+                    requested_model: row.get(3)?,
+                    upstream_id: row.get(4)?,
+                    request_sha256: row.get(5)?,
+                    response_sha256: row.get(6)?,
+                    model_alias_resolved: row.get(7)?,
+                    attempts: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(LedgerError::from)
+    }
+
+    /// Settle a `pending` exchange's proof status.
+    ///
+    /// Only ever moves a row out of `pending`, and only into a settled label:
+    /// a verdict already written is never overwritten, so two checks racing on
+    /// one row cannot leave the weaker answer standing over the stronger one,
+    /// and nothing can move a row back to `pending`. Returns whether the row
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a write failure.
+    pub fn settle_proof(&self, id: i64, status: ProofStatus) -> Result<bool> {
+        if !status.is_settled() {
+            return Ok(false);
+        }
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE exchanges SET proof = ?1 WHERE id = ?2 AND proof = 'pending'",
+            rusqlite::params![status.as_str(), id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Record that a check could not finish this time, and should be retried.
+    ///
+    /// Returns the attempts now spent, so the caller can settle the row once
+    /// the budget is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a write failure.
+    pub fn defer_proof(&self, id: i64) -> Result<u32> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE exchanges SET proof_attempts = COALESCE(proof_attempts, 0) + 1
+             WHERE id = ?1 AND proof = 'pending'",
+            [id],
+        )?;
+        let attempts: Option<i64> = conn
+            .query_row(
+                "SELECT proof_attempts FROM exchanges WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(attempts.and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
+    }
+
+    /// Calls, cost and proof status per model and backend since `since`.
+    ///
+    /// One `GROUP BY` in SQL, folded in Rust. The model is the served one,
+    /// falling back to the requested one when the provider named none.
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Sqlite`] on a read failure.
+    pub fn proof_summary(&self, since: DateTime<Utc>) -> Result<ProofSummary> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT COALESCE(served_model, requested_model), backend, proof,
+                    COUNT(*),
+                    SUM(CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END),
+                    COALESCE(SUM(cost_usd), 0.0)
+             FROM exchanges WHERE started_at >= ?1
+             GROUP BY 1, 2, 3",
+        )?;
+        let rows = statement
+            .query_map([since.to_rfc3339()], |row| {
+                Ok(proof::GroupRow {
+                    model: row.get(0)?,
+                    backend: row.get(1)?,
+                    status: row
+                        .get::<_, Option<String>>(2)?
+                        .as_deref()
+                        .and_then(ProofStatus::parse),
+                    calls: row.get(3)?,
+                    priced_calls: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    cost_usd: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(proof::fold(rows))
+    }
+
     /// Drop records older than `retain`, keeping the file bounded.
     ///
     /// # Errors
@@ -748,6 +887,8 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("confidence_bucket", "TEXT"),
     ("confidence_tokens", "INTEGER"),
     ("model_alias_resolved", "TEXT"),
+    ("proof", "TEXT"),
+    ("proof_attempts", "INTEGER"),
 ];
 
 /// Add any column in [`ADDED_COLUMNS`] the open ledger does not have.
@@ -781,7 +922,7 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error,
             mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
-            model_alias_resolved";
+            model_alias_resolved, proof";
 
 /// Rebuild the confidence aggregate from its four columns.
 ///
@@ -846,6 +987,10 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
         confidence: read_confidence(row)?,
         // Index 29, after the four confidence columns `read_confidence` takes.
         model_alias_resolved: row.get(29)?,
+        proof: row
+            .get::<_, Option<String>>(30)?
+            .as_deref()
+            .and_then(ProofStatus::parse),
     })
 }
 
@@ -895,6 +1040,7 @@ mod tests {
             status: 200,
             error: None,
             confidence: None,
+            proof: None,
         }
     }
 
@@ -1666,5 +1812,181 @@ mod tests {
         }
         let ledger = Ledger::open(&path).expect("reopens");
         assert_eq!(ledger.recent(10).expect("reads").len(), 1);
+    }
+
+    fn nearai(at_secs: i64) -> Exchange {
+        let mut exchange = exchange("nearai", at_secs);
+        exchange.served_model = Some("Qwen/Qwen3.6-35B-A3B-FP8".into());
+        exchange.upstream_id = Some("c54961ab1d594cf591e5566caa21196b".into());
+        exchange.request_sha256 = Some("aa".repeat(32));
+        exchange.response_sha256 = Some("bb".repeat(32));
+        exchange.proof = Some(ProofStatus::Pending);
+        exchange
+    }
+
+    #[test]
+    fn a_proof_status_survives_the_round_trip() {
+        let ledger = Ledger::in_memory().expect("opens");
+        ledger.record(&nearai(0)).expect("records");
+        let mut outside = exchange("claude-sub", 1);
+        outside.proof = Some(ProofStatus::Outside);
+        ledger.record(&outside).expect("records");
+
+        let rows = ledger.page(at(0), None, 10).expect("reads");
+        assert_eq!(rows[0].proof, Some(ProofStatus::Pending));
+        assert_eq!(rows[1].proof, Some(ProofStatus::Outside));
+    }
+
+    /// A row from before the column existed must read as "no status", never
+    /// as `outside` -- that would paint every old NEAR AI call red.
+    #[test]
+    fn a_row_without_a_status_reads_as_absent() {
+        let ledger = Ledger::in_memory().expect("opens");
+        ledger.record(&exchange("nearai", 0)).expect("records");
+        assert_eq!(ledger.recent(1).expect("reads")[0].proof, None);
+    }
+
+    /// What a newer IronWire might write must not fail an older reader.
+    #[test]
+    fn an_unrecognised_label_reads_as_absent() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let id = ledger.record(&nearai(0)).expect("records");
+        ledger
+            .lock()
+            .execute("UPDATE exchanges SET proof = 'quantum' WHERE id = ?1", [id])
+            .expect("writes");
+        assert_eq!(ledger.recent(1).expect("reads")[0].proof, None);
+        let json = r#"{"proof":"quantum"}"#;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            #[serde(default, deserialize_with = "proof::lenient")]
+            proof: Option<ProofStatus>,
+        }
+        let row: Row = serde_json::from_str(json).expect("parses leniently");
+        assert_eq!(row.proof, None);
+    }
+
+    #[test]
+    fn only_pending_rows_are_candidates() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let pending = ledger.record(&nearai(0)).expect("records");
+        let mut outside = exchange("claude-sub", 1);
+        outside.proof = Some(ProofStatus::Outside);
+        ledger.record(&outside).expect("records");
+        ledger.record(&exchange("nearai", 2)).expect("legacy row");
+
+        let candidates = ledger.proof_candidates(10, 5).expect("reads");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, pending);
+        assert_eq!(candidates[0].attempts, 0);
+        assert_eq!(
+            candidates[0].upstream_id.as_deref(),
+            Some("c54961ab1d594cf591e5566caa21196b")
+        );
+    }
+
+    /// A verdict is written once. A second, weaker one racing in behind it
+    /// must not replace it, and nothing may reopen a settled row.
+    #[test]
+    fn a_settled_status_is_never_overwritten() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let id = ledger.record(&nearai(0)).expect("records");
+        assert!(
+            ledger
+                .settle_proof(id, ProofStatus::Verified)
+                .expect("settles")
+        );
+        assert!(!ledger.settle_proof(id, ProofStatus::Failed).expect("no-op"));
+        assert!(
+            !ledger
+                .settle_proof(id, ProofStatus::Pending)
+                .expect("no-op")
+        );
+        assert_eq!(
+            ledger.recent(1).expect("reads")[0].proof,
+            Some(ProofStatus::Verified)
+        );
+        assert!(ledger.proof_candidates(10, 5).expect("reads").is_empty());
+    }
+
+    /// An outside row is settled from the moment it is written.
+    #[test]
+    fn an_outside_row_cannot_be_promoted() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut outside = exchange("claude-sub", 0);
+        outside.proof = Some(ProofStatus::Outside);
+        let id = ledger.record(&outside).expect("records");
+        assert!(
+            !ledger
+                .settle_proof(id, ProofStatus::Verified)
+                .expect("no-op")
+        );
+    }
+
+    #[test]
+    fn the_retry_budget_is_enforced_by_the_query() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let id = ledger.record(&nearai(0)).expect("records");
+        assert_eq!(ledger.defer_proof(id).expect("defers"), 1);
+        assert_eq!(ledger.defer_proof(id).expect("defers"), 2);
+        assert_eq!(ledger.proof_candidates(10, 3).expect("reads").len(), 1);
+        assert_eq!(ledger.proof_candidates(10, 2).expect("reads").len(), 0);
+        assert_eq!(
+            ledger.proof_candidates(10, 3).expect("reads")[0].attempts,
+            2
+        );
+    }
+
+    #[test]
+    fn the_proof_summary_groups_by_model_and_backend() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let a = ledger.record(&nearai(0)).expect("records");
+        ledger.record(&nearai(1)).expect("records");
+        ledger
+            .settle_proof(a, ProofStatus::Verified)
+            .expect("settles");
+        let mut outside = exchange("claude-sub", 2);
+        outside.proof = Some(ProofStatus::Outside);
+        outside.cost_usd = None;
+        ledger.record(&outside).expect("records");
+        // Before the window: not counted.
+        ledger.record(&nearai(-100)).expect("records");
+
+        let summary = ledger.proof_summary(at(-10)).expect("summarises");
+        assert_eq!(summary.routed.calls, 2);
+        assert_eq!(summary.routed.proof.verified, 1);
+        assert_eq!(summary.routed.proof.pending, 1);
+        assert!((summary.routed.cost_usd - 0.84).abs() < 1e-9);
+        assert_eq!(summary.outside.calls, 1);
+        assert_eq!(
+            summary.outside.priced_calls, 0,
+            "an unpriced call is not free"
+        );
+        assert_eq!(summary.outside.cost_usd, 0.0);
+        let near = &summary.groups[0];
+        assert_eq!(near.backend, "nearai");
+        assert_eq!(near.model.as_deref(), Some("Qwen/Qwen3.6-35B-A3B-FP8"));
+        assert_eq!(near.route, Route::Routed);
+        assert_eq!(near.work_kind, None);
+    }
+
+    /// Opening an older file adds the two columns; its rows read as absent.
+    #[test]
+    fn an_older_ledger_gains_the_proof_columns_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let ledger = Ledger::open(&path).expect("open");
+            ledger.record(&exchange("nearai", 0)).expect("records");
+            let conn = ledger.lock();
+            conn.execute_batch(
+                "ALTER TABLE exchanges DROP COLUMN proof;
+                 ALTER TABLE exchanges DROP COLUMN proof_attempts;",
+            )
+            .expect("simulate an older file");
+        }
+        let ledger = Ledger::open(&path).expect("reopens");
+        assert_eq!(ledger.recent(1).expect("reads")[0].proof, None);
+        assert!(ledger.proof_candidates(10, 5).expect("reads").is_empty());
     }
 }
