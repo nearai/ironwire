@@ -235,6 +235,11 @@ pub struct EmbedOptions {
     pub credentials: Option<CredentialSource>,
     /// Whether the credential files Claude Code and Codex write may be read.
     pub credential_files: CredentialFiles,
+    /// Who ties a receipt's signing key to a verified TDX quote. See
+    /// [`EmbedOptions::with_signer_attestor`].
+    pub signer_attestor: Option<Arc<dyn crate::proof::SignerAttestor>>,
+    /// How hard the receipt check works, when it runs.
+    pub proof_settings: crate::proof::ProofSettings,
 }
 
 /// Renders whether a host supplied a credential source, never anything it
@@ -253,11 +258,48 @@ impl std::fmt::Debug for EmbedOptions {
                 },
             )
             .field("credential_files", &self.credential_files)
+            .field("proof_settings", &self.proof_settings)
+            .field(
+                "signer_attestor",
+                match self.signer_attestor {
+                    Some(_) => &"host-supplied",
+                    None => &"none",
+                },
+            )
             .finish()
     }
 }
 
 impl EmbedOptions {
+    /// Supply the attestor that ties a NEAR AI receipt's signing key to a
+    /// verified TDX quote, and turn receipt checks on.
+    ///
+    /// IronWire carries no DCAP quote verifier of its own. Without one, a
+    /// receipt that checks out is recorded `unattested` and never `verified`
+    /// (`crate::proof`). A host that already verifies quotes -- and pins their
+    /// measurements; a genuine TDX VM proves nothing about whose -- supplies
+    /// it here, and rows it vouches for can reach `verified`.
+    ///
+    /// Supplying one is the host deciding receipts are checked, so it turns
+    /// `capture.receipts` on for this start whatever the configuration says.
+    /// That costs one `GET` per NEAR AI exchange, to NEAR AI, with the NEAR AI
+    /// key, off the response path; the provider learns that a call it already
+    /// served is being checked.
+    #[must_use]
+    pub fn with_signer_attestor(mut self, attestor: Arc<dyn crate::proof::SignerAttestor>) -> Self {
+        self.signer_attestor = Some(attestor);
+        self
+    }
+
+    /// Tune the background receipt check: batch, concurrency, retry budget
+    /// and period. The defaults suit a daemon; a host that wants answers
+    /// sooner shortens the period.
+    #[must_use]
+    pub fn with_proof_settings(mut self, settings: crate::proof::ProofSettings) -> Self {
+        self.proof_settings = settings;
+        self
+    }
+
     /// Select who owns upgrading the running proxy implementation.
     #[must_use]
     pub fn with_update_policy(mut self, update_policy: UpdatePolicy) -> Self {
@@ -608,6 +650,10 @@ pub async fn start_with_options(
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
     let mut config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
     apply_token_capture_override(&mut config, options.token_capture_enabled)?;
+    // A host that supplies an attestor has decided receipts are checked.
+    if options.signer_attestor.is_some() {
+        config.capture.receipts = true;
+    }
     let checks = options.checks_enabled(config.updates.check);
     let port = port_override.unwrap_or(config.server.port);
     if config.limits.any_cap() && !config.capture.enabled {
@@ -720,6 +766,21 @@ pub async fn start_with_options(
     }
     if let Some(task) = spawn_catalogue_discovery(state.clone(), options.startup_probes) {
         background.0.push(task);
+    }
+    // Receipt checks: opt-in, and only with a ledger to settle rows in. Off
+    // the response path by construction -- it reads rows already written.
+    if state.config.capture.receipts
+        && let Some(ledger) = state.ledger.clone()
+    {
+        background.0.push(crate::proof::spawn(
+            ledger,
+            state.backends.clone(),
+            options
+                .signer_attestor
+                .clone()
+                .unwrap_or_else(|| Arc::new(crate::proof::NoQuoteVerification)),
+            options.proof_settings,
+        ));
     }
     let quota = QuotaWriter::new(paths.quota_file());
     background.0.push(quota.spawn(state.clone()));

@@ -19,6 +19,7 @@ pub mod headers;
 pub mod observe;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod receipt;
 pub mod sse;
 
 pub use backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};

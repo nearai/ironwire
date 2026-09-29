@@ -475,6 +475,35 @@ impl Backend for ChatCompletionsBackend {
         }
     }
 
+    /// NEAR AI is the only Chat Completions provider that signs its answers.
+    /// A generic OpenAI-compatible endpoint is somebody else's server, and
+    /// asking it for a receipt would send the user's key to a path it never
+    /// agreed to serve.
+    fn offers_receipts(&self) -> bool {
+        self.kind == BackendKind::Credits
+    }
+
+    async fn fetch_receipt(&self, upstream_id: &str, model: &str) -> crate::receipt::ReceiptFetch {
+        use crate::receipt::{FETCH_TIMEOUT, ReceiptFetch, usable_id};
+        if !self.offers_receipts() {
+            return ReceiptFetch::NotOffered;
+        }
+        if !usable_id(upstream_id) {
+            return ReceiptFetch::NotFound;
+        }
+        let request = self
+            .authorize(
+                self.client
+                    .get(format!("{}/signature/{upstream_id}", self.base_url)),
+            )
+            .query(&[("model", model), ("signing_algo", "ed25519")])
+            .timeout(FETCH_TIMEOUT);
+        match request.send().await {
+            Ok(response) => crate::receipt::read(response).await,
+            Err(_) => ReceiptFetch::Unavailable,
+        }
+    }
+
     async fn probe(&self) -> Result<(), UpstreamError> {
         let response = self
             .authorize(self.client.get(format!("{}/models", self.base_url)))

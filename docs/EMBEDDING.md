@@ -299,6 +299,29 @@ implementation relies on the user's profile-directory permissions. No new
 package or package version is added: `anyhow`, `reqwest`, and `getrandom 0.2`
 become direct uses of packages already in the proxy's dependency tree.
 
+## Receipt proof: supplying the attestor
+
+A NEAR AI receipt proves which model answered only if its ed25519 signing key
+is bound by a **verified** TDX quote whose measurements are pinned. IronWire
+checks the receipt itself -- signature, digests, model, `provider_tee` kind --
+but carries no DCAP quote verifier, so on its own the best a row can reach is
+`unattested` (`docs/DESIGN.md` §8).
+
+A host that already verifies quotes supplies that last step:
+
+```rust,ignore
+let options = EmbedOptions::default()
+    .with_signer_attestor(Arc::new(my_attestor)); // impl proof::SignerAttestor
+```
+
+`SignerAttestor::model_keys(backend, model)` answers with the per-model keys a
+verified, measurement-pinned quote binds -- never the gateway key -- or says why
+it cannot. Supplying one turns `capture.receipts` on for that start: request
+and response digests are taken as the bytes stream past (no body is kept or
+written unless `capture.bodies` is also on), and a background task settles each
+NEAR AI row off the response path. `with_proof_settings` tunes its batch,
+concurrency, retry budget and period.
+
 ## Pointing a coding tool at an embedded instance
 
 `ironwire_agents::tools::plan_connect` works out the edit; the host shows it and

@@ -337,6 +337,8 @@ GET  /_ironwire/settings        what can be changed, what is selectable, and
                                 which coding agents are wired to us
 GET  /_ironwire/log?limit=      recent exchanges from the local ledger,
                                 also ?since= and ?after_id= to page
+GET  /_ironwire/summary?since=  calls, cost and proof status per model and
+                                backend, split routed (NEAR AI) vs outside
 GET  /_ironwire/events          SSE: route decisions, quota changes, errors
 GET  /_ironwire/health          liveness. The one route with no token
 POST /_ironwire/pin             { backend, model } — no backend clears the pin
@@ -496,6 +498,43 @@ Because IronWire sees consecutive calls in one conversation, the ledger
 naturally captures the signal that matters: *model proposed X → tool returned an
 error → model repaired it with Y → next call succeeded.* A later opt-in hooks
 plugin can add `git diff`, test results and human acceptance to close the loop.
+
+### `capture.receipts` — whether an answer carries proof
+
+Every row carries a `proof` label. A row served by a backend that signs its
+answers (NEAR AI) is recorded `pending`; anything else is `outside` and is never
+checked. With `capture.receipts = true` a background task later fetches the
+receipt for each `pending` row's `upstream_id` and settles it on exactly one of:
+
+| label | meaning |
+|---|---|
+| `verified` | a `provider_tee` receipt over this row's digests, signed by a key a verified TDX quote binds for the model. The only label that is proof. |
+| `gateway_only` | a valid receipt, but the gateway's: it names the relay, not the model. |
+| `unattested` | a valid `provider_tee` receipt whose key nothing has tied to a verified quote. |
+| `unavailable` | no receipt to be had (a brokered model 404s permanently), no digests to check one against, a provider-rewritten body, or retries exhausted. |
+| `failed` | a receipt that does not check out. |
+
+The task never runs on the response path -- it reads rows that are already
+written -- and it can only move a row *out* of `pending`, so a verdict is never
+overwritten. Retries and concurrency are bounded (`ironwire_proxy::proof`). A
+404 is looked at once more, a round later, before it is believed: a brokered
+model's 404 is permanent, but a hosted call checked moments after it finished
+can be ahead of the provider writing its record, and one extra `GET` per
+brokered call is cheaper than a wrong `unavailable`.
+
+IronWire has no DCAP quote verifier of its own, so standalone, a receipt that
+checks out settles `unattested`, never `verified`. An embedding host that
+verifies quotes supplies the attestor (`docs/EMBEDDING.md`).
+
+Receipts are checked against the digests of the upstream bytes. With
+`capture.receipts` on those are taken as the bytes stream past whether or not
+`capture.bodies` is on; with bodies off nothing is accumulated or written, only
+hashed. The digest is SHA-256 over the request exactly as sent and the response
+exactly as received (for a stream, the raw concatenated events), pinned against
+a live NEAR AI capture in `crates/ironwire_proxy/tests/proof_status.rs`.
+
+`GET /_ironwire/summary` rolls the same rows up per model and backend. There is
+no kind-of-work breakdown: nothing classifies work, so `work_kind` is `null`.
 
 ### `capture.logprobs` — per-token confidence, cross-family only
 

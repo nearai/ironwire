@@ -331,6 +331,7 @@ pub(crate) mod test_support {
             status: 200,
             error: None,
             confidence: None,
+            proof: None,
         }
     }
 

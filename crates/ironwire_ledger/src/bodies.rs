@@ -39,6 +39,38 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// [`sha256_hex`], fed in pieces.
+///
+/// For a body that is hashed as it streams past and never held: the digest of
+/// the concatenated chunks is the digest of the whole, so the answer is the
+/// same one [`sha256_hex`] gives over the same bytes, without the bytes.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingSha256(Sha256);
+
+impl StreamingSha256 {
+    /// Start an empty digest.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next chunk, in wire order.
+    pub fn update(&mut self, chunk: &[u8]) {
+        self.0.update(chunk);
+    }
+
+    /// Lowercase hex, exactly as [`sha256_hex`] renders it.
+    #[must_use]
+    pub fn finish_hex(self) -> String {
+        let digest = self.0.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+}
+
 /// Bodies on disk, under `$IRONWIRE_HOME/bodies` (`docs/PACKAGING.md`).
 ///
 /// Files rather than ledger blobs because that is what the runtime layout
@@ -245,6 +277,20 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// Hashing a body in pieces must give the digest of the whole, or a
+    /// streamed response would never match its receipt.
+    #[test]
+    fn a_streamed_digest_is_the_digest_of_the_whole() {
+        let body = b"data: {\"id\":\"x\"}\n\ndata: [DONE]\n\n";
+        for split in [0, 1, 7, body.len()] {
+            let mut streaming = StreamingSha256::new();
+            streaming.update(&body[..split]);
+            streaming.update(&body[split..]);
+            assert_eq!(streaming.finish_hex(), sha256_hex(body), "split at {split}");
+        }
+        assert_eq!(StreamingSha256::new().finish_hex(), sha256_hex(b""));
     }
 
     #[test]
