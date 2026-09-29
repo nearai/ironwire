@@ -324,3 +324,80 @@ async fn a_persistently_overloaded_provider_still_gives_up_and_reports() {
     );
     assert!(!body.is_empty(), "the client should be told why");
 }
+
+#[tokio::test]
+async fn a_restarted_chat_stream_persists_only_its_complete_token_capture() {
+    use ironwire_core::config::{TokenCaptureConfig, TokenCaptureTarget};
+    use ironwire_core::protocol::{BackendId, BackendKind};
+    use ironwire_upstream::openai_chat::ChatCompletionsBackend;
+    let role = "data: {\"id\":\"failed\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string();
+    let content = "data: {\"id\":\"recovered\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"blue\"},\"finish_reason\":\"stop\",\"logprobs\":{\"content\":[{\"bytes\":[98,108,117,101],\"logprob\":-1.0,\"top_logprobs\":[]}]}}]}\n\n".to_string();
+    let done = "data: [DONE]\n\n".to_string();
+    let expected = format!("{content}{done}");
+    let (base, connections) = spawn(vec![
+        Behaviour::Truncate(vec![role]),
+        Behaviour::Frames(vec![content, done]),
+    ])
+    .await;
+    let mut registry = BackendRegistry::new();
+    registry.push(Arc::new(
+        ChatCompletionsBackend::new(
+            BackendId::from("nearai"),
+            "fixture",
+            BackendKind::Credits,
+            Some(SecretString::from("fixture-key")),
+            base,
+            Vec::new(),
+            5,
+        )
+        .unwrap(),
+    ));
+    let mut config = Config::default();
+    config.capture.token_capture = Some(TokenCaptureConfig {
+        targets: vec![TokenCaptureTarget {
+            backend: "nearai".into(),
+            model: "fixture-model".into(),
+        }],
+        ..Default::default()
+    });
+    config.resilience.keepalive_secs = 1;
+    config.resilience.stall_timeout_secs = 3;
+    let home = tempfile::tempdir().unwrap();
+    let spool = Arc::new(
+        ironwire_ledger::token_spool::TokenSpool::open(home.path(), 1024 * 1024, 86400).unwrap(),
+    );
+    let state = AppState::new(
+        registry,
+        config,
+        ConsentLedger::default(),
+        "fixture-token".into(),
+    )
+    .with_ledger(Some(ironwire_ledger::Ledger::in_memory().unwrap()))
+    .with_token_spool(Some(spool.clone()));
+    let response = app(state).oneshot(Request::builder().method("POST").uri("/openai/v1/chat/completions")
+        .header("content-type","application/json").header("session-id","restarted-session")
+        .body(Body::from(r#"{"model":"fixture-model","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("blue"));
+    assert_eq!(connections.load(Ordering::SeqCst), 2);
+    let now = chrono::Utc::now().timestamp();
+    let captures = spool.list("restarted-session", now).unwrap();
+    assert_eq!(captures.len(), 1);
+    assert!(captures[0].streaming);
+    let lease = spool
+        .acquire(
+            "restarted-session",
+            &[captures[0].capture_id.clone()],
+            "fixture-owner",
+            now,
+            300,
+        )
+        .unwrap();
+    let (_, response) = spool
+        .read(&lease.lease_id, &lease.owner, &captures[0].capture_id, now)
+        .unwrap();
+    assert_eq!(response, expected.as_bytes());
+}

@@ -40,10 +40,9 @@ pub fn restrict_permissions(path: &std::path::Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn restrict_permissions(_path: &std::path::Path, _mode: u32) -> Result<()> {
-    // Windows ACLs land with the M4 packaging work; the directory still sits
-    // under the user profile.
-    Ok(())
+pub fn restrict_permissions(path: &std::path::Path, _mode: u32) -> Result<()> {
+    ironwire_ledger::token_spool::secure_windows_path(path)
+        .map_err(|_| anyhow::anyhow!("private-state-permissions"))
 }
 
 #[cfg(test)]

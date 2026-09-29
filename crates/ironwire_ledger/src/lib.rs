@@ -1990,3 +1990,6 @@ mod tests {
         assert!(ledger.proof_candidates(10, 5).expect("reads").is_empty());
     }
 }
+
+/// Leased token capture evidence.
+pub mod token_spool;

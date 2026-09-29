@@ -238,7 +238,7 @@ pub fn insert_binding(body: &[u8], binding: &str) -> Result<Vec<u8>, AdmissionEr
 }
 
 type Member = (String, usize, usize);
-fn members(body: &[u8]) -> Result<Vec<Member>, AdmissionError> {
+pub(crate) fn members(body: &[u8]) -> Result<Vec<Member>, AdmissionError> {
     let fail = AdmissionError::MetadataConflict;
     let whitespace = |at: &mut usize| {
         while body.get(*at).is_some_and(u8::is_ascii_whitespace) {

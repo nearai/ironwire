@@ -537,6 +537,62 @@ async fn dispatch_inner(
             }
         };
 
+        let upstream_protocol = if decision.translated { target } else { inbound };
+        let token_target = state
+            .config
+            .capture
+            .token_capture
+            .as_ref()
+            .filter(|_| {
+                state.config.capture.enabled
+                    && state.ledger.is_some()
+                    && session.is_some()
+                    && upstream_protocol == Protocol::OpenAiChat
+            })
+            .filter(|capture| {
+                capture.selects(
+                    decision.backend.as_str(),
+                    decision
+                        .model
+                        .as_deref()
+                        .or(peek.requested_model.as_deref())
+                        .unwrap_or(""),
+                )
+            })
+            .zip(state.token_spool.as_ref())
+            .and_then(|(config, store)| {
+                if store
+                    .can_accept_capture(session.as_deref().unwrap_or(""), request.body.len() as u64)
+                    .ok()
+                    != Some(true)
+                {
+                    if let Some(session) = session.as_ref() {
+                        let _ = store.note_absence(
+                            session,
+                            &ironwire_ledger::token_spool::SpoolError::Capacity,
+                            Utc::now().timestamp(),
+                        );
+                    }
+                    return None;
+                }
+                match ironwire_core::token_capture::augment_chat(&request.body, config.top_k) {
+                    Some(bytes) => {
+                        request.body = Bytes::from(bytes);
+                        Some((store.clone(), upstream_protocol.to_string(), peek.stream))
+                    }
+                    None => {
+                        if let Some(session) = session.as_ref() {
+                            let _ = store.note_absence(
+                                session,
+                                &ironwire_ledger::token_spool::SpoolError::Invalid,
+                                Utc::now().timestamp(),
+                            );
+                        }
+                        None
+                    }
+                }
+            });
+
         if binding
             .as_ref()
             .is_some_and(|b| b.expires_at <= Utc::now().timestamp())
@@ -558,8 +614,10 @@ async fn dispatch_inner(
         // With `capture.receipts` on and bodies off, only the digests are
         // taken -- and only for a backend that signs its answers, since a
         // digest is worth nothing without a receipt to check it against.
-        let capture = if state.bodies.is_some() {
-            Some(Capture::of_request(request.body.clone()))
+        let mut capture = if state.bodies.is_some() || token_target.is_some() {
+            let mut capture = Capture::of_request(request.body.clone());
+            capture.token_target = token_target;
+            Some(capture)
         } else if state.ledger.is_some()
             && state.config.capture.receipts
             && backend.offers_receipts()
@@ -574,7 +632,10 @@ async fn dispatch_inner(
                 // Teed before translation, for the same reason. On a translated
                 // route the bytes the client eventually sees are ours, not the
                 // provider's, and only the provider's are in its receipt.
-                if let Some(capture) = capture.as_ref() {
+                if let Some(capture) = capture.as_mut() {
+                    if let Some((_, _, streaming)) = capture.token_target.as_mut() {
+                        *streaming = is_event_stream(&response.headers);
+                    }
                     response.body = capture_stream(response.body, capture).boxed();
                 }
                 let response = if decision.translated {
@@ -1082,11 +1143,11 @@ const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 /// `tests/proof_status.rs`.
 ///
 /// Two modes. [`Self::of_request`] keeps the bytes as well, for
-/// `capture.bodies`. [`Self::digest_only`] keeps nothing but the two digests,
-/// for `capture.receipts` with bodies off: the response is hashed as it
-/// streams and never accumulated, so nothing of the user's content outlives
-/// the exchange in this process or on disk.
-#[derive(Debug, Clone)]
+/// `capture.bodies` and token capture. [`Self::digest_only`] keeps nothing but
+/// the two digests, for `capture.receipts` with bodies off: the response is
+/// hashed as it streams and never accumulated, so nothing of the user's
+/// content outlives the exchange in this process or on disk.
+#[derive(Clone)]
 pub struct Capture {
     /// Exactly the bytes handed to the backend, when bodies are kept.
     request: Option<Bytes>,
@@ -1099,9 +1160,18 @@ pub struct Capture {
     /// A cancelled, restarted or failed response leaves this empty on
     /// purpose. There is no honest digest of a response that did not finish.
     response: Arc<std::sync::Mutex<Option<CapturedResponse>>>,
+    token_target: Option<(Arc<ironwire_ledger::token_spool::TokenSpool>, String, bool)>,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for Capture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capture")
+            .field("complete", &self.response_sha256().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 struct CapturedResponse {
     sha256: String,
     /// `None` in digest-only mode, and when the body outgrew
@@ -1119,6 +1189,7 @@ impl Capture {
             request: Some(request),
             keep_bodies: true,
             response: Arc::new(std::sync::Mutex::new(None)),
+            token_target: None,
         }
     }
 
@@ -1130,6 +1201,7 @@ impl Capture {
             request: None,
             keep_bodies: false,
             response: Arc::new(std::sync::Mutex::new(None)),
+            token_target: None,
         }
     }
 
@@ -1548,6 +1620,28 @@ impl LedgerContext {
                 None
             }
         };
+        if let (Some(capture), Some(session)) =
+            (self.capture.as_ref(), exchange.client_session_id.as_ref())
+            && let Some((spool, protocol, streaming)) = &capture.token_target
+        {
+            let result = match (recorded, kept.as_ref()) {
+                (Some(id), Some((request, response))) => spool
+                    .record(
+                        session,
+                        id,
+                        protocol,
+                        *streaming,
+                        (request, response),
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .map(|_| ()),
+                _ => Err(ironwire_ledger::token_spool::SpoolError::Unavailable),
+            };
+            if let Err(error) = result {
+                let _ = spool.note_absence(session, &error, chrono::Utc::now().timestamp());
+                tracing::debug!(%error,"detailed capture unavailable for completed exchange");
+            }
+        }
         // The rolling window. Only ever rotates rows that are already in the
         // ledger, which means exchanges whose response finished -- an in-flight
         // one has no row and no files yet, so this cannot delete a body that is
