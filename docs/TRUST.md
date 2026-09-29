@@ -397,3 +397,27 @@ control bearer and returns only that session's active/expired/inactive status
 and expiry; it does not list session identifiers or return binding values.
 Register again to renew, or DELETE that exact session to revoke. State is
 memory-only and a proxy restart clears registrations and tombstones.
+
+## Token-distribution evidence capture
+
+`capture.token_capture` is a separate, off-by-default opt-in for explicitly
+named backend/model pairs. It records verbatim evidence in a separate bounded
+spool; it does not change the rolling retention of ordinary body capture.
+Default limits are 512 MiB and three days; leases can retain a selected snapshot
+for at most seven days from capture. A full spool stops new capture, not inference.
+Only authenticated control clients can acquire/read/release exact snapshots.
+One destination releasing its lease does not release another destination's lease
+or a later exchange. No lease names a user filesystem path. Contribution approval
+and durable server acknowledgment are responsibilities of the consuming client;
+local capture itself never grants upload consent.
+
+The detailed spool also enforces a 64 MiB per-session ceiling (or the smaller
+configured global ceiling). Exact request/response digest lookup searches all
+retained captures and refuses ambiguous matches; the bounded display listing
+is not used as a complete session index. Missing-capture counters are persisted
+as bounded reason labels, separately from raw evidence.
+
+On Windows, owned state and the detailed spool receive protected current-user
+ACLs. Foreign-owned paths and reparse ancestors are refused. Fresh payloads
+inherit the verified spool ACL; status and control never depend on a broadly
+readable custom home. The Windows spool CI leg checks raw-file ACLs.

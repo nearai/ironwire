@@ -532,6 +532,62 @@ async fn dispatch_inner(
             }
         };
 
+        let upstream_protocol = if decision.translated { target } else { inbound };
+        let token_target = state
+            .config
+            .capture
+            .token_capture
+            .as_ref()
+            .filter(|_| {
+                state.config.capture.enabled
+                    && state.ledger.is_some()
+                    && session.is_some()
+                    && upstream_protocol == Protocol::OpenAiChat
+            })
+            .filter(|capture| {
+                capture.selects(
+                    decision.backend.as_str(),
+                    decision
+                        .model
+                        .as_deref()
+                        .or(peek.requested_model.as_deref())
+                        .unwrap_or(""),
+                )
+            })
+            .zip(state.token_spool.as_ref())
+            .and_then(|(config, store)| {
+                if store
+                    .can_accept_capture(session.as_deref().unwrap_or(""), request.body.len() as u64)
+                    .ok()
+                    != Some(true)
+                {
+                    if let Some(session) = session.as_ref() {
+                        let _ = store.note_absence(
+                            session,
+                            &ironwire_ledger::token_spool::SpoolError::Capacity,
+                            Utc::now().timestamp(),
+                        );
+                    }
+                    return None;
+                }
+                match ironwire_core::token_capture::augment_chat(&request.body, config.top_k) {
+                    Some(bytes) => {
+                        request.body = Bytes::from(bytes);
+                        Some((store.clone(), upstream_protocol.to_string(), peek.stream))
+                    }
+                    None => {
+                        if let Some(session) = session.as_ref() {
+                            let _ = store.note_absence(
+                                session,
+                                &ironwire_ledger::token_spool::SpoolError::Invalid,
+                                Utc::now().timestamp(),
+                            );
+                        }
+                        None
+                    }
+                }
+            });
+
         if binding
             .as_ref()
             .is_some_and(|b| b.expires_at <= Utc::now().timestamp())
@@ -549,17 +605,23 @@ async fn dispatch_inner(
         // Cloned before the request moves into the backend, because these are
         // the bytes the upstream will hash: `send` puts `request.body` on the
         // wire unchanged. Cheap -- `Bytes` is refcounted.
-        let capture = state
-            .bodies
-            .as_ref()
-            .map(|_| Capture::of_request(request.body.clone()));
+        let mut capture = if state.bodies.is_some() || token_target.is_some() {
+            let mut capture = Capture::of_request(request.body.clone());
+            capture.token_target = token_target;
+            Some(capture)
+        } else {
+            None
+        };
 
         match backend.send(request).await {
             Ok(mut response) => {
                 // Teed before translation, for the same reason. On a translated
                 // route the bytes the client eventually sees are ours, not the
                 // provider's, and only the provider's are in its receipt.
-                if let Some(capture) = capture.as_ref() {
+                if let Some(capture) = capture.as_mut() {
+                    if let Some((_, _, streaming)) = capture.token_target.as_mut() {
+                        *streaming = is_event_stream(&response.headers);
+                    }
                     response.body = capture_stream(response.body, capture).boxed();
                 }
                 let response = if decision.translated {
@@ -1059,7 +1121,7 @@ const MAX_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
 /// privacy reverser. On a translated route the client's own bytes are a
 /// different document entirely, and hashing those would fail against every
 /// receipt while looking exactly like tampering.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Capture {
     /// Exactly the bytes handed to the backend.
     pub request: Bytes,
@@ -1069,6 +1131,15 @@ pub struct Capture {
     /// A cancelled, restarted or oversized response leaves this empty on
     /// purpose. There is no honest digest of a response that did not finish.
     response: Arc<std::sync::Mutex<Option<Bytes>>>,
+    token_target: Option<(Arc<ironwire_ledger::token_spool::TokenSpool>, String, bool)>,
+}
+
+impl std::fmt::Debug for Capture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capture")
+            .field("complete", &self.response().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Capture {
@@ -1078,6 +1149,7 @@ impl Capture {
         Self {
             request,
             response: Arc::new(std::sync::Mutex::new(None)),
+            token_target: None,
         }
     }
 
@@ -1448,6 +1520,28 @@ impl LedgerContext {
                 None
             }
         };
+        if let (Some(capture), Some(session)) =
+            (self.capture.as_ref(), exchange.client_session_id.as_ref())
+            && let Some((spool, protocol, streaming)) = &capture.token_target
+        {
+            let result = match (recorded, captured.as_ref()) {
+                (Some(id), Some((request, response))) => spool
+                    .record(
+                        session,
+                        id,
+                        protocol,
+                        *streaming,
+                        (request, response),
+                        chrono::Utc::now().timestamp(),
+                    )
+                    .map(|_| ()),
+                _ => Err(ironwire_ledger::token_spool::SpoolError::Unavailable),
+            };
+            if let Err(error) = result {
+                let _ = spool.note_absence(session, &error, chrono::Utc::now().timestamp());
+                tracing::debug!(%error,"detailed capture unavailable for completed exchange");
+            }
+        }
         // The rolling window. Only ever rotates rows that are already in the
         // ledger, which means exchanges whose response finished -- an in-flight
         // one has no row and no files yet, so this cannot delete a body that is

@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+mod token_capture;
+
 /// One backend, as `ironwire status` renders it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendView {
@@ -491,6 +493,7 @@ pub struct LogView {
 /// Routes for the control API.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/token-captures", post(token_capture::handle))
         .route("/status", get(status))
         .route("/backends", get(status))
         .route("/pin", post(pin))

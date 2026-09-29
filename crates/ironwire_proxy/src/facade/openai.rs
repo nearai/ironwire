@@ -271,6 +271,7 @@ async fn forward(
     // the fact has to be carried across. Read here rather than in the backend:
     // the backend's own observation feeds quota state and never reaches a row.
     let model_alias_resolved = ironwire_upstream::observe::model_alias_resolved(&response.headers);
+    let reconnect_entry = entry.clone();
     let observed = pipeline::observe_boxed(
         response.body,
         dialect_for(protocol),
@@ -299,7 +300,7 @@ async fn forward(
         None => Box::pin(observed),
     };
 
-    let body: Body = if peek.stream {
+    let body: Body = if streaming {
         // A restarted stream carries the same placeholders, so it needs the
         // same map. Without this the reverser is bypassed on exactly the path
         // that runs when something already went wrong.
@@ -320,18 +321,39 @@ async fn forward(
             let body = body.clone();
             let headers = forwarded.clone();
             let map = reconnect_map.clone();
+            let mut entry = reconnect_entry.clone();
             Box::pin(async move {
+                entry.started_at = chrono::Utc::now();
+                entry.started = std::time::Instant::now();
                 match pipeline::dispatch(&state, protocol, &path, &peek, key, body, headers).await {
                     Ok((response, routed)) => {
                         tracing::info!(backend = %routed.decision.backend, "stream restarted");
                         // The restarted stream's own shape, not the original
                         // request's: a reconnect is a fresh response.
                         let streaming = pipeline::is_event_stream(&response.headers);
+                        let backend = state.backends.get(&routed.decision.backend)?.clone();
+                        entry.backend = routed.decision.backend.to_string();
+                        entry.backend_is_local =
+                            backend.kind() == ironwire_core::protocol::BackendKind::Local;
+                        entry.backend_is_metered = backend.kind().is_metered();
+                        entry.rung = format!("{:?}", routed.decision.rung).to_lowercase();
+                        entry.attempts = routed.attempts;
+                        entry.status = response.status.as_u16();
+                        entry.confidence = routed.confidence;
+                        entry.capture = routed.capture;
+                        let alias =
+                            ironwire_upstream::observe::model_alias_resolved(&response.headers);
                         let restarted = pipeline::observe_boxed(
                             response.body,
                             dialect_for(protocol),
                             streaming,
-                            |_| {},
+                            move |mut obs| {
+                                obs.model_alias_resolved = alias;
+                                pipeline::record(&backend, &obs);
+                                if let Some(ledger) = state.ledger.as_ref() {
+                                    entry.write(ledger, &state.spend, &obs);
+                                }
+                            },
                         );
                         Some(match map {
                             Some(map) => Box::pin(crate::privacy::reverse_stream(restarted, map))

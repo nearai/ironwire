@@ -1668,3 +1668,6 @@ mod tests {
         assert_eq!(ledger.recent(10).expect("reads").len(), 1);
     }
 }
+
+/// Leased token capture evidence.
+pub mod token_spool;
