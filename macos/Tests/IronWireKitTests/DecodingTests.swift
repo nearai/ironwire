@@ -14,6 +14,30 @@ final class DecodingTests: XCTestCase {
         try controlDecoder().decode(type, from: Data(json.utf8))
     }
 
+    func test_a_thousand_login_records_preserve_distinct_identities_and_opaque_bindings() throws {
+        let records: [[String: Any]] = (0..<1024).map { index in
+            ["id": "claude-\(index)", "name": "Claude subscription", "kind": "subscription",
+             "authenticated": true, "consented": false, "requires_consent": true,
+             "headroom": ["state": "unknown"], "consent_prompt": [
+                "version": 2, "backend_id": "claude-\(index)", "binding": "opaque-login-\(index)",
+                "product": "Claude", "summary": "Read this login", "points": ["Private auth risk"],
+                "question": "Enable this login?"]]
+        }
+        let decoder = controlDecoder()
+        let status = try decoder.decode(StatusView.self,
+            from: JSONSerialization.data(withJSONObject: ["backends": records]))
+        let settings = try decoder.decode(SettingsView.self,
+            from: JSONSerialization.data(withJSONObject: ["services": records]))
+        XCTAssertEqual(status.backends.count, 1024)
+        XCTAssertEqual(Set(status.backends.map(\.id)).count, 1024)
+        XCTAssertEqual(settings.services.map(\.id), status.backends.map(\.id))
+        for (index, service) in settings.services.enumerated() {
+            XCTAssertEqual(service.consentPrompt?.backendId, service.id)
+            XCTAssertEqual(service.consentPrompt?.binding, "opaque-login-\(index)")
+            XCTAssertEqual(status.backends[index].headroom, .unknown)
+        }
+    }
+
     func test_a_full_status_document_decodes_every_field_the_menu_shows() throws {
         let status = try decode(StatusView.self, Fixtures.status)
 
@@ -28,6 +52,8 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(status.lastRoute?.backend, "nearai")
         XCTAssertEqual(status.lastRoute?.from, "claude-sub")
         XCTAssertEqual(status.lastRoute?.rung, .crossFamily)
+        XCTAssertEqual(status.backends[0].connectCommand, "ironwire connect claude")
+        XCTAssertEqual(status.balance.subscriptionUsed.map(\.id), ["claude-sub"])
 
         guard case .observed(let usedPct, let ago, let resets) = status.backends[0].headroom else {
             return XCTFail("expected an observation, got \(status.backends[0].headroom)")
@@ -35,6 +61,39 @@ final class DecodingTests: XCTestCase {
         XCTAssertEqual(usedPct, 82, accuracy: 0.001)
         XCTAssertEqual(ago, 40)
         XCTAssertEqual(resets, 1800)
+    }
+
+    /// Two logins of one product, under one display name. The rows are keyed
+    /// on the backend id the daemon sends, so neither can take the other's
+    /// place in a list, and each carries the command for its own login.
+    func test_two_logins_of_one_product_are_told_apart_by_backend_id_not_by_name() throws {
+        let status = try decode(StatusView.self, Fixtures.twoClaudeLogins)
+
+        let uses = status.balance.subscriptionUsed
+        XCTAssertEqual(uses.map(\.name), ["Claude subscription", "Claude subscription"])
+        XCTAssertEqual(uses.map(\.backend), ["claude-sub", "claude-work"])
+        XCTAssertEqual(uses.map(\.id), ["claude-sub", "claude-work"])
+        XCTAssertEqual(Set(uses.map(\.id)).count, uses.count, "two rows share one identity")
+        XCTAssertEqual(uses.map(\.usedPct), [82, nil])
+        XCTAssertEqual(uses.map(\.exchanges), [41, 3])
+
+        XCTAssertEqual(status.backends.map(\.id), ["claude-sub", "claude-work"])
+        XCTAssertEqual(
+            status.backends.map(\.connectCommand),
+            ["ironwire connect claude", "ironwire connect claude --config-dir ~/.claude-work"])
+    }
+
+    /// A daemon from before several logins sends no `backend`, and had one
+    /// login per product, so the name is still a unique key there.
+    func test_a_subscription_from_a_daemon_without_backend_ids_is_keyed_by_its_name() throws {
+        let use = try decode(
+            SubscriptionUse.self, #"{"name":"Claude subscription","used_pct":82.0,"exchanges":41}"#)
+        XCTAssertEqual(use.backend, "")
+        XCTAssertEqual(use.id, "Claude subscription")
+        XCTAssertEqual(use.usedPct, 82)
+
+        let backend = try decode(BackendView.self, #"{"id":"claude-sub","name":"Claude subscription"}"#)
+        XCTAssertNil(backend.connectCommand, "an absent command is absent, not composed from the id")
     }
 
     func test_an_unobserved_backend_decodes_as_unknown_rather_than_as_a_number() throws {
@@ -216,7 +275,8 @@ enum Fixtures {
           "detail": null,
           "headroom": {"state": "observed", "used_pct": 82.0, "observed_secs_ago": 40, "resets_in_secs": 1800},
           "health": {"circuit": "closed", "consecutive_failures": 0, "retry_in_secs": null},
-          "models": ["claude-opus-4", "claude-sonnet-4"]
+          "models": ["claude-opus-4", "claude-sonnet-4"],
+          "connect_command": "ironwire connect claude"
         },
         {
           "id": "nearai",
@@ -227,7 +287,8 @@ enum Fixtures {
           "detail": null,
           "headroom": {"state": "unknown"},
           "health": {"circuit": "open", "consecutive_failures": 3, "retry_in_secs": 45},
-          "models": ["qwen3-coder"]
+          "models": ["qwen3-coder"],
+          "connect_command": "ironwire connect near"
         }
       ],
       "balance": {
@@ -240,7 +301,9 @@ enum Fixtures {
         "cache_hit_rate": 0.72,
         "cache_exchanges": 41,
         "spend_cap": {"spent_usd": 0.16, "cap_usd": 5.0},
-        "subscription_used": [{"name": "Claude subscription", "used_pct": 82.0, "exchanges": 41}]
+        "subscription_used": [
+          {"backend": "claude-sub", "name": "Claude subscription", "used_pct": 82.0, "exchanges": 41}
+        ]
       },
       "privacy": "redacting emails and API keys",
       "catalog_serial": 0,
@@ -252,7 +315,70 @@ enum Fixtures {
         "rung": "cross_family",
         "at": "2026-08-08T12:00:00.123456789Z"
       },
-      "usage": {"sessions": []}
+      "usage": {"sessions": []},
+      "cross_account_fallback": false
+    }
+    """#
+
+    /// A default Claude login and a second one in `~/.claude-work`, both
+    /// consented and both reporting use.
+    ///
+    /// The daemon names the two apart (`Claude subscription (~/.claude-work)`).
+    /// They share one name here on purpose: a name is for reading, and nothing
+    /// that keeps rows apart may depend on it.
+    static let twoClaudeLogins = #"""
+    {
+      "version": "0.1.0",
+      "port": 8463,
+      "tracked_conversations": 2,
+      "pin": null,
+      "backends": [
+        {
+          "id": "claude-sub",
+          "name": "Claude subscription",
+          "kind": "subscription",
+          "authenticated": true,
+          "consented": true,
+          "detail": null,
+          "headroom": {"state": "observed", "used_pct": 82.0, "observed_secs_ago": 40, "resets_in_secs": 1800},
+          "health": {"circuit": "closed", "consecutive_failures": 0, "retry_in_secs": null},
+          "models": ["claude-opus-4"],
+          "connect_command": "ironwire connect claude"
+        },
+        {
+          "id": "claude-work",
+          "name": "Claude subscription",
+          "kind": "subscription",
+          "authenticated": true,
+          "consented": true,
+          "detail": null,
+          "headroom": {"state": "unknown"},
+          "health": {"circuit": "closed", "consecutive_failures": 0, "retry_in_secs": null},
+          "models": ["claude-opus-4"],
+          "connect_command": "ironwire connect claude --config-dir ~/.claude-work"
+        }
+      ],
+      "balance": {
+        "available": 2,
+        "free_available": 2,
+        "unknown": 1,
+        "unavailable": 0,
+        "next_available_at": null,
+        "spend_today_usd": 0.0,
+        "cache_hit_rate": null,
+        "cache_exchanges": 0,
+        "spend_cap": null,
+        "subscription_used": [
+          {"backend": "claude-sub", "name": "Claude subscription", "used_pct": 82.0, "exchanges": 41},
+          {"backend": "claude-work", "name": "Claude subscription", "used_pct": null, "exchanges": 3}
+        ]
+      },
+      "privacy": null,
+      "catalog_serial": 0,
+      "update": {"state": "up_to_date"},
+      "last_route": null,
+      "usage": {"sessions": []},
+      "cross_account_fallback": false
     }
     """#
 }

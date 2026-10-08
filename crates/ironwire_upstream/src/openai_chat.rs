@@ -12,7 +12,6 @@ use futures_util::StreamExt;
 use ironwire_core::capability::Capabilities;
 use ironwire_core::protocol::{BackendId, BackendKind, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
-use ironwire_creds::Bearer;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};
@@ -248,25 +247,29 @@ impl ChatCompletionsBackend {
         self.with_extra_headers(vec![(NO_ALIASING_HEADER.to_string(), "true".to_string())])
     }
 
-    fn bearer(&self) -> Option<Bearer> {
-        Some(Bearer {
-            token: self.api_key.clone()?,
-            // Leaked to a `&'static str` because `Bearer` binds a credential to
-            // a compile-time host for the first-party backends; a user-supplied
-            // endpoint is configured once at startup, so this leaks once per
-            // backend rather than per request.
-            issuer_host: Box::leak(self.issuer_host.clone().into_boxed_str()),
-        })
-    }
-
     /// Attach the credential, if there is one.
     ///
     /// A local server usually takes none, and sending `Authorization: Bearer `
     /// with nothing after it is not the same as sending no header — some
     /// servers reject it outright.
+    fn account_scope(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let key = self.api_key.as_ref()?.expose_secret();
+        if key.is_empty() {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"ironwire:compatible-api-credential:v1\0");
+        hash.update(self.base_url.as_bytes());
+        hash.update([0]);
+        hash.update(key.as_bytes());
+        Some(format!("{:x}", hash.finalize()))
+    }
+
     fn authorize(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.bearer() {
-            Some(bearer) => builder.bearer_auth(bearer.token.expose_secret()),
+        debug_assert_eq!(self.issuer_host, host_of(&self.base_url));
+        match self.api_key.as_ref() {
+            Some(key) => builder.bearer_auth(key.expose_secret()),
             None => builder,
         }
     }
@@ -327,6 +330,7 @@ impl Backend for ChatCompletionsBackend {
             name: self.name.clone(),
             kind: self.kind,
             authenticated,
+            account_scope: self.account_scope(),
             detail: (!authenticated).then(|| "no API key configured".to_string()),
             quota: self.quota(),
             models: self.models(),
@@ -334,6 +338,19 @@ impl Backend for ChatCompletionsBackend {
     }
 
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        if request
+            .expected_account_scope
+            .as_ref()
+            .is_some_and(|expected| self.account_scope().as_ref() != Some(expected))
+        {
+            return Err(UpstreamError::NeedsAuth {
+                backend: self.id.clone(),
+                detail:
+                    "the credential changed; start a new session or restore the original API key"
+                        .into(),
+            });
+        }
+
         let url = crate::endpoint_url(&self.base_url, &request.path);
         let mut builder = self
             .authorize(self.client.post(&url))
@@ -578,13 +595,43 @@ mod tests {
         .expect("client builds")
     }
 
+    #[tokio::test]
+    async fn a_native_responses_replay_cannot_use_another_compatible_api_credential() {
+        let original = backend("http://127.0.0.1:1/v1");
+        let scope = original
+            .status()
+            .await
+            .account_scope
+            .expect("configured key identity");
+        let replaced = ChatCompletionsBackend::nearai(
+            Some(SecretString::from("another-inert-key")),
+            Some("http://127.0.0.1:1/v1".into()),
+            Vec::new(),
+            60,
+        )
+        .expect("backend");
+        let error = replaced
+            .send(UpstreamRequest {
+                path: "/v1/responses".into(),
+                body: bytes::Bytes::from_static(b"{}"),
+                headers: Vec::new(),
+                stream: false,
+                expected_account_scope: Some(scope),
+            })
+            .await
+            .expect_err("changed credential refused before network");
+        assert!(matches!(error, UpstreamError::NeedsAuth { .. }));
+    }
+
     #[test]
     fn the_credential_is_bound_to_the_configured_endpoint() {
         // TRUST.md I2 for a user-supplied host: derived, not hardcoded.
         let b = backend("https://api.near.ai/v1");
-        assert_eq!(b.bearer().expect("a key").issuer_host, "api.near.ai");
+        assert_eq!(b.issuer_host, "api.near.ai");
+        assert!(b.api_key.is_some());
         let b = backend("http://127.0.0.1:9000/v1");
-        assert_eq!(b.bearer().expect("a key").issuer_host, "127.0.0.1:9000");
+        assert_eq!(b.issuer_host, "127.0.0.1:9000");
+        assert!(b.api_key.is_some());
     }
 
     #[test]
@@ -675,7 +722,13 @@ mod local_tests {
     /// nothing after it is not the same as sending no header — some reject it.
     #[test]
     fn a_local_backend_without_a_key_carries_no_credential() {
-        assert!(local(Vec::new()).bearer().is_none());
+        let backend = local(Vec::new());
+        assert!(backend.api_key.is_none());
+        let request = backend
+            .authorize(backend.client.get(&backend.base_url))
+            .build()
+            .expect("request builds");
+        assert!(!request.headers().contains_key(http::header::AUTHORIZATION));
     }
 
     #[test]
@@ -689,8 +742,27 @@ mod local_tests {
             60,
         )
         .expect("client builds");
-        let bearer = backend.bearer().expect("a key was configured");
-        assert_eq!(bearer.issuer_host, "127.0.0.1:11434");
+        assert_eq!(backend.issuer_host, "127.0.0.1:11434");
+        assert_eq!(
+            backend
+                .api_key
+                .as_ref()
+                .expect("a key was configured")
+                .expose_secret(),
+            "sk-local"
+        );
+        for _ in 0..1024 {
+            let request = backend
+                .authorize(backend.client.get(&backend.base_url))
+                .build()
+                .expect("request builds");
+            assert_eq!(request.url().host_str(), Some("127.0.0.1"));
+            assert_eq!(request.url().port(), Some(11434));
+            assert_eq!(
+                request.headers()[http::header::AUTHORIZATION],
+                "Bearer sk-local"
+            );
+        }
     }
 
     /// Free at the margin, not metered, and no consent gate — the three things

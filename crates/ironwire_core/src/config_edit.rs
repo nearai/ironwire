@@ -13,7 +13,9 @@
 //! pure `&str -> String` transformation with no I/O: the caller reads and
 //! writes the file.
 
-use crate::config::{Config, PrivacyMode};
+use std::path::Path;
+
+use crate::config::{BackendImpl, Config, PrivacyMode, expand_config_dir};
 
 /// Why an edit could not be made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,10 @@ pub enum EditError {
     /// The edit produced something that does not parse, or does not mean what
     /// was asked. A bug here, caught before it reaches the disk.
     WouldCorrupt(String),
+    /// The file already says something different about the thing being
+    /// declared. Refused rather than overwritten: the entry there is the
+    /// user's, and which of the two they meant is theirs to say.
+    Conflicts(String),
 }
 
 impl std::fmt::Display for EditError {
@@ -42,8 +48,130 @@ impl std::fmt::Display for EditError {
                     "that change would have produced an unusable config.toml: {detail}"
                 )
             }
+            Self::Conflicts(detail) => {
+                write!(f, "config.toml was left alone: {detail}")
+            }
         }
     }
+}
+
+/// Declare one subscription login as a `[[backends]]` entry, unless config.toml
+/// already declares it.
+///
+/// Appended as text, like every edit here, so the rest of the file is left
+/// byte for byte. Idempotent: an entry with this id, this kind and this
+/// directory already there is the answer, and the file comes back unchanged.
+/// `config_dir` is written exactly as given — Claude Code keys its Keychain
+/// item on the directory string, so tidying it would name a different login.
+///
+/// # Errors
+///
+/// [`EditError::Unparseable`] when the existing file is not valid TOML,
+/// [`EditError::Conflicts`] when `id` is already declared differently or the
+/// directory is already declared under another id, and
+/// [`EditError::WouldCorrupt`] when the result would not parse, would not carry
+/// the entry, or would fail [`Config::validate`].
+pub fn ensure_subscription_entry(
+    existing: &str,
+    id: &str,
+    kind: BackendImpl,
+    config_dir: &str,
+) -> Result<String, EditError> {
+    ensure_subscription_entry_in(
+        existing,
+        id,
+        kind,
+        config_dir,
+        &dirs::home_dir().unwrap_or_default(),
+    )
+}
+
+/// [`ensure_subscription_entry`] against an explicit home, which is only ever
+/// used to compare a `~/` directory with an absolute one.
+fn ensure_subscription_entry_in(
+    existing: &str,
+    id: &str,
+    kind: BackendImpl,
+    config_dir: &str,
+    home: &Path,
+) -> Result<String, EditError> {
+    let parsed: Config = if existing.trim().is_empty() {
+        Config::default()
+    } else {
+        toml::from_str(existing).map_err(|e| EditError::Unparseable(e.to_string()))?
+    };
+
+    // Compared as paths, as `Config::validate` compares them, so the absolute
+    // spelling of a `~/` directory is the same login and not a second one.
+    let wanted = expand_config_dir(config_dir, home);
+    let same_dir = |entry: &crate::config::BackendConfig| {
+        entry
+            .config_dir
+            .as_deref()
+            .is_some_and(|dir| expand_config_dir(dir, home) == wanted)
+    };
+    for entry in &parsed.backends {
+        if entry.id == id {
+            if entry.kind == kind.as_str() && same_dir(entry) {
+                return Ok(existing.to_string());
+            }
+            let declared = match &entry.config_dir {
+                Some(dir) => format!("`kind = \"{}\"` in `{dir}`", entry.kind),
+                None => format!("`kind = \"{}\"` with no `config_dir`", entry.kind),
+            };
+            return Err(EditError::Conflicts(format!(
+                "it already declares `{id}` as {declared}. Pick another id with \
+                 `--id`, or change that entry by hand if it is the one you meant"
+            )));
+        }
+        if BackendImpl::parse(&entry.kind) == Some(kind) && same_dir(entry) {
+            return Err(EditError::Conflicts(format!(
+                "`{config_dir}` is already declared as `{other}`, and one login \
+                 declared twice would be one pool counted twice. Run the command \
+                 again with `--id {other}`",
+                other = entry.id
+            )));
+        }
+    }
+
+    let mut text = existing.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !text.trim().is_empty() && !text.ends_with("\n\n") {
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "[[backends]]\nid = {}\nkind = {}\nconfig_dir = {}\n",
+        quoted(id),
+        quoted(kind.as_str()),
+        quoted(config_dir)
+    ));
+
+    let reparsed: Config =
+        toml::from_str(&text).map_err(|e| EditError::WouldCorrupt(e.to_string()))?;
+    let declared = reparsed.backends.iter().find(|b| b.id == id);
+    if !declared
+        .is_some_and(|b| b.kind == kind.as_str() && b.config_dir.as_deref() == Some(config_dir))
+    {
+        return Err(EditError::WouldCorrupt(format!(
+            "the file would not declare `{id}` as asked"
+        )));
+    }
+    // The checks a daemon start would make. Failing them here is the
+    // difference between a refusal now and a daemon that will not start.
+    reparsed
+        .validate_with_home(Path::new("config.toml"), home)
+        .map_err(|error| match error {
+            crate::Error::ConfigInvalid { detail, .. } => EditError::WouldCorrupt(detail),
+            other => EditError::WouldCorrupt(other.to_string()),
+        })?;
+    Ok(text)
+}
+
+/// A string as TOML writes it, quotes and escapes included.
+fn quoted(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
 }
 
 impl std::error::Error for EditError {}
@@ -320,5 +448,188 @@ enabled = true
         }
         assert_eq!(text.matches("[privacy]").count(), 1, "{text}");
         assert_eq!(text.matches("mode =").count(), 1, "{text}");
+    }
+
+    const HOME: &str = "/home/alice";
+
+    fn declare(
+        existing: &str,
+        id: &str,
+        kind: BackendImpl,
+        dir: &str,
+    ) -> Result<String, EditError> {
+        ensure_subscription_entry_in(existing, id, kind, dir, Path::new(HOME))
+    }
+
+    fn backends_of(text: &str) -> Vec<crate::config::BackendConfig> {
+        toml::from_str::<Config>(text).expect("parses").backends
+    }
+
+    #[test]
+    fn a_login_is_declared_by_appending_its_entry() {
+        let before = "[server]\nport = 8463\n";
+        let after = declare(
+            before,
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-work",
+        )
+        .expect("edits");
+        assert!(
+            after.starts_with(before),
+            "the existing text moved: {after}"
+        );
+        let backends = backends_of(&after);
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0].id, "claude-work");
+        assert_eq!(backends[0].kind, "claude-subscription");
+        assert_eq!(backends[0].config_dir.as_deref(), Some("~/.claude-work"));
+    }
+
+    #[test]
+    fn declaring_a_login_twice_changes_nothing_the_second_time() {
+        let once = declare(
+            "",
+            "codex-work",
+            BackendImpl::CodexSubscription,
+            "~/.codex-work",
+        )
+        .expect("edits");
+        let twice = declare(
+            &once,
+            "codex-work",
+            BackendImpl::CodexSubscription,
+            "~/.codex-work",
+        )
+        .expect("edits");
+        assert_eq!(twice, once);
+        // The absolute spelling of the same directory is the same login.
+        let spelled_out = declare(
+            &once,
+            "codex-work",
+            BackendImpl::CodexSubscription,
+            "/home/alice/.codex-work",
+        )
+        .expect("edits");
+        assert_eq!(spelled_out, once);
+    }
+
+    /// The entry there is the user's. Which of the two they meant is theirs to
+    /// say, so it is neither overwritten nor joined by a second one.
+    #[test]
+    fn an_id_already_declared_differently_is_refused() {
+        let existing = "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+                        config_dir = \"~/.claude-work\"\n";
+        let elsewhere = declare(
+            existing,
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-other",
+        );
+        assert!(
+            matches!(&elsewhere, Err(EditError::Conflicts(detail)) if detail.contains("~/.claude-work")),
+            "{elsewhere:?}"
+        );
+
+        let another_kind = declare(
+            existing,
+            "claude-work",
+            BackendImpl::CodexSubscription,
+            "~/.codex-work",
+        );
+        assert!(
+            matches!(another_kind, Err(EditError::Conflicts(_))),
+            "{another_kind:?}"
+        );
+    }
+
+    /// One directory under two ids is one pool shown as two. The refusal names
+    /// the id it already has, which is what the user should have asked for.
+    #[test]
+    fn a_directory_already_declared_under_another_id_is_refused_naming_that_id() {
+        let existing = "[[backends]]\nid = \"work\"\nkind = \"claude-subscription\"\n\
+                        config_dir = \"/home/alice/.claude-work\"\n";
+        let outcome = declare(
+            existing,
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-work",
+        );
+        assert!(
+            matches!(&outcome, Err(EditError::Conflicts(detail)) if detail.contains("--id work")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The reason this edits text. `ironwire init --write` puts a comment above
+    /// every setting, and declaring a login must not cost the user any of them.
+    #[test]
+    fn declaring_a_login_keeps_every_comment() {
+        let before = "\
+# IronWire configuration
+[server]
+port = 8463          # the loopback port
+
+# [subscriptions]
+# cross_account_fallback = false
+";
+        let after = declare(
+            before,
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-work",
+        )
+        .expect("edits");
+        assert!(after.starts_with(before), "{after}");
+        assert!(after.contains("port = 8463          # the loopback port"));
+        assert!(after.contains("# cross_account_fallback = false"));
+    }
+
+    /// A directory with a quote or a space in it is still one TOML string.
+    #[test]
+    fn a_directory_is_written_exactly_as_given() {
+        let dir = "/home/alice/Work \"Claude\"/";
+        let after = declare("", "claude-odd", BackendImpl::ClaudeSubscription, dir).expect("edits");
+        assert_eq!(backends_of(&after)[0].config_dir.as_deref(), Some(dir));
+    }
+
+    #[test]
+    fn a_login_is_not_declared_into_a_file_we_cannot_parse() {
+        let outcome = declare(
+            "[server\nport = ",
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-work",
+        );
+        assert!(
+            matches!(outcome, Err(EditError::Unparseable(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// Anything `serve` would refuse to start with is refused here instead,
+    /// before it reaches the disk.
+    #[test]
+    fn a_declaration_the_daemon_would_refuse_is_refused_before_it_is_written() {
+        let relative = declare(
+            "",
+            "claude-work",
+            BackendImpl::ClaudeSubscription,
+            ".claude-work",
+        );
+        assert!(
+            matches!(&relative, Err(EditError::WouldCorrupt(detail)) if detail.contains("absolute")),
+            "{relative:?}"
+        );
+        let not_an_id = declare(
+            "",
+            "claude work",
+            BackendImpl::ClaudeSubscription,
+            "~/.claude-work",
+        );
+        assert!(
+            matches!(not_an_id, Err(EditError::WouldCorrupt(_))),
+            "{not_an_id:?}"
+        );
     }
 }

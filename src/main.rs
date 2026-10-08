@@ -63,12 +63,27 @@ enum Command {
     Statusline,
 
     /// Connect a coding agent or a capacity source.
+    ///
+    /// For Claude Code and Codex, one login at a time: the default one, or the
+    /// one in `--config-dir`. With `CLAUDE_CONFIG_DIR` set, `connect claude`
+    /// means the login in that directory.
     Connect {
         /// What to connect: `claude`, `codex`, `anthropic-api`, `openai-api`, `near`.
         target: String,
         /// Enable the subscription backend for this target, after consent.
         #[arg(long)]
         subscription: bool,
+        /// A login of its own: the directory you export as `CLAUDE_CONFIG_DIR`
+        /// (Claude Code) or `CODEX_HOME` (Codex) when you use it. Declared in
+        /// config.toml, and that client is pointed at a URL naming it. The
+        /// client's usual directory (`~/.claude`, `~/.codex`) moves your
+        /// default login there instead.
+        #[arg(long, value_name = "DIR")]
+        config_dir: Option<String>,
+        /// The backend id for that login. Defaults to one taken from the
+        /// directory's name, e.g. `claude-work` for `~/.claude-work`.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -78,9 +93,15 @@ enum Command {
     Disconnect {
         /// What to disconnect.
         target: String,
-        /// Revoke the subscription consent as well.
+        /// Revoke the subscription consent instead, leaving the client wired.
         #[arg(long)]
         subscription: bool,
+        /// The login, by the directory its client uses.
+        #[arg(long, value_name = "DIR", conflicts_with = "id")]
+        config_dir: Option<String>,
+        /// The login, by its backend id.
+        #[arg(long, value_name = "ID")]
+        id: Option<String>,
     },
 
     /// Check every connection end to end, with a real request per backend.
@@ -193,12 +214,26 @@ async fn main() -> Result<()> {
         Command::Connect {
             target,
             subscription,
+            config_dir,
+            id,
             dry_run,
-        } => commands::connect::run(&target, subscription, dry_run, cli.port),
+        } => commands::connect::run(
+            &target,
+            subscription,
+            dry_run,
+            cli.port,
+            commands::connect::LoginArgs { config_dir, id },
+        ),
         Command::Disconnect {
             target,
             subscription,
-        } => commands::connect::disconnect(&target, subscription),
+            config_dir,
+            id,
+        } => commands::connect::disconnect(
+            &target,
+            subscription,
+            commands::connect::LoginArgs { config_dir, id },
+        ),
         Command::Doctor => commands::doctor::run(cli.port).await,
         Command::Log { limit, json } => commands::log::run(cli.port, limit, json, style).await,
         Command::Update => commands::update::run(cli.port).await,

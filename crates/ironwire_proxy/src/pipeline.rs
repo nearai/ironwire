@@ -12,6 +12,7 @@
 //!    client has already committed to its transcript. After that point an
 //!    upstream failure is surfaced on the open stream, never retried (§5).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -394,7 +395,15 @@ async fn dispatch_inner(
         )
     });
 
-    let statuses = state.backends.statuses().await;
+    let cross_account_fallback = state
+        .policy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cross_account_fallback();
+    let statuses = state
+        .backends
+        .routing_statuses(peek, cross_account_fallback)
+        .await;
     let consent = state.consent_snapshot();
     let (candidates, refused) = capped_candidates(state, &statuses, &consent, Utc::now());
     // `on_breach = "refuse"` is a hard stop, so it is answered before routing
@@ -417,19 +426,33 @@ async fn dispatch_inner(
     // backend that is failing, not to turn a degraded proxy into a dead one:
     // when every circuit is open, the honest move is to try anyway and report
     // the real upstream error rather than a 503 of our own invention.
+    //
+    // Skipped by marking it unhealthy, as the loop below marks one that just
+    // failed, and for the same reasons: the rung can see a preferred backend
+    // was passed over, and a refusal can see the client's own login is there.
+    // Dropped, it read as missing, and a client on its own login's URL was
+    // told to rebind itself for as long as that circuit stayed open.
     let now = Utc::now();
-    let healthy: Vec<_> = candidates
+    let open: HashSet<_> = candidates
         .iter()
-        .filter(|c| state.breakers.allows(&c.id, now))
-        .cloned()
+        .filter(|c| !state.breakers.allows(&c.id, now))
+        .map(|c| c.id.clone())
         .collect();
-    let candidates = if healthy.is_empty() {
+    let candidates = if open.len() == candidates.len() {
         if !candidates.is_empty() {
             tracing::warn!("every backend's circuit is open; trying anyway");
         }
         candidates
     } else {
-        healthy
+        candidates
+            .into_iter()
+            .map(|mut candidate| {
+                if open.contains(&candidate.id) {
+                    candidate.healthy = false;
+                }
+                candidate
+            })
+            .collect()
     };
 
     // Where this conversation was before we decided anything, so a genuine
@@ -447,8 +470,11 @@ async fn dispatch_inner(
     // Bounded: each iteration marks the failed backend unavailable, so the
     // candidate set strictly shrinks. The cap is belt and braces against a
     // backend that reports itself healthy after failing.
-    let max_attempts = candidates.len().max(1) + MAX_SAME_BACKEND_RETRIES;
-    let mut excluded: Vec<ironwire_core::protocol::BackendId> = Vec::new();
+    let max_attempts = candidates
+        .len()
+        .max(1)
+        .saturating_mul(1 + MAX_SAME_BACKEND_RETRIES);
+    let mut excluded: HashSet<ironwire_core::protocol::BackendId> = HashSet::new();
     let mut same_backend_attempts = 0usize;
 
     while attempts < max_attempts {
@@ -493,7 +519,7 @@ async fn dispatch_inner(
         };
 
         let Some(backend) = state.backends.get(&decision.backend) else {
-            excluded.push(decision.backend.clone());
+            excluded.insert(decision.backend.clone());
             continue;
         };
 
@@ -516,7 +542,7 @@ async fn dispatch_inner(
                 Err(reason) => {
                     // Refusing beats sending a body the target cannot parse.
                     rejected.push((decision.backend.to_string(), reason.clone()));
-                    excluded.push(decision.backend.clone());
+                    excluded.insert(decision.backend.clone());
                     if let Ok(mut policy) = state.policy.lock() {
                         policy.forget(&key);
                     }
@@ -534,8 +560,13 @@ async fn dispatch_inner(
                 ),
                 headers: headers.clone(),
                 stream: peek.stream,
+                expected_account_scope: None,
             }
         };
+        request.expected_account_scope = available
+            .iter()
+            .find(|candidate| candidate.id == decision.backend)
+            .and_then(|candidate| candidate.account_scope.clone());
 
         let upstream_protocol = if decision.translated { target } else { inbound };
         let token_target = state
@@ -741,7 +772,7 @@ async fn dispatch_inner(
                 if let Ok(mut policy) = state.policy.lock() {
                     policy.forget(&key);
                 }
-                excluded.push(decision.backend.clone());
+                excluded.insert(decision.backend.clone());
                 last_error = Some(error);
             }
         }
@@ -862,6 +893,7 @@ fn translate_request(
         // none of them mean anything to a backend speaking a different one.
         headers: Vec::new(),
         stream: peek.stream,
+        expected_account_scope: None,
     })
 }
 

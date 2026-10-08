@@ -36,6 +36,11 @@ pub enum Rung {
     SmallerModel,
     /// Same wire format, different credential. Cache cold, reasoning intact,
     /// zero translation.
+    ///
+    /// With one exception, enforced rather than tolerated: a conversation
+    /// replaying ChatGPT encrypted reasoning never changes ChatGPT account,
+    /// because the provider rejects reasoning minted under another
+    /// organization ([`Ineligible::ReasoningBoundToAccount`]).
     AlternateCredential,
     /// Different API family. Cache cold, reasoning dropped, translation
     /// required. The user is told.
@@ -52,13 +57,25 @@ impl Rung {
 
 /// Opaque per-conversation identity derived from request content.
 ///
-/// IronWire gets no session ID from the client, so it derives one from the
-/// stable head of the conversation. Keys are memory-only and never persisted
+/// A supplied client session takes precedence; otherwise IronWire derives a
+/// key from the stable head of the conversation. Keys are memory-only and never persisted
 /// alongside content.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConversationKey(pub u64);
 
 impl ConversationKey {
+    /// A client's session remains one conversation across changed preambles,
+    /// tools and compaction. The protocol and login keep equal session strings
+    /// from different clients from sharing a route or privacy salt.
+    #[must_use]
+    pub fn for_session(protocol: Protocol, session: &str, login: Option<&BackendId>) -> Self {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        protocol.hash(&mut hasher);
+        session.hash(&mut hasher);
+        login.hash(&mut hasher);
+        Self(hasher.finish())
+    }
     /// Derive a key from the parts of a request that stay fixed as a
     /// conversation grows: the façade, the system preamble and the tool set.
     ///
@@ -97,12 +114,24 @@ pub struct Candidate {
     pub quota: QuotaSnapshot,
     /// Whether the credential is currently usable.
     pub healthy: bool,
+    /// Provider-observed credential account scope, when the backend has one.
+    pub account_scope: Option<String>,
     /// Whether the user has consented to this backend, where consent is
     /// required (`docs/TRUST.md` §2).
     pub consented: bool,
     /// The one client identity this backend will serve, if it has one. Set for
     /// subscription backends; see `docs/TRUST.md` §3.
     pub required_client_identity: Option<ClientIdentity>,
+    /// Whether this is the login the plain façade belongs to: its product's
+    /// default login (`claude-sub`, `codex-sub`) in the default location, the
+    /// one a client with no `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is using.
+    ///
+    /// False for a default login relocated with `config_dir`. Its token is
+    /// another directory's, and the client still reading the default
+    /// directory may well be logged in as someone else, so a relocated default
+    /// is reached only through its login-bound URL, like an additional login.
+    /// False for anything that is not a subscription.
+    pub default_login: bool,
     /// Models this backend offers, best-first, with the tier each satisfies.
     pub models: Vec<(String, ModelTier)>,
     /// Whether the user's privacy mode permits routing here.
@@ -268,6 +297,57 @@ struct Turn<'a> {
     tier: ModelTier,
     candidates: &'a [Candidate],
     now: DateTime<Utc>,
+    accounts: Accounts<'a>,
+}
+
+/// What a decision knows about the user's logins beyond the candidate and the
+/// request.
+#[derive(Clone, Copy)]
+struct Accounts<'a> {
+    /// `[subscriptions] cross_account_fallback`.
+    cross_account_fallback: bool,
+    /// The native Responses backend and observed scope that served this
+    /// session. A missing record makes every native encrypted replay ineligible.
+    reasoning_account: Option<&'a ReasoningAccount>,
+}
+
+/// Which Responses credential scope last served a client session a native Responses
+/// turn, and so minted the encrypted reasoning its history replays.
+///
+/// Kept apart from [`Affinity`] because the two have different lifetimes. An
+/// affinity is where the conversation should go next, and the pipeline forgets
+/// it whenever its backend fails so the retry can re-select. Which account the
+/// reasoning came from does not change when that account fails. Taking the
+/// lock's answer from the affinity handed a sibling's reasoning to the
+/// client's own login on the sibling's first 429, the one move the lock
+/// exists to prevent, and the wrong account then held the lock.
+#[derive(Debug, Clone)]
+struct ReasoningAccount {
+    backend: BackendId,
+    account_scope: Option<String>,
+    last_seen: DateTime<Utc>,
+}
+
+/// Whose [`ReasoningAccount`] a request reads and writes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReasoningKey {
+    /// The client's own session id ([`RequestPeek::client_session`]), with
+    /// the login it came in on. The conversation key cannot tell two
+    /// concurrent Codex sessions apart, and when one of them moves to a
+    /// sibling the other's reasoning has not moved with it.
+    Session(String, Option<BackendId>),
+    /// No session id: the conversation key and the login, the best a request
+    /// that names no session allows.
+    Conversation(ConversationKey, Option<BackendId>),
+}
+
+impl ReasoningKey {
+    fn of(key: &ConversationKey, peek: &RequestPeek) -> Self {
+        match &peek.client_session {
+            Some(session) => Self::Session(session.clone(), peek.client_login.clone()),
+            None => Self::Conversation(key.clone(), peek.client_login.clone()),
+        }
+    }
 }
 
 /// Sticky per-conversation route state.
@@ -295,6 +375,14 @@ pub struct Affinity {
     /// [`Self::pressure_since`], cleared whenever pressure returns, and a
     /// promotion needs it older than [`PROMOTION_DEBOUNCE`].
     pub recovery_since: Option<DateTime<Utc>>,
+    /// The client login this route was chosen for ([`RequestPeek::client_login`]).
+    ///
+    /// The conversation key is the system preamble and the tool names, which
+    /// every session of one client version shares, so a Claude Code on one
+    /// login and a Claude Code on another derive the same key. Neither may
+    /// inherit the other's route — least of all its account lock, which would
+    /// send one login's encrypted reasoning to the other's account.
+    pub client_login: Option<BackendId>,
 }
 
 /// How long pressure must persist before a conversation descends a rung.
@@ -331,13 +419,23 @@ pub const AFFINITY_TTL: Duration = Duration::hours(24);
 /// state for its whole life, and the thing being dropped costs one cold cache.
 pub const MAX_AFFINITIES: usize = 512;
 
+/// Replay origins outlive the route cache. Losing one refuses an encrypted
+/// native replay rather than guessing which account minted it.
+pub const MAX_REASONING_ACCOUNTS: usize = 4096;
+
 /// Routing policy over a set of candidate backends.
 #[derive(Debug, Default)]
 pub struct Policy {
     affinities: HashMap<ConversationKey, Affinity>,
+    /// The account lock's memory. Bounded by [`AFFINITY_TTL`] and
+    /// [`MAX_REASONING_ACCOUNTS`], independently of route affinities. Restart,
+    /// expiry or eviction leaves an unknown origin; native replay is refused.
+    reasoning_accounts: HashMap<ReasoningKey, ReasoningAccount>,
     /// User-forced backend/model (`ironwire pin`). Overrides everything except
     /// eligibility — we will not serve a pin that would corrupt the request.
     pin: Option<(BackendId, Option<String>)>,
+    /// `[subscriptions] cross_account_fallback`. Off unless the user set it.
+    cross_account_fallback: bool,
 }
 
 impl Policy {
@@ -345,6 +443,23 @@ impl Policy {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a client may be served by another of the user's subscriptions
+    /// to the same product, when its own cannot serve it
+    /// (`[subscriptions] cross_account_fallback`).
+    ///
+    /// Held here rather than passed per call because it is a setting, read
+    /// once, like the pin — and every decision, including a sticky one, has to
+    /// be judged against the same value.
+    pub fn set_cross_account_fallback(&mut self, enabled: bool) {
+        self.cross_account_fallback = enabled;
+    }
+
+    /// Whether cross-account fallback is on.
+    #[must_use]
+    pub fn cross_account_fallback(&self) -> bool {
+        self.cross_account_fallback
     }
 
     /// Force all conversations onto a backend (and optionally a model).
@@ -369,6 +484,9 @@ impl Policy {
     }
 
     /// Forget a conversation's affinity.
+    ///
+    /// Not which account its reasoning came from: a failed backend still
+    /// minted what the history replays.
     pub fn forget(&mut self, key: &ConversationKey) {
         self.affinities.remove(key);
     }
@@ -393,21 +511,54 @@ impl Policy {
     /// same trade-off; a second, more complicated answer to the same question
     /// in the same daemon is worse than a slightly slower one.
     fn sweep(&mut self, now: DateTime<Utc>) {
-        self.affinities
-            .retain(|_, affinity| now - affinity.last_seen < AFFINITY_TTL);
+        bound(&mut self.affinities, now, MAX_AFFINITIES, |affinity| {
+            affinity.last_seen
+        });
+        bound(
+            &mut self.reasoning_accounts,
+            now,
+            MAX_REASONING_ACCOUNTS,
+            |record| record.last_seen,
+        );
+    }
 
-        // Oldest use first, so a busy conversation outlives an idle one even
-        // when both are inside the TTL.
-        while self.affinities.len() > MAX_AFFINITIES {
-            let Some(stalest) = self
-                .affinities
+    /// Record the native Responses credential scope that served this turn.
+    /// Cross-family turns leave its origin intact because earlier encrypted
+    /// history can still be replayed. Unknown scopes never authorize a replay.
+    fn note_reasoning_account(
+        &mut self,
+        key: ReasoningKey,
+        inbound: Protocol,
+        decision: &RouteDecision,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+    ) {
+        let minted_here = inbound == Protocol::OpenAiResponses
+            && !decision.translated
+            && candidates
                 .iter()
-                .min_by_key(|(_, affinity)| affinity.last_seen)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.affinities.remove(&stalest);
+                .find(|c| c.id == decision.backend)
+                .is_some_and(|candidate| candidate.caps.wires.speaks(Protocol::OpenAiResponses));
+        if minted_here {
+            self.reasoning_accounts.insert(
+                key,
+                ReasoningAccount {
+                    backend: decision.backend.clone(),
+                    account_scope: candidates
+                        .iter()
+                        .find(|c| c.id == decision.backend)
+                        .and_then(|c| c.account_scope.clone()),
+                    last_seen: now,
+                },
+            );
+            bound(
+                &mut self.reasoning_accounts,
+                now,
+                MAX_REASONING_ACCOUNTS,
+                |record| record.last_seen,
+            );
+        } else if let Some(record) = self.reasoning_accounts.get_mut(&key) {
+            record.last_seen = now;
         }
     }
 
@@ -451,6 +602,25 @@ impl Policy {
         now: DateTime<Utc>,
         route_override: Option<(BackendId, Option<String>)>,
     ) -> Result<RouteDecision, NoRoute> {
+        let reasoning_key = ReasoningKey::of(&key, peek);
+        let decision = self.route(key, inbound, peek, candidates, now, route_override)?;
+        // Pins and overrides passed the same origin gate before reaching here.
+        self.note_reasoning_account(reasoning_key, inbound, &decision, candidates, now);
+        Ok(decision)
+    }
+
+    /// [`Self::decide_with_override`], short of recording which account the
+    /// route mints reasoning on.
+    fn route(
+        &mut self,
+        key: ConversationKey,
+        inbound: Protocol,
+        peek: &RequestPeek,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+        route_override: Option<(BackendId, Option<String>)>,
+    ) -> Result<RouteDecision, NoRoute> {
+        self.sweep(now);
         if candidates.is_empty() {
             return Err(NoRoute::NoBackendsConfigured);
         }
@@ -492,6 +662,27 @@ impl Policy {
                     missing: Vec::new(),
                 });
             }
+            // Nor whose capacity this is. A header a client can set must not
+            // make one product's subscription serve another product's client,
+            // nor one login serve a client logged in as another while
+            // `cross_account_fallback` is off.
+
+            if let Err(why) = serves_this_client(candidate, peek, self.cross_account_fallback) {
+                return Err(match why {
+                    Unusable::NeedsClientIdentity => NoRoute::RequiresClientIdentity,
+                    other => NoRoute::NoneUsable {
+                        refusals: vec![(candidate.id.clone(), Refusal::from(&other))],
+                    },
+                });
+            }
+            // Nor the consent the user never gave. Consent is what authorises
+            // replaying another product's token at all (`docs/TRUST.md` §2),
+            // and a pin, or a header any local client can set, is not that.
+            if candidate.kind.requires_consent() && !candidate.consented {
+                return Err(NoRoute::NoneUsable {
+                    refusals: vec![(candidate.id.clone(), Refusal::NotConsented)],
+                });
+            }
             // The same wire question `usable` asks, and for the same reason. It
             // used to compare *families* here, which is a different question
             // with the same shape: Responses and Chat Completions share a
@@ -502,8 +693,10 @@ impl Policy {
             // override preference, never turn a refusal into a malformed
             // request.
             let cross = !candidate.caps.wires.speaks(inbound);
+            let origin = self.reasoning_accounts.get(&ReasoningKey::of(&key, peek));
+            let requirements = requirements_for(candidate, peek, origin);
             eligible(
-                &peek.requirements,
+                &requirements,
                 &candidate.caps,
                 cross,
                 Some((
@@ -521,6 +714,9 @@ impl Policy {
             return Ok(RouteDecision {
                 backend: candidate.id.clone(),
                 model: model.or_else(|| pick_model(candidate, tier)),
+                // `Preferred` even on another of the user's logins, unlike
+                // the same route chosen by `select`: the user named it, so it
+                // is not a fallback the opt-in took on their behalf.
                 rung: if cross {
                     Rung::CrossFamily
                 } else {
@@ -543,16 +739,39 @@ impl Policy {
         // possible turn to spend it on: the summary becomes the conversation.
         // So a compaction turn re-selects rather than inheriting a degraded
         // affinity, and pays the cache cost to do it.
-        let inherit_affinity = !peek.likely_compaction
-            || self
-                .affinities
-                .get(&key)
-                .is_none_or(|a| a.rung == Rung::Preferred);
+        //
+        // Only an affinity chosen for this client's own login counts; see
+        // `Affinity::client_login`.
+        let affinity = self
+            .affinities
+            .get(&key)
+            .filter(|a| a.client_login == peek.client_login)
+            .cloned();
+        let inherit_affinity =
+            !peek.likely_compaction || affinity.as_ref().is_none_or(|a| a.rung == Rung::Preferred);
+        // Binds whether or not that account is among the candidates. One
+        // missing from them is not known to be up or down, and not knowing is
+        // no licence to send its reasoning to an account that will refuse it.
+        let reasoning_account = self
+            .reasoning_accounts
+            .get(&ReasoningKey::of(&key, peek))
+            .cloned();
+        let turn = Turn {
+            inbound,
+            peek,
+            tier,
+            candidates,
+            now,
+            accounts: Accounts {
+                cross_account_fallback: self.cross_account_fallback,
+                reasoning_account: reasoning_account.as_ref(),
+            },
+        };
 
         if inherit_affinity
-            && let Some(affinity) = self.affinities.get(&key).cloned()
+            && let Some(affinity) = affinity.clone()
             && let Some(candidate) = candidates.iter().find(|c| c.id == affinity.backend)
-            && incumbent_is_usable(candidate, peek, inbound, now)
+            && incumbent_is_usable(candidate, turn)
         {
             let pressured = candidate.quota.is_pressured(now);
             let entry = self.affinities.get_mut(&key).expect("just found above");
@@ -589,17 +808,7 @@ impl Policy {
                 // Sustained pressure: fall through to a fresh selection.
                 Some(_) => {}
                 None => {
-                    if let Some(promoted) = self.consider_promotion(
-                        &key,
-                        &affinity,
-                        Turn {
-                            inbound,
-                            peek,
-                            tier,
-                            candidates,
-                            now,
-                        },
-                    ) {
+                    if let Some(promoted) = self.consider_promotion(&key, &affinity, turn) {
                         return Ok(promoted);
                     }
                     return Ok(RouteDecision {
@@ -613,7 +822,7 @@ impl Policy {
             }
         }
 
-        let decision = self.select(inbound, peek, tier, candidates, now)?;
+        let decision = self.select(turn)?;
         self.affinities.insert(
             key,
             Affinity {
@@ -624,6 +833,7 @@ impl Policy {
                 last_seen: now,
                 pressure_since: None,
                 recovery_since: None,
+                client_login: peek.client_login.clone(),
             },
         );
         // After the insert, not before: sweeping first leaves room for one more
@@ -631,7 +841,9 @@ impl Policy {
         // the map grows, and it is safely clear of the `get`/`get_mut` pair
         // above, where an eviction could have pulled the ground out from under
         // that `expect`.
-        self.sweep(now);
+        bound(&mut self.affinities, now, MAX_AFFINITIES, |affinity| {
+            affinity.last_seen
+        });
         Ok(decision)
     }
 
@@ -652,13 +864,7 @@ impl Policy {
         affinity: &Affinity,
         turn: Turn<'_>,
     ) -> Option<RouteDecision> {
-        let Turn {
-            inbound,
-            peek,
-            tier,
-            candidates,
-            now,
-        } = turn;
+        let Turn { peek, now, .. } = turn;
         // A conversation already at the top has nowhere to climb, and this is
         // the common case: no `select` runs for it.
         if affinity.rung == Rung::Preferred {
@@ -673,8 +879,14 @@ impl Policy {
         //
         // Compared by *rung*, never by backend id: rung 1 to rung 0 can be a
         // model change on the very same backend.
+        //
+        // That includes the account lock. A conversation replaying encrypted
+        // reasoning minted on a sibling ChatGPT login cannot climb back to the
+        // client's own login — the move would be rejected exactly as the
+        // descent would — and `select` refuses that login for it, while still
+        // reporting the sibling as rung 2, so nothing here looks better.
         let better = self
-            .select(inbound, peek, tier, candidates, now)
+            .select(turn)
             .ok()
             .filter(|decision| decision.rung < affinity.rung);
         let Some(candidate) = better else {
@@ -716,6 +928,7 @@ impl Policy {
             last_seen: now,
             pressure_since: None,
             recovery_since: None,
+            client_login: affinity.client_login.clone(),
         };
         // The decision `select` produced, not a patched copy of the old one:
         // `translated` has to come from the new route. Updating the rung while
@@ -727,15 +940,17 @@ impl Policy {
         })
     }
 
-    /// Fresh selection, ignoring affinity. Walks the ladder rung by rung.
-    fn select(
-        &self,
-        inbound: Protocol,
-        peek: &RequestPeek,
-        tier: ModelTier,
-        candidates: &[Candidate],
-        now: DateTime<Utc>,
-    ) -> Result<RouteDecision, NoRoute> {
+    /// Fresh selection, ignoring affinity — except for the account the
+    /// conversation's reasoning is bound to. Walks the ladder rung by rung.
+    fn select(&self, turn: Turn<'_>) -> Result<RouteDecision, NoRoute> {
+        let Turn {
+            inbound,
+            peek,
+            tier,
+            candidates,
+            now,
+            ..
+        } = turn;
         // Every backend that did not take the request, and why. Collected for
         // all of them rather than only the ones that failed the capability gate
         // — see `NoRoute::NoneUsable`.
@@ -751,7 +966,7 @@ impl Policy {
         let mut cross_family: Vec<&Candidate> = Vec::new();
 
         for candidate in candidates {
-            if let Err(unusable) = usable(candidate, peek, inbound, now) {
+            if let Err(unusable) = usable(candidate, turn) {
                 if matches!(unusable, Unusable::NoCapacity)
                     && let crate::quota::Headroom::CapReached {
                         spent_usd, cap_usd, ..
@@ -775,9 +990,18 @@ impl Policy {
         // permanent history and resent every turn afterwards
         // (`docs/PROTOCOL.md` §8). Saving money there buys one cheaper request
         // and pays for it for the rest of the session.
+        //
+        // Among equal cost, the client's own login comes before the user's
+        // other logins, and only then registration order. Without cross-account
+        // fallback the others are never usable and this changes nothing. With
+        // it, pressure still outranks the own-login preference: an own login
+        // at 90% or more sorts behind an unpressured sibling, so a fresh
+        // selection moves at once, and a conversation already on the own login
+        // once that pressure outlasts `DESCENT_DEBOUNCE`.
         let sort_key = |c: &&Candidate| {
             let pressured = u8::from(c.quota.is_pressured(now));
             let cost = c.kind.marginal_cost_rank();
+            let another_login = u8::from(!is_own_login(c, peek));
             // Local capacity is the cheapest there is — rank 0, ahead of a
             // subscription — and descending a rung is normally fine, because
             // rung 1 means "same account, smaller model". A local backend
@@ -797,12 +1021,14 @@ impl Policy {
                     beyond_its_tier,
                     u8::from(!serves_tier(c, tier)),
                     cost,
+                    another_login,
                 )
             } else {
                 (
                     pressured,
                     beyond_its_tier,
                     cost,
+                    another_login,
                     u8::from(pick_model(c, tier).is_none()),
                 )
             }
@@ -811,6 +1037,54 @@ impl Policy {
         cross_family.sort_by_key(sort_key);
 
         if let Some(best) = same_wire.first() {
+            // Two independent ways a same-wire route can be degraded, and the
+            // rung is the worse of them. Deriving it from the model tier alone
+            // — as this did — recorded a fall from a subscription to a metered
+            // key as `Preferred`, because the key serves the same tier. That
+            // made the most expensive fallback in the product invisible in the
+            // ledger and, worse, permanent: `consider_promotion` returns early
+            // on `Preferred`, so the conversation never went back to the
+            // subscription once its window reset.
+            //
+            // "Better credential" is `marginal_cost_rank`, which is already the
+            // router's own statement of preference — a second definition of
+            // which backend the user wanted would drift from it. Only
+            // candidates that could actually have served this request count, so
+            // a cheaper backend skipped for tier reasons, or refused for good
+            // (`was_passed_over`), does not make every route look degraded.
+            // Preference is the order `sort_key` uses: cost, then the client's
+            // own login, then registration order (`BackendRegistry::push`).
+            // Cost alone was not enough: two API keys rank equal, so falling
+            // from one to the other read as `Preferred`, which is the same
+            // invisible-and-permanent fallback rung 2 exists to prevent, one
+            // class narrower.
+            let positions: HashMap<_, _> = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| (&candidate.id, index))
+                .collect();
+            let position = |id: &BackendId| positions.get(id).copied();
+            let preference = |c: &Candidate| {
+                (
+                    c.kind.marginal_cost_rank(),
+                    u8::from(!is_own_login(c, peek)),
+                    position(&c.id),
+                )
+            };
+            let passed_over_a_preferred_credential = candidates
+                .iter()
+                .filter(|c| c.caps.wires.speaks(inbound) && c.id != best.id)
+                .filter(|c| serves_tier(c, tier))
+                .filter(|c| was_passed_over(usable(c, turn)))
+                .any(|c| preference(c) < preference(best));
+            // Another of the user's logins is a credential change whatever
+            // else was refused. Asking only what was passed over recorded a
+            // client served on another account's token as rung 0 whenever its
+            // own login was absent or could never have served, which hid
+            // exactly the move the opt-in makes.
+            let alternate_credential = passed_over_a_preferred_credential
+                || (best.required_client_identity.is_some() && !is_own_login(best, peek));
+
             // A model missing from a catalogue we only *guessed* is not a model
             // that does not exist — it is a build older than the model. The
             // providers ship faster than we do, so on the native lane, with
@@ -827,7 +1101,16 @@ impl Policy {
                 return Ok(RouteDecision {
                     backend: best.id.clone(),
                     model: None,
-                    rung: Rung::Preferred,
+                    // No tier to compare without a catalogue entry, but the
+                    // credential question still has an answer. Reporting
+                    // `Preferred` here after falling off the first choice
+                    // hid the fallback and, because promotion stops at
+                    // `Preferred`, kept the conversation on it for good.
+                    rung: if alternate_credential {
+                        Rung::AlternateCredential
+                    } else {
+                        Rung::Preferred
+                    },
                     translated: false,
                     reason: format!("native lane, {} capacity", kind_label(best.kind)),
                 });
@@ -835,38 +1118,7 @@ impl Policy {
 
             let model = pick_model(best, tier);
             let served_tier = model.as_deref().map_or(tier, ModelTier::from_model_hint);
-            // Two independent ways a same-wire route can be degraded, and the
-            // rung is the worse of them. Deriving it from the model tier alone
-            // — as this did — recorded a fall from a subscription to a metered
-            // key as `Preferred`, because the key serves the same tier. That
-            // made the most expensive fallback in the product invisible in the
-            // ledger and, worse, permanent: `consider_promotion` returns early
-            // on `Preferred`, so the conversation never went back to the
-            // subscription once its window reset.
-            //
-            // "Better credential" is `marginal_cost_rank`, which is already the
-            // router's own statement of preference — a second definition of
-            // which backend the user wanted would drift from it. Only
-            // candidates that could actually have served this request count, so
-            // a cheaper backend skipped for tier reasons does not make every
-            // route look degraded.
-            // Preference is cost first and registration order second — the
-            // same two signals, in the same order, that `sort_key` and
-            // `BackendRegistry::push` already use. Cost alone was not enough:
-            // two API keys rank equal, so falling from one to the other read as
-            // `Preferred`, which is the same invisible-and-permanent fallback
-            // rung 2 exists to prevent, one class narrower.
-            let position = |id: &BackendId| candidates.iter().position(|c| &c.id == id);
-            let passed_over_a_preferred_credential = candidates
-                .iter()
-                .filter(|c| c.caps.wires.speaks(inbound) && c.id != best.id)
-                .filter(|c| serves_tier(c, tier))
-                .any(|c| {
-                    let (theirs, ours) =
-                        (c.kind.marginal_cost_rank(), best.kind.marginal_cost_rank());
-                    theirs < ours || (theirs == ours && position(&c.id) < position(&best.id))
-                });
-            let rung = match (served_tier < tier, passed_over_a_preferred_credential) {
+            let rung = match (served_tier < tier, alternate_credential) {
                 (_, true) => Rung::AlternateCredential,
                 (true, false) => Rung::SmallerModel,
                 (false, false) => Rung::Preferred,
@@ -937,7 +1189,33 @@ impl Policy {
             // is a better answer than a list of backends with nothing wrong
             // with them. Anything else is a configuration problem and gets the
             // full list.
-            if refusals.iter().all(|(_, why)| why.is_transient()) {
+            //
+            // A login that belongs to another client stays out of that
+            // question: it was never this request's capacity. Counting it
+            // turned "your subscription is spent, come back later" into a 503
+            // about a configuration nobody got wrong, on every machine with a
+            // second login. When it is all there is, it still gets named below.
+            //
+            // Unless this client has no login of its own among the
+            // candidates. Then nothing is coming back later: it is pointed at
+            // the wrong URL, and the refusal that says which login exists and
+            // what binds a client to it is the answer. A transient refusal
+            // beside it is incidental, and there always is one: NEAR AI is
+            // registered without a key and reads as unhealthy.
+            let wrong_url = refusals
+                .iter()
+                .any(|(_, why)| matches!(why, Refusal::AnotherLogin { .. }))
+                && !candidates.iter().any(|c| {
+                    c.required_client_identity.is_some()
+                        && c.required_client_identity == peek.client_identity
+                        && is_own_login(c, peek)
+                });
+            if !wrong_url
+                && refusals.iter().any(|(_, why)| why.is_transient())
+                && refusals.iter().all(|(_, why)| {
+                    why.is_transient() || matches!(why, Refusal::AnotherLogin { .. })
+                })
+            {
                 return Err(NoRoute::AllExhausted);
             }
             // Stable sort, so backends keep registration order within a group
@@ -967,6 +1245,14 @@ pub enum Refusal {
     /// Needs the originating product's own client identity, which this request
     /// does not carry (`docs/TRUST.md` §3).
     NeedsClientIdentity,
+    /// One of the user's other logins for this product. The request carries
+    /// the right product's identity, but its client is logged in as someone
+    /// else, and `[subscriptions] cross_account_fallback` is off.
+    AnotherLogin {
+        /// The client this login serves, so the answer can name the command
+        /// that points one at it.
+        client: ClientIdentity,
+    },
     /// The breaker has it open, or it is failing.
     Unhealthy,
     /// Rate limited, or out of window capacity.
@@ -984,7 +1270,10 @@ impl Refusal {
     /// problems.
     #[must_use]
     pub fn is_actionable(&self) -> bool {
-        matches!(self, Self::NotConsented | Self::NeedsClientIdentity)
+        matches!(
+            self,
+            Self::NotConsented | Self::NeedsClientIdentity | Self::AnotherLogin { .. }
+        )
     }
 
     /// Whether this is a capacity problem rather than a configuration one.
@@ -1009,8 +1298,26 @@ impl Refusal {
                 "needs the originating product's own client identity, which this request does not carry"
                     .to_string()
             }
+            Self::AnotherLogin { client } => format!(
+                "another login: this subscription serves only the {client} logged in with \
+                 it. To point that {client} here, run `ironwire connect {command} \
+                 --config-dir DIR` with the directory it keeps its login in",
+                command = match client {
+                    ClientIdentity::ClaudeCode => "claude",
+                    ClientIdentity::Codex => "codex",
+                },
+            ),
             Self::Unhealthy => "unhealthy: recent requests to it failed".to_string(),
             Self::NoCapacity => "no capacity: rate limited or out of window".to_string(),
+            // The variant name stays in the sentence, as it does for every
+            // other ineligibility, so the two read alike in a log.
+            Self::Ineligible(Ineligible::ReasoningBoundToAccount) => {
+                "cannot preserve this request (ReasoningBoundToAccount): its encrypted \
+                 reasoning requires the original ChatGPT account or API credential. Its \
+                 origin is unknown or another account was selected; start a new session, \
+                 restore the original login, or use another family at a turn boundary"
+                    .to_string()
+            }
             Self::Ineligible(why) => format!("cannot preserve this request ({why:?})"),
         }
     }
@@ -1022,6 +1329,7 @@ enum Unusable {
     NoCapacity,
     NotConsented,
     NeedsClientIdentity,
+    AnotherLogin(ClientIdentity),
     Ineligible(Ineligible),
 }
 
@@ -1032,9 +1340,35 @@ impl From<&Unusable> for Refusal {
             Unusable::NoCapacity => Self::NoCapacity,
             Unusable::NotConsented => Self::NotConsented,
             Unusable::NeedsClientIdentity => Self::NeedsClientIdentity,
+            Unusable::AnotherLogin(client) => Self::AnotherLogin { client: *client },
             Unusable::Ineligible(why) => Self::Ineligible(*why),
         }
     }
+}
+
+/// Whether a candidate refused this way could still have been the better
+/// route, so that serving the request elsewhere is a descent.
+///
+/// Only refusals that are about *now* count: a busy or failing backend, and the
+/// account lock, which lasts only as long as this conversation. A switch nobody
+/// flipped (consent), a client that is not this backend's, or a capability the
+/// request needs and the backend lacks are permanent facts about this request,
+/// and counting them labelled every route rung 2 for good — an unconsented
+/// second login, or the Claude subscription under an Aider request, was enough.
+///
+/// The lock counts for the opposite reason. A conversation whose reasoning is
+/// bound to a sibling login really is on an alternate credential, and saying
+/// otherwise would let `consider_promotion` relabel it `Preferred`, after
+/// which promotion never looks again and the conversation key stays on the
+/// sibling even once the lock has lifted.
+fn was_passed_over(result: Result<(), Unusable>) -> bool {
+    matches!(
+        result,
+        Ok(())
+            | Err(Unusable::NoCapacity
+                | Unusable::Unhealthy
+                | Unusable::Ineligible(Ineligible::ReasoningBoundToAccount))
+    )
 }
 
 /// Whether the backend a conversation is *already on* can serve this turn.
@@ -1049,24 +1383,30 @@ impl From<&Unusable> for Refusal {
 /// ineligible meant a mid-loop turn found its own backend unusable and fell
 /// through to a fresh selection, which dragged it back to the native family —
 /// mid tool loop, which is the exact move the rule exists to prevent.
-fn incumbent_is_usable(
-    candidate: &Candidate,
-    peek: &RequestPeek,
-    inbound: Protocol,
-    now: DateTime<Utc>,
-) -> bool {
+///
+/// The account lock is not tolerated, and needs no tolerance: it already lets
+/// the account the reasoning came from serve. Tolerating it trusted the
+/// affinity to be that account, and every session of one Codex version shares
+/// a conversation key, so a session that moved to a sibling took the others'
+/// affinity, and their reasoning, with it.
+fn incumbent_is_usable(candidate: &Candidate, turn: Turn<'_>) -> bool {
     matches!(
-        usable(candidate, peek, inbound, now),
+        usable(candidate, turn),
         Ok(()) | Err(Unusable::Ineligible(Ineligible::MidToolLoop))
     )
 }
 
-fn usable(
-    candidate: &Candidate,
-    peek: &RequestPeek,
-    inbound: Protocol,
-    now: DateTime<Utc>,
-) -> Result<(), Unusable> {
+fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
+    let Turn {
+        inbound,
+        peek,
+        now,
+        accounts,
+        ..
+    } = turn;
+    // Ownership is independent of credential health. Unobserved sibling
+    // logins must explain how to bind the client, never imply a bad credential.
+    serves_this_client(candidate, peek, accounts.cross_account_fallback)?;
     if !candidate.healthy {
         return Err(Unusable::Unhealthy);
     }
@@ -1077,17 +1417,6 @@ fn usable(
     // has to do, rather than the thing that happens to be true as well.
     if candidate.kind.requires_consent() && !candidate.consented {
         return Err(Unusable::NotConsented);
-    }
-    // TRUST.md §3: we serve a subscription only for the client it belongs to,
-    // and we never synthesize that client's identity to unlock it.
-    // The identity must be the one *this* backend belongs to. Asking only
-    // "does the request carry some product's identity" let Claude Code unlock
-    // the ChatGPT subscription the moment a translator existed between the two
-    // wires — `docs/TRUST.md` I5, in the one direction it forbids.
-    if let Some(required) = candidate.required_client_identity
-        && peek.client_identity != Some(required)
-    {
-        return Err(Unusable::NeedsClientIdentity);
     }
     // Checked before the capability gate on purpose: a user who forbade this
     // destination should be told that, not handed an incidental capability
@@ -1106,8 +1435,9 @@ fn usable(
     // the target genuinely cannot express still refuses the route, but that is
     // decided by the emitter, on the body, in `pipeline::translate_request`.
     let cross = !candidate.caps.wires.speaks(inbound);
+    let requirements = requirements_for(candidate, peek, accounts.reasoning_account);
     eligible(
-        &peek.requirements,
+        &requirements,
         &candidate.caps,
         cross,
         Some((
@@ -1120,6 +1450,89 @@ fn usable(
         )),
     )
     .map_err(Unusable::Ineligible)
+}
+
+/// Whether a subscription is this request's client's to use: the right
+/// product, and — unless the user turned on cross-account fallback — the right
+/// login of it. Anything without a required client is anyone's.
+fn serves_this_client(
+    candidate: &Candidate,
+    peek: &RequestPeek,
+    cross_account_fallback: bool,
+) -> Result<(), Unusable> {
+    let Some(required) = candidate.required_client_identity else {
+        return Ok(());
+    };
+    // TRUST.md §3: we serve a subscription only for the client it belongs to,
+    // and we never synthesize that client's identity to unlock it.
+    // The identity must be the one *this* backend belongs to. Asking only
+    // "does the request carry some product's identity" let Claude Code unlock
+    // the ChatGPT subscription the moment a translator existed between the two
+    // wires — `docs/TRUST.md` I5, in the one direction it forbids.
+    if peek.client_identity != Some(required) {
+        return Err(Unusable::NeedsClientIdentity);
+    }
+    // One request, one login. Claude Code's body names the account it is
+    // logged in as, so the same bytes on another account's token are a
+    // request the provider can see was moved — and moving after a 429 is the
+    // plainest reading of both providers' rate-limit terms. Serving a client
+    // from another of the user's logins is therefore the user's explicit
+    // choice, never a default (`docs/TRUST.md`).
+    if !cross_account_fallback && !is_own_login(candidate, peek) {
+        return Err(Unusable::AnotherLogin(required));
+    }
+    Ok(())
+}
+
+/// Whether `candidate` is the login this request's client is using. A request
+/// at the plain façade belongs to each product's default login.
+fn is_own_login(candidate: &Candidate, peek: &RequestPeek) -> bool {
+    match &peek.client_login {
+        Some(login) => candidate.id == *login,
+        None => candidate.default_login,
+    }
+}
+
+/// Native encrypted reasoning requires a recorded and currently observed
+/// credential scope; missing history or a relogin cannot authorize a guess.
+fn requirements_for(
+    candidate: &Candidate,
+    peek: &RequestPeek,
+    origin: Option<&ReasoningAccount>,
+) -> RequestRequirements {
+    let mut requirements = peek.requirements.clone();
+    requirements.reasoning_backend = origin
+        .filter(|origin| {
+            origin.backend == candidate.id
+                && origin.account_scope.is_some()
+                && origin.account_scope == candidate.account_scope
+        })
+        .map(|origin| origin.backend.to_string());
+    requirements
+}
+
+/// Drop the entries unused for [`AFFINITY_TTL`], then the stalest beyond
+/// [`MAX_AFFINITIES`].
+fn bound<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut HashMap<K, V>,
+    now: DateTime<Utc>,
+    capacity: usize,
+    last_seen: impl Fn(&V) -> DateTime<Utc>,
+) {
+    map.retain(|_, value| now - last_seen(value) < AFFINITY_TTL);
+
+    // Oldest use first, so a busy conversation outlives an idle one even
+    // when both are inside the TTL.
+    while map.len() > capacity {
+        let Some(stalest) = map
+            .iter()
+            .min_by_key(|(_, value)| last_seen(value))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        map.remove(&stalest);
+    }
 }
 
 /// Best model this candidate offers at or below `tier`, preferring an exact
@@ -1196,8 +1609,13 @@ mod tests {
             caps: caps(protocol),
             quota: QuotaSnapshot::default(),
             healthy: true,
+            account_scope: Some(format!("scope-{id}")),
             consented: true,
             required_client_identity: None,
+            // The two ids production gives the default logins, so every test
+            // written before additional logins existed still means what it
+            // meant.
+            default_login: matches!(id, "claude-sub" | "codex-sub"),
             models: vec![
                 ("claude-opus-4-6".to_string(), ModelTier::Frontier),
                 ("claude-sonnet-4-6".to_string(), ModelTier::Balanced),
@@ -1215,7 +1633,33 @@ mod tests {
             client_identity: Some(ClientIdentity::ClaudeCode),
             message_count: 3,
             likely_compaction: false,
+            client_login: None,
+            client_session: None,
         }
+    }
+
+    #[test]
+    fn client_sessions_are_stable_and_isolated_by_protocol_and_login() {
+        let protocol = Protocol::OpenAiResponses;
+        let personal = BackendId::from("personal");
+        let work = BackendId::from("work");
+        let key = ConversationKey::for_session(protocol, "session", Some(&personal));
+        assert_eq!(
+            key,
+            ConversationKey::for_session(protocol, "session", Some(&personal))
+        );
+        assert_ne!(
+            key,
+            ConversationKey::for_session(protocol, "another-session", Some(&personal))
+        );
+        assert_ne!(
+            key,
+            ConversationKey::for_session(protocol, "session", Some(&work))
+        );
+        assert_ne!(
+            key,
+            ConversationKey::for_session(Protocol::AnthropicMessages, "session", Some(&personal))
+        );
     }
 
     fn key() -> ConversationKey {
@@ -1609,6 +2053,175 @@ mod tests {
             assert_eq!(decision.rung, Rung::Preferred);
         }
 
+        /// A backend that could never have served the request was not passed
+        /// over. Counting one made every route rung 2 for good — and promotion
+        /// then ran `select` on every turn, forever, for nothing.
+        #[test]
+        fn a_backend_that_could_not_have_served_the_request_does_not_make_the_route_rung_two() {
+            // An unconsented subscription ahead of a metered key.
+            let mut unconsented = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            unconsented.consented = false;
+            let key_backend = candidate(
+                "anthropic-key",
+                BackendKind::ApiKey,
+                Protocol::AnthropicMessages,
+            );
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &peek("claude-opus-4-6"),
+                    &[unconsented, key_backend.clone()],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::Preferred, "an unconsented backend");
+
+            // The Claude subscription under an Aider request.
+            let mut claude_code_only = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            claude_code_only.required_client_identity = Some(ClientIdentity::ClaudeCode);
+            let mut aider = peek("claude-opus-4-6");
+            aider.client_identity = None;
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &aider,
+                    &[claude_code_only, key_backend.clone()],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::Preferred, "a subscription for Aider");
+
+            // Both at once: it is still not a login of this client's.
+            let mut neither = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            neither.required_client_identity = Some(ClientIdentity::ClaudeCode);
+            neither.consented = false;
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &aider,
+                    &[neither, key_backend.clone()],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(
+                decision.rung,
+                Rung::Preferred,
+                "an unconsented subscription for Aider"
+            );
+
+            // And one the request needs something from that it cannot give.
+            let mut text_only = candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            );
+            text_only.caps.images = false;
+            let mut with_image = peek("claude-opus-4-6");
+            with_image.requirements.images = true;
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &with_image,
+                    &[text_only, key_backend],
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.rung, Rung::Preferred, "an ineligible backend");
+        }
+
+        /// The fast path for a model newer than this build skipped the rung
+        /// calculation entirely, so a fallback taken there was recorded as
+        /// `Preferred` — invisible, and never promoted back.
+        #[test]
+        fn the_unrecognised_model_path_reports_rung_two_after_passing_over_a_preferred_backend() {
+            let guessed = |mut c: Candidate| {
+                c.catalogue_from_provider = false;
+                c
+            };
+            let newer = peek("claude-opus-5");
+
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &newer,
+                    &subscription_and_key(true)
+                        .into_iter()
+                        .map(guessed)
+                        .collect::<Vec<_>>(),
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.model, None, "still the client's own model string");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+
+            // The first choice, available, is still rung 0 on the same path.
+            let decision = Policy::new()
+                .decide(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &newer,
+                    &subscription_and_key(false)
+                        .into_iter()
+                        .map(guessed)
+                        .collect::<Vec<_>>(),
+                    t(0),
+                )
+                .expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-sub");
+            assert_eq!(decision.model, None);
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+
+        /// The routing consequence of a reading outliving its window. Nothing
+        /// refreshes the subscription's 95% once traffic has left it, so if
+        /// that reading still counted it would lose to the metered key long
+        /// after the provider said it would reset.
+        #[test]
+        fn a_subscription_whose_window_has_reset_is_chosen_over_a_metered_key_again() {
+            let mut candidates = subscription_and_key(false);
+            candidates[0].quota.primary = Headroom::Observed {
+                used_pct: 95.0,
+                resets_at: Some(t(600)),
+                observed_at: t(0),
+            };
+            let route_at = |at| {
+                Policy::new()
+                    .decide(
+                        key(),
+                        Protocol::AnthropicMessages,
+                        &peek("claude-opus-4-6"),
+                        &candidates,
+                        at,
+                    )
+                    .expect("routes")
+            };
+            assert_eq!(route_at(t(1)).backend.as_str(), "anthropic-key");
+            let after_reset = route_at(t(601));
+            assert_eq!(after_reset.backend.as_str(), "claude-sub");
+            assert_eq!(after_reset.rung, Rung::Preferred);
+        }
+
         /// Unchanged: descending a model tier on the *same* backend is rung 1.
         #[test]
         fn a_smaller_model_on_the_same_backend_is_still_rung_one() {
@@ -1750,6 +2363,1152 @@ mod tests {
                 decision.backend.as_str(),
                 "nearai",
                 "a sticky affinity kept sending to a backend the user excluded"
+            );
+        }
+    }
+
+    /// Several logins to one product, each its own backend. By default a client
+    /// is served by its own; another login is the user's explicit opt-in, and
+    /// even then a Codex conversation's encrypted reasoning never changes
+    /// account.
+    mod logins {
+        #[test]
+        fn hundreds_of_new_sessions_do_not_move_an_existing_sessions_reasoning() {
+            let mut policy = with_fallback();
+            let own = codex_login("codex-sub", true);
+            let sibling = codex_login("codex-work", false);
+            let mut request = codex(None, false);
+            request.client_session = Some("long-running-session".into());
+            let first = codex_route(
+                &mut policy,
+                &request,
+                &[exhausted(own.clone(), t(600)), sibling.clone()],
+                t(0),
+            )
+            .expect("the first turn may start on a sibling");
+            assert_eq!(first.backend, sibling.id);
+            for index in 0..1024 {
+                let mut new_session = codex(None, false);
+                new_session.client_session = Some(format!("new-{index}"));
+                codex_route(
+                    &mut policy,
+                    &new_session,
+                    std::slice::from_ref(&own),
+                    t(1 + index),
+                )
+                .expect("new own-account session");
+            }
+            request.requirements.encrypted_reasoning = true;
+            let replay = codex_route(&mut policy, &request, &[own, sibling.clone()], t(1100))
+                .expect("the original account is still available");
+            assert_eq!(
+                replay.backend, sibling.id,
+                "session churn must not forget the minting account"
+            );
+        }
+
+        #[test]
+        fn relogging_the_same_backend_cannot_replay_the_old_accounts_reasoning() {
+            let mut policy = with_fallback();
+            let original = codex_login("codex-sub", true);
+            codex_route(
+                &mut policy,
+                &codex(None, false),
+                std::slice::from_ref(&original),
+                t(0),
+            )
+            .expect("first turn");
+            let mut relogged = original.clone();
+            relogged.account_scope = Some("another-account".into());
+            assert!(codex_route(&mut policy, &codex(None, true), &[relogged], t(1)).is_err());
+            codex_route(&mut policy, &codex(None, true), &[original], t(2))
+                .expect("restored original account");
+        }
+
+        #[test]
+        fn an_unknown_scope_never_authorizes_a_native_encrypted_replay() {
+            let mut policy = with_fallback();
+            let mut unknown = codex_login("codex-sub", true);
+            unknown.account_scope = None;
+            codex_route(
+                &mut policy,
+                &codex(None, false),
+                std::slice::from_ref(&unknown),
+                t(0),
+            )
+            .expect("plain first turn");
+            assert!(codex_route(&mut policy, &codex(None, true), &[unknown], t(1)).is_err());
+        }
+
+        #[test]
+        fn an_expired_origin_refuses_a_replay_even_when_the_same_account_is_pinned() {
+            let mut policy = with_fallback();
+            let own = codex_login("codex-sub", true);
+            codex_route(
+                &mut policy,
+                &codex(None, false),
+                std::slice::from_ref(&own),
+                t(0),
+            )
+            .expect("first turn");
+            policy.set_pin(Some(own.id.clone()), None);
+            assert!(codex_route(&mut policy, &codex(None, true), &[own], t(86401)).is_err());
+            assert!(policy.reasoning_accounts.is_empty());
+        }
+
+        #[test]
+        fn evicting_an_origin_at_capacity_refuses_instead_of_guessing_an_account() {
+            let mut policy = with_fallback();
+            let own = codex_login("codex-sub", true);
+            let mut original = codex(None, false);
+            original.client_session = Some("old-session".into());
+            codex_route(&mut policy, &original, std::slice::from_ref(&own), t(0))
+                .expect("first turn");
+            for index in 0..MAX_REASONING_ACCOUNTS {
+                let mut request = codex(None, false);
+                request.client_session = Some(format!("session-{index}"));
+                codex_route(
+                    &mut policy,
+                    &request,
+                    std::slice::from_ref(&own),
+                    t(1 + index as i64),
+                )
+                .expect("new session");
+            }
+            assert_eq!(policy.reasoning_accounts.len(), MAX_REASONING_ACCOUNTS);
+            original.requirements.encrypted_reasoning = true;
+            assert!(codex_route(&mut policy, &original, &[own], t(5000)).is_err());
+        }
+
+        #[test]
+        fn a_route_override_cannot_move_another_accounts_encrypted_reasoning() {
+            let mut policy = with_fallback();
+            let both = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+            codex_route(&mut policy, &codex(None, false), &both, t(0)).expect("first turn");
+            let result = policy.decide_with_override(
+                codex_key(),
+                Protocol::OpenAiResponses,
+                &codex(None, true),
+                &both,
+                t(1),
+                Some((BackendId::from("codex-work"), None)),
+            );
+            assert!(
+                result.is_err(),
+                "an override must preserve the same eligibility rules"
+            );
+        }
+
+        use super::*;
+
+        /// A Claude subscription login. `default` is the one Claude Code uses
+        /// with no `CLAUDE_CONFIG_DIR`.
+        fn claude_login(id: &str, default: bool) -> Candidate {
+            let mut login = candidate(id, BackendKind::Subscription, Protocol::AnthropicMessages);
+            login.required_client_identity = Some(ClientIdentity::ClaudeCode);
+            login.default_login = default;
+            login
+        }
+
+        /// A ChatGPT subscription login, for Codex.
+        fn codex_login(id: &str, default: bool) -> Candidate {
+            let mut login = candidate(id, BackendKind::Subscription, Protocol::OpenAiResponses);
+            login.required_client_identity = Some(ClientIdentity::Codex);
+            login.default_login = default;
+            login.models = vec![("gpt-5".to_string(), ModelTier::Frontier)];
+            login
+        }
+
+        fn anthropic_key() -> Candidate {
+            candidate(
+                "anthropic-key",
+                BackendKind::ApiKey,
+                Protocol::AnthropicMessages,
+            )
+        }
+
+        fn openai_key() -> Candidate {
+            let mut key = candidate("openai-key", BackendKind::ApiKey, Protocol::OpenAiResponses);
+            key.models = vec![("gpt-5".to_string(), ModelTier::Frontier)];
+            key
+        }
+
+        /// NEAR AI as every daemon registers it unless the user disabled it:
+        /// present without a key, and so unhealthy to the router.
+        fn nearai_without_a_key() -> Candidate {
+            let mut nearai = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+            nearai.healthy = false;
+            nearai
+        }
+
+        fn exhausted(mut backend: Candidate, until: DateTime<Utc>) -> Candidate {
+            backend.quota.primary = Headroom::Exhausted { until };
+            backend
+        }
+
+        /// Claude Code, pointed at a login-bound URL or at the plain façade.
+        fn claude_code(login: Option<&str>) -> RequestPeek {
+            let mut request = peek("claude-opus-4-6");
+            request.client_login = login.map(BackendId::from);
+            request
+        }
+
+        /// A Codex turn. `replayed` is whether it carries encrypted reasoning,
+        /// which every turn after a conversation's first does.
+        fn codex(login: Option<&str>, replayed: bool) -> RequestPeek {
+            let mut request = peek("gpt-5");
+            request.client_identity = Some(ClientIdentity::Codex);
+            request.client_login = login.map(BackendId::from);
+            request.requirements.encrypted_reasoning = replayed;
+            if replayed {
+                request.requirements.reasoning = ReasoningNeed::LoadBearing;
+            }
+            request
+        }
+
+        fn codex_key() -> ConversationKey {
+            ConversationKey::derive(Protocol::OpenAiResponses, "You are Codex", &["shell"])
+        }
+
+        fn with_fallback() -> Policy {
+            let mut policy = Policy::new();
+            policy.set_cross_account_fallback(true);
+            policy
+        }
+
+        fn claude(
+            policy: &mut Policy,
+            request: &RequestPeek,
+            candidates: &[Candidate],
+        ) -> Result<RouteDecision, NoRoute> {
+            policy.decide(
+                key(),
+                Protocol::AnthropicMessages,
+                request,
+                candidates,
+                t(0),
+            )
+        }
+
+        fn codex_route(
+            policy: &mut Policy,
+            request: &RequestPeek,
+            candidates: &[Candidate],
+            at: DateTime<Utc>,
+        ) -> Result<RouteDecision, NoRoute> {
+            policy.decide(
+                codex_key(),
+                Protocol::OpenAiResponses,
+                request,
+                candidates,
+                at,
+            )
+        }
+
+        fn refusals_by_id(error: NoRoute) -> HashMap<String, Refusal> {
+            match error {
+                NoRoute::NoneUsable { refusals } => refusals
+                    .into_iter()
+                    .map(|(id, why)| (id.to_string(), why))
+                    .collect(),
+                other => panic!("expected a refusal list, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn by_default_an_exhausted_own_login_descends_to_the_metered_key_not_to_the_sibling() {
+            let candidates = [
+                claude_login("claude-sub", true),
+                claude_login("claude-work", false),
+                anthropic_key(),
+            ];
+            let decision =
+                claude(&mut Policy::new(), &claude_code(None), &candidates).expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-sub", "its own login");
+            assert_eq!(decision.rung, Rung::Preferred);
+
+            let candidates = [
+                exhausted(claude_login("claude-sub", true), t(600)),
+                claude_login("claude-work", false),
+                anthropic_key(),
+            ];
+            let decision =
+                claude(&mut Policy::new(), &claude_code(None), &candidates).expect("routes");
+            assert_eq!(
+                decision.backend.as_str(),
+                "anthropic-key",
+                "fell onto another of the user's logins without the opt-in"
+            );
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+
+            // The same from the other side: a client on the additional login
+            // does not fall onto the default one either.
+            let candidates = [
+                claude_login("claude-sub", true),
+                exhausted(claude_login("claude-work", false), t(600)),
+                anthropic_key(),
+            ];
+            let decision = claude(
+                &mut Policy::new(),
+                &claude_code(Some("claude-work")),
+                &candidates,
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// Registration order is preference among equals, and it must not
+        /// outrank whose login a client is using.
+        #[test]
+        fn a_client_bound_to_the_additional_login_is_served_by_it_though_the_default_is_registered_first()
+         {
+            let candidates = [
+                claude_login("claude-sub", true),
+                claude_login("claude-work", false),
+                anthropic_key(),
+            ];
+            let decision = claude(
+                &mut Policy::new(),
+                &claude_code(Some("claude-work")),
+                &candidates,
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-work");
+            assert_eq!(
+                decision.rung,
+                Rung::Preferred,
+                "another client's login was counted as a credential passed over"
+            );
+        }
+
+        #[test]
+        fn with_cross_account_fallback_an_exhausted_own_login_falls_to_the_sibling_at_rung_two() {
+            let candidates = [
+                exhausted(claude_login("claude-sub", true), t(600)),
+                claude_login("claude-work", false),
+                anthropic_key(),
+            ];
+            let decision =
+                claude(&mut with_fallback(), &claude_code(None), &candidates).expect("routes");
+            assert_eq!(
+                decision.backend.as_str(),
+                "claude-work",
+                "a subscription the user opted into is cheaper than the key"
+            );
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// With the opt-in, the default login is not "the" preferred one: the
+        /// client's own login is, wherever it was registered.
+        #[test]
+        fn with_cross_account_fallback_a_client_bound_to_the_sibling_still_prefers_it() {
+            let both = [
+                claude_login("claude-sub", true),
+                claude_login("claude-work", false),
+            ];
+            let decision = claude(
+                &mut with_fallback(),
+                &claude_code(Some("claude-work")),
+                &both,
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-work");
+            assert_eq!(decision.rung, Rung::Preferred);
+
+            // And when its own runs out, falling to the default login is the
+            // fallback, recorded as one.
+            let own_exhausted = [
+                claude_login("claude-sub", true),
+                exhausted(claude_login("claude-work", false), t(600)),
+            ];
+            let decision = claude(
+                &mut with_fallback(),
+                &claude_code(Some("claude-work")),
+                &own_exhausted,
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-sub");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// The opt-in does not loosen the product rule it refines.
+        #[test]
+        fn cross_account_fallback_never_lets_another_product_in() {
+            let mut aider = claude_code(None);
+            aider.client_identity = None;
+            let error = claude(
+                &mut with_fallback(),
+                &aider,
+                &[
+                    claude_login("claude-sub", true),
+                    claude_login("claude-work", false),
+                ],
+            )
+            .expect_err("neither login is Aider's");
+            assert_eq!(error, NoRoute::RequiresClientIdentity);
+        }
+
+        /// A request on another account's token is the move the opt-in makes,
+        /// and the ledger has to show it whether or not the client's own login
+        /// was there to be passed over. Deriving the rung from what was
+        /// passed over recorded these as rung 0.
+        #[test]
+        fn a_request_served_by_another_login_is_always_recorded_as_rung_two() {
+            let sibling_serves = |own: Option<Candidate>| {
+                let candidates: Vec<Candidate> = own
+                    .into_iter()
+                    .chain([claude_login("claude-work", false)])
+                    .collect();
+                claude(&mut with_fallback(), &claude_code(None), &candidates).expect("routes")
+            };
+
+            let mut unconsented = claude_login("claude-sub", true);
+            unconsented.consented = false;
+            let mut untrusted = claude_login("claude-sub", true);
+            untrusted.trusted = false;
+            for (own, case) in [
+                (Some(unconsented), "the client's own login is not consented"),
+                (Some(untrusted), "the client's own login is not trusted"),
+                (None, "the client has no login of its own"),
+            ] {
+                let decision = sibling_serves(own);
+                assert_eq!(decision.backend.as_str(), "claude-work", "{case}");
+                assert_eq!(decision.rung, Rung::AlternateCredential, "{case}");
+            }
+
+            // The client's own login, the only one there, is still rung 0.
+            let decision = claude(
+                &mut with_fallback(),
+                &claude_code(Some("claude-work")),
+                &[claude_login("claude-work", false)],
+            )
+            .expect("routes");
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+
+        /// The P1 rule itself, for a login: one that belongs to another
+        /// client could never have served this request, so the metered key
+        /// serving it is the first choice, not a descent.
+        #[test]
+        fn another_clients_login_is_not_a_credential_passed_over() {
+            let decision = claude(
+                &mut Policy::new(),
+                &claude_code(None),
+                &[claude_login("claude-work", false), anthropic_key()],
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+
+        /// The client's own login comes first on the turn whose output
+        /// becomes the conversation, too.
+        #[test]
+        fn a_compaction_turn_still_prefers_the_clients_own_login() {
+            let mut compaction = claude_code(Some("claude-work"));
+            compaction.likely_compaction = true;
+            let decision = claude(
+                &mut with_fallback(),
+                &compaction,
+                &[
+                    claude_login("claude-sub", true),
+                    claude_login("claude-work", false),
+                ],
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "claude-work");
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+
+        /// The opt-in moves a client off its own login on the trigger every
+        /// rung uses — sustained pressure, 90% observed for longer than the
+        /// descent debounce — not only once that login is spent.
+        #[test]
+        fn with_cross_account_fallback_sustained_pressure_moves_the_client_off_its_own_login() {
+            let pressured_own = || {
+                let mut own = claude_login("claude-sub", true);
+                own.quota.primary = Headroom::Observed {
+                    used_pct: 92.0,
+                    resets_at: Some(t(3600)),
+                    observed_at: t(5),
+                };
+                [own, claude_login("claude-work", false)]
+            };
+            let at = |policy: &mut Policy, candidates: &[Candidate], when| {
+                policy
+                    .decide(
+                        key(),
+                        Protocol::AnthropicMessages,
+                        &claude_code(None),
+                        candidates,
+                        when,
+                    )
+                    .expect("routes")
+            };
+
+            // A fresh selection sorts the pressured login behind the sibling.
+            let decision = at(&mut with_fallback(), &pressured_own(), t(10));
+            assert_eq!(decision.backend.as_str(), "claude-work");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+
+            // A conversation already on its own login waits out the debounce,
+            // then moves.
+            let mut policy = with_fallback();
+            let fresh = [
+                claude_login("claude-sub", true),
+                claude_login("claude-work", false),
+            ];
+            assert_eq!(at(&mut policy, &fresh, t(0)).backend.as_str(), "claude-sub");
+            assert_eq!(
+                at(&mut policy, &pressured_own(), t(10)).backend.as_str(),
+                "claude-sub",
+                "pressure not yet sustained"
+            );
+            let moved = at(&mut policy, &pressured_own(), t(10) + DESCENT_DEBOUNCE);
+            assert_eq!(moved.backend.as_str(), "claude-work");
+            assert_eq!(moved.rung, Rung::AlternateCredential);
+
+            // Without the opt-in the same pressure leaves it where it is.
+            let decision = at(&mut Policy::new(), &pressured_own(), t(10));
+            assert_eq!(decision.backend.as_str(), "claude-sub");
+        }
+
+        /// Ownership is asked before consent. Consenting to the sibling would
+        /// change nothing for this client, so it is not the answer — and a
+        /// spent own login stays a 429 rather than a 503 telling the user to
+        /// enable the sibling.
+        #[test]
+        fn an_unconsented_sibling_does_not_turn_a_spent_own_login_into_a_configuration_error() {
+            let mut unconsented = claude_login("claude-sub", true);
+            unconsented.consented = false;
+            for candidates in [
+                vec![
+                    unconsented.clone(),
+                    exhausted(claude_login("claude-work", false), t(600)),
+                ],
+                vec![
+                    unconsented.clone(),
+                    exhausted(claude_login("claude-work", false), t(600)),
+                    nearai_without_a_key(),
+                ],
+            ] {
+                let error = claude(
+                    &mut Policy::new(),
+                    &claude_code(Some("claude-work")),
+                    &candidates,
+                )
+                .expect_err("its own login is spent");
+                assert_eq!(error, NoRoute::AllExhausted);
+            }
+
+            // For the client's own login consent is still the first answer.
+            let error = claude(
+                &mut Policy::new(),
+                &claude_code(None),
+                &[unconsented, claude_login("claude-work", false)],
+            )
+            .expect_err("its own login is not enabled");
+            let NoRoute::NoneUsable { refusals } = error else {
+                panic!("expected a refusal list, got {error:?}");
+            };
+            assert_eq!(
+                refusals[0],
+                (BackendId::from("claude-sub"), Refusal::NotConsented)
+            );
+        }
+
+        #[test]
+        fn a_first_codex_turn_may_start_on_the_sibling() {
+            let decision = codex_route(
+                &mut with_fallback(),
+                &codex(None, false),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("nothing has been minted yet, so any account will do");
+            assert_eq!(decision.backend.as_str(), "codex-work");
+            assert_eq!(decision.rung, Rung::AlternateCredential);
+        }
+
+        /// OpenAI rejects encrypted reasoning minted under another
+        /// organization, so moving the conversation would fail the turn it was
+        /// meant to save.
+        #[test]
+        fn a_codex_conversation_carrying_encrypted_reasoning_is_not_moved_to_a_sibling() {
+            let mut policy = with_fallback();
+            let first = codex_route(
+                &mut policy,
+                &codex(None, false),
+                &[
+                    codex_login("codex-sub", true),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("routes");
+            assert_eq!(first.backend.as_str(), "codex-sub");
+
+            let spent = [
+                exhausted(codex_login("codex-sub", true), t(3600)),
+                codex_login("codex-work", false),
+            ];
+            let error = codex_route(&mut policy, &codex(None, true), &spent, t(60))
+                .expect_err("the sibling is a different ChatGPT account");
+            let refusals = refusals_by_id(error);
+            assert_eq!(refusals.get("codex-sub"), Some(&Refusal::NoCapacity));
+            let lock = refusals.get("codex-work").expect("named");
+            assert_eq!(
+                *lock,
+                Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)
+            );
+            let said = lock.describe();
+            assert!(said.contains("ChatGPT account"), "{said}");
+            assert!(said.contains("turn boundary"), "{said}");
+
+            // A metered key also belongs to a different credential scope.
+            let error = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[spent[0].clone(), spent[1].clone(), openai_key()],
+                t(61),
+            )
+            .expect_err("a metered key cannot replay subscription ciphertext");
+            assert_eq!(
+                refusals_by_id(error).get("openai-key"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount))
+            );
+        }
+
+        /// The mirror image: a conversation that started on the sibling has
+        /// its reasoning there, and promotion back to the client's own login
+        /// would be rejected exactly as a descent would.
+        #[test]
+        fn a_codex_conversation_that_started_on_the_sibling_stays_there_and_is_not_promoted_back() {
+            let mut policy = with_fallback();
+            let first = codex_route(
+                &mut policy,
+                &codex(None, false),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("routes");
+            assert_eq!(first.backend.as_str(), "codex-work");
+
+            let recovered = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+            for at in [
+                t(700),
+                t(700) + PROMOTION_DEBOUNCE,
+                t(700) + PROMOTION_DEBOUNCE * 3,
+            ] {
+                let decision =
+                    codex_route(&mut policy, &codex(None, true), &recovered, at).expect("routes");
+                assert_eq!(
+                    decision.backend.as_str(),
+                    "codex-work",
+                    "moved a conversation's encrypted reasoning to another account"
+                );
+                assert_eq!(
+                    decision.rung,
+                    Rung::AlternateCredential,
+                    "the sibling is still not the client's own login"
+                );
+            }
+
+            // Nor does losing the sibling send it back to its own login.
+            let error = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[
+                    codex_login("codex-sub", true),
+                    exhausted(codex_login("codex-work", false), t(99_999)),
+                ],
+                t(700) + PROMOTION_DEBOUNCE * 4,
+            )
+            .expect_err("the only account this reasoning fits is spent");
+            assert_eq!(
+                refusals_by_id(error).get("codex-sub"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount))
+            );
+        }
+
+        /// A backend missing from the candidates — as one whose circuit was
+        /// open once was — must not read as "this conversation is on no
+        /// account" and release the reasoning to the client's own login.
+        #[test]
+        fn an_incumbent_whose_circuit_is_open_still_holds_the_conversations_reasoning() {
+            let mut policy = with_fallback();
+            codex_route(
+                &mut policy,
+                &codex(None, false),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("routes");
+
+            // codex-work is failing and has been dropped; codex-sub recovered.
+            let error = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[codex_login("codex-sub", true)],
+                t(700),
+            )
+            .expect_err("the reasoning was minted on codex-work");
+            assert_eq!(
+                refusals_by_id(error).get("codex-sub"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount))
+            );
+        }
+
+        /// Why the sibling keeps reporting rung 2 under the lock: it is what
+        /// lets the conversation key come home once nothing binds it — which,
+        /// for Codex, is the next session, since every session of one Codex
+        /// version derives the same key.
+        #[test]
+        fn once_nothing_binds_the_conversation_it_returns_to_its_own_login() {
+            let mut policy = with_fallback();
+            codex_route(
+                &mut policy,
+                &codex(None, false),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("routes");
+            let recovered = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+            codex_route(&mut policy, &codex(None, true), &recovered, t(700)).expect("routes");
+
+            let fresh = codex(None, false);
+            codex_route(&mut policy, &fresh, &recovered, t(800)).expect("routes");
+            let decision =
+                codex_route(&mut policy, &fresh, &recovered, t(800) + PROMOTION_DEBOUNCE)
+                    .expect("routes");
+            assert_eq!(decision.backend.as_str(), "codex-sub");
+            assert_eq!(decision.rung, Rung::Preferred);
+        }
+
+        /// Every session of one client version shares a conversation key, so
+        /// a route chosen for one login must not be inherited by a client on
+        /// another — least of all its account lock.
+        #[test]
+        fn a_conversation_on_one_login_lends_no_account_lock_to_a_client_on_another() {
+            let mut policy = with_fallback();
+            let both = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+            let bound = codex_route(&mut policy, &codex(Some("codex-work"), false), &both, t(0))
+                .expect("routes");
+            assert_eq!(bound.backend.as_str(), "codex-work");
+
+            // Record the plain client's own first turn independently.
+            codex_route(&mut policy, &codex(None, false), &both, t(4)).expect("plain first turn");
+            let plain = codex_route(&mut policy, &codex(None, true), &both, t(5)).expect("routes");
+            assert_eq!(
+                plain.backend.as_str(),
+                "codex-sub",
+                "a client inherited another login's conversation"
+            );
+        }
+
+        /// A conversation that fell back to codex-work and is now replaying
+        /// codex-work's reasoning, with codex-sub's window reset.
+        fn replaying_the_siblings_reasoning() -> Policy {
+            let mut policy = with_fallback();
+            let first = codex_route(
+                &mut policy,
+                &codex(None, false),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    codex_login("codex-work", false),
+                ],
+                t(0),
+            )
+            .expect("routes");
+            assert_eq!(first.backend.as_str(), "codex-work");
+            let sticky = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[
+                    codex_login("codex-sub", true),
+                    codex_login("codex-work", false),
+                ],
+                t(700),
+            )
+            .expect("routes");
+            assert_eq!(sticky.backend.as_str(), "codex-work");
+            policy
+        }
+
+        /// What the pipeline does when the chosen backend answers 429, 5xx,
+        /// a transport error or `NeedsAuth`: forget the affinity and decide
+        /// again with that backend excluded. The reasoning in the history is
+        /// still codex-work's, so the client's own login must not get it.
+        #[test]
+        fn a_failing_sibling_keeps_the_reasoning_it_minted_from_the_clients_own_login() {
+            let failing = || {
+                let mut work = codex_login("codex-work", false);
+                work.healthy = false;
+                vec![codex_login("codex-sub", true), work]
+            };
+
+            let mut policy = replaying_the_siblings_reasoning();
+            policy.forget(&codex_key());
+            let error = codex_route(&mut policy, &codex(None, true), &failing(), t(701))
+                .expect_err("the only account this reasoning fits is failing");
+            assert_eq!(
+                refusals_by_id(error).get("codex-sub"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)),
+                "a failure of the sibling released its reasoning to the own login"
+            );
+
+            // Once codex-work recovers it serves the conversation again.
+            let decision = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[
+                    codex_login("codex-sub", true),
+                    codex_login("codex-work", false),
+                ],
+                t(702),
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "codex-work");
+
+            // Translation at a turn boundary drops the ciphertext safely.
+            {
+                let (elsewhere, rung) = (anthropic_key(), Rung::CrossFamily);
+                let mut policy = replaying_the_siblings_reasoning();
+                policy.forget(&codex_key());
+                let mut candidates = failing();
+                candidates.push(elsewhere.clone());
+                let decision = codex_route(&mut policy, &codex(None, true), &candidates, t(701))
+                    .expect("routes");
+                assert_eq!(decision.backend, elsewhere.id);
+                assert_eq!(decision.rung, rung);
+            }
+        }
+
+        /// Every session of one Codex version derives one conversation key, so
+        /// a session that moves to the sibling moves the shared affinity with
+        /// it. Each session's own reasoning stays where it was minted.
+        #[test]
+        fn a_session_that_moves_to_the_sibling_does_not_take_another_sessions_reasoning_with_it() {
+            let session = |id: &str, replayed: bool| {
+                let mut request = codex(None, replayed);
+                request.client_session = Some(id.to_string());
+                request
+            };
+            let both = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+            let spent = [
+                exhausted(codex_login("codex-sub", true), t(3600)),
+                codex_login("codex-work", false),
+            ];
+
+            let mut policy = with_fallback();
+            for (id, at) in [("one", t(0)), ("two", t(1))] {
+                let decision =
+                    codex_route(&mut policy, &session(id, false), &both, at).expect("routes");
+                assert_eq!(decision.backend.as_str(), "codex-sub");
+            }
+            let third =
+                codex_route(&mut policy, &session("three", false), &spent, t(2)).expect("routes");
+            assert_eq!(third.backend.as_str(), "codex-work");
+
+            for id in ["one", "two"] {
+                let error = codex_route(&mut policy, &session(id, true), &spent, t(3))
+                    .expect_err("its reasoning is codex-sub's, which is spent");
+                assert_eq!(
+                    refusals_by_id(error).get("codex-work"),
+                    Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)),
+                    "session {id} was sent to the account another session moved to"
+                );
+            }
+            let decision = codex_route(&mut policy, &session("three", true), &spent, t(4))
+                .expect("its reasoning is codex-work's");
+            assert_eq!(decision.backend.as_str(), "codex-work");
+        }
+
+        /// A conversation that crossed to another family at a turn boundary
+        /// still replays the reasoning its own login minted; the other family
+        /// minted none. When that backend drops out of the candidates — its
+        /// circuit opened — the own login serves it again.
+        #[test]
+        fn a_codex_conversation_back_from_another_family_returns_to_its_own_login() {
+            for fallback in [false, true] {
+                let mut policy = Policy::new();
+                policy.set_cross_account_fallback(fallback);
+                let first = codex_route(
+                    &mut policy,
+                    &codex(None, false),
+                    &[
+                        codex_login("codex-sub", true),
+                        codex_login("codex-work", false),
+                        anthropic_key(),
+                    ],
+                    t(0),
+                )
+                .expect("routes");
+                assert_eq!(first.backend.as_str(), "codex-sub");
+
+                let crossed = codex_route(
+                    &mut policy,
+                    &codex(None, true),
+                    &[
+                        exhausted(codex_login("codex-sub", true), t(600)),
+                        codex_login("codex-work", false),
+                        anthropic_key(),
+                    ],
+                    t(60),
+                )
+                .expect("routes");
+                assert_eq!(crossed.backend.as_str(), "anthropic-key");
+                assert_eq!(crossed.rung, Rung::CrossFamily);
+
+                let back = codex_route(
+                    &mut policy,
+                    &codex(None, true),
+                    &[
+                        codex_login("codex-sub", true),
+                        codex_login("codex-work", false),
+                    ],
+                    t(700),
+                )
+                .unwrap_or_else(|e| panic!("fallback {fallback}: {e}"));
+                assert_eq!(back.backend.as_str(), "codex-sub", "fallback {fallback}");
+                assert_eq!(back.rung, Rung::Preferred, "fallback {fallback}");
+            }
+        }
+
+        #[test]
+        fn encrypted_reasoning_minted_by_a_metered_key_stays_on_that_key() {
+            let mut policy = with_fallback();
+            let first = codex_route(&mut policy, &codex(None, false), &[openai_key()], t(0))
+                .expect("first turn may use the metered key");
+            assert_eq!(first.backend.as_str(), "openai-key");
+            let replay = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[codex_login("codex-sub", true), openai_key()],
+                t(700),
+            )
+            .expect("replay");
+            assert_eq!(replay.backend.as_str(), "openai-key");
+            assert!(
+                codex_route(
+                    &mut policy,
+                    &codex(None, true),
+                    &[codex_login("codex-sub", true)],
+                    t(701)
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn with_no_record_encrypted_reasoning_is_refused_rather_than_assigned_an_account() {
+            let error = codex_route(
+                &mut with_fallback(),
+                &codex(None, true),
+                &[
+                    codex_login("codex-sub", true),
+                    codex_login("codex-work", false),
+                    openai_key(),
+                ],
+                t(0),
+            )
+            .expect_err("no credential is known to have minted this ciphertext");
+            for refusal in refusals_by_id(error).values() {
+                assert_eq!(
+                    *refusal,
+                    Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)
+                );
+            }
+        }
+
+        /// The refusal a user can act on, named with the command that acts on
+        /// it — for a machine whose only Claude login is an additional one.
+        ///
+        /// With NEAR AI beside it, unkeyed, as every daemon registers it: a
+        /// transient refusal next to the wrong URL used to turn this into a
+        /// 429, and the client backed off forever without being told.
+        #[test]
+        fn a_login_reserved_for_another_client_is_refused_by_name_with_the_command_that_binds_one()
+        {
+            let error = claude(
+                &mut Policy::new(),
+                &claude_code(None),
+                &[claude_login("claude-work", false), nearai_without_a_key()],
+            )
+            .expect_err("the plain façade belongs to the default login");
+            assert_eq!(
+                error,
+                NoRoute::NoneUsable {
+                    refusals: vec![
+                        (
+                            BackendId::from("claude-work"),
+                            Refusal::AnotherLogin {
+                                client: ClientIdentity::ClaudeCode
+                            }
+                        ),
+                        (BackendId::from("nearai"), Refusal::Unhealthy),
+                    ]
+                }
+            );
+            let said = error.to_string();
+            assert!(said.contains("claude-work"), "{said}");
+            assert!(
+                said.contains("ironwire connect claude --config-dir"),
+                "{said}"
+            );
+
+            let codex_error = codex_route(
+                &mut Policy::new(),
+                &codex(None, false),
+                &[codex_login("codex-work", false), nearai_without_a_key()],
+                t(0),
+            )
+            .expect_err("the plain façade belongs to the default login");
+            assert!(
+                codex_error
+                    .to_string()
+                    .contains("ironwire connect codex --config-dir"),
+                "{codex_error}"
+            );
+        }
+
+        /// A second login on the machine must not turn "your subscription is
+        /// spent, come back later" into a configuration error.
+        #[test]
+        fn an_exhausted_own_login_beside_another_login_is_still_exhaustion() {
+            let error = claude(
+                &mut Policy::new(),
+                &claude_code(None),
+                &[
+                    exhausted(claude_login("claude-sub", true), t(600)),
+                    claude_login("claude-work", false),
+                    nearai_without_a_key(),
+                ],
+            )
+            .expect_err("nothing of this client's has capacity");
+            assert_eq!(error, NoRoute::AllExhausted);
+        }
+
+        /// A header a client can set must not relax a constraint the user set
+        /// in their own config — nor the product rule that constraint refines.
+        #[test]
+        fn a_pin_cannot_hand_a_client_another_login() {
+            let both = [
+                claude_login("claude-sub", true),
+                claude_login("claude-work", false),
+            ];
+            let override_to = |id: &str| Some((BackendId::from(id), None));
+
+            let error = Policy::new()
+                .decide_with_override(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &claude_code(None),
+                    &both,
+                    t(0),
+                    override_to("claude-work"),
+                )
+                .expect_err("cross-account fallback is off");
+            assert!(
+                refusals_by_id(error)
+                    .get("claude-work")
+                    .is_some_and(|why| matches!(why, Refusal::AnotherLogin { .. }))
+            );
+
+            // With the opt-in, the user's instruction stands.
+            let decision = with_fallback()
+                .decide_with_override(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &claude_code(None),
+                    &both,
+                    t(0),
+                    override_to("claude-work"),
+                )
+                .expect("the user opted in");
+            assert_eq!(decision.backend.as_str(), "claude-work");
+
+            // And no opt-in makes a subscription serve another product.
+            let mut aider = claude_code(None);
+            aider.client_identity = None;
+            let error = with_fallback()
+                .decide_with_override(
+                    key(),
+                    Protocol::AnthropicMessages,
+                    &aider,
+                    &both,
+                    t(0),
+                    override_to("claude-sub"),
+                )
+                .expect_err("Aider is not Claude Code");
+            assert_eq!(error, NoRoute::RequiresClientIdentity);
+        }
+
+        /// Pins may choose the first turn's account, but cannot move a replay.
+        #[test]
+        fn a_pin_can_start_reasoning_on_an_account_but_cannot_move_a_replay() {
+            let both = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+            ];
+
+            let mut policy = with_fallback();
+            let first = codex_route(&mut policy, &codex(None, false), &both, t(0)).expect("routes");
+            assert_eq!(first.backend.as_str(), "codex-sub");
+            policy.set_pin(Some(BackendId::from("codex-work")), None);
+            assert!(
+                codex_route(&mut policy, &codex(None, true), &both, t(1)).is_err(),
+                "the user's pin cannot move ciphertext to another account"
+            );
+            policy.set_pin(None, None);
+            let unpinned =
+                codex_route(&mut policy, &codex(None, true), &both, t(2)).expect("routes");
+            assert_eq!(
+                unpinned.backend.as_str(),
+                "codex-sub",
+                "a pinned replay that minted nothing kept the conversation on the pinned account"
+            );
+
+            let mut policy = with_fallback();
+            policy.set_pin(Some(BackendId::from("codex-work")), None);
+            let first =
+                codex_route(&mut policy, &codex(None, false), &both, t(0)).expect("the user's pin");
+            assert_eq!(first.backend.as_str(), "codex-work");
+            policy.set_pin(None, None);
+            let unpinned =
+                codex_route(&mut policy, &codex(None, true), &both, t(1)).expect("routes");
+            assert_eq!(
+                unpinned.backend.as_str(),
+                "codex-work",
+                "the reasoning a pinned first turn minted was sent to another account"
             );
         }
     }
@@ -2230,6 +3989,54 @@ mod tests {
         assert!(matches!(err, NoRoute::NoneUsable { .. }));
     }
 
+    /// Consent is what lets IronWire replay another product's token at all,
+    /// and neither a pin nor a header any local client can set gives it.
+    #[test]
+    fn a_pin_cannot_reach_a_subscription_nobody_consented_to() {
+        let mut unconsented = candidate(
+            "claude-sub",
+            BackendKind::Subscription,
+            Protocol::AnthropicMessages,
+        );
+        unconsented.consented = false;
+        let candidates = [
+            unconsented,
+            candidate(
+                "anthropic-key",
+                BackendKind::ApiKey,
+                Protocol::AnthropicMessages,
+            ),
+        ];
+        let refused = NoRoute::NoneUsable {
+            refusals: vec![(BackendId::from("claude-sub"), Refusal::NotConsented)],
+        };
+
+        let mut pinned = Policy::new();
+        pinned.set_pin(Some(BackendId::from("claude-sub")), None);
+        let err = pinned
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &candidates,
+                t(0),
+            )
+            .expect_err("a pin is not consent");
+        assert_eq!(err, refused);
+
+        let err = Policy::new()
+            .decide_with_override(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-4-6"),
+                &candidates,
+                t(0),
+                Some((BackendId::from("claude-sub"), None)),
+            )
+            .expect_err("nor is X-IronWire-Route");
+        assert_eq!(err, refused);
+    }
+
     /// The pin path used to ask a *family* question where the wire question is
     /// the one that matters. Responses and Chat Completions share a family, so
     /// a pinned Codex request was handed to a Chat backend as a **native
@@ -2503,8 +4310,10 @@ mod compaction_tests {
             caps: caps(protocol),
             quota: QuotaSnapshot::default(),
             healthy: true,
+            account_scope: Some(format!("scope-{id}")),
             consented: true,
             required_client_identity: None,
+            default_login: false,
             models: models
                 .iter()
                 .map(|(m, tier)| ((*m).to_string(), *tier))
@@ -2524,6 +4333,8 @@ mod compaction_tests {
             client_identity: Some(ClientIdentity::ClaudeCode),
             message_count: 40,
             likely_compaction: compaction,
+            client_login: None,
+            client_session: None,
         }
     }
 

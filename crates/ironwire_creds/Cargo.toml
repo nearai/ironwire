@@ -20,6 +20,10 @@ dirs.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Both only to name the Keychain item Claude Code keeps for a config dir:
+# sha256 over the NFC form of the dir string (`claude::ClaudeLogin`).
+sha2 = "0.10"
+unicode-normalization = "0.1"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

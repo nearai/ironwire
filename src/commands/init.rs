@@ -19,13 +19,14 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use ironwire_core::DEFAULT_PORT;
+use chrono::{DateTime, Utc};
+use ironwire_agents::{claude_settings, codex_config};
 use ironwire_core::config::Config;
-use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
 use ironwire_creds::consent::ConsentLedger;
+use ironwire_creds::{SubscriptionLogin, SubscriptionProduct};
 
+use super::logins::{self, Login};
 use super::{connect, paths, service};
 
 /// A key an agent on this machine is already configured to use.
@@ -43,87 +44,199 @@ struct AgentKey {
     in_environment: bool,
 }
 
+/// A subscription login IronWire would use, and whether it can.
+struct FoundLogin {
+    login: Login,
+    /// Whether it holds a credential its backend can use right now.
+    usable: bool,
+}
+
 /// What IronWire found on this machine.
 struct Found {
-    claude_subscription: bool,
-    codex_subscription: bool,
+    /// The default logins that are logged in, and every login config.toml
+    /// declares whether it is or not — a declared login is one the user asked
+    /// about, so "not logged in" is an answer worth a line.
+    logins: Vec<FoundLogin>,
     codex_api_key: bool,
     anthropic_key: bool,
     openai_key: bool,
     nearai_key: bool,
     agent_keys: Vec<AgentKey>,
+    /// A `CLAUDE_CONFIG_DIR` in this shell that no declared login uses.
+    unknown_claude_dir: Option<String>,
 }
 
 impl Found {
-    fn detect() -> Self {
-        let codex = CodexCredentials::discover().ok();
+    fn detect(config: &Config) -> Self {
+        let declared = logins::configured(config);
+        let logins = declared
+            .iter()
+            .filter(|login| login.enabled)
+            .map(|login| FoundLogin {
+                usable: login.check().is_ok(),
+                login: login.clone(),
+            })
+            // A default login in its usual place is something we looked for,
+            // not something the user named; its absence is not news.
+            .filter(|found| found.usable || found.login.config_dir.is_some())
+            .collect();
+        let unknown_claude_dir = logins::undeclared_claude_dir(&declared);
         Self {
-            claude_subscription: ClaudeCodeCredentials::discover().is_ok(),
-            codex_subscription: codex.as_ref().is_some_and(|c| c.mode == CodexMode::ChatGpt),
-            codex_api_key: codex.is_some_and(|c| c.mode == CodexMode::ApiKey),
+            logins,
+            codex_api_key: CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ApiKey),
             anthropic_key: has_env("ANTHROPIC_API_KEY"),
             openai_key: has_env("OPENAI_API_KEY"),
             nearai_key: has_env("NEARAI_API_KEY"),
-            agent_keys: detect_agent_keys(),
+            agent_keys: detect_agent_keys(&declared),
+            unknown_claude_dir,
         }
     }
 
     fn anything(&self) -> bool {
-        self.claude_subscription
-            || self.codex_subscription
+        self.logins.iter().any(|found| found.usable)
             || self.codex_api_key
             || self.anthropic_key
             || self.openai_key
             || self.nearai_key
     }
 
-    /// Subscriptions that are here but not yet consented to.
-    fn ungranted_subscriptions(&self, consent: &ConsentLedger) -> Vec<Subscription> {
-        SUBSCRIPTIONS
+    /// Logins that are here but not yet consented to — including one whose
+    /// consent was given while its id read a login somewhere else.
+    fn ungranted_subscriptions(&self, consent: &ConsentLedger) -> Vec<Pending> {
+        self.logins
             .iter()
-            .filter(|s| (s.present)(self) && !consent.is_granted(s.backend_id))
-            .copied()
+            .filter(|found| found.usable)
+            .map(|found| Pending {
+                id: found.login.id.clone(),
+                login: found.login.describe(),
+                location: found.login.location(),
+            })
+            .filter(|p| !consent.is_granted_for(&p.id, p.login.consent_location()))
             .collect()
     }
 }
 
-/// One subscription backend, and how to talk about it.
-#[derive(Clone, Copy)]
-struct Subscription {
-    backend_id: &'static str,
-    /// What the user calls the thing they pay for.
-    product: &'static str,
-    /// The app that stored the token we would be replaying.
-    client: &'static str,
-    /// The only host its token is ever sent to.
-    host: &'static str,
-    /// Who would object.
-    vendor: &'static str,
-    /// The unambiguous alternative.
-    alternative: &'static str,
-    present: fn(&Found) -> bool,
+/// One login the consent question is about.
+struct Pending {
+    /// The backend id consent is recorded under.
+    id: String,
+    login: SubscriptionLogin,
+    /// Where it lives, for people — a default login's too, which
+    /// `SubscriptionLogin` leaves unsaid.
+    location: String,
 }
 
-const SUBSCRIPTIONS: &[Subscription] = &[
-    Subscription {
-        backend_id: "claude-sub",
-        product: "Claude",
-        client: "Claude Code",
-        host: "api.anthropic.com",
-        vendor: "Anthropic",
-        alternative: "an Anthropic API key",
-        present: |f| f.claude_subscription,
-    },
-    Subscription {
-        backend_id: "codex-sub",
-        product: "ChatGPT",
-        client: "Codex",
-        host: "chatgpt.com",
-        vendor: "OpenAI",
-        alternative: "an OpenAI API key",
-        present: |f| f.codex_subscription,
-    },
-];
+/// The one question `init` asks, as text.
+#[derive(Debug, PartialEq, Eq)]
+struct Question {
+    /// What IronWire would do, in a sentence or two.
+    intro: String,
+    /// What the user is taking on.
+    points: Vec<String>,
+    /// The question itself, without the `[Y/n]`.
+    question: String,
+}
+
+/// Word the consent question for every pending login at once.
+///
+/// One question, because `docs/TRUST.md` §2 does not ask for the same risk to
+/// be asked about twice. Several logins of one product share a vendor, a host
+/// and a client, so each of those is said once — "Anthropic and Anthropic do
+/// not document…" is the sentence this exists never to produce — while the
+/// logins themselves are named by where they live, because with two Claude
+/// logins "the Claude subscription" does not say which accounts are being
+/// handed over. Logins in their usual places keep the wording people have
+/// already answered.
+fn consent_question(pending: &[Pending]) -> Question {
+    let mut products: Vec<SubscriptionProduct> = Vec::new();
+    for p in pending {
+        if !products.contains(&p.login.product) {
+            products.push(p.login.product);
+        }
+    }
+    let names = join(products.iter().map(|p| p.name()), "and");
+    let clients = join(products.iter().map(|p| p.client()), "and");
+    let vendors = join(products.iter().map(|p| p.vendor()), "and");
+    let hosts = join(products.iter().map(|p| p.host()), "and");
+    let alternatives = join(products.iter().map(|p| alternative(*p)), "or");
+
+    let (subject, object) = if pending.iter().all(|p| p.login.location.is_none()) {
+        if pending.len() == 1 {
+            (
+                format!("your {names} subscription"),
+                format!("the {names} subscription"),
+            )
+        } else {
+            (
+                format!("the {names} subscriptions above"),
+                format!("the {names} subscriptions"),
+            )
+        }
+    } else {
+        let groups: Vec<String> = products
+            .iter()
+            .map(|product| {
+                let places: Vec<&str> = pending
+                    .iter()
+                    .filter(|p| p.login.product == *product)
+                    .map(|p| p.location.as_str())
+                    .collect();
+                let plural = if places.len() == 1 { "" } else { "s" };
+                format!(
+                    "the {} subscription{plural} in {}",
+                    product.name(),
+                    join(places.into_iter(), "and")
+                )
+            })
+            .collect();
+        let separator = if groups.iter().any(|g| g.contains(" and ")) {
+            ", and "
+        } else {
+            " and "
+        };
+        let named = groups.join(separator);
+        (named.clone(), named)
+    };
+
+    let intro = match (pending.len(), products.len()) {
+        (1, _) => format!(
+            "IronWire can use {subject}, by replaying the OAuth token {clients} has \
+             already stored on this machine. It goes only to {hosts}, from this computer."
+        ),
+        (_, 1) => format!(
+            "IronWire can use {subject}, by replaying the OAuth tokens {clients} has \
+             already stored on this machine. They go only to {hosts}, from this computer."
+        ),
+        _ => format!(
+            "IronWire can use {subject}, by replaying the OAuth tokens {clients} have \
+             already stored on this machine. Each token goes only to its own provider \
+             ({hosts}), from this computer."
+        ),
+    };
+    Question {
+        intro,
+        points: vec![
+            format!(
+                "{vendors} {} not document this authentication path and may change or \
+                 block it at any time.",
+                if products.len() > 1 { "do" } else { "does" }
+            ),
+            "Using it from a third-party proxy may fall outside your subscription's \
+             intended use. If they object, it is your account that is affected."
+                .to_string(),
+            format!("You can use {alternatives} instead — fully supported, no ambiguity."),
+        ],
+        question: format!("Use {object}?"),
+    }
+}
+
+/// The unambiguous alternative to a product's subscription.
+fn alternative(product: SubscriptionProduct) -> &'static str {
+    match product {
+        SubscriptionProduct::Claude => "an Anthropic API key",
+        SubscriptionProduct::ChatGpt => "an OpenAI API key",
+    }
+}
 
 /// Join names the way a sentence would: "a", "a and b", "a, b and c".
 ///
@@ -144,19 +257,28 @@ fn has_env(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
 }
 
-/// Read the keys the installed agents are already configured with.
+/// Read the keys the installed agents are already configured with, in the
+/// default places and in every declared login's.
 ///
 /// Detection only. Copying a secret out of one config and into another — or
 /// into a service unit, which is where this would naturally lead — would put
 /// IronWire in the business of storing keys, which it is not (`docs/TRUST.md`
 /// §5).
-fn detect_agent_keys() -> Vec<AgentKey> {
+fn detect_agent_keys(logins: &[Login]) -> Vec<AgentKey> {
     let mut keys = Vec::new();
-    if let Some(path) = claude_settings_path() {
-        keys.extend(claude_settings_keys(&path));
-    }
-    if let Some(path) = codex_config_path() {
-        keys.extend(codex_config_keys(&path));
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for login in logins {
+        let Some(path) = login.client_config() else {
+            continue;
+        };
+        if seen.contains(&path) {
+            continue;
+        }
+        keys.extend(match login.product {
+            SubscriptionProduct::Claude => claude_settings_keys(&path),
+            SubscriptionProduct::ChatGpt => codex_config_keys(&path),
+        });
+        seen.push(path);
     }
     keys.sort_by(|a, b| a.var.cmp(&b.var));
     keys.dedup_by(|a, b| a.var == b.var);
@@ -220,24 +342,6 @@ fn looks_like_a_key(name: &str) -> bool {
     name.ends_with("_API_KEY") || name.ends_with("_AUTH_TOKEN") || name.ends_with("_TOKEN")
 }
 
-fn claude_settings_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir).join("settings.json"));
-    }
-    Some(dirs::home_dir()?.join(".claude").join("settings.json"))
-}
-
-fn codex_config_path() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("CODEX_HOME")
-        && !home.is_empty()
-    {
-        return Some(PathBuf::from(home).join("config.toml"));
-    }
-    Some(dirs::home_dir()?.join(".codex").join("config.toml"))
-}
-
 /// Say what was found, and what each thing is worth.
 fn report(found: &Found, local: &[(u16, &'static str)]) {
     let line = |present: bool, what: &str, note: &str| {
@@ -245,16 +349,26 @@ fn report(found: &Found, local: &[(u16, &'static str)]) {
             println!("  found    {what:<28}{note}");
         }
     };
-    line(
-        found.claude_subscription,
-        "Claude Code login",
-        "capacity you have already paid for",
-    );
-    line(
-        found.codex_subscription,
-        "ChatGPT login (Codex)",
-        "capacity you have already paid for",
-    );
+    // One line per login, naming where it lives: with two Claude logins,
+    // "Claude Code login" twice says nothing about which is which.
+    for FoundLogin { login, usable } in &found.logins {
+        let what = match login.product {
+            SubscriptionProduct::Claude => "Claude Code login",
+            SubscriptionProduct::ChatGpt => "ChatGPT login (Codex)",
+        };
+        if *usable {
+            println!(
+                "  found    {what:<28}{} · capacity you have already paid for",
+                login.location()
+            );
+        } else {
+            println!(
+                "  missing  {what:<28}{} · not logged in — run `{}`",
+                login.location(),
+                login.login_command()
+            );
+        }
+    }
     line(found.codex_api_key, "OpenAI key (via Codex)", "metered");
     line(found.anthropic_key, "ANTHROPIC_API_KEY", "metered");
     line(found.openai_key, "OPENAI_API_KEY", "metered");
@@ -268,6 +382,18 @@ fn report(found: &Found, local: &[(u16, &'static str)]) {
         println!(
             "  found    {:<28}free, private, and yours",
             format!("{name} on :{port}")
+        );
+    }
+
+    if let Some(dir) = &found.unknown_claude_dir {
+        // Claude Code keys its login to this directory, so it is a login of
+        // its own — and one IronWire has not been told about. Wiring it as
+        // the default would send that Claude Code's traffic out on the
+        // default login's account.
+        println!("  note     CLAUDE_CONFIG_DIR is {dir}, a login IronWire does not know yet;");
+        println!(
+            "           `ironwire connect claude` {}",
+            logins::connect_would(dir)
         );
     }
 
@@ -332,9 +458,14 @@ pub(crate) async fn run(
     no_service: bool,
 ) -> Result<()> {
     let paths = paths()?;
-    let port = port
-        .or_else(|| Config::load(&paths).ok().map(|c| c.server.port))
-        .unwrap_or(DEFAULT_PORT);
+    // A config the daemon would refuse still leaves everything else here worth
+    // doing, so it is said and set aside rather than ending the run.
+    let config = Config::load(&paths).unwrap_or_else(|error| {
+        println!("{error}");
+        println!();
+        Config::default()
+    });
+    let port = port.unwrap_or(config.server.port);
 
     println!("IronWire — one local endpoint for the AI capacity you already have");
     println!();
@@ -345,7 +476,7 @@ pub(crate) async fn run(
     println!("Looking at this machine…");
     println!();
 
-    let found = Found::detect();
+    let found = Found::detect(&config);
     let local = find_local_servers().await;
     report(&found, &local);
 
@@ -372,7 +503,7 @@ pub(crate) async fn run(
     }
 
     let enabled = ask_for_subscriptions(&paths, &found, dry_run)?;
-    let wired = wire_agents(port, dry_run)?;
+    let wired = wire_agents(&config, &found, port, dry_run)?;
     let daemon = start_daemon(port, no_service, dry_run).await?;
 
     summarise(port, &found, &enabled, &wired, &daemon);
@@ -394,7 +525,7 @@ fn ask_for_subscriptions(
     paths: &ironwire_core::config::PathsConfig,
     found: &Found,
     dry_run: bool,
-) -> Result<Vec<&'static str>> {
+) -> Result<Vec<String>> {
     let path = paths.consent_file();
     let mut ledger = ConsentLedger::load(&path);
     let pending = found.ungranted_subscriptions(&ledger);
@@ -402,52 +533,43 @@ fn ask_for_subscriptions(
         return Ok(Vec::new());
     }
 
-    let products = join(pending.iter().map(|s| s.product), "and");
-    let clients = join(pending.iter().map(|s| s.client), "and");
-    let vendors = join(pending.iter().map(|s| s.vendor), "and");
-    let hosts = join(pending.iter().map(|s| s.host), "and");
-    let many = pending.len() > 1;
-
+    let question = consent_question(&pending);
     println!();
-    if many {
-        println!("  IronWire can use the {products} subscriptions above, by replaying");
-        println!("  the OAuth tokens {clients} have already stored on this machine.");
-        println!("  Each token goes only to its own provider ({hosts}),");
-        println!("  from this computer.");
-    } else {
-        println!("  IronWire can use your {products} subscription, by replaying the");
-        println!("  OAuth token {clients} has already stored on this machine. It goes");
-        println!("  only to {hosts}, from this computer.");
+    for line in connect::wrap(&question.intro, 70) {
+        println!("  {line}");
     }
     println!();
-    println!(
-        "  · {vendors} {} not document this authentication path and may",
-        if many { "do" } else { "does" }
-    );
-    println!("    change or block it at any time.");
-    println!("  · Using it from a third-party proxy may fall outside your");
-    println!("    subscription's intended use. If they object, it is your account");
-    println!("    that is affected.");
-    println!(
-        "  · You can use {} instead —",
-        join(pending.iter().map(|s| s.alternative), "or")
-    );
-    println!("    fully supported, no ambiguity.");
+    for point in &question.points {
+        let mut lines = connect::wrap(point, 68).into_iter();
+        if let Some(first) = lines.next() {
+            println!("  · {first}");
+        }
+        for rest in lines {
+            println!("    {rest}");
+        }
+    }
     println!();
 
-    let question = if many {
-        format!("  Use the {products} subscriptions? [Y/n] ")
-    } else {
-        format!("  Use the {products} subscription? [Y/n] ")
-    };
-    if !ask(&question)? {
+    if !ask(&format!("  {} [Y/n] ", question.question))? {
         println!();
         println!("  Left disabled. IronWire will use API keys and local models only.");
-        println!("  `ironwire connect claude --subscription` asks again, one at a time.");
+        let again: Vec<String> = pending
+            .iter()
+            .map(|p| format!("{} --subscription", p.login.connect_command()))
+            .collect();
+        match again.as_slice() {
+            [one] => println!("  `{one}` asks again."),
+            many => {
+                println!("  Each of these asks again, one login at a time:");
+                for command in many {
+                    println!("      {command}");
+                }
+            }
+        }
         return Ok(Vec::new());
     }
 
-    let enabled: Vec<&'static str> = pending.iter().map(|s| s.backend_id).collect();
+    let enabled: Vec<String> = pending.iter().map(|p| p.id.clone()).collect();
     if dry_run {
         println!(
             "  [dry run] would record consent for: {}",
@@ -455,12 +577,19 @@ fn ask_for_subscriptions(
         );
         return Ok(enabled);
     }
-    for id in &enabled {
-        ledger.grant(id, Utc::now());
-    }
+    grant_all(&mut ledger, &pending, Utc::now());
     ledger.save(&path).context("writing the consent ledger")?;
     println!("  Recorded in {}.", path.display());
     Ok(enabled)
+}
+
+/// Record the one yes against every login it was given for, each by the
+/// directory it is read from: the id alone does not say which account was
+/// handed over.
+fn grant_all(ledger: &mut ConsentLedger, pending: &[Pending], now: DateTime<Utc>) {
+    for p in pending {
+        ledger.grant_for(&p.id, p.login.consent_location(), now);
+    }
 }
 
 /// Read a yes/no answer, defaulting to yes.
@@ -486,23 +615,71 @@ fn ask(question: &str) -> Result<bool> {
     ))
 }
 
-/// Point every agent that is installed at IronWire.
+/// What [`wire_agents`] pointed at IronWire.
+struct Wired {
+    /// Every client, named for the summary.
+    labels: Vec<String>,
+    /// The config files the built-in clients were wired in, which is how the
+    /// summary tells whether the `claude` or `codex` this shell starts is one
+    /// of them.
+    files: Vec<PathBuf>,
+}
+
+/// Point every agent that is installed at IronWire — and each declared login's
+/// client at the URL that names that login.
 ///
 /// Only the ones that are installed: writing a settings file nothing will read
-/// is how a setup step turns into litter in someone's home directory.
-fn wire_agents(port: u16, dry_run: bool) -> Result<Vec<String>> {
-    let mut wired = Vec::new();
+/// is how a setup step turns into litter in someone's home directory. A login
+/// config.toml declares counts as installed, because declaring it is the user
+/// saying they use it; a disabled one does not, because the URL that names it
+/// would be refused.
+fn wire_agents(config: &Config, found: &Found, port: u16, dry_run: bool) -> Result<Wired> {
+    let declared = logins::configured(config);
+    // A directory a login of its own claims is that login's, even when it is
+    // also where the default login would be — the more specific answer wins.
+    let claimed: Vec<PathBuf> = declared
+        .iter()
+        .filter(|login| !login.is_default() && login.enabled)
+        .filter_map(Login::client_config)
+        .collect();
+
+    let mut wired = Wired {
+        labels: Vec::new(),
+        files: Vec::new(),
+    };
     println!();
-    if connect::claude_installed() {
-        connect::wire_claude(port, dry_run)?;
-        wired.push("Claude Code".to_string());
+    for login in &declared {
+        let wire = if !login.is_default() || login.config_dir.is_some() {
+            login.enabled
+        } else {
+            let installed = match login.product {
+                // `claude` on PATH is the Claude Code this shell starts, and
+                // with an undeclared CLAUDE_CONFIG_DIR that one does not read
+                // ~/.claude. Only a directory it has already made says the
+                // default login's Claude Code runs here too.
+                SubscriptionProduct::Claude if found.unknown_claude_dir.is_some() => {
+                    claude_settings::default_dir().is_some_and(|dir| dir.exists())
+                }
+                SubscriptionProduct::Claude => connect::claude_installed(),
+                SubscriptionProduct::ChatGpt => connect::codex_installed(),
+            };
+            installed
+                && login
+                    .client_config()
+                    .is_none_or(|path| !claimed.contains(&path))
+        };
+        if wire {
+            connect::warn_shared_settings(login);
+            connect::wire_login(login, port, dry_run)?;
+            connect::warn_left_behind(login);
+            wired.labels.push(login.client_label());
+            wired.files.extend(login.client_config());
+        }
     }
-    if connect::codex_installed() {
-        connect::wire_codex(port, dry_run)?;
-        wired.push("Codex".to_string());
-    }
-    wired.extend(wire_catalog_agents(port, dry_run));
-    if wired.is_empty() {
+    wired.labels.extend(wire_catalog_agents(port, dry_run));
+    // With an undeclared CLAUDE_CONFIG_DIR there is an agent here, and the
+    // summary names the command that wires it.
+    if wired.labels.is_empty() && found.unknown_claude_dir.is_none() {
         println!("No coding agent found here yet. Once one is installed, run");
         println!("`ironwire init` again and it will be pointed at IronWire.");
     }
@@ -615,13 +792,7 @@ async fn wait_until_listening(port: u16) -> bool {
 }
 
 /// Say what is true now, and the one command that comes next.
-fn summarise(
-    port: u16,
-    found: &Found,
-    enabled: &[&'static str],
-    wired: &[String],
-    daemon: &Daemon,
-) {
+fn summarise(port: u16, found: &Found, enabled: &[String], wired: &Wired, daemon: &Daemon) {
     println!();
     match daemon {
         Daemon::Service | Daemon::AlreadyUp => {
@@ -635,8 +806,8 @@ fn summarise(
     }
     println!();
 
-    if !wired.is_empty() {
-        println!("  wired    {}", wired.join(", "));
+    if !wired.labels.is_empty() {
+        println!("  wired    {}", wired.labels.join(", "));
     }
     if !enabled.is_empty() {
         println!("  enabled  {}", enabled.join(", "));
@@ -656,11 +827,39 @@ fn summarise(
     // Only once there is something to talk to. "Run `claude`" while the daemon
     // is down sends the user at a connection error, which is a worse first
     // impression than the extra step they still have to take.
+    //
+    // And only about the client this shell starts, as the login it is: with
+    // a CLAUDE_CONFIG_DIR no login here uses, `claude` reads a settings file
+    // nothing above touched — or, for `~/.claude` on macOS, the default's
+    // file while logged in as itself. Either way connecting it comes next,
+    // and "it goes through IronWire now" would say it is done.
+    let starts_here = |path: Option<PathBuf>| path.is_some_and(|path| wired.files.contains(&path));
     if matches!(daemon, Daemon::Service | Daemon::AlreadyUp) {
-        if wired.iter().any(|w| w == "Claude Code") {
+        if found.unknown_claude_dir.is_none() && starts_here(claude_settings::path()) {
             println!("Start a new terminal and run `claude` — it goes through IronWire now.");
-        } else if wired.iter().any(|w| w == "Codex") {
+        } else if starts_here(codex_config::path()) {
             println!("Start a new `codex` session — it goes through IronWire now.");
+        }
+    }
+    if let Some(dir) = &found.unknown_claude_dir {
+        let shown = logins::shown(std::path::Path::new(dir));
+        if logins::shares_plain_claudes_settings(dir) {
+            println!(
+                "Next: `ironwire connect claude`. The Claude Code this shell starts uses \
+                 {shown} through CLAUDE_CONFIG_DIR, which on macOS is a login of its own — \
+                 not the Keychain item plain `claude` uses — though both read \
+                 {shown}/settings.json{}.",
+                if starts_here(claude_settings::path()) {
+                    "; until then IronWire serves it from plain `claude`'s login"
+                } else {
+                    ""
+                }
+            );
+        } else {
+            println!(
+                "Next: `ironwire connect claude`. The Claude Code this shell starts uses \
+                 {shown} (CLAUDE_CONFIG_DIR), a login IronWire does not know yet."
+            );
         }
     }
     println!("    ironwire doctor    confirm it end to end, with a real request");
@@ -794,6 +993,29 @@ scan_tool_results = false
 # serve` refuses to start with a cap set and capture off, rather than leaving
 # you believing in a limit that can never fire.
 
+# [subscriptions]
+# Each login is its own backend, and a client is served by its own: the
+# Claude Code on ~/.claude-work by that login's subscription and, under quota
+# pressure or once it runs out, by the ordinary ladder below it — API key,
+# NEAR AI, local — never by your other Claude subscription.
+#
+# Turning this on lets a client be served by another of your subscriptions
+# for the same product as soon as its own is under quota pressure — the
+# trigger every rung of the ladder uses, which outranks the preference for
+# your own login and does not wait for it to run out. Pressure means
+# at least 90% used as the provider reports it, or spent: a request choosing
+# afresh moves at once, and a conversation already on your own login once
+# that has lasted the 20-second descent debounce. Read docs/TRUST.md first.
+# Moving to another account after a rate limit is the most direct reading of
+# what OpenAI's terms ("circumvent any rate limits") and Anthropic's usage
+# policy ("bypass ... restrictions") forbid; the provider can see it, because
+# Claude Code's request names the account it is logged in as and would arrive
+# on the other account's token; and a Codex conversation carrying encrypted
+# reasoning never moves account even with this on, because OpenAI refuses
+# reasoning minted by another one.
+#
+# cross_account_fallback = false
+
 # Backends are discovered from your logins and environment, so this section is
 # usually unnecessary. Declare one to override how a discovered backend is
 # built, to switch one off, or to add an endpoint IronWire cannot discover.
@@ -807,6 +1029,16 @@ scan_tool_results = false
 #                               # openai-compatible
 # enabled = false               # a real kill switch: it is never registered
 # api_key_env = "ANTHROPIC_API_KEY_WORK"   # which variable holds the key
+#
+# [[backends]]
+# id = "claude-work"            # a second Claude login, as its own backend:
+# kind = "claude-subscription"  # its own consent, quota and ledger rows
+# config_dir = "~/.claude-work" # what you export as CLAUDE_CONFIG_DIR when you
+#                               # use it (CODEX_HOME, for codex-subscription).
+#                               # `ironwire connect claude --config-dir DIR`
+#                               # writes this entry and points that Claude Code
+#                               # at a URL naming it, so it is served by its own
+#                               # subscription and nobody else's.
 #
 # [[backends]]
 # id = "local"
@@ -833,6 +1065,7 @@ scan_tool_results = false
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironwire_core::DEFAULT_PORT;
 
     #[test]
     fn the_generated_config_parses_and_equals_the_built_in_defaults() {
@@ -862,6 +1095,239 @@ mod tests {
     fn the_generated_config_carries_the_port_it_was_given() {
         let template = config_template(9999);
         assert!(template.contains("port = 9999"));
+    }
+
+    /// A block of the template, uncommented, from `first` to the next line
+    /// that is only `#`.
+    fn uncommented(template: &str, first: &str) -> String {
+        template
+            .lines()
+            .skip_while(|line| *line != first)
+            .take_while(|line| line.trim() != "#" && !line.trim().is_empty())
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The two settings people with a second login need are discoverable —
+    /// and still only documentation: neither changes anything until it is
+    /// uncommented, and the risky one is described as such.
+    #[test]
+    fn the_generated_config_documents_several_logins_without_turning_any_on() {
+        let template = config_template(DEFAULT_PORT);
+        assert!(template.contains("# cross_account_fallback = false"));
+        assert!(template.contains("docs/TRUST.md"));
+        // The move happens on the trigger every rung uses, and the comment
+        // has to say so rather than promise it waits for a spent login.
+        assert!(
+            template.contains("# at least 90% used as the provider reports it"),
+            "{template}"
+        );
+        assert!(template.contains("# afresh moves at once"), "{template}");
+        assert!(!template.contains("whose own subscription is spent"));
+        let parsed: Config = toml::from_str(&template).expect("parses");
+        assert!(!parsed.subscriptions.cross_account_fallback);
+        assert!(parsed.backends.is_empty());
+
+        // The example is one the daemon would accept, as written.
+        let start = template
+            .find("# id = \"claude-work\"")
+            .expect("the example is there");
+        let header = template[..start]
+            .rfind("# [[backends]]")
+            .expect("under a header");
+        let example = uncommented(&template[header..], "# [[backends]]");
+        let declared: Config = toml::from_str(&example).expect("the example parses");
+        assert_eq!(declared.backends.len(), 1, "{example}");
+        assert_eq!(
+            declared.backends[0].config_dir.as_deref(),
+            Some("~/.claude-work")
+        );
+        declared
+            .validate(std::path::Path::new("config.toml"))
+            .expect("the example is a valid login");
+    }
+
+    fn pending(id: &str, product: SubscriptionProduct, location: Option<&str>) -> Pending {
+        let usual = match product {
+            SubscriptionProduct::Claude => "~/.claude",
+            SubscriptionProduct::ChatGpt => "~/.codex",
+        };
+        Pending {
+            id: id.to_string(),
+            login: SubscriptionLogin {
+                product,
+                location: location.map(str::to_string),
+                config_dir: location.map(str::to_string),
+                source_dir: None,
+                default: location.is_none(),
+            },
+            location: location.unwrap_or(usual).to_string(),
+        }
+    }
+
+    /// Nobody who already answered the one-login question should find it
+    /// reworded under them.
+    #[test]
+    fn one_default_login_is_asked_about_in_the_words_people_have_answered() {
+        let question =
+            consent_question(&[pending("claude-sub", SubscriptionProduct::Claude, None)]);
+        assert_eq!(
+            question.intro,
+            "IronWire can use your Claude subscription, by replaying the OAuth token \
+             Claude Code has already stored on this machine. It goes only to \
+             api.anthropic.com, from this computer."
+        );
+        assert_eq!(
+            question.points[0],
+            "Anthropic does not document this authentication path and may change or \
+             block it at any time."
+        );
+        assert_eq!(
+            question.points[2],
+            "You can use an Anthropic API key instead — fully supported, no ambiguity."
+        );
+        assert_eq!(question.question, "Use the Claude subscription?");
+
+        let both = consent_question(&[
+            pending("claude-sub", SubscriptionProduct::Claude, None),
+            pending("codex-sub", SubscriptionProduct::ChatGpt, None),
+        ]);
+        assert_eq!(
+            both.intro,
+            "IronWire can use the Claude and ChatGPT subscriptions above, by replaying the \
+             OAuth tokens Claude Code and Codex have already stored on this machine. Each \
+             token goes only to its own provider (api.anthropic.com and chatgpt.com), from \
+             this computer."
+        );
+        assert!(both.points[0].starts_with("Anthropic and OpenAI do not"));
+        assert_eq!(both.question, "Use the Claude and ChatGPT subscriptions?");
+    }
+
+    /// The case this was rewritten for. Two Claude logins share a vendor, a
+    /// host and a client, so each is said once — and the logins themselves are
+    /// named by where they live, because "the Claude subscription" no longer
+    /// says which accounts are being handed over.
+    #[test]
+    fn the_question_for_two_claude_logins_names_each_and_repeats_nothing() {
+        let question = consent_question(&[
+            pending("claude-sub", SubscriptionProduct::Claude, None),
+            pending(
+                "claude-work",
+                SubscriptionProduct::Claude,
+                Some("~/.claude-work"),
+            ),
+        ]);
+        assert_eq!(
+            question.intro,
+            "IronWire can use the Claude subscriptions in ~/.claude and ~/.claude-work, by \
+             replaying the OAuth tokens Claude Code has already stored on this machine. \
+             They go only to api.anthropic.com, from this computer."
+        );
+        assert_eq!(
+            question.question,
+            "Use the Claude subscriptions in ~/.claude and ~/.claude-work?"
+        );
+        let all = format!("{} {}", question.intro, question.points.join(" "));
+        for repeated in [
+            "Anthropic and Anthropic",
+            "Claude Code and Claude Code",
+            "api.anthropic.com and api.anthropic.com",
+            "API key or an Anthropic",
+        ] {
+            assert!(!all.contains(repeated), "{repeated:?} in: {all}");
+        }
+        assert!(question.points[0].starts_with("Anthropic does not document"));
+    }
+
+    #[test]
+    fn logins_of_both_products_are_named_product_by_product() {
+        let question = consent_question(&[
+            pending("claude-sub", SubscriptionProduct::Claude, None),
+            pending(
+                "claude-work",
+                SubscriptionProduct::Claude,
+                Some("~/.claude-work"),
+            ),
+            pending(
+                "codex-work",
+                SubscriptionProduct::ChatGpt,
+                Some("~/.codex-work"),
+            ),
+        ]);
+        assert_eq!(
+            question.question,
+            "Use the Claude subscriptions in ~/.claude and ~/.claude-work, and the ChatGPT \
+             subscription in ~/.codex-work?"
+        );
+        assert!(question.intro.contains("Claude Code and Codex have"));
+        assert!(
+            question
+                .intro
+                .contains("(api.anthropic.com and chatgpt.com)")
+        );
+        assert_eq!(
+            question.points[2],
+            "You can use an Anthropic API key or an OpenAI API key instead — fully \
+             supported, no ambiguity."
+        );
+
+        // One additional login alone is still named, even with nothing to tell
+        // it apart from on this screen: the prompt has to say which account.
+        let alone = consent_question(&[pending(
+            "codex-work",
+            SubscriptionProduct::ChatGpt,
+            Some("~/.codex-work"),
+        )]);
+        assert_eq!(
+            alone.question,
+            "Use the ChatGPT subscription in ~/.codex-work?"
+        );
+        assert!(alone.intro.contains("the OAuth token Codex has"));
+    }
+
+    /// Consent answers for the login it was given to. A `claude-sub` moved
+    /// since it was consented to is asked about again, and the yes is
+    /// recorded against the directory it reads now.
+    #[test]
+    fn a_moved_login_is_asked_about_again_and_recorded_by_its_directory() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).expect("valid timestamp");
+        let config: Config = toml::from_str(
+            "[[backends]]\nid = \"claude-sub\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.claude-main\"\n",
+        )
+        .expect("parses");
+        let moved = Login::default_for(SubscriptionProduct::Claude, &config);
+        let found = Found {
+            logins: vec![FoundLogin {
+                login: moved.clone(),
+                usable: true,
+            }],
+            codex_api_key: false,
+            anthropic_key: false,
+            openai_key: false,
+            nearai_key: false,
+            agent_keys: Vec::new(),
+            unknown_claude_dir: None,
+        };
+
+        // Given while `claude-sub` read the login in ~/.claude.
+        let mut ledger = ConsentLedger::default();
+        ledger.grant("claude-sub", now);
+        let pending = found.ungranted_subscriptions(&ledger);
+        let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["claude-sub"]);
+
+        grant_all(&mut ledger, &pending, now);
+        let described = moved.describe();
+        let location = described.consent_location();
+        assert!(
+            location.is_some_and(|l| l.ends_with("/.claude-main")),
+            "{location:?}"
+        );
+        assert!(ledger.is_granted_for("claude-sub", location));
+        assert!(!ledger.is_granted("claude-sub"));
+        assert!(found.ungranted_subscriptions(&ledger).is_empty());
     }
 
     #[test]

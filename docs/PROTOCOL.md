@@ -31,15 +31,81 @@ and any `anthropic-*` we do not recognize.
 | `POST /v1/chat/completions` | Chat Completions | Aider, Cline, most third parties |
 | `GET /v1/models` | — | pickers |
 
+### Login-bound URLs — `…/anthropic/account/{id}`, `…/openai/account/{id}`
+
+Every route above also exists under an account prefix, for a client bound to
+one of the user's logins (`DESIGN.md` §5):
+
+| Client | Pointed at | So it requests |
+|---|---|---|
+| Claude Code with `CLAUDE_CONFIG_DIR=~/.claude-work` | `ANTHROPIC_BASE_URL=http://127.0.0.1:8463/anthropic/account/claude-work` | `…/account/claude-work/v1/messages`, `…/v1/messages/count_tokens`, `…/v1/models` |
+| Codex with `CODEX_HOME=~/.codex-work` | `base_url = "http://127.0.0.1:8463/openai/account/codex-work/v1"` | `…/v1/responses`, `…/v1/chat/completions`, `…/v1/models` |
+
+- **The segment is IronWire's.** It says whose request this is and is consumed:
+  the upstream URL is the backend's base URL plus `/v1/...`, exactly as from
+  the plain façade, and the request that leaves differs from the unbound one
+  only in which login's credential is attached
+  (`a_bound_url_changes_which_login_pays_and_nothing_else_on_the_wire`,
+  `a_bound_codex_request_carries_its_own_homes_bearer_and_account`).
+- **`{id}` must name a registered login of the façade's product** — a Claude
+  login under `/anthropic`, a ChatGPT login under `/openai`. The default logins
+  qualify too (`/anthropic/account/claude-sub`), and a moved default is reached
+  no other way (below). Anything else is a 404 in the façade's own envelope —
+  Anthropic `not_found_error`, OpenAI `invalid_request_error` — naming the
+  logins that do exist, their URLs, and the command that adds one. Nothing is
+  sent and no ledger row is written. It is never served as the plain façade
+  instead: that would put one account's request on another account's token. An
+  `{id}` that is not a plain identifier is described in the message rather than
+  echoed back to a terminal. That includes an empty one, and one that is not
+  UTF-8 once percent-decoded (`/anthropic/account/%FF/…`) — which the router
+  would otherwise have answered with its own plain-text 400 before the façade
+  saw it (`a_bound_url_naming_no_such_login_is_refused_naming_the_fix`).
+- **The model lists are the login's.** A bound `GET /v1/models` offers what that
+  login's client could be served: its own subscription, another login's only
+  when cross-account fallback is on, and everything that is not a login.
+  Codex's catalogue document is its own login's, because two plans can carry
+  different models.
+- **The plain façade is the default login's, in its default place.** Nothing
+  about it changed for anyone who has not moved the default. A default moved
+  with `config_dir` reads a directory that a different client uses — the
+  Claude Code or Codex still on the plain URL kept the old one — so it is
+  served only at its bound URL, `ironwire connect` wires it with that, and the
+  plain façade's model lists stop offering it. A request still at the plain URL
+  is served by no subscription of that product: the ladder without one, or the
+  refusal below (`a_moved_default_login_serves_its_bound_url_and_never_the_plain_one`,
+  `a_moved_default_codex_login_serves_only_its_bound_url`).
+- **A client with no login of its own is told how to get one.** A Claude Code
+  left on the plain façade while the only Claude login is another one gets a
+  503 naming that login and its real `ironwire connect … --config-dir`
+  command — not a 429, which its back-off would retry forever. A transient
+  refusal beside it does not change that, and there always is one: every
+  daemon registers NEAR AI, which reads as unhealthy without a key
+  (`a_client_on_the_wrong_url_is_told_the_command_that_binds_it`). A client
+  whose own login is registered but spent, or has its circuit open, is still
+  told to wait, as a 429, whatever the other logins' state
+  (`a_login_whose_circuit_is_open_is_still_its_clients_and_the_client_is_told_to_wait`).
+
 ---
 
 ## 2. What "passthrough" means precisely
 
 For a native-lane request, IronWire performs exactly these mutations:
 
-1. **URL**: façade path → backend base URL + same suffix.
-2. **Auth headers**: strip inbound `authorization` / `x-api-key`; attach the
-   chosen backend's credential.
+1. **URL**: façade path → backend base URL + same suffix. On a login-bound URL
+   the `/account/{id}` segment is part of the façade prefix, not the suffix, so
+   it never reaches the provider (§1).
+2. **Auth headers**: strip inbound `authorization` / `x-api-key` / `api-key`
+   and the account-bound `chatgpt-account-id` / `x-openai-fedramp`; attach the
+   chosen backend's credential. For a ChatGPT subscription that credential
+   includes `chatgpt-account-id`, read from the `chatgpt_account_id` claim of
+   the very token being presented and attached to every request made with it
+   — inference, the auth probe and the `/models` fetch alike. The header names
+   the workspace a bearer belongs to, so a client's copy sent beside another
+   login's bearer would be credential drift (`AGENTS.md` rule 4); it is
+   dropped even when it happens to match. `x-openai-fedramp` is not
+   re-attached, because no credential IronWire reads states it. Codex sends
+   neither header to a custom provider, so stripping them costs a Codex
+   client nothing.
 3. **Host-ish headers**: strip hop-by-hop headers (`connection`,
    `transfer-encoding`, `keep-alive`, `upgrade`, `proxy-*`), set `host`.
 4. **`model`**: rewritten *only* when policy selected a different model, via a
@@ -114,7 +180,11 @@ account binding/nonce never appears in status or log messages.
 Everything IronWire needs for policy comes from a **peek**: a bounded,
 non-consuming scan of the parsed body for `model`, `stream`, `system[0]`,
 message count, `tools[].name`, and the presence of `cache_control`, `thinking`,
-image blocks and `reasoning`. The peek result never re-encodes the body.
+image blocks and `reasoning` — including whether a replayed Responses
+`reasoning` item carries `encrypted_content` (§6). The peek result never
+re-encodes the body. Which login a request belongs to is not in the peek's
+reach: the façade sets it from the URL, and the client's session id from its
+headers (§6).
 
 ### Streaming
 
@@ -182,9 +252,12 @@ stored verbatim**, read from a request header the client sent.
 | Any | `x-ironwire-session-id`, when present (takes precedence) |
 | Anthropic (`Protocol::AnthropicMessages`) | `x-claude-code-session-id` |
 | OpenAI (`Protocol::OpenAiResponses`, `Protocol::OpenAiChat`) | `session-id` |
+| OpenAI Responses, when `session-id` is absent | `session_id`, older Codex's spelling |
 
 `x-ironwire-session-id` is addressed to IronWire and is **not forwarded** to
-the provider. The two native headers are forwarded untouched, as before. A
+the provider. The native headers are forwarded untouched, as before. The older
+spelling is read because the same value keys where a session's reasoning lives
+(§6), not only the ledger row (`codexs_older_session_header_is_read_after_the_current_one`). A
 client that sends no native session header -- Aider, Cline, Roo -- can set
 the neutral one wherever its provider settings allow an extra request
 header, and its rows become attributable without an IronWire release.
@@ -210,11 +283,11 @@ already caused a wrong assumption:
   carries. A consumer holding the same session under a different spelling --
   a filename stem, a path, a prefixed form -- must do that mapping itself.
   IronWire cannot, because it never sees the other spelling.
-- **It is not `conversation`.** That column is a routing-affinity key derived
-  from protocol family, preamble head and tool list. It is deliberately stable
-  across a whole session, which also makes it stable across two *different*
-  sessions with the same tools and across machines. It is right for stickiness
-  and wrong for attribution.
+- **It is not `conversation`.** That column is a hashed routing-affinity key.
+  With a valid session header it uses protocol, session and login; without
+  one it falls back to protocol family, preamble head and tool list, which may
+  collide across sessions with the same tools. It is right for stickiness and
+  wrong for direct attribution.
 - **It is not unique to a machine or an install.** It identifies a session as
   its client named it, nothing more.
 
@@ -377,6 +450,90 @@ it, for exactly the same reason: the recent assistant turns carry none of the
 native family's signed reasoning state. A blocked promotion waits for a clean
 turn without losing its accumulated recovery, so a busy tool loop postpones the
 climb rather than cancelling it.
+
+### The account twin: ChatGPT reasoning stays where it was minted
+
+The family rule has a twin one level down. OpenAI binds Responses encrypted
+reasoning to the organization that produced it and rejects it anywhere else —
+`invalid_encrypted_content`, "Encrypted content organization_id did not match
+the target organization" — and Codex asks for encrypted reasoning on every turn
+and replays it on the next. So for a Codex conversation, two ChatGPT logins are
+not interchangeable credentials on one wire: from the second turn on, any
+account but the one that minted the reasoning answers with a 400. This matters
+only once a conversation can change account at all, which takes cross-account
+fallback (`TRUST.md` §2); without it, another login is never usable to begin
+with.
+
+The gate lives in `eligible()`, fed by the policy's recorded origin:
+
+- `RequestRequirements::encrypted_reasoning` is set when the input replays a
+  `reasoning` item with non-empty `encrypted_content`. Empty or null content
+  carries no private state, so a first turn can start on any eligible login.
+- Native Responses replay requires the recorded backend and its known scope
+  to match the current candidate. Subscriptions use a domain-separated hash
+  of the provider's `chatgpt_account_id`; absent identity stays unknown.
+  Metered keys use a different domain-separated hash of the actual key. That
+  identifies the credential, without claiming to know its API organization.
+  A changed key requires a new origin even if its organization might be the
+  same. Missing origin, unknown subscription identity or mismatch yields
+  `Ineligible::ReasoningBoundToAccount`.
+- The Responses sender recomputes the scope from the credential it actually
+  read and refuses before HTTP if routing selected a different one. A relogin
+  between status and send cannot put an old account's state on a new bearer.
+
+**The record is not the affinity.** An affinity says where a conversation
+should go next and is forgotten when a backend fails. Its replay origin
+survives 429, 5xx, stale credentials, retries and translated detours. Native
+Responses selections establish the origin, for metered keys as well as
+subscriptions; translated routes do not invent one. Scope hashes stay in
+memory and are never a substitute for provider quota observations.
+
+A valid client session header keys affinity by protocol, session and client
+login, so changing instructions or tools during one session does not move its
+route and a new session does not inherit a sibling's descent. Origin records
+also include the client session and login. With no header, the content-derived
+conversation key is the fallback and cannot distinguish identical concurrent
+conversations. Tests include
+`a_session_that_moves_to_the_sibling_does_not_take_another_sessions_reasoning_with_it`
+and `one_codex_session_moving_to_another_login_takes_no_other_sessions_reasoning_with_it`.
+
+The recorded origin remains binding whether its backend is healthy, absent
+from the candidates, or currently rate limited. If it cannot serve, the request
+may cross families at a turn boundary, where translation drops encrypted
+reasoning, or it is refused. Moving to another native Responses login or a
+metered key is refused before the provider can reject that state. When the
+origin recovers, it can serve again. Tests:
+`a_failing_sibling_keeps_the_reasoning_it_minted_from_the_clients_own_login`,
+`a_failing_sibling_never_hands_its_reasoning_to_the_clients_own_login`, and
+`encrypted_reasoning_minted_by_a_metered_key_stays_on_that_key`.
+
+Three edges:
+
+- **Pins and `X-IronWire-Route` obey the same gate.** They override preference,
+  never semantic eligibility, consent or login ownership. A pin may start a
+  new origin on a plaintext turn but cannot move encrypted replay to another
+  account or key (`a_pin_can_start_reasoning_on_an_account_but_cannot_move_a_replay`,
+  `a_route_override_cannot_move_another_accounts_encrypted_reasoning`). A
+  user-named same-wire pin still records rung 0 rather than automatic rung 2.
+- **Origins are memory-only and separately bounded.** The route cache holds
+  at most 512 affinities; replay origins hold at most 4,096 entries, with
+  24-hour idle retention. Expiry, capacity eviction or daemon restart loses
+  knowledge, so native encrypted continuation refuses instead of assuming
+  the client's own login (`with_no_record_encrypted_reasoning_is_refused_rather_than_assigned_an_account`,
+  `an_expired_origin_refuses_a_replay_even_when_the_same_account_is_pinned`,
+  `evicting_an_origin_at_capacity_refuses_instead_of_guessing_an_account`).
+  Starting a new session or restoring authenticated origin evidence is needed
+  for native continuation; persistent origin recovery is not implemented.
+- **Provider behavior remains a live acceptance gap.** These local refusal
+  gates prevent an unchecked subscription-to-key descent. They do not prove
+  which real ChatGPT accounts share an organization or reproduce the reported
+  `invalid_encrypted_content` response. Two-account and API-key live checks
+  remain in `ROADMAP.md`.
+
+Anthropic has no rule here because none is documented. Signed thinking is
+"compatible across platforms"; whether another account accepts it is not
+stated, and a Claude conversation moved by cross-account fallback carries its
+blocks unchanged. That needs a live check with two accounts (`ROADMAP.md`).
 
 ### What crossing a family actually costs
 
@@ -591,6 +748,30 @@ stated by that command before it writes anything:
   ([openai/codex#15364](https://github.com/openai/codex/issues/15364)), so a
   desktop thread keeps the model it was created with. That is Codex's
   limitation, but pointing it at IronWire is what makes a user meet it.
+
+**More than one `CODEX_HOME`.** Codex keeps everything per home — `auth.json`,
+`config.toml`, its installation id — so a second ChatGPT login is a second home,
+and IronWire reads it as a second backend (`DESIGN.md` §6). `ironwire connect
+codex --config-dir ~/.codex-work` writes the `[[backends]]` entry and points
+*that* home's `config.toml` at the login-bound URL,
+`http://127.0.0.1:8463/openai/account/codex-work/v1` (§1); the default home is
+left as it was. Each home's requests carry its own bearer and its own
+`chatgpt-account-id` (§2.2), and are served by its own subscription — by
+another only with cross-account fallback on, and then never mid-conversation
+(§6).
+
+Two rules about homes are Codex's, not IronWire's, and the not-logged-in
+message names them. A `CODEX_HOME` that does not exist is refused by
+Codex, so `mkdir -p` comes before `CODEX_HOME=~/.codex-work codex login`. A home
+in keyring mode (`cli_auth_credentials_store = "keyring"` or `"auto"`) has no
+`auth.json`, and IronWire does not read Codex's keyring item; set it to `"file"`
+in that home's `config.toml` and log in again.
+
+The default login is `~/.codex`, or `$CODEX_HOME` when the daemon's own
+environment sets it — unchanged, because existing setups rely on it. A home you
+use from a shell belongs in `config_dir` instead: a daemon under launchd or
+systemd does not see your shell's variables. Whether the desktop app can be
+pointed at a home other than `~/.codex` at all has not been checked.
 
 **What has not been verified.** The client-identity gate (`docs/TRUST.md` §3)
 recognises the CLI by its `originator` header and its `instructions` preamble.

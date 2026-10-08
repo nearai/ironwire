@@ -120,6 +120,7 @@ struct RequestRequirements {
     structured_output: bool,
     min_context_tokens: u32,
     mid_tool_loop: bool,          // the cross-family gate
+    encrypted_reasoning: bool,    // the cross-account gate (§3)
 }
 ```
 
@@ -140,14 +141,26 @@ earlier version of this document got it wrong.
 IronWire has no session ID from the client. It derives one:
 
 ```
-conversation_key = H(façade, first_system_block_prefix, first_user_message, tool_name_set)
+conversation_key = H(protocol, client session, client login)  # when session supplied
+otherwise: H(protocol family, system_preamble[..512 bytes], sorted tool names, client login)
 ```
 
-with a rolling secondary match on the longest common message prefix, so a
-growing conversation keeps its key across turns. Keys are memory-only,
-TTL-evicted, and never persisted with content.
+Deliberately not the messages, which change every turn: a key that changes
+every turn is not affinity. Keys are memory-only, TTL-evicted, and never
+persisted with content.
 
-Each conversation gets a sticky `RouteAffinity { backend, model, since, rung }`.
+A request at a login-bound URL (§6) also mixes in the login. Every session of
+one client version shares a preamble and a tool set, so without it the Claude
+Code on one login and the Claude Code on another would be one conversation,
+each evicting the other's route.
+
+Each conversation gets a sticky `Affinity { backend, model, rung, since,
+client_login, … }`, reused only by a request from the login it was chosen for.
+Beside it, and deliberately outliving it, `Policy` records the native Responses
+backend and credential scope for each client session. Subscriptions use the
+provider account id; API backends use their actual credential fingerprint.
+The affinity is forgotten when a backend fails; the replay origin must not be
+(`PROTOCOL.md` §6). Unknown origins refuse native encrypted continuation.
 
 ### The fidelity ladder
 
@@ -159,12 +172,39 @@ conversation is at a safe boundary (no in-flight signed reasoning state).
 |---|---|---|---|---|
 | 0 | stay | warm | intact | no |
 | 1 | same account, smaller model | mostly warm | intact | no |
-| 2 | same wire format, different credential | cold | intact | no |
+| 2 | same wire format, different credential: a metered key, or another of your subscriptions (opt-in) | cold | intact, except ChatGPT's (below) | no |
 | 3 | different family (needs translation) | cold | dropped | **yes** |
 
-Hysteresis: a rung change requires the trigger to persist past a debounce
-window, so a single 429 with a 3-second `retry-after` waits rather than
-resetting a 200k-token cache.
+Rung 2's second form is off by default. A client is served by its own login
+(§5); with `[subscriptions] cross_account_fallback = true` a client whose own
+subscription is under the pressure that triggers every rung — at least 90% used
+as the provider reports it, or spent — may be served by another of the user's
+subscriptions to the same product, before a metered key. Pressure outranks the
+preference for the client's own login, so a fresh selection moves at once, and
+a conversation already on that login once the pressure has lasted the
+twenty-second descent debounce. Every such request is recorded at rung 2. Why
+it is opt-in — the providers' rate-limit terms, and a request body that names
+the account it came from — is `TRUST.md` §2.
+
+"Intact" has one exception, and it is enforced rather than tolerated: OpenAI
+binds encrypted reasoning to the organization that minted it and rejects it
+anywhere else. So a Codex conversation that replays encrypted reasoning never
+changes ChatGPT account, even with the opt-in. It stays on the account that
+minted it, or crosses families at a turn boundary, where the reasoning is
+dropped rather than rejected (`Ineligible::ReasoningBoundToAccount`,
+`PROTOCOL.md` §6). The eligibility gate also refuses a descent from the
+ChatGPT subscription to a metered OpenAI key for encrypted native replay,
+including pins and route overrides. It does not infer an API organization.
+Anthropic's documentation calls signed thinking "compatible across platforms"
+and says nothing about accounts, so a Claude conversation moved by the opt-in
+carries its thinking blocks on an assumption nobody has checked — also in
+`ROADMAP.md`.
+
+Hysteresis: a conversation already on a backend changes rung only once the
+trigger has persisted past a debounce window, so a single 429 with a 3-second
+`retry-after` waits rather than resetting a 200k-token cache. A fresh selection
+has no cache to keep: there a pressured backend sorts behind an unpressured one
+from the first request.
 
 ### Inputs to the decision
 
@@ -172,6 +212,8 @@ resetting a 200k-token cache.
 |---|---|---|
 | requested model | request body | client hint → tier |
 | requirements | body peek | authoritative |
+| the client's login | the façade URL it was pointed at (§6); the plain URL is the default login's while it is in its default place | authoritative: the user wired it |
+| the client's session | its own session header (`PROTOCOL.md` §3) | keys affinity, privacy salt and replay origin |
 | approximate prompt size | body byte length + message count | heuristic |
 | observed quota | provider rate-limit headers | authoritative, with age |
 | recent errors | circuit breaker per backend | authoritative |
@@ -188,7 +230,9 @@ and `ironwire/*` slugs for clients that accept free-form model strings.
 
 1. Serve at the requested tier from the highest-fidelity backend that is
    authenticated, in-quota and healthy.
-2. Prefer marginal-cost-zero capacity (subscriptions) over metered.
+2. Prefer marginal-cost-zero capacity (subscriptions) over metered — the
+   client's own subscription, and with cross-account fallback on, the user's
+   others after it.
 3. Under quota pressure, descend the ladder — do not jump.
 4. Never interrupt the client: a request that cannot be served at *any* rung
    returns a protocol-correct error the client already knows how to handle,
@@ -272,6 +316,36 @@ the Claude subscription. This is the difference between *routing the traffic a
 subscription was sold for* and *dressing one client up as another*, and it is a
 hard rule, not a default. See [`TRUST.md`](./TRUST.md).
 
+### A product, and a login
+
+A user may hold several logins of one product — Claude Code under two config
+directories, Codex under two `CODEX_HOME`s — and each is a backend of its own
+(§6). So the identity a subscription requires is a product *and* a login: the
+Claude subscription in `~/.claude-work` serves the Claude Code logged in there,
+and by default nothing else.
+
+IronWire learns which login a client is from the URL it was pointed at, never
+from the body. `ironwire connect claude --config-dir ~/.claude-work` writes
+`…/anthropic/account/claude-work` into that directory's `settings.json`, so the
+Claude Code that reads it names its login on every request; a request at the
+plain façade is the default login's. Only while that login is in its default
+place, though: the client still on the plain URL is the one that kept the
+default directory, so a default moved with `config_dir` is reached at its own
+bound URL (`/anthropic/account/claude-sub`) and the plain URL then has no login
+of that product. The body cannot answer the question: Codex sends no account id
+to a custom provider at all, and Claude Code's `metadata.user_id` is a
+client-private field whose format has already changed once. The peek does not
+read it.
+
+By default a client is served by its own login only (`TRUST.md` I8). That keeps
+every request self-consistent — Claude Code's body names its own account, and
+goes out on that account's token — and keeps a subscription under pressure from
+being quietly replaced by another account, which is the plainest reading of
+what both providers' rate-limit terms forbid. `[subscriptions]
+cross_account_fallback = true` relaxes the login half and never the product
+half: Aider still does not reach a Claude subscription, and Claude Code still
+does not reach a ChatGPT one.
+
 ---
 
 ## 6. Component map
@@ -301,28 +375,134 @@ replace it.
 
 ```
 for each [[backends]] entry:
-    enabled = false          → never registered, and not shown in status
-    id matches a discovered backend
+    enabled = false          → never registered, and not shown in status;
+                               a disabled login's files are not even read
+    id is one discovery uses (claude-sub, anthropic-key, codex-sub,
+                              openai-key, nearai)
                              → discovery builds it; the entry overrides
-                               base_url, api_key_env and models
-    any other id             → built from `kind`
+                               base_url, api_key_env, config_dir (which
+                               moves a default login) and, for nearai,
+                               models. Its kind must be the one discovery
+                               builds under that id
+    any other id             → built from `kind`; a subscription kind is an
+                               additional login, read from its config_dir
 then: every backend discovery can produce that no entry named
 ```
 
-Config-declared backends are appended after the discovered ones. Registration
-order is the tie-break in `Policy::select`, so putting them first would silently
-change which backend wins a tie for everyone who already had a config.
+Config-declared backends are appended after the discovered ones, in the order
+the file lists them. Registration order is the tie-break in `Policy::select`, so
+putting them first would silently change which backend wins a tie for everyone
+who already had a config. Among logins of one product it is also the order
+cross-account fallback tries them in, after the client's own.
 
-A backend whose credential is missing is still registered, so `status` can say
-"not logged in" rather than omitting it — which reads as though IronWire never
-heard of it. `enabled = false` is a different statement, and does omit it.
+Whether a backend appears without a credential depends on who asked for it.
+Discovery registers what it finds — someone who never ran Claude Code is not
+shown a Claude subscription — with one exception: NEAR AI is registered with or
+without a key, because it is the destination `privacy.mode = "full"` names by
+default and a trusted destination the user cannot see is one they cannot act
+on. A login the user declared by directory is registered whether or not anyone
+has logged in there yet: they named it, and `status` saying "not logged in —
+run `CLAUDE_CONFIG_DIR=~/.claude-work claude`" is what they need, where silence
+reads as though IronWire never heard of it. An unauthenticated backend is
+unhealthy to the router, so nothing is sent to it. `enabled = false` is a
+different statement, and does omit it.
 
 `kind` must be one of `claude-subscription`, `anthropic-api`,
-`codex-subscription`, `openai-api`, `nearai`, `openai-compatible`. An unknown
-kind, a duplicate id, or an `openai-compatible` entry without both `base_url`
-and `api_key_env` fails at load, naming the entry — before the port is bound,
-because a backend that silently never appears is the worst way to learn about a
-typo.
+`codex-subscription`, `openai-api`, `nearai`, `openai-compatible`, `local`.
+These fail at load, naming the entry and what to change — before the port is
+bound, because a backend that silently never appears is the worst way to learn
+about a typo:
+
+- an unknown kind, or a duplicate id;
+- an `openai-compatible` entry without both `base_url` and `api_key_env`;
+- one of discovery's ids under a kind discovery does not build for it, which
+  used to be accepted and ignored;
+- a `config_dir` on anything but a subscription, or one that is neither
+  absolute nor `~/…` — the daemon's working directory is not the user's shell's;
+- an additional login without a `config_dir`, which used to build a silent
+  second copy of the default login under the default's id;
+- two logins of one kind whose directories are the same path, which would show
+  one pool as two;
+- an additional login whose directory is the product's default one (`~/.claude`,
+  `~/.codex`): that is the default login moved there, so the message says to put
+  `config_dir` on `claude-sub` or `codex-sub` instead.
+
+Two backends under one id are refused again at registration
+(`BackendRegistry::try_push`), so nothing that slipped past validation can
+shadow another: consent, quota, pins and ledger rows are keyed by id, and every
+lookup takes the first match.
+
+### More than one login of one product
+
+`claude-sub` and `codex-sub` are the default logins, and keep those ids
+forever: consent, persisted quota, pins, `privacy.trusted_backends`,
+`[[limits.backends]]` and ledger history are all keyed on them. Every other
+login is a `[[backends]]` entry with an id of its own and the directory its
+client keeps the login in:
+
+```toml
+[[backends]]
+id = "claude-work"
+kind = "claude-subscription"
+config_dir = "~/.claude-work"     # what you export as CLAUDE_CONFIG_DIR for it
+
+[[backends]]
+id = "codex-work"
+kind = "codex-subscription"
+config_dir = "~/.codex-work"      # what you export as CODEX_HOME for it
+```
+
+`ironwire connect claude|codex --config-dir DIR [--id ID]` writes that entry
+(the id defaults to the directory's name: `.claude-work` → `claude-work`) and
+points the client that uses `DIR` at its login-bound URL:
+
+```
+http://127.0.0.1:8463/anthropic/account/claude-work       ANTHROPIC_BASE_URL in DIR/settings.json
+http://127.0.0.1:8463/openai/account/codex-work/v1        base_url in DIR/config.toml
+```
+
+The URL is how a client says which login it is (§5). The account segment is
+IronWire's and is never forwarded, an id that names no login of that product is
+refused rather than served as the plain façade, and the bound model lists offer
+only what that login's client could be served (`PROTOCOL.md` §1). `config_dir`
+is kept exactly as typed, because Claude Code names a login's Keychain item
+after the exact directory string (`TRUST.md` §2). Logins are declared, never
+discovered by scanning — that is a destination the user did not choose. A
+`--config-dir` naming a directory an entry already declares reuses that entry
+as declared, spelling included, so the CLI checks, and asks consent for, the
+same Keychain item the daemon will read
+(`a_declared_login_typed_another_way_is_consented_to_as_declared`).
+
+Moving the default is the same command with `--id claude-sub` (or
+`codex-sub`), and a `--config-dir` that names the default directory itself
+means exactly that, never a second login. A moved default is wired with its
+bound URL, `…/anthropic/account/claude-sub`, like any other login: the plain URL
+belongs to the client that kept the default directory, which the moved login's
+token does not serve. So `connect` warns when that client's file still points
+at the plain façade — it will now be served by no subscription — and names the
+command that takes it off
+(`moving_the_default_login_warns_about_the_client_still_pointed_at_the_plain_url`),
+and `doctor` flags the same state
+(`a_client_left_on_ironwire_by_a_moved_default_login_is_flagged`).
+
+Writing a bound URL replaces a plain URL of ours in that file, and never a URL
+that is not ours. The reverse never happens: a connect that names no login —
+plain `ironwire connect claude`, `init`, the menu bar app — keeps a file's
+existing binding and only follows the daemon to a new port. Otherwise
+re-running any of them on a work directory would quietly move that client
+onto the default login's subscription
+(`a_connect_that_names_no_login_does_not_unbind_one`, in both
+`claude_settings` and `codex_config`). The menu bar app's connect is the
+daemon's, and the daemon never follows its own `CLAUDE_CONFIG_DIR`: it writes
+the default login's `~/.claude/settings.json`, never the directory that variable
+names
+(`a_control_api_connect_never_writes_the_plain_url_into_another_logins_directory`).
+Nor does it write the plain URL into a directory config has moved a login to —
+`claude-sub` relocated to `~/.claude` itself, or `codex-sub` to the daemon's
+`CODEX_HOME`. That login is served only at its bound URL, so the connect is
+refused with reason `login-directory` and the `connect --config-dir` command
+that binds it
+(`a_control_api_connect_never_writes_the_plain_url_where_a_moved_login_reads`).
 
 ### The daemon and its control API
 
@@ -349,8 +529,11 @@ POST /_ironwire/tools           { id, connect } — point a coding agent here,
                                 making it, and { as_previewed } to make only
                                 the edit a preview described. A refusal
                                 carries `reason` beside `error`: unknown-tool,
-                                no-path, unparseable, jsonc, unusable-entry
-POST /_ironwire/probe           hit every backend for real
+                                no-path, unparseable, jsonc, unusable-entry,
+                                login-directory
+POST /_ironwire/probe           hit every backend for real, except a
+                                subscription awaiting consent: that one is
+                                reported unprobed, with `connect_command`
 ```
 
 There is no shutdown route. The daemon stops on a signal, which is what a
@@ -397,7 +580,10 @@ running daemon *and* `config.toml`, because a change that only applied at the
 next restart is a switch that appears to do nothing, and one that only lived in
 memory would quietly revert the user onto a weaker filter. `POST /consent`
 carries the prompt version the user was actually shown and refuses anything
-else: an answer belongs to the wording it answered (`docs/TRUST.md` §2).
+else: an answer belongs to the wording it answered (`docs/TRUST.md` §2). It is
+recorded with the directory the backend's login is read from, for the same
+reason — an answer belongs to the account it answered, and a moved login is
+asked again.
 
 ---
 
@@ -479,9 +665,9 @@ those surviving final-call bodies; the window bounds their *number*.
 
 The session id is worth separating from the conversation key, because they
 answer different questions. The conversation key is a routing-affinity hash
-(protocol family, the head of the preamble, the tool list), deliberately stable
-across a whole session — and therefore equally stable across two sessions that
-share a tool list, and across machines. The session id is what the agent itself
+of protocol, supplied session and client login. Without a supplied session it
+falls back to protocol family, the preamble head, the tool list and client login;
+that fallback cannot distinguish identical concurrent conversations. The session id is what the agent itself
 calls the session: `x-claude-code-session-id` from Claude Code, `session-id`
 from Codex, both already forwarded untouched. It is what makes a row in
 `ironwire log` line up with the session a user is actually looking at. Recorded
@@ -632,7 +818,7 @@ both.
 | Upstream 5xx before first byte | retry same backend (bounded, jittered), then descend |
 | Upstream 4xx | the request itself is wrong, so no other backend is tried; the provider's own status and its own explanation are returned to the client and written to the ledger's `error` column |
 | Client disconnects | **abort the upstream request** — abandoned requests must not burn quota |
-| Credential expired | refresh once inline; on failure mark backend `NeedsAuth`, descend, and surface it in `status` |
+| Credential expired | never refreshed — the store belongs to the client that wrote it, and refreshing rotates the token out from under that client. A subscription token is re-read on every request, one past its stated expiry is not sent, and a Claude token rejected with a 401 is re-read once in case Claude Code refreshed it meanwhile. Then the backend is `NeedsAuth`, the conversation descends, and `status` names the command that logs that login in again |
 | No eligible backend | protocol-correct error the client already handles; never a made-up success |
 | Daemon not running | CLI says so and offers `ironwire serve`; never silently proxies to the real provider |
 

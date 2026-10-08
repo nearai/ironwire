@@ -23,7 +23,7 @@
 //!    not are worth reading.
 
 use anyhow::Result;
-use ironwire_proxy::control::{HeadroomView, StatusView};
+use ironwire_proxy::control::{BackendView, HeadroomView, StatusView};
 use ironwire_update::UpdateStatus;
 
 use super::control_client::ControlClient;
@@ -121,22 +121,44 @@ fn routing(status: &StatusView, client: Option<&ClientContext>) -> Option<String
 /// Capacity, but only for the pools that have actually reported one, and only
 /// when there is something to say about them.
 fn capacity(status: &StatusView) -> Vec<String> {
-    status
+    let serving: Vec<&BackendView> = status
         .backends
         .iter()
         .filter(|b| b.authenticated && b.consented)
-        .filter_map(|backend| match backend.headroom {
-            // Below a third used is not news. A status line that always shows a
-            // number teaches people to stop seeing it.
-            HeadroomView::Observed { used_pct, .. } if used_pct >= 33.0 => {
-                Some(format!("{} {used_pct:.0}%", short_name(&backend.name)))
+        .collect();
+    serving
+        .iter()
+        .filter_map(|backend| {
+            let name = label(backend, &serving);
+            match backend.headroom {
+                // Below a third used is not news. A status line that always
+                // shows a number teaches people to stop seeing it.
+                HeadroomView::Observed { used_pct, .. } if used_pct >= 33.0 => {
+                    Some(format!("{name} {used_pct:.0}%"))
+                }
+                HeadroomView::Exhausted { .. } => Some(format!("{name} exhausted")),
+                _ => None,
             }
-            HeadroomView::Exhausted { .. } => {
-                Some(format!("{} exhausted", short_name(&backend.name)))
-            }
-            _ => None,
         })
         .collect()
+}
+
+/// A backend's name on the line: the short one, unless another backend that
+/// could appear beside it shortens the same way.
+///
+/// Two Claude logins are both "Claude", and "Claude 95% · Claude exhausted"
+/// says nothing about which is which. The id is the next-shortest thing that
+/// tells them apart, and the one `ironwire pin` takes. Decided over every
+/// serving backend rather than the ones with news, so a label does not change
+/// under the user as one window fills.
+fn label<'a>(backend: &'a BackendView, serving: &[&BackendView]) -> &'a str {
+    let short = short_name(&backend.name);
+    let shared = serving
+        .iter()
+        .filter(|other| short_name(&other.name) == short)
+        .count()
+        > 1;
+    if shared { &backend.id } else { short }
 }
 
 /// Notify-only, exactly as everywhere else: say a release exists, never act
@@ -222,6 +244,7 @@ mod tests {
             update: UpdateStatus::UpToDate,
             last_route,
             usage: ironwire_usage::UsageReport::default(),
+            cross_account_fallback: false,
         }
     }
 
@@ -233,6 +256,52 @@ mod tests {
             rung: ironwire_core::policy::Rung::CrossFamily,
             at: chrono::Utc::now() - ago,
         }
+    }
+
+    fn backend(id: &str, name: &str, used_pct: f32) -> BackendView {
+        BackendView {
+            id: id.into(),
+            name: name.into(),
+            kind: "subscription".into(),
+            authenticated: true,
+            consented: true,
+            detail: None,
+            headroom: HeadroomView::Observed {
+                used_pct,
+                observed_secs_ago: 10,
+                resets_in_secs: None,
+            },
+            health: ironwire_proxy::control::HealthView::default(),
+            models: Vec::new(),
+            connect_command: None,
+        }
+    }
+
+    /// "Claude 80% · Claude 95%" says nothing about which login is which.
+    #[test]
+    fn two_logins_that_shorten_alike_are_shown_by_id() {
+        let mut status = status_with(None);
+        status.backends = vec![
+            backend("claude-sub", "Claude subscription", 80.0),
+            backend("claude-work", "Claude subscription (~/.claude-work)", 95.0),
+            backend("codex-sub", "ChatGPT subscription", 50.0),
+        ];
+        assert_eq!(
+            capacity(&status),
+            vec!["claude-sub 80%", "claude-work 95%", "ChatGPT 50%"]
+        );
+    }
+
+    /// The label is decided over every serving backend, so it does not change
+    /// under the user as the other login's window fills.
+    #[test]
+    fn a_label_does_not_change_when_only_one_of_two_logins_has_news() {
+        let mut status = status_with(None);
+        status.backends = vec![
+            backend("claude-sub", "Claude subscription", 10.0),
+            backend("claude-work", "Claude subscription (~/.claude-work)", 95.0),
+        ];
+        assert_eq!(capacity(&status), vec!["claude-work 95%"]);
     }
 
     #[test]

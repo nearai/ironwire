@@ -24,11 +24,19 @@ futures-util.workspace = true
 http.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
+sha2 = "0.10"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# Already compiled in through reqwest; named here only so the credential host
+# check can match on `url::Host`, which reqwest does not re-export.
+url.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

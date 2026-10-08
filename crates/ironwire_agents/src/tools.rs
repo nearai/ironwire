@@ -80,8 +80,20 @@ pub fn all(catalog_document: &Catalog) -> Vec<Tool> {
     tools
 }
 
+/// The settings file of the Claude Code the default login belongs to:
+/// `~/.claude/settings.json`, whatever this process's `CLAUDE_CONFIG_DIR` says.
+///
+/// The daemon builds `claude-sub` from the unsuffixed Keychain item and
+/// `~/.claude` regardless of its own environment, and the plain URL written
+/// here is served by that login. Following the variable would point another
+/// login's Claude Code at it — one account's requests on another's token.
+/// That Claude Code is connected from a terminal, as a login of its own.
+fn default_claude_settings() -> Option<PathBuf> {
+    Some(claude_settings::path_in(&claude_settings::default_dir()?))
+}
+
 fn built_in_claude() -> Tool {
-    let path = claude_settings::path();
+    let path = default_claude_settings();
     let contents = read(path.as_ref());
     Tool {
         id: "claude".to_string(),
@@ -412,9 +424,9 @@ pub fn plan_connect_with(
 ) -> Result<Planned, Error> {
     match id {
         "claude" => {
-            let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let path = default_claude_settings().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
-            let url = format!("http://127.0.0.1:{port}/anthropic");
+            let url = crate::endpoint::anthropic_url(port, None);
             let command = match options.status_line {
                 StatusLine::Offer => Some(statusline_command()),
                 StatusLine::Decline => None,
@@ -504,7 +516,7 @@ pub fn plan_connect_with(
 pub fn plan_disconnect(id: &str, catalog_document: &Catalog) -> Result<Planned, Error> {
     match id {
         "claude" => {
-            let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
+            let path = default_claude_settings().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
             let edit =
                 claude_settings::disconnect(&existing).map_err(|error| Error::Unparseable {

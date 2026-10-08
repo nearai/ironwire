@@ -12,11 +12,13 @@ use ironwire_catalog::AnthropicCatalog;
 use ironwire_core::capability::Capabilities;
 use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
-use ironwire_creds::claude::{ANTHROPIC_HOST, ClaudeCodeCredentials};
-use ironwire_creds::{Bearer, CredentialError};
+use ironwire_creds::claude::{ANTHROPIC_HOST, ClaudeLogin};
+use ironwire_creds::{Bearer, CredentialError, SubscriptionLogin, SubscriptionProduct};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};
+use crate::backend::{
+    Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse, unusable_login,
+};
 use crate::headers::forward_response_header;
 use crate::observe::{Observation, anthropic_rate_limit, retry_after};
 
@@ -26,9 +28,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 /// How a given Anthropic backend authenticates.
 #[derive(Clone)]
 pub enum AnthropicAuth {
-    /// A Claude Code subscription token, re-read from the credential store on
-    /// every request so a background refresh by Claude Code is picked up.
-    Subscription,
+    /// One Claude Code login's subscription token, re-read from that login's
+    /// store on every request so a background refresh by Claude Code is
+    /// picked up.
+    Subscription(ClaudeLogin),
     /// A metered API key.
     ApiKey(SecretString),
 }
@@ -92,19 +95,48 @@ impl AnthropicBackend {
         self
     }
 
-    /// Build a subscription-backed Anthropic backend.
+    /// Build the subscription backend for the default Claude Code login, as
+    /// `claude-sub`.
     ///
     /// # Errors
     ///
     /// Propagates a reqwest client build failure.
     pub fn subscription(base_url: Option<String>, timeout_secs: u64) -> reqwest::Result<Self> {
+        Self::subscription_for(
+            BackendId::from(SubscriptionProduct::Claude.default_backend_id()),
+            "Claude subscription".to_string(),
+            ClaudeLogin::default_login(),
+            base_url,
+            timeout_secs,
+        )
+    }
+
+    /// Build the subscription backend for one Claude Code login.
+    ///
+    /// `id` is the backend's identity everywhere — consent, quota, ledger — so
+    /// it must stay attached to this login across restarts: `claude-sub` for
+    /// the default login (relocated or not), the config entry's id otherwise.
+    /// `name` is what `ironwire status` shows; for a login other than the
+    /// default that is normally its [`SubscriptionLogin::label`], so two
+    /// logins never share a heading.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a reqwest client build failure.
+    pub fn subscription_for(
+        id: BackendId,
+        name: String,
+        login: ClaudeLogin,
+        base_url: Option<String>,
+        timeout_secs: u64,
+    ) -> reqwest::Result<Self> {
         Ok(Self {
-            id: BackendId::from("claude-sub"),
-            name: "Claude subscription".to_string(),
+            id,
+            name,
             kind: BackendKind::Subscription,
-            auth: AnthropicAuth::Subscription,
+            auth: AnthropicAuth::Subscription(login),
             base_url: normalize_base(base_url),
-            client: build_client(timeout_secs)?,
+            client: crate::first_party_client::build(timeout_secs)?,
             capabilities: anthropic_capabilities(),
             models: anthropic_models(),
             discovered: Arc::new(Mutex::new(None)),
@@ -129,7 +161,7 @@ impl AnthropicBackend {
             kind: BackendKind::ApiKey,
             auth: AnthropicAuth::ApiKey(key),
             base_url: normalize_base(base_url),
-            client: build_client(timeout_secs)?,
+            client: crate::first_party_client::build(timeout_secs)?,
             capabilities: anthropic_capabilities(),
             models: anthropic_models(),
             discovered: Arc::new(Mutex::new(None)),
@@ -143,9 +175,23 @@ impl AnthropicBackend {
     /// The subscription token is re-read every time rather than cached: Claude
     /// Code refreshes it in the background, and a cached copy would go stale in
     /// a way that looks like a rate limit.
-    fn credential(&self) -> Result<Bearer, CredentialError> {
-        match &self.auth {
-            AnthropicAuth::Subscription => Ok(ClaudeCodeCredentials::discover()?.bearer()),
+    fn credential(auth: &AnthropicAuth) -> Result<Bearer, CredentialError> {
+        match auth {
+            AnthropicAuth::Subscription(login) => {
+                let creds = login.read()?;
+                // A token past its stated expiry is refused here rather than
+                // sent to earn a 401. IronWire never refreshes it (see `send`),
+                // so a login whose Claude Code has not run for a while stays
+                // stale until it does — the usual state of a second login, and
+                // one command fixes it.
+                if creds.is_expired(Utc::now()) {
+                    return Err(CredentialError::Expired {
+                        product: "Claude Code",
+                        command: login.login_command(),
+                    });
+                }
+                Ok(creds.bearer())
+            }
             AnthropicAuth::ApiKey(key) => Ok(Bearer {
                 token: key.clone(),
                 issuer_host: ANTHROPIC_HOST,
@@ -153,29 +199,23 @@ impl AnthropicBackend {
         }
     }
 
+    /// The credential, or the reason it cannot be used ending in what to run.
+    async fn credential_or_detail(&self) -> Result<Bearer, String> {
+        let auth = self.auth.clone();
+        crate::credential_read::read(move || {
+            Self::credential(&auth).map_err(|err| match &auth {
+                AnthropicAuth::Subscription(login) => unusable_login(&err, &login.login_command()),
+                AnthropicAuth::ApiKey(_) => err.to_string(),
+            })
+        })
+        .await
+    }
+
     /// Assert the credential is going to the host that issued it
     /// (`docs/TRUST.md` I2). This is a guard against our own bugs, not against
     /// the user.
     fn check_host(&self, bearer: &Bearer) -> Result<(), UpstreamError> {
-        let target = self
-            .base_url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or_default();
-        // A localhost base URL is a test double; the rule is about not leaking
-        // a credential to a *third party*, and loopback is not one.
-        if target == bearer.issuer_host
-            || target.starts_with("127.0.0.1")
-            || target.starts_with("localhost")
-            || target.starts_with("[::1]")
-        {
-            return Ok(());
-        }
-        Err(UpstreamError::CredentialHostMismatch {
-            issuer: bearer.issuer_host,
-            attempted: target.to_string(),
-        })
+        crate::credential_host::check(&self.base_url, bearer.issuer_host)
     }
 }
 
@@ -215,19 +255,33 @@ impl Backend for AnthropicBackend {
     fn required_client_identity(&self) -> Option<ClientIdentity> {
         // TRUST.md §3: the subscription serves the client it belongs to — and
         // only that one. The metered key serves anyone.
-        matches!(self.auth, AnthropicAuth::Subscription).then_some(ClientIdentity::ClaudeCode)
+        matches!(self.auth, AnthropicAuth::Subscription(_)).then_some(ClientIdentity::ClaudeCode)
+    }
+
+    fn login(&self) -> Option<SubscriptionLogin> {
+        match &self.auth {
+            // The default backend id is the default login even when relocated
+            // to a directory: everything recorded under `claude-sub` is about
+            // it.
+            AnthropicAuth::Subscription(login) => Some(
+                login
+                    .describe(self.id.as_str() == SubscriptionProduct::Claude.default_backend_id()),
+            ),
+            AnthropicAuth::ApiKey(_) => None,
+        }
     }
 
     async fn status(&self) -> BackendStatus {
-        let (authenticated, detail) = match self.credential() {
+        let (authenticated, detail) = match self.credential_or_detail().await {
             Ok(_) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
+            Err(detail) => (false, Some(detail)),
         };
         BackendStatus {
             id: self.id.clone(),
             name: self.name.clone(),
             kind: self.kind,
             authenticated,
+            account_scope: None,
             detail,
             quota: self.quota(),
             models: self.models(),
@@ -235,13 +289,16 @@ impl Backend for AnthropicBackend {
     }
 
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
-        let bearer = self.credential().map_err(|e| UpstreamError::NeedsAuth {
-            backend: self.id.clone(),
-            detail: e.to_string(),
-        })?;
+        let bearer =
+            self.credential_or_detail()
+                .await
+                .map_err(|detail| UpstreamError::NeedsAuth {
+                    backend: self.id.clone(),
+                    detail,
+                })?;
         self.check_host(&bearer)?;
 
-        match self.send_once(request.clone(), &bearer).await {
+        match (self.send_once(request.clone(), &bearer).await, &self.auth) {
             // A 401 on a subscription usually means Claude Code rotated the
             // token between our read and our send. Re-read and retry once.
             //
@@ -251,21 +308,19 @@ impl Backend for AnthropicBackend {
             // — breaking the thing they actually care about in order to fix
             // something they did not ask us to fix. Re-reading is enough,
             // because Claude Code refreshes in the background anyway.
-            Err(UpstreamError::NeedsAuth { .. })
-                if matches!(self.auth, AnthropicAuth::Subscription) =>
-            {
-                let refreshed = self.credential().map_err(|e| UpstreamError::NeedsAuth {
-                    backend: self.id.clone(),
-                    detail: e.to_string(),
+            (Err(UpstreamError::NeedsAuth { .. }), AnthropicAuth::Subscription(login)) => {
+                let refreshed = self.credential_or_detail().await.map_err(|detail| {
+                    UpstreamError::NeedsAuth {
+                        backend: self.id.clone(),
+                        detail,
+                    }
                 })?;
                 if refreshed.token.expose_secret() == bearer.token.expose_secret() {
                     // Same token, same answer. Retrying would just burn a
                     // request and delay telling the user to re-authenticate.
                     return Err(UpstreamError::NeedsAuth {
                         backend: self.id.clone(),
-                        detail: "the stored Claude Code token was rejected; \
-                                 re-authenticate by running `claude` and logging in"
-                            .to_string(),
+                        detail: rejected_token_detail(login),
                     });
                 }
                 tracing::debug!(
@@ -274,7 +329,7 @@ impl Backend for AnthropicBackend {
                 );
                 self.send_once(request, &refreshed).await
             }
-            other => other,
+            (other, _) => other,
         }
     }
 
@@ -311,10 +366,13 @@ impl Backend for AnthropicBackend {
     }
 
     async fn probe(&self) -> Result<(), UpstreamError> {
-        let bearer = self.credential().map_err(|e| UpstreamError::NeedsAuth {
-            backend: self.id.clone(),
-            detail: e.to_string(),
-        })?;
+        let bearer =
+            self.credential_or_detail()
+                .await
+                .map_err(|detail| UpstreamError::NeedsAuth {
+                    backend: self.id.clone(),
+                    detail,
+                })?;
         self.check_host(&bearer)?;
 
         // `GET /v1/models` validates the credential without an inference call.
@@ -330,7 +388,7 @@ impl Backend for AnthropicBackend {
             .header("anthropic-version", &self.catalog.api_version)
             .timeout(std::time::Duration::from_secs(15));
         builder = match &self.auth {
-            AnthropicAuth::Subscription => builder
+            AnthropicAuth::Subscription(_) => builder
                 .header(
                     reqwest::header::AUTHORIZATION,
                     format!("Bearer {}", bearer.token.expose_secret()),
@@ -410,7 +468,7 @@ impl AnthropicBackend {
         }
 
         match &self.auth {
-            AnthropicAuth::Subscription => {
+            AnthropicAuth::Subscription(_) => {
                 builder = builder.header(
                     reqwest::header::AUTHORIZATION,
                     format!("Bearer {}", bearer.token.expose_secret()),
@@ -525,21 +583,24 @@ impl AnthropicBackend {
     }
 }
 
+/// What to say when the provider rejected a token that re-reading did not
+/// change: which login it was, and the command that logs that one in.
+fn rejected_token_detail(login: &ClaudeLogin) -> String {
+    let whose = match login.describe(false).location {
+        None => String::new(),
+        Some(location) => format!(" for {location}"),
+    };
+    format!(
+        "the stored Claude Code token{whose} was rejected; re-authenticate by running `{}` \
+         and logging in",
+        login.login_command()
+    )
+}
+
 fn normalize_base(base: Option<String>) -> String {
     base.unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
         .trim_end_matches('/')
         .to_string()
-}
-
-fn build_client(timeout_secs: u64) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        // No total-request timeout: a coding agent legitimately generates for
-        // many minutes, and cutting it off mid-stream is worse than waiting.
-        // The read timeout catches a genuinely dead connection.
-        .read_timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
 }
 
 #[cfg(test)]
@@ -595,6 +656,69 @@ mod tests {
             issuer_host: ANTHROPIC_HOST,
         };
         assert!(backend.check_host(&bearer).is_ok());
+    }
+
+    /// Whether this backend would attach its Claude token to `base`.
+    fn sends_the_token_to(base: &str) -> bool {
+        let bearer = Bearer {
+            token: SecretString::from("sk-ant-oat01-x"),
+            issuer_host: ANTHROPIC_HOST,
+        };
+        subscription_backend(base).check_host(&bearer).is_ok()
+    }
+
+    /// TRUST.md I2. Everything before the `@` is userinfo; the request goes to
+    /// what follows it.
+    #[test]
+    fn userinfo_cannot_dress_a_foreign_host_as_loopback_or_the_issuer() {
+        for base in [
+            "https://127.0.0.1@evil.example",
+            "https://localhost:443@evil.example",
+            "https://api.anthropic.com@evil.example",
+            "https://user:pw@api.anthropic.com",
+        ] {
+            assert!(!sends_the_token_to(base), "{base} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_host_that_merely_begins_like_loopback_or_the_issuer_is_neither() {
+        for base in [
+            "https://localhost.evil.example",
+            "https://127.0.0.1.evil.example",
+            "https://api.anthropic.com.evil.example",
+            "https://api.anthropic.com.",
+        ] {
+            assert!(!sends_the_token_to(base), "{base} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_real_provider_is_never_sent_the_token_in_cleartext() {
+        assert!(!sends_the_token_to("http://api.anthropic.com"));
+    }
+
+    #[test]
+    fn the_issuers_host_is_recognised_however_it_is_spelled() {
+        for base in [
+            "https://API.Anthropic.com",
+            "https://api.anthropic.com:443/",
+            "https://api.anthropic.com/",
+        ] {
+            assert!(sends_the_token_to(base), "{base} is the issuer");
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_this_machine_is_loopback() {
+        for base in [
+            "http://127.0.0.1:1234",
+            "http://[::1]:1234",
+            "http://localhost:9",
+            "http://127.0.0.2",
+        ] {
+            assert!(sends_the_token_to(base), "{base} is loopback");
+        }
     }
 
     #[test]

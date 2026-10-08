@@ -240,6 +240,8 @@ public struct ConsentPromptView: Decodable, Sendable, Equatable {
     public let version: Int
     /// Backend this grants.
     public let backendId: String
+    /// Opaque login identity from the daemon, echoed unchanged with a grant.
+    public let binding: String?
     /// What the user calls it.
     public let product: String
     /// What IronWire will do, in one sentence.
@@ -250,13 +252,14 @@ public struct ConsentPromptView: Decodable, Sendable, Equatable {
     public let question: String
 
     private enum CodingKeys: String, CodingKey {
-        case version, backendId, product, summary, points, question
+        case version, backendId, binding, product, summary, points, question
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
         backendId = try c.decodeIfPresent(String.self, forKey: .backendId) ?? ""
+        binding = try c.decodeIfPresent(String.self, forKey: .binding)
         product = try c.decodeIfPresent(String.self, forKey: .product) ?? ""
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         points = try c.decodeIfPresent([String].self, forKey: .points) ?? []
@@ -265,10 +268,11 @@ public struct ConsentPromptView: Decodable, Sendable, Equatable {
 
     public init(
         version: Int, backendId: String, product: String,
-        summary: String, points: [String], question: String
+        summary: String, points: [String], question: String, binding: String? = nil
     ) {
         self.version = version
         self.backendId = backendId
+        self.binding = binding
         self.product = product
         self.summary = summary
         self.points = points

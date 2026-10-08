@@ -21,7 +21,11 @@
 //! the CLI is calling; a host embedding this crate that has no `statusline`
 //! subcommand asks for the routing alone. See [`connect`].
 
+use std::path::{Path, PathBuf};
+
 use serde_json::{Map, Value};
+
+use crate::endpoint;
 
 /// Marks the status line as ours, so `disconnect` can remove exactly what
 /// `connect` added and nothing else. A command string is not enough — the user
@@ -86,6 +90,11 @@ impl Edit {
 /// Declining does not report `statusLine` as [`Occupied`]: a slot we never
 /// wanted is not one the user took from us. It does take out a status line we
 /// installed on an earlier connect — see [`clear_status_line`].
+///
+/// `base_url` may name a login (`/anthropic/account/{id}`, see
+/// [`crate::endpoint`]), for the Claude Code that runs with a config dir of its
+/// own. Either form of ours already in the file is ours to update, except that a
+/// plain URL never replaces one naming a login — see [`keep_binding`].
 ///
 /// # Errors
 ///
@@ -190,10 +199,12 @@ fn set_base_url(
     }
 
     match root.get("env").and_then(|e| e.get(BASE_URL)) {
-        // Ours, but the port may have changed since we wrote it.
+        // Ours, but the port may have changed since we wrote it — or the
+        // login it is bound to, which is a connect naming this directory.
         Some(current) if current.as_str().is_some_and(points_at_us) => {
-            if current.as_str() != Some(url) {
-                insert_base_url(root, url);
+            let url = keep_binding(current.as_str().unwrap_or_default(), url);
+            if current.as_str() != Some(url.as_str()) {
+                insert_base_url(root, &url);
                 changes.push(format!("env.{BASE_URL}: updated to `{url}`"));
             }
         }
@@ -222,22 +233,40 @@ fn insert_base_url(root: &mut Map<String, Value>, url: &str) {
     }
 }
 
-/// Whether a base URL is one of ours.
+/// Whether a base URL is one of ours — the plain façade or a login-bound one.
 ///
 /// Loopback and our own path: anything else is another proxy or a deliberate
 /// choice, and overwriting it would move someone's traffic without telling
-/// them. A port change still counts as ours, which is what lets `connect`
-/// follow the daemon to a new port instead of giving up.
+/// them. See [`crate::endpoint::parse_anthropic`].
 fn points_at_us(url: &str) -> bool {
-    let rest = url
-        .strip_prefix("http://127.0.0.1:")
-        .or_else(|| url.strip_prefix("http://localhost:"));
-    rest.is_some_and(|rest| {
-        let path = rest.trim_end_matches('/');
-        path.split_once('/').is_some_and(|(port, path)| {
-            port.chars().all(|c| c.is_ascii_digit()) && path == "anthropic"
-        })
-    })
+    endpoint::parse_anthropic(url).is_some()
+}
+
+/// The URL to write over one of ours that is already there.
+///
+/// A URL naming a login is more specific than one that does not. A connect
+/// that names no login — the menu bar's, or one run where this file is the
+/// default login's — must not quietly unbind the Claude Code that reads this
+/// file, which would move its traffic onto the default login's subscription.
+/// So it keeps the login and follows only the port. A connect that does name
+/// one is a person pointing this directory at that login, and wins.
+fn keep_binding(current: &str, wanted: &str) -> String {
+    match (
+        endpoint::parse_anthropic(current),
+        endpoint::parse_anthropic(wanted),
+    ) {
+        (
+            Some(endpoint::Endpoint {
+                account: Some(account),
+                ..
+            }),
+            Some(endpoint::Endpoint {
+                port,
+                account: None,
+            }),
+        ) => endpoint::anthropic_url(port, Some(&account)),
+        _ => wanted.to_string(),
+    }
 }
 
 /// Remove what [`connect`] added, and only that.
@@ -304,28 +333,60 @@ fn render(root: &Map<String, Value>) -> String {
     out
 }
 
-/// Where Claude Code keeps its settings.
+/// The settings file of the Claude Code this process would start:
+/// `CLAUDE_CONFIG_DIR`'s when that is set, as it is for Claude Code itself.
 ///
-/// `CLAUDE_CONFIG_DIR` wins, because it wins for Claude Code itself — reading a
-/// different file from the one the agent reads would make every answer here
-/// wrong in the one case someone deliberately moved it.
+/// For asking whether *that* Claude Code was wired — never for choosing a
+/// file to write the plain URL into. Such a directory is a login of its own,
+/// wired with [`path_in`] and the URL naming it; the plain URL belongs in
+/// [`default_dir`]'s file alone, which is why the control API's Claude Code
+/// entry reads that one.
 #[must_use]
-pub fn path() -> Option<std::path::PathBuf> {
+pub fn path() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
         && !dir.is_empty()
     {
-        return Some(std::path::PathBuf::from(dir).join("settings.json"));
+        return Some(path_in(Path::new(&dir)));
     }
-    Some(dirs::home_dir()?.join(".claude").join("settings.json"))
+    Some(path_in(&default_dir()?))
 }
 
-/// Whether these settings currently route Claude Code through IronWire.
+/// The settings file of the Claude Code that runs with
+/// `CLAUDE_CONFIG_DIR=dir`.
+#[must_use]
+pub fn path_in(dir: &Path) -> PathBuf {
+    dir.join("settings.json")
+}
+
+/// Where Claude Code keeps everything when `CLAUDE_CONFIG_DIR` is unset —
+/// the default login's directory. Never this process's `CLAUDE_CONFIG_DIR`.
+#[must_use]
+pub fn default_dir() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".claude"))
+}
+
+/// Whether these settings currently route Claude Code through IronWire,
+/// bound to a login or not.
 #[must_use]
 pub fn is_wired(existing: &str) -> bool {
-    serde_json::from_str::<Value>(existing)
-        .ok()
-        .and_then(|root| root.get("env")?.get(BASE_URL)?.as_str().map(points_at_us))
-        .unwrap_or(false)
+    base_url(existing).is_some_and(|url| points_at_us(&url))
+}
+
+/// The base URL these settings point Claude Code at, if they set one.
+///
+/// An unparseable file says nothing: callers report on the user's setup and
+/// must not fail over a syntax error in a file they do not own.
+#[must_use]
+pub fn base_url(existing: &str) -> Option<String> {
+    let root = serde_json::from_str::<Value>(existing).ok()?;
+    Some(root.get("env")?.get(BASE_URL)?.as_str()?.to_string())
+}
+
+/// The login these settings bind Claude Code to, when they point at a
+/// login-bound URL of ours.
+#[must_use]
+pub fn account(existing: &str) -> Option<String> {
+    endpoint::parse_anthropic(&base_url(existing)?)?.account
 }
 
 #[cfg(test)]
@@ -558,5 +619,85 @@ mod tests {
     fn invalid_json_is_refused_rather_than_rewritten() {
         assert!(connect("{ not json", Some(COMMAND), Some(URL)).is_err());
         assert!(disconnect("{ not json").is_err());
+    }
+
+    const BOUND: &str = "http://127.0.0.1:8463/anthropic/account/claude-work";
+
+    #[test]
+    fn a_settings_file_pointed_at_a_login_bound_url_counts_as_ours() {
+        let existing = format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{BOUND}"}}}}"#);
+        assert!(is_wired(&existing));
+        assert_eq!(account(&existing).as_deref(), Some("claude-work"));
+        assert_eq!(
+            account(&format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{URL}"}}}}"#)),
+            None
+        );
+
+        // Ours to take back out, like the plain one.
+        let removed = disconnect(&existing).expect("valid");
+        assert!(
+            parsed(&removed).get("env").is_none(),
+            "{}",
+            removed.contents
+        );
+    }
+
+    #[test]
+    fn wiring_a_login_directory_writes_its_bound_url() {
+        let fresh = connect("", Some(COMMAND), Some(BOUND)).expect("valid");
+        assert_eq!(parsed(&fresh)["env"][BASE_URL], BOUND);
+
+        // The plain URL in that file is ours, so binding the login replaces it.
+        let plain = connect("", Some(COMMAND), Some(URL)).expect("valid");
+        let bound = connect(&plain.contents, Some(COMMAND), Some(BOUND)).expect("valid");
+        assert_eq!(parsed(&bound)["env"][BASE_URL], BOUND);
+        assert_eq!(
+            bound.changes,
+            vec![format!("env.{BASE_URL}: updated to `{BOUND}`")]
+        );
+    }
+
+    /// Binding a login is not a licence over the existing rule: a URL that is
+    /// not ours stays, and is reported as theirs.
+    #[test]
+    fn a_login_never_takes_a_url_that_is_not_ours() {
+        let existing = r#"{"env":{"ANTHROPIC_BASE_URL":"https://proxy.corp.internal"}}"#;
+        let edit = connect(existing, Some(COMMAND), Some(BOUND)).expect("valid");
+        assert_eq!(
+            edit.occupied_slot(BASE_URL),
+            Some("https://proxy.corp.internal")
+        );
+        assert_eq!(
+            parsed(&edit)["env"][BASE_URL],
+            "https://proxy.corp.internal"
+        );
+    }
+
+    /// The menu bar's connect names no login. Run against a work directory's
+    /// file, replacing its URL with the plain one would move that Claude Code
+    /// onto the default login's subscription without a word.
+    #[test]
+    fn a_connect_that_names_no_login_does_not_unbind_one() {
+        let existing = format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{BOUND}"}}}}"#);
+        let same_port = connect(&existing, Some(COMMAND), Some(URL)).expect("valid");
+        assert_eq!(parsed(&same_port)["env"][BASE_URL], BOUND);
+
+        // It still follows the daemon to a new port.
+        let moved = connect(
+            &existing,
+            Some(COMMAND),
+            Some("http://127.0.0.1:9000/anthropic"),
+        )
+        .expect("valid");
+        assert_eq!(
+            parsed(&moved)["env"][BASE_URL],
+            "http://127.0.0.1:9000/anthropic/account/claude-work"
+        );
+    }
+
+    #[test]
+    fn a_login_directory_keeps_its_settings_beside_its_credentials() {
+        let dir = std::path::Path::new("/home/alice/.claude-work");
+        assert_eq!(path_in(dir), dir.join("settings.json"));
     }
 }

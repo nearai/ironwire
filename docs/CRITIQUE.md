@@ -62,7 +62,7 @@ under pressure, along an explicit fidelity ladder:
 |---|---|---|---|---|
 | 0 | Same account, same model | warm | intact | none |
 | 1 | Same account, smaller model (Opus→Sonnet) | warm-ish | intact | none |
-| 2 | Same wire format, different credential (Claude sub → Anthropic API key / Bedrock / Vertex) | cold | intact | none |
+| 2 | Same wire format, different credential (Claude sub → Anthropic API key / Bedrock / Vertex, or — opt-in — another of the user's own Claude subscriptions) | cold | intact — except across two of the user's accounts: unverified for Claude (ROADMAP), and ChatGPT's encrypted reasoning is rejected by any account but its own, so a Codex conversation carrying it never changes ChatGPT account (PROTOCOL §6) | none |
 | 3 | Different family (Anthropic façade → Codex/NEAR) | cold | dropped | full |
 
 Rungs 0–2 are silent. **Rung 3 is announced** — the user's agent will behave

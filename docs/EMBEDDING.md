@@ -60,9 +60,9 @@ a host can confirm it declined rather than assume it.
 **This is not a general outbound kill switch**, and it is not the startup probe.
 Startup catalogue discovery probes registered backends over the network under
 either value, and a registered backend is not the same as a configured one:
-`build_registry` registers the Claude subscription, Codex subscription, and
-Anthropic/OpenAI key backends from credentials found in the environment with no
-config entry naming them, and the NEAR AI backend is registered unconditionally so
+`build_registry` registers the default Claude and Codex subscription logins and
+the Anthropic/OpenAI key backends from credentials found in the environment with
+no config entry naming them, and the NEAR AI backend is registered unconditionally so
 that `privacy.mode = "full"` has a visible destination. Which backends are probed
 is `StartupProbes`, below.
 
@@ -79,7 +79,9 @@ The reason a host may want to decline is that it did not ask for all of these
 requests. A bare embedded start against a home with no `config.toml` still asks
 NEAR AI for its model catalogue, because that backend is registered whether or not
 anything names it, and a host whose user happens to be logged into Claude Code or
-Codex probes those providers too.
+Codex probes those providers too, once that subscription has the user's consent.
+A subscription awaiting consent is never probed, under any value below: the
+probe would send its token before the user said yes (`docs/TRUST.md` §2).
 
 ```rust,no_run
 # async fn example() -> Result<(), ironwire_proxy::embed::EmbedError> {
@@ -98,7 +100,7 @@ let proxy = start_with_options(
 ```
 
 - `StartupProbes::All` is the default and what the CLI does: probe everything
-  registered. Nothing changes for a standalone install.
+  registered and consented to. Nothing changes for a standalone install.
 - `StartupProbes::Configured` probes only backends an entry in `config.toml`
   names. A host that declared its backends deliberately keeps the startup answer
   for those, and makes no request on behalf of one IronWire found on its own.
@@ -165,8 +167,9 @@ cannot state it while IronWire is still finding its own. Either the host
 manages credentials or IronWire does, never half of each.
 
 The consequence is worth planning for. A host that answers only
-`NEARAI_API_KEY` gets NEAR AI and nothing else — no Claude or Codex
-subscription backend, however logged-in the user running it happens to be. A
+`NEARAI_API_KEY` gets NEAR AI and nothing else — no subscription backend for
+any login, however logged-in the user running it happens to be and however
+many logins its `config.toml` declares. A
 host that answers nothing, with the unconditional NEAR AI entry disabled, gets
 an empty registry: `StartupReport::no_backends` is the field for that state,
 and until now almost nothing could reach it. Check it.
@@ -176,9 +179,10 @@ and until now almost nothing could reach it. Check it.
 Those are two questions, and until recently one value answered both.
 `CredentialSource` settles whose answer counts for a *name*; the credential
 files are a different matter, because the subscription backends are key-less by
-construction. A Claude Code or Codex login is a token in a file, not a value any
+construction. Every Claude Code or Codex login — the default one, and each one
+`config.toml` declares by directory — is a token in a file, not a value any
 name-keyed source can supply. So a host that answers `NEARAI_API_KEY` cannot
-answer for those two, and deriving one question from the other left it unable to
+answer for those, and deriving one question from the other left it unable to
 say "the answer for this name is mine, and the user's own logins are still
 fine": it had to give up every subscription the user already had in exchange for
 supplying one key of its own.
@@ -223,6 +227,22 @@ let proxy = start_with_options(
 The metered key Codex stores after `codex login --api-key` is a file, so it
 follows this switch rather than the source: it is the one credential that is
 both a file and a key.
+
+**The switch covers every login, not two.** A Claude or ChatGPT login that
+`config.toml` declares with `config_dir` is read from that directory on every
+request, so it is a file credential exactly like the default ones. With the
+files off it is not registered at all — not registered and unauthenticated, but
+absent — and with them on it is registered whether or not anyone has logged in
+there yet, so `status` can say what to run. That is held by kind rather than by
+the two default ids (`a_start_that_may_not_read_the_files_registers_no_login_of_any_kind`),
+so a login added under any id is covered. A login switched off with
+`enabled = false` is not read either.
+
+There is no way to name a login directory in code. A host that wants a second
+login declares it in `config.toml` like any other backend — a file it may not
+own, as above — and finds it in the control API's status beside the rest, with
+the `connect_command` that sets it up. `StartupProbes::Configured` probes it
+once it has consent, because an entry names it.
 
 Supplying no source is the default and discovers credentials exactly as before,
 from the same places, at the same points, so the CLI and every existing

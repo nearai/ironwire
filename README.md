@@ -112,7 +112,7 @@ Then:
 ironwire status     # capacity, as the providers reported it
 ironwire log        # what your agents sent, and what it cost
 ironwire watch      # live routing; silent unless something changes
-ironwire doctor     # probe every backend for real
+ironwire doctor     # probe every backend you have enabled, for real
 ```
 
 ```
@@ -139,15 +139,22 @@ says `unknown` rather than showing a plausible guess — see
 Routing is **per conversation, not per request.** A coding session carries a
 large warm prompt cache and often provider-private reasoning state; moving it
 costs money and latency, and moving it across API families can cost correctness.
-So fallback is a state transition taken under sustained pressure, down an
-explicit ladder:
+So fallback is a state transition taken under quota pressure — at once for a new
+conversation, and for one already under way only once the pressure has lasted
+twenty seconds — down an explicit ladder:
 
 | Rung | Route | Cache | Reasoning | Told? |
 |---|---|---|---|---|
 | 0 | same account, same model | warm | intact | — |
 | 1 | same account, smaller model | warm-ish | intact | — |
-| 2 | same wire format, different credential | cold | intact | — |
+| 2 | same wire format, different credential | cold | intact¹ | — |
 | 3 | different API family | cold | dropped | **yes** |
+
+¹ Except between two of your own subscriptions (opt-in, below). ChatGPT's
+encrypted reasoning is bound to the account that minted it and is rejected on
+any other, so IronWire keeps such a Codex conversation on its account; whether
+Anthropic accepts thinking minted on another account is undocumented and not yet
+verified.
 
 Rungs 0–2 need no translation at all — IronWire forwards your request's bytes
 untouched. Rung 3 does: a Claude Code session can keep working on NEAR AI (or
@@ -166,6 +173,64 @@ being refused. Everything that would genuinely *break* the request (tools a
 backend does not have, images it cannot see, a context that does not fit) is
 still refused outright rather than silently degraded. See
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §6.
+
+## More than one subscription
+
+Claude Code keeps a login per config directory — Anthropic's own docs suggest
+`CLAUDE_CONFIG_DIR` for keeping a work and a personal account apart — and Codex
+keeps one per `CODEX_HOME`. IronWire treats each login as a backend of its own,
+with its own consent, capacity and ledger rows:
+
+```bash
+ironwire connect claude --config-dir ~/.claude-work --subscription
+ironwire connect codex  --config-dir ~/.codex-work  --subscription
+```
+
+That adds a `[[backends]]` entry naming the directory, points the Claude Code
+(or Codex) that uses it at a URL of its own —
+`http://127.0.0.1:8463/anthropic/account/claude-work` — and asks that login's
+consent question. The daemon reads its logins when it starts, so restart it
+once; then run the agent as you already do:
+`CLAUDE_CONFIG_DIR=~/.claude-work claude`. In a shell where `CLAUDE_CONFIG_DIR`
+is already set, plain `ironwire connect claude` means that login. `CODEX_HOME`
+keeps meaning the default Codex login, as it always has, so a second Codex home
+always takes `--config-dir`. `ironwire disconnect claude --subscription
+--config-dir ~/.claude-work` (or `--id claude-work`) withdraws one login's
+consent and leaves the others alone.
+
+**Each agent is served by its own login.** When the work subscription comes
+under quota pressure — 90% used, as the provider reports it — or runs out, the
+work Claude Code descends the ladder as it always did — API key, NEAR AI,
+local — and never lands on your personal subscription. Moving to another account after a rate limit is the plainest
+reading of what both providers' terms forbid, and the provider can see it:
+Claude Code's request names the account it is logged in as.
+
+If you want it anyway, it is one line, off by default:
+
+```toml
+[subscriptions]
+cross_account_fallback = true
+```
+
+It moves on the same trigger as every rung, and that pressure outranks the
+preference for your own login: at 90% used as the provider reports it — not
+only once a plan has run out — a new conversation goes to your other
+subscription at once, and one already on yours after the twenty-second descent
+debounce. Every request it moves is recorded at rung 2. Even then, a Codex conversation that carries
+encrypted reasoning stays on the ChatGPT account that minted it, because OpenAI
+rejects that reasoning on any other. [`docs/TRUST.md`](docs/TRUST.md) §2 has the
+whole argument.
+
+To move your default login rather than add one, connect with `--id claude-sub`
+(or `codex-sub`). The moved login then has a URL of its own like any other, and
+a Claude Code still on the plain URL is served by no subscription; `connect`
+and `ironwire doctor` say so. On macOS, `~/.claude` itself is a special case:
+Claude Code run with `CLAUDE_CONFIG_DIR=~/.claude` keeps a Keychain item of its
+own but reads plain `claude`'s `settings.json`, so moving the default there
+(`--config-dir ~/.claude`, or `connect` in a shell exporting it) has a plain
+`claude` served by the moved login too; `connect` says so before writing.
+Moving any login asks for its consent again: a yes answers the directory it was
+given for.
 
 ## How fast it is going
 
@@ -268,6 +333,10 @@ pass. That position comes with hard commitments, not defaults
   the Anthropic façade routes to an API key, not to your Claude Max.
 - **Subscription backends are off until you say yes**, once, to a specific
   question that names the risk and whose account bears it.
+- **One request, one login.** A request's token and every account header beside
+  it belong to the same login, and with several Claude or ChatGPT logins each
+  agent is served by its own. Falling over to another of your subscriptions is
+  an opt-in you make in `config.toml`.
 - **Traces stay local by default.** Upload is a separate, explicit decision.
 - **IronWire never updates itself.** `ironwire update` tells you a release
   exists and prints your package manager's command. The only thing it refreshes
@@ -346,3 +415,5 @@ subscription quota — run it before a release, not in CI.
 ## License
 
 MIT OR Apache-2.0.
+
+Scale workload, resource bounds and remaining live-account acceptance are documented in [docs/SCALE.md](docs/SCALE.md).

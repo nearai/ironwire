@@ -93,6 +93,18 @@ final class SettingsTests: XCTestCase {
         XCTAssertFalse(unversioned.isComplete, "an answer has to belong to a version")
     }
 
+    func test_the_prompt_login_binding_is_decoded_verbatim() throws {
+        let binding = "opaque-login-identity"
+        let data = Data("""
+            {"version":2,"backend_id":"claude-sub","binding":"\(binding)",
+             "product":"Claude","summary":"summary","points":["risk"],"question":"Enable?"}
+            """.utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let prompt = try decoder.decode(ConsentPromptView.self, from: data)
+        XCTAssertEqual(prompt.binding, binding)
+    }
+
     // MARK: - What the app may act on
 
     /// Consent is the only thing here the daemon can act on directly. A missing

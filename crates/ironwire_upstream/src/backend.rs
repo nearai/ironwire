@@ -12,6 +12,7 @@ use futures_util::stream::BoxStream;
 use ironwire_core::capability::Capabilities;
 use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier};
 use ironwire_core::quota::QuotaSnapshot;
+use ironwire_creds::{CredentialError, SubscriptionLogin};
 
 use crate::observe::Observation;
 
@@ -27,6 +28,9 @@ pub struct UpstreamRequest {
     pub headers: Vec<(String, String)>,
     /// Whether the client asked for SSE.
     pub stream: bool,
+    /// Account or API credential scope selected by routing, if known. Native
+    /// Responses backends recheck it against the credential actually sent.
+    pub expected_account_scope: Option<String>,
 }
 
 /// A response on its way back to the client.
@@ -222,6 +226,30 @@ pub fn reason(body: &Bytes) -> String {
     }
 }
 
+/// Why a subscription's credential cannot be used, ending in the command that
+/// logs that login in.
+///
+/// Most reader errors already end that way; the ones that do not (an I/O
+/// failure, an explicit fixture file) get it added. With several logins per
+/// product, "run `claude`" is the wrong fix for all but one of them, so the
+/// command has to be the login's own.
+pub(crate) fn unusable_login(err: &CredentialError, login_command: &str) -> String {
+    let says_what_to_run = matches!(
+        err,
+        CredentialError::NotLoggedIn { .. }
+            | CredentialError::Expired { .. }
+            | CredentialError::Malformed {
+                command: Some(_),
+                ..
+            }
+    );
+    if says_what_to_run {
+        err.to_string()
+    } else {
+        format!("{err}; run `{login_command}` to log in")
+    }
+}
+
 /// Current state of a backend, as `ironwire status` shows it.
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
@@ -233,6 +261,11 @@ pub struct BackendStatus {
     pub kind: BackendKind,
     /// Whether a credential was found and looks usable.
     pub authenticated: bool,
+    /// Opaque replay identity: a subscription's provider-observed account id
+    /// (stable across token refresh), or an API key's exact credential hash.
+    /// The latter identifies only the key, never an inferred organization.
+    /// Missing subscription account identity remains `None`.
+    pub account_scope: Option<String>,
     /// Why not, when `authenticated` is false.
     pub detail: Option<String>,
     /// Observed capacity. Never estimated (`docs/CRITIQUE.md` §4).
@@ -242,6 +275,11 @@ pub struct BackendStatus {
 }
 
 /// A place requests can go.
+///
+/// Async implementations must offload blocking filesystem, process, or
+/// credential-store I/O themselves (for example with `spawn_blocking`). The
+/// registry awaits them under bounded semaphores and never occupies a blocking
+/// worker while waiting for another blocking job.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
     /// Stable id.
@@ -282,6 +320,18 @@ pub trait Backend: Send + Sync {
     /// ChatGPT's subscription. `None` means the backend serves anyone, which is
     /// every metered key.
     fn required_client_identity(&self) -> Option<ClientIdentity> {
+        None
+    }
+
+    /// The login this backend reads its credential from, if it is a
+    /// subscription.
+    ///
+    /// One product can have several logins (Claude Code under several config
+    /// dirs, Codex under several homes), each its own backend. This is how the
+    /// router tells a product's default login from the others, and how the
+    /// control API, CLI and consent prompt name the one they mean. `None` for
+    /// everything that is not a subscription.
+    fn login(&self) -> Option<SubscriptionLogin> {
         None
     }
 

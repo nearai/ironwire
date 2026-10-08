@@ -84,6 +84,21 @@ final class MenuContentTests: XCTestCase {
         return rendered.size.height
     }
 
+    func test_a_menu_with_a_thousand_logins_renders_offscreen_without_losing_identity() throws {
+        let backends = (0..<1024).map { BackendView(id: "claude-\($0)", name: "Claude subscription") }
+        let services = backends.map { backend in
+            ServiceView(id: backend.id, name: backend.name, requiresConsent: true, consented: false,
+                consentPrompt: ConsentPromptView(version: 2, backendId: backend.id, product: "Claude",
+                    summary: "Read this login", points: ["Private auth risk"], question: "Enable?",
+                    binding: "opaque-\(backend.id)"))
+        }
+        let rendered = try XCTUnwrap(render(status(backends: backends), settings: settings(services: services)))
+        XCTAssertEqual(Set(backends.map(\.id)).count, 1024)
+        XCTAssertTrue(rendered.size.width.isFinite && rendered.size.height.isFinite)
+        XCTAssertGreaterThan(rendered.size.width, 0)
+        XCTAssertGreaterThan(rendered.size.height, 0)
+    }
+
     // MARK: - The bar
 
     /// The acceptance criterion the issue calls the single most likely place for
@@ -190,7 +205,7 @@ final class MenuContentTests: XCTestCase {
             summary: "IronWire will read the OAuth token that Claude Code stores on this machine "
                 + "and send requests to api.anthropic.com with it, from this computer only.",
             points: (0..<points).map { "Point number \($0), which is a whole sentence about a real cost." },
-            question: "Enable the Claude subscription backend?")
+            question: "Enable the Claude subscription backend?", binding: "test-login")
     }
 
     private func settings(
@@ -246,7 +261,7 @@ final class MenuContentTests: XCTestCase {
                 version: 2, backendId: "claude-sub", product: "Claude",
                 summary: String(repeating: "A very long summary sentence. ", count: 12),
                 points: (0..<12).map { "Point \($0), which is a whole sentence about a real cost." },
-                question: "Enable the Claude subscription backend?"))
+                question: "Enable the Claude subscription backend?", binding: "test-login"))
         XCTAssertEqual(
             try height(shortStatus, settings: shortSettings),
             try height(longStatus, settings: longSettings),
@@ -282,6 +297,57 @@ final class MenuContentTests: XCTestCase {
             ]),
             settings: settings(services: [service]))
         XCTAssertNotNil(rendered)
+    }
+
+    /// The status document is polled and settings is fetched on open, so the
+    /// row's own copy of the command is the one that is there first.
+    func test_a_backend_with_no_credential_names_its_command_before_settings_arrive() throws {
+        let withCommand = try height(
+            status(backends: [
+                BackendView(
+                    id: "claude-work", name: "Claude subscription (~/.claude-work)",
+                    authenticated: false, consented: false,
+                    detail: "Claude Code is not logged in for ~/.claude-work",
+                    connectCommand: "ironwire connect claude --config-dir ~/.claude-work")
+            ]))
+        let without = try height(
+            status(backends: [
+                BackendView(
+                    id: "claude-work", name: "Claude subscription (~/.claude-work)",
+                    authenticated: false, consented: false,
+                    detail: "Claude Code is not logged in for ~/.claude-work")
+            ]))
+        XCTAssertGreaterThan(withCommand, without, "the row's own connect command is not being drawn")
+    }
+
+    // MARK: - Several logins of one product
+
+    /// Two Claude logins under one display name. The daemon names them apart,
+    /// but a name is for reading: this is the case where rows keyed on it
+    /// would collapse.
+    private func twoClaudeLogins(_ uses: [SubscriptionUse]) -> StatusView {
+        status(
+            backends: [
+                BackendView(id: "claude-sub", name: "Claude subscription"),
+                BackendView(id: "claude-work", name: "Claude subscription"),
+            ],
+            balance: BalanceView(available: 2, freeAvailable: 2, subscriptionUsed: uses))
+    }
+
+    private let personal = SubscriptionUse(
+        backend: "claude-sub", name: "Claude subscription", usedPct: 82, exchanges: 41)
+    private let work = SubscriptionUse(
+        backend: "claude-work", name: "Claude subscription", usedPct: nil, exchanges: 3)
+
+    /// Identity is asserted directly as well as by height: an off-screen render
+    /// draws both rows even when they share an id. It is a live list being
+    /// updated that goes wrong, and that is not something a render can catch.
+    func test_two_logins_with_one_display_name_are_two_rows_in_the_balance() throws {
+        XCTAssertNotEqual(personal.id, work.id, "two logins share one row identity")
+
+        let both = try height(twoClaudeLogins([personal, work]))
+        let one = try height(twoClaudeLogins([personal]))
+        XCTAssertGreaterThan(both, one, "the second login's row is not being drawn")
     }
 
     // MARK: - The window
@@ -456,11 +522,12 @@ final class MenuContentTests: XCTestCase {
     func test_the_pin_control_offers_every_backend_the_daemon_reported() {
         let status = status(backends: [
             BackendView(id: "claude-sub", name: "Claude subscription"),
+            BackendView(id: "claude-work", name: "Claude subscription (~/.claude-work)"),
             BackendView(id: "codex-sub", name: "ChatGPT subscription", authenticated: false),
             BackendView(id: "nearai", name: "NEAR AI", health: HealthView(circuit: "open")),
         ])
         // The menu is built straight off this list, so the list is the
         // assertion: no filtering, no ranking, no opinion.
-        XCTAssertEqual(status.backends.map(\.id), ["claude-sub", "codex-sub", "nearai"])
+        XCTAssertEqual(status.backends.map(\.id), ["claude-sub", "claude-work", "codex-sub", "nearai"])
     }
 }

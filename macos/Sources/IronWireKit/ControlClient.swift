@@ -32,7 +32,7 @@ public final class ControlClient: ObservableObject {
 
     /// While the menu is closed. `/_ironwire/status` calls
     /// `BackendRegistry::statuses()`, which does a credential check per backend
-    /// — a Keychain read for the Claude one — so a background poll is not free.
+    /// — a Keychain read for each Claude login — so a background poll is not free.
     public static let idleInterval: Duration = .seconds(5)
     /// While the menu is open and someone is watching numbers change.
     public static let activeInterval: Duration = .seconds(1)
@@ -45,7 +45,15 @@ public final class ControlClient: ObservableObject {
     /// Fetched when the settings pane opens rather than on every poll: it costs
     /// another `statuses()` sweep on the daemon, and nothing in it changes
     /// unless this app changed it.
-    @Published public private(set) var settings: SettingsView?
+    @Published public private(set) var settings: SettingsView? {
+        didSet {
+            servicesById = Dictionary((settings?.services ?? []).map { ($0.id, $0) },
+                                      uniquingKeysWith: { first, _ in first })
+        }
+    }
+    /// Settings and status arrive separately; index the join once per settings
+    /// snapshot instead of scanning every login for every visible row.
+    public private(set) var servicesById: [String: ServiceView] = [:]
 
     /// Raised while the dropdown is on screen, which is the only time the fast
     /// poll is worth its Keychain reads.
@@ -328,18 +336,17 @@ public final class ControlClient: ObservableObject {
     /// merely knows about — the whole point is that an answer belongs to the
     /// wording it answered.
     public func setConsent(
-        backend: String, granted: Bool, promptVersion: Int
+        backend: String, granted: Bool, promptVersion: Int, binding: String? = nil
     ) async -> Result<Void, PinError> {
         guard var request = authorised(path: "/consent") else {
             return .failure(PinError(message: "IronWire is not running"))
         }
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "backend": backend,
-            "granted": granted,
-            "prompt_version": promptVersion,
-        ])
+        var body: [String: Any] = ["backend": backend, "granted": granted,
+                                    "prompt_version": promptVersion]
+        if let binding { body["binding"] = binding }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         switch await send(request, retryingUnauthorised: true) {
         case .success:

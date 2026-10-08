@@ -2,17 +2,20 @@
 //!
 //! Errors carry fixed labels and at most a port; never credentials or bodies.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use futures_util::{StreamExt, stream};
 
 use crate::state::{AppState, BackendRegistry};
 use anyhow::{Context, Result};
 use ironwire_catalog::CatalogStore;
 use ironwire_core::config::ModelEntry;
-use ironwire_core::config::{Config, PathsConfig};
+use ironwire_core::config::{BackendImpl, Config, PathsConfig};
 use ironwire_core::protocol::{BackendId, BackendKind, ModelTier};
-use ironwire_creds::ConsentLedger;
 use ironwire_creds::claude::ClaudeCodeCredentials;
 use ironwire_creds::codex::{CodexCredentials, CodexMode};
+use ironwire_creds::{ClaudeLogin, CodexLogin, ConsentLedger, SubscriptionProduct};
 use ironwire_ledger::Ledger;
 use ironwire_ledger::bodies::BodyStore;
 use ironwire_upstream::anthropic::AnthropicBackend;
@@ -66,7 +69,8 @@ pub enum UpdatePolicy {
 ///
 /// **It is not a general network kill switch, and must not be described as
 /// one.** Startup catalogue discovery still probes every registered backend
-/// over the network (`spawn_catalogue_discovery`, calling `Backend::probe`),
+/// but a subscription awaiting consent over the network
+/// (`spawn_catalogue_discovery`, calling `Backend::probe`),
 /// under either value. Two things make that reach further than "only what the
 /// host configured": `build_registry` registers Claude, Codex, and API-key
 /// backends from credentials it discovers in the environment with no config
@@ -93,7 +97,8 @@ pub enum UpdateChecks {
 ///
 /// Startup discovery calls `Backend::probe` on registered backends: a live
 /// request that both proves the backend works right now and learns the model
-/// catalogue the provider actually serves. It is real work, so declining is a
+/// catalogue the provider actually serves. Never on a subscription awaiting
+/// consent, under any value: the probe would send its OAuth token. It is real work, so declining is a
 /// trade, not a free saving. A host that declines starts without that answer:
 /// the daemon runs on configured or compiled-in catalogue values, and an
 /// expired credential is discovered by the first real request rather than at
@@ -111,7 +116,8 @@ pub enum UpdateChecks {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StartupProbes {
-    /// Probe every registered backend. The default, and what the CLI does.
+    /// Probe every registered backend but a subscription awaiting consent.
+    /// The default, and what the CLI does.
     #[default]
     All,
     /// Probe only backends an entry in `config.toml` names.
@@ -174,6 +180,11 @@ pub use secrecy::SecretString as HostSecret;
 /// no key for any name the host answers. The metered key Codex stores after
 /// `codex login --api-key` is a file, so it follows this switch too — it is the
 /// one credential that is both a file and a key.
+///
+/// It covers every login, not just the default ones discovery finds: an
+/// additional Claude or ChatGPT login that `config.toml` declares is a token in
+/// a directory too, and with the files off no subscription of any login is
+/// registered.
 ///
 /// Hosts must allow future values rather than exhaustively matching today's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -960,6 +971,11 @@ fn seed_spend(state: &crate::state::AppState) {
 /// Failures are logged at debug and otherwise ignored — this is an
 /// optimisation of what we know, not a health check, and `ironwire doctor`
 /// remains the place that reports whether a backend actually works.
+///
+/// A subscription nobody has said yes to is not probed: a probe sends its
+/// OAuth token as surely as a request does, and consent is what lets IronWire
+/// send it at all (`docs/TRUST.md` §2). Its catalogue is learned on the first
+/// probe after consent.
 fn spawn_catalogue_discovery(
     state: crate::state::AppState,
     probes: StartupProbes,
@@ -968,35 +984,34 @@ fn spawn_catalogue_discovery(
         return None;
     }
     Some(tokio::spawn(async move {
-        for backend in state.backends.all() {
-            // `Configured` is about who asked for the request, not about
-            // whether the backend works: an entry naming it is the host saying
-            // "this one is mine". Discovery's own registrations, which no entry
-            // names, are the ones a host cannot otherwise decline.
-            if probes == StartupProbes::Configured && !is_named_in_config(&state, backend.id()) {
-                tracing::debug!(
-                    backend = %backend.id(),
-                    "not probing a backend no configuration entry names"
-                );
+        let consent = state.consent_snapshot();
+        let configured: HashSet<_> = state
+            .config
+            .backends
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let mut checks = Vec::new();
+        for backend in state.backends.all().iter().cloned() {
+            if !crate::state::consents_to(&consent, backend.as_ref())
+                || (probes == StartupProbes::Configured
+                    && !configured.contains(backend.id().as_str()))
+            {
                 continue;
             }
-            if let Err(error) = backend.probe().await {
-                tracing::debug!(backend = %backend.id(), %error, "could not learn this backend's catalogue at startup");
-            }
+            let registry = &state.backends;
+            checks.push(async move {
+                let id = backend.id().clone();
+                if let Err(error) = registry.probe(backend).await {
+                    tracing::debug!(backend = %id, %error, "could not learn this backend's catalogue at startup");
+                }
+            });
         }
+        stream::iter(checks)
+            .buffer_unordered(crate::state::BACKEND_CHECK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
     }))
-}
-
-/// Whether an entry in `config.toml` names this backend.
-///
-/// An entry that switched the backend off never reaches registration, so this
-/// only ever sees entries that named it and left it on.
-fn is_named_in_config(state: &crate::state::AppState, id: &BackendId) -> bool {
-    state
-        .config
-        .backends
-        .iter()
-        .any(|entry| entry.id == id.as_str())
 }
 
 /// Open the trace ledger, or explain why we are running without one.
@@ -1055,9 +1070,13 @@ fn sweep_bodies(ledger: &Option<Ledger>, bodies: Option<&BodyStore>) {
 
 /// Construct every backend the environment can support.
 ///
-/// A backend that cannot find a credential is still registered: `status` should
-/// be able to say "Claude subscription — not logged in" rather than silently
-/// omitting it, which reads as though IronWire never heard of it.
+/// Whether a backend with no credential is registered depends on who asked
+/// for it (`docs/DESIGN.md` §6). Discovery registers only what it finds —
+/// someone who never ran Claude Code is not shown a Claude subscription —
+/// except NEAR AI, which `privacy.mode = "full"` names by default. A login the
+/// user declared by directory is registered either way, so `status` can say
+/// "not logged in — run …" rather than silently omitting it, which reads as
+/// though IronWire never heard of it.
 ///
 /// `credentials` is where every credential comes from — variables and files
 /// both. It is a parameter rather than a set of direct calls so that an
@@ -1070,22 +1089,28 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
     // than by skipping the config entry. A backend can arrive from discovery
     // without any entry naming it, so filtering the config list would let a
     // backend the user switched off come straight back.
-    let mut push = |backend: Arc<dyn ironwire_upstream::backend::Backend>| {
-        if is_disabled(config, backend.id().as_str()) {
+    let disabled: HashSet<_> = config
+        .backends
+        .iter()
+        .filter(|entry| !entry.enabled)
+        .map(|entry| entry.id.as_str())
+        .collect();
+    let mut push = |backend: Arc<dyn ironwire_upstream::backend::Backend>| -> Result<()> {
+        if disabled.contains(backend.id().as_str()) {
             tracing::info!(backend = %backend.id(), "backend disabled in config.toml; not registered");
-            return;
+            return Ok(());
         }
-        registry.push(backend);
+        registry.try_push(backend).map_err(|duplicate| {
+            tracing::error!(%duplicate, "not starting with two backends under one id");
+            anyhow::Error::new(duplicate).context(RegistryLabel(
+                "two backends would share one id; give each `[[backends]]` entry its own",
+            ))
+        })
     };
 
-    if credentials.discovers_files() && ClaudeCodeCredentials::discover().is_ok() {
-        push(Arc::new(
-            AnthropicBackend::subscription(
-                base_url_for(config, "claude-sub", "IRONWIRE_ANTHROPIC_BASE_URL"),
-                timeout,
-            )
-            .context(RegistryLabel("building the Claude subscription backend"))?,
-        ));
+    if let Some(backend) = default_login(config, credentials, SubscriptionProduct::Claude, timeout)?
+    {
+        push(backend)?;
     }
 
     if let Some(key) = api_key_for(config, "anthropic-key", "ANTHROPIC_API_KEY", credentials) {
@@ -1096,28 +1121,30 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
                 timeout,
             )
             .context(RegistryLabel("building the Anthropic API backend"))?,
-        ));
+        ))?;
     }
 
     // The ChatGPT subscription. Same wire as the metered OpenAI key below, so
     // the two are rungs of one ladder and falling between them costs nothing
     // but money (`docs/DESIGN.md` §3).
-    if credentials.discovers_files()
-        && CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt)
+    if let Some(backend) =
+        default_login(config, credentials, SubscriptionProduct::ChatGpt, timeout)?
     {
-        push(Arc::new(
-            ResponsesBackend::codex_subscription(
-                base_url_for(config, "codex-sub", "IRONWIRE_CODEX_BASE_URL"),
-                timeout,
-            )
-            .context(RegistryLabel("building the ChatGPT subscription backend"))?,
-        ));
+        push(backend)?;
     }
 
     // A key from the environment, or the one Codex itself stored — a user who
     // ran `codex login --api-key` has exactly one place they expect it to live.
-    if let Some(key) = api_key_for(config, "openai-key", "OPENAI_API_KEY", credentials)
-        .or_else(|| codex_stored_key(credentials))
+    // That file is not read at all for a user who switched this backend off.
+    let stored_key = || {
+        if is_disabled(config, "openai-key") {
+            None
+        } else {
+            codex_stored_key(credentials)
+        }
+    };
+    if let Some(key) =
+        api_key_for(config, "openai-key", "OPENAI_API_KEY", credentials).or_else(stored_key)
     {
         push(Arc::new(
             ResponsesBackend::openai_api_key(
@@ -1126,7 +1153,7 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
                 timeout,
             )
             .context(RegistryLabel("building the OpenAI API backend"))?,
-        ));
+        ))?;
     }
 
     // NEAR AI is a different API family, so it is only ever reached through the
@@ -1145,35 +1172,131 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
             timeout,
         )
         .context(RegistryLabel("building the NEAR AI backend"))?,
-    ));
+    ))?;
 
-    // Anything the user declared that discovery does not produce. Appended
-    // rather than prepended: registration order is the tie-break in
+    // Anything the user declared that discovery does not produce — including
+    // every additional subscription login, in the order the file lists them.
+    // An entry naming one of discovery's own ids configures that backend
+    // rather than constructing a second one.
+    //
+    // Appended rather than prepended: registration order is the tie-break in
     // `Policy::select`, so putting config entries first would silently change
-    // which backend wins a tie for every existing user.
+    // which backend wins a tie for every existing user. Among logins of one
+    // product it is the order cross-account fallback tries them in.
     for entry in &config.backends {
-        if !entry.enabled || DISCOVERED_IDS.contains(&entry.id.as_str()) {
+        if !entry.enabled || BackendImpl::discovered_as(&entry.id).is_some() {
             continue;
         }
         if let Some(backend) = backend_from_config(entry, timeout, credentials)? {
-            push(backend);
+            push(backend)?;
         }
     }
 
     Ok(registry)
 }
 
-/// Ids that discovery produces on its own.
+/// The default login of `product`, if it is to be registered.
 ///
-/// An entry naming one of these configures it; an entry naming anything else
-/// constructs it.
-const DISCOVERED_IDS: &[&str] = &[
-    "claude-sub",
-    "anthropic-key",
-    "codex-sub",
-    "openai-key",
-    "nearai",
-];
+/// Discovered where the client keeps it unprompted, and registered only when
+/// a login is there: someone who never ran Claude Code should not be shown a
+/// Claude subscription. An entry for the default id with a `config_dir` moves
+/// the login, and then the user has named the directory — so, like every login
+/// a config declares, it is registered whether or not it holds a login yet.
+///
+/// Nothing is read when the files may not be, or when the user switched this
+/// login off: neither start has any business looking at the disk.
+fn default_login(
+    config: &Config,
+    credentials: &Credentials<'_>,
+    product: SubscriptionProduct,
+    timeout: u64,
+) -> Result<Option<Arc<dyn ironwire_upstream::backend::Backend>>> {
+    let id = product.default_backend_id();
+    if !credentials.discovers_files() || is_disabled(config, id) {
+        return Ok(None);
+    }
+    let entry = config.backends.iter().find(|entry| entry.id == id);
+    let relocated = entry.and_then(|entry| entry.config_dir.as_deref());
+    let present = || match product {
+        SubscriptionProduct::Claude => ClaudeCodeCredentials::discover().is_ok(),
+        // An `auth.json` holding an API key is the metered key, not a plan.
+        SubscriptionProduct::ChatGpt => {
+            CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt)
+        }
+    };
+    if relocated.is_none() && !present() {
+        return Ok(None);
+    }
+    subscription_login(
+        product,
+        id,
+        relocated,
+        base_url_of(entry, base_url_variable(product)),
+        timeout,
+    )
+    .map(Some)
+}
+
+/// The backend for one subscription login: the one in `config_dir`, or the
+/// product's default login for `None`.
+///
+/// Named by its login, so two logins of one product never share a heading in
+/// `status`. Reads nothing: whether the login is there is the backend's
+/// question, asked again on every request.
+fn subscription_login(
+    product: SubscriptionProduct,
+    id: &str,
+    config_dir: Option<&str>,
+    base_url: Option<String>,
+    timeout: u64,
+) -> Result<Arc<dyn ironwire_upstream::backend::Backend>> {
+    let default = id == product.default_backend_id();
+    Ok(match product {
+        SubscriptionProduct::Claude => {
+            let login = config_dir.map_or_else(ClaudeLogin::default_login, ClaudeLogin::in_dir);
+            let name = login.describe(default).label();
+            Arc::new(
+                AnthropicBackend::subscription_for(
+                    BackendId::from(id),
+                    name,
+                    login,
+                    base_url,
+                    timeout,
+                )
+                .context(RegistryLabel("building a Claude subscription backend"))?,
+            )
+        }
+        SubscriptionProduct::ChatGpt => {
+            let home = config_dir.map(std::path::PathBuf::from);
+            let name = home
+                .clone()
+                .map_or_else(CodexLogin::default_login, CodexLogin::in_home)
+                .describe(default)
+                .label();
+            Arc::new(
+                ResponsesBackend::codex_subscription_for(
+                    BackendId::from(id),
+                    name,
+                    home,
+                    base_url,
+                    timeout,
+                )
+                .context(RegistryLabel("building a ChatGPT subscription backend"))?,
+            )
+        }
+    })
+}
+
+/// The variable the conformance harness uses to point a product's backends at
+/// a mock. Every login of the product follows it: a harness that redirected the
+/// default login and left a second one dialling the real provider would be
+/// sending a real token somewhere the test never meant to.
+fn base_url_variable(product: SubscriptionProduct) -> &'static str {
+    match product {
+        SubscriptionProduct::Claude => "IRONWIRE_ANTHROPIC_BASE_URL",
+        SubscriptionProduct::ChatGpt => "IRONWIRE_CODEX_BASE_URL",
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -1194,20 +1317,41 @@ fn backend_from_config(
     timeout: u64,
     credentials: &Credentials<'_>,
 ) -> Result<Option<Arc<dyn ironwire_upstream::backend::Backend>>> {
-    use ironwire_core::config::BackendImpl;
-
     let key = |default: &str| entry_key(entry, default, credentials);
     let backend: Option<Arc<dyn ironwire_upstream::backend::Backend>> =
         match BackendImpl::parse(&entry.kind) {
-            Some(BackendImpl::ClaudeSubscription) => (credentials.discovers_files()
-                && ClaudeCodeCredentials::discover().is_ok())
-            .then(|| {
-                AnthropicBackend::subscription(entry.base_url.clone(), timeout).context(
-                    RegistryLabel("building a configured Claude subscription backend"),
-                )
-            })
-            .transpose()?
-            .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
+            // An additional login. Registered whether or not its directory
+            // holds a login yet: the user named it, and "not logged in — run
+            // …" in `status` is what they need to see, where silence would
+            // read as IronWire never having heard of it. An unauthenticated
+            // backend is already unhealthy to the router, so nothing is sent.
+            //
+            // Still behind the files switch, because its token is read from
+            // that directory on every request.
+            Some(kind @ (BackendImpl::ClaudeSubscription | BackendImpl::CodexSubscription)) => {
+                if !credentials.discovers_files() {
+                    return Ok(None);
+                }
+                // Unreachable for a config that came through `Config::validate`,
+                // which requires a directory on every login but the default's.
+                // Building one without would be the default login again under
+                // another id — the copy this entry used to silently become.
+                let Some(config_dir) = entry.config_dir.as_deref() else {
+                    return Ok(None);
+                };
+                let product = if kind == BackendImpl::ClaudeSubscription {
+                    SubscriptionProduct::Claude
+                } else {
+                    SubscriptionProduct::ChatGpt
+                };
+                Some(subscription_login(
+                    product,
+                    &entry.id,
+                    Some(config_dir),
+                    base_url_of(Some(entry), base_url_variable(product)),
+                    timeout,
+                )?)
+            }
             Some(BackendImpl::AnthropicApi) => key("ANTHROPIC_API_KEY")
                 .map(|key| {
                     AnthropicBackend::api_key(key, entry.base_url.clone(), timeout)
@@ -1215,15 +1359,6 @@ fn backend_from_config(
                 })
                 .transpose()?
                 .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
-            Some(BackendImpl::CodexSubscription) => (credentials.discovers_files()
-                && CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt))
-            .then(|| {
-                ResponsesBackend::codex_subscription(entry.base_url.clone(), timeout).context(
-                    RegistryLabel("building a configured ChatGPT subscription backend"),
-                )
-            })
-            .transpose()?
-            .map(|b| Arc::new(b) as Arc<dyn ironwire_upstream::backend::Backend>),
             Some(BackendImpl::OpenAiApi) => key("OPENAI_API_KEY")
                 .or_else(|| codex_stored_key(credentials))
                 .map(|key| {
@@ -1511,10 +1646,15 @@ fn models_from(models: &[ModelEntry], kind: BackendKind) -> Vec<(String, ModelTi
 /// start — including one holding a credential for a different provider, which
 /// `check_host` would then have to refuse (`docs/TRUST.md` I2).
 fn base_url_for(config: &Config, id: &str, env_key: &str) -> Option<String> {
-    config
-        .backends
-        .iter()
-        .find(|b| b.id == id)
+    base_url_of(config.backends.iter().find(|b| b.id == id), env_key)
+}
+
+/// [`base_url_for`], for an entry already in hand.
+fn base_url_of(
+    entry: Option<&ironwire_core::config::BackendConfig>,
+    env_key: &str,
+) -> Option<String> {
+    entry
         .and_then(|b| b.base_url.clone())
         .or_else(|| std::env::var(env_key).ok())
         .filter(|url| !url.is_empty())
@@ -1574,6 +1714,7 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key_env: None,
+            config_dir: None,
             models: None,
             refuse_model_aliases: false,
         }
@@ -1814,12 +1955,11 @@ mod tests {
         let empty = env_with(&[]);
 
         let owned = build_registry(&config, &Credentials::host_owned(&host)).expect("builds");
-        for id in ["claude-sub", "codex-sub"] {
-            assert!(
-                owned.get(&BackendId::from(id)).is_none(),
-                "{id} was registered from a file the host never named"
-            );
-        }
+        assert!(
+            subscriptions(&owned).is_empty(),
+            "{:?} registered from a file the host never named",
+            subscriptions(&owned)
+        );
 
         let discovered = build_registry(&config, &Credentials::discovered(&empty)).expect("builds");
         if ClaudeCodeCredentials::discover().is_ok() {
@@ -1922,6 +2062,214 @@ mod tests {
 
         let registry = build_registry(&config, &Credentials::host_owned(&host)).expect("builds");
         assert!(registry.is_empty());
+    }
+
+    /// Every subscription backend in a registry, by id — whatever its id is.
+    fn subscriptions(registry: &BackendRegistry) -> Vec<String> {
+        registry
+            .all()
+            .iter()
+            .filter(|backend| backend.kind() == BackendKind::Subscription)
+            .map(|backend| backend.id().to_string())
+            .collect()
+    }
+
+    /// A config whose discovered backends are all switched off, so building
+    /// it never looks at this developer's own logins or Keychain, plus `extra`.
+    fn config_with(extra: Vec<BackendConfig>) -> Config {
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("claude-sub", "claude-subscription"),
+            ("codex-sub", "codex-subscription"),
+            ("openai-key", "openai-api"),
+        ] {
+            let mut off = entry(id, kind);
+            off.enabled = false;
+            config.backends.push(off);
+        }
+        config.backends.extend(extra);
+        config
+    }
+
+    /// A directory's last component — what survives the home being shown as
+    /// `~` when the temporary directory happens to live under it.
+    fn leaf(dir: &std::path::Path) -> String {
+        dir.file_name()
+            .expect("a named directory")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn login_entry(id: &str, kind: &str, dir: &std::path::Path) -> BackendConfig {
+        let mut declared = entry(id, kind);
+        declared.config_dir = Some(dir.display().to_string());
+        declared
+    }
+
+    /// The gate covers every login, not two literal ids. Asserted on kind, so
+    /// a login added under any id is covered — and with a real credential in
+    /// each directory, so "not registered" means "not read", not "not there".
+    #[test]
+    fn a_start_that_may_not_read_the_files_registers_no_login_of_any_kind() {
+        let claude_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            claude_dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-work"}}"#,
+        )
+        .expect("writes");
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            codex_dir.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"eyJ","refresh_token":"rt","account_id":"a"}}"#,
+        )
+        .expect("writes");
+        let config = config_with(vec![
+            login_entry("claude-work", "claude-subscription", claude_dir.path()),
+            login_entry("codex-work", "codex-subscription", codex_dir.path()),
+        ]);
+        let host = host_with(&[]);
+        let env = env_with(&[]);
+
+        for (what, credentials) in [
+            (
+                "a host that owns credentials",
+                Credentials::host_owned(&host),
+            ),
+            (
+                "a start that declined the files",
+                Credentials::discovered(&env).with_files(CredentialFiles::Off),
+            ),
+        ] {
+            let registry = build_registry(&config, &credentials).expect("builds");
+            assert!(
+                subscriptions(&registry).is_empty(),
+                "{what}: {:?} registered",
+                subscriptions(&registry)
+            );
+        }
+
+        // The control: the same config, files allowed, registers both.
+        let registry = build_registry(&config, &Credentials::discovered(&env)).expect("builds");
+        assert_eq!(subscriptions(&registry), vec!["claude-work", "codex-work"]);
+    }
+
+    /// The latent bug this change found: an entry for a second subscription used
+    /// to build the *default* login again under the default's id — one login
+    /// counted twice, sharing consent and quota, the second copy unreachable.
+    #[test]
+    fn a_second_subscription_entry_is_its_own_backend_not_a_copy_of_the_first() {
+        let claude_dir = tempfile::tempdir().expect("tempdir");
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with(vec![
+            login_entry("claude-work", "claude-subscription", claude_dir.path()),
+            login_entry("codex-work", "codex-subscription", codex_dir.path()),
+        ]);
+        let env = env_with(&[]);
+        let registry = build_registry(&config, &Credentials::discovered(&env)).expect("builds");
+
+        for (id, dir, product) in [
+            (
+                "claude-work",
+                claude_dir.path(),
+                SubscriptionProduct::Claude,
+            ),
+            ("codex-work", codex_dir.path(), SubscriptionProduct::ChatGpt),
+        ] {
+            let backend = registry
+                .get(&BackendId::from(id))
+                .unwrap_or_else(|| panic!("{id} is registered under its own id"));
+            let login = backend.login().expect("a subscription reads a login");
+            assert_eq!(login.product, product);
+            assert!(!login.default, "{id} is not the default login");
+            let location = login.location.clone().expect("its own directory");
+            assert!(location.ends_with(&leaf(dir)), "{location}");
+            assert!(
+                backend.name().contains(&location),
+                "{id} is named by its login, so two never share a heading: {}",
+                backend.name()
+            );
+        }
+        assert_eq!(
+            subscriptions(&registry),
+            vec!["claude-work", "codex-work"],
+            "and nothing else: no copy under a default id"
+        );
+    }
+
+    /// A declared login is registered before it is logged in, so `status` can
+    /// say what to run rather than leave it out — which reads as IronWire never
+    /// having heard of it. Codex here, because its store is a file on every
+    /// platform; the Claude half runs in a child process (`tests/embed.rs`).
+    #[tokio::test]
+    async fn a_declared_login_with_nothing_in_its_directory_says_how_to_log_in() {
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with(vec![login_entry(
+            "codex-work",
+            "codex-subscription",
+            codex_dir.path(),
+        )]);
+        let env = env_with(&[]);
+        let registry = build_registry(&config, &Credentials::discovered(&env)).expect("builds");
+
+        let status = status_of(&registry, "codex-work").await;
+        assert!(!status.authenticated);
+        let detail = status.detail.expect("says why");
+        assert!(
+            detail.contains("CODEX_HOME=") && detail.contains("codex login"),
+            "{detail}"
+        );
+    }
+
+    /// The order logins are declared in is the order cross-account fallback
+    /// would try them, so registration must keep it.
+    #[test]
+    fn additional_logins_register_in_the_order_the_config_lists_them() {
+        let dirs: Vec<_> = (0..3)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let config = config_with(vec![
+            login_entry("claude-play", "claude-subscription", dirs[0].path()),
+            login_entry("claude-work", "claude-subscription", dirs[1].path()),
+            login_entry("claude-client", "claude-subscription", dirs[2].path()),
+        ]);
+        let env = env_with(&[]);
+        let registry = build_registry(&config, &Credentials::discovered(&env)).expect("builds");
+        assert_eq!(
+            subscriptions(&registry),
+            vec!["claude-play", "claude-work", "claude-client"]
+        );
+    }
+
+    /// An entry for a default id with a directory moves that login. It keeps
+    /// the id — quota and history are recorded under it — and is still the
+    /// default. It is not the plain façade's, though: its client is reached
+    /// through the login-bound URL (`state::tests`).
+    #[test]
+    fn a_default_login_can_be_moved_and_is_still_the_default() {
+        let moved = tempfile::tempdir().expect("tempdir");
+        let mut config = config_with(Vec::new());
+        config.backends.retain(|entry| entry.id != "claude-sub");
+        config.backends.push(login_entry(
+            "claude-sub",
+            "claude-subscription",
+            moved.path(),
+        ));
+        let env = env_with(&[]);
+        let registry = build_registry(&config, &Credentials::discovered(&env)).expect("builds");
+
+        let backend = registry
+            .get(&BackendId::from("claude-sub"))
+            .expect("registered, though nothing is logged in there yet");
+        let login = backend.login().expect("a login");
+        assert!(login.default);
+        assert!(
+            login
+                .location
+                .as_deref()
+                .is_some_and(|location| location.ends_with(&leaf(moved.path()))),
+            "{login:?}"
+        );
+        assert_eq!(subscriptions(&registry), vec!["claude-sub"]);
     }
 
     async fn status_of(
@@ -2156,6 +2504,7 @@ mod refuse_model_aliases_wiring {
             .expect("a key was configured, so there is a backend");
         let _ = backend
             .send(UpstreamRequest {
+                expected_account_scope: None,
                 path: "/v1/chat/completions".to_string(),
                 body: bytes::Bytes::from_static(b"{}"),
                 headers: Vec::new(),

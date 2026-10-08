@@ -4,17 +4,23 @@
 //! `docs/PROTOCOL.md` §1 lists what has to exist here and why —
 //! `count_tokens` in particular is not optional, because Claude Code drives its
 //! context budget and compaction trigger off it.
+//!
+//! Every route also exists under `/anthropic/account/{id}`, for a Claude Code
+//! bound to one login. The account segment is IronWire's: it says whose request
+//! this is, and is never forwarded.
 
 use super::client_session_id;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::ConversationKey;
-use ironwire_core::protocol::{ClientIdentity, Protocol};
+use ironwire_core::protocol::{BackendId, ClientIdentity, Protocol};
+use ironwire_creds::SubscriptionProduct;
 use ironwire_upstream::headers::{forward_request_header, forward_response_header};
 
 use crate::facade::error::FacadeError;
@@ -30,6 +36,12 @@ pub fn router() -> Router<AppState> {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
+        .route("/account/{account}/v1/messages", post(bound_messages))
+        .route(
+            "/account/{account}/v1/messages/count_tokens",
+            post(bound_count_tokens),
+        )
+        .route("/account/{account}/v1/models", get(bound_models))
 }
 
 async fn messages(
@@ -37,7 +49,7 @@ async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    forward(state, headers, body, "/v1/messages").await
+    forward(state, headers, body, "/v1/messages", None).await
 }
 
 /// Claude Code calls this before every turn to decide whether to compact.
@@ -48,20 +60,71 @@ async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    forward(state, headers, body, "/v1/messages/count_tokens").await
+    forward(state, headers, body, "/v1/messages/count_tokens", None).await
+}
+
+async fn bound_messages(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    forward(state, headers, body, "/v1/messages", Some(login)).await
+}
+
+async fn bound_count_tokens(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    forward(
+        state,
+        headers,
+        body,
+        "/v1/messages/count_tokens",
+        Some(login),
+    )
+    .await
+}
+
+async fn bound_models(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    Ok(list_models(state, Some(login)).await)
+}
+
+/// The Claude login a bound URL names, or the refusal for one that names none.
+fn bound(state: &AppState, account: &str) -> Result<BackendId, FacadeError> {
+    super::bound_login(state, account, SubscriptionProduct::Claude)
+        .map_err(|message| FacadeError::unknown_login(message, false))
+}
+
+async fn models(State(state): State<AppState>) -> Response {
+    list_models(state, None).await
 }
 
 /// Synthesized from the backends that are actually eligible, so a picker never
 /// offers a model IronWire cannot currently serve.
-async fn models(State(state): State<AppState>) -> Response {
+async fn list_models(state: AppState, client_login: Option<BackendId>) -> Response {
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
+    let fallback = state.cross_account_fallback();
     let mut data = Vec::new();
     for status in &statuses {
         if !status.authenticated {
             continue;
         }
-        if status.kind.requires_consent() && !consent.is_granted(status.id.as_str()) {
+        if !state.backends.consented(&status.id, &consent) {
+            continue;
+        }
+        if !state.backends.get(&status.id).is_none_or(|backend| {
+            super::offered_to(backend.as_ref(), client_login.as_ref(), fallback)
+        }) {
             continue;
         }
         for (model, _) in &status.models {
@@ -83,6 +146,7 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
     path: &str,
+    client_login: Option<BackendId>,
 ) -> Result<Response, FacadeError> {
     let started_at = chrono::Utc::now();
     let started = std::time::Instant::now();
@@ -106,8 +170,19 @@ async fn forward(
     {
         peek.client_identity = Some(ClientIdentity::ClaudeCode);
     }
+    peek.client_login = client_login;
+    peek.client_session = client_session_id(&headers, PROTOCOL);
+    let key = peek.client_session.as_deref().map_or_else(
+        || super::key_for_login(conversation_key(&parsed), peek.client_login.as_ref()),
+        |session| {
+            ironwire_core::policy::ConversationKey::for_session(
+                PROTOCOL,
+                session,
+                peek.client_login.as_ref(),
+            )
+        },
+    );
     let peek = peek;
-    let key = conversation_key(&parsed);
     let conversation = key.0;
 
     // The privacy filter is the one documented exception to byte-identical
@@ -149,7 +224,8 @@ async fn forward(
     .await
     .map_err(|e| {
         tracing::warn!(error = %e, "no route for request");
-        let rendered = FacadeError::from_pipeline(&e);
+        let rendered =
+            FacadeError::from_pipeline_naming(&e, &|id| super::connect_command(&state, id));
         if let Some(ledger) = state.ledger.as_ref() {
             pipeline::Refusal {
                 started_at,
@@ -157,7 +233,7 @@ async fn forward(
                 facade: "anthropic",
                 path: path.to_string(),
                 conversation: conversation.to_string(),
-                client_session_id: client_session_id(&headers, Protocol::AnthropicMessages),
+                client_session_id: peek.client_session.clone(),
                 requested_model: peek.requested_model.clone(),
                 status: rendered.status().as_u16(),
             }
@@ -196,7 +272,7 @@ async fn forward(
         facade: "anthropic",
         path: path.to_string(),
         conversation: conversation.to_string(),
-        client_session_id: client_session_id(&headers, PROTOCOL),
+        client_session_id: peek.client_session.clone(),
         backend: routed.decision.backend.to_string(),
         backend_is_local,
         backend_is_metered,
