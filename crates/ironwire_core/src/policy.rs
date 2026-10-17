@@ -451,6 +451,28 @@ impl Policy {
         now: DateTime<Utc>,
         route_override: Option<(BackendId, Option<String>)>,
     ) -> Result<RouteDecision, NoRoute> {
+        // A model named by the override or the pin is the user's instruction,
+        // and outranks the one in the request.
+        let forced_model = route_override
+            .as_ref()
+            .or(self.pin.as_ref())
+            .and_then(|(backend, model)| model.as_ref().map(|_| backend.clone()));
+        let mut decision = self.route(key, inbound, peek, candidates, now, route_override)?;
+        if forced_model.as_ref() != Some(&decision.backend) {
+            keep_listed_model(&mut decision, peek, candidates);
+        }
+        Ok(decision)
+    }
+
+    fn route(
+        &mut self,
+        key: ConversationKey,
+        inbound: Protocol,
+        peek: &RequestPeek,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+        route_override: Option<(BackendId, Option<String>)>,
+    ) -> Result<RouteDecision, NoRoute> {
         if candidates.is_empty() {
             return Err(NoRoute::NoBackendsConfigured);
         }
@@ -1120,6 +1142,40 @@ fn usable(
         )),
     )
     .map_err(Unusable::Ineligible)
+}
+
+/// Serve the model the client named when the chosen backend's provider lists
+/// it by that exact name.
+///
+/// The model string is a tier hint for choosing *between* backends
+/// (`docs/DESIGN.md` §3). Once a backend is chosen, a name its own provider
+/// reported is not a hint any more: it is a selection the provider can serve,
+/// and replacing it with a sibling of the same tier is what made a tool's
+/// model picker decorative. A one-provider, many-family catalogue such as
+/// NEAR AI's puts almost everything at one tier, so the tier pick always
+/// landed on its first entry.
+///
+/// A compiled-in catalogue is a guess and does not count. A deliberate
+/// descent to a smaller model is left alone, and so is a model the user
+/// forced (handled by the caller).
+fn keep_listed_model(decision: &mut RouteDecision, peek: &RequestPeek, candidates: &[Candidate]) {
+    if decision.rung == Rung::SmallerModel {
+        return;
+    }
+    let Some(requested) = peek.requested_model.as_deref() else {
+        return;
+    };
+    let listed = candidates.iter().any(|c| {
+        c.id == decision.backend
+            && c.catalogue_from_provider
+            && c.models.iter().any(|(model, _)| model == requested)
+    });
+    if !listed {
+        return;
+    }
+    // On the native lane `None` forwards the client's own bytes untouched; a
+    // translated body is rebuilt and has to be told the model.
+    decision.model = decision.translated.then(|| requested.to_string());
 }
 
 /// Best model this candidate offers at or below `tier`, preferring an exact
@@ -2460,6 +2516,171 @@ mod tests {
                 refusals: vec![(BackendId::from("claude-sub"), Refusal::NotConsented)]
             }
         );
+    }
+
+    /// A catalogue shaped like NEAR AI's: one backend serving many families,
+    /// listed alphabetically, almost every model at the same tier. A tier pick
+    /// on it always lands on the first frontier entry, whatever was asked for.
+    fn near_catalogue(protocol: Protocol) -> Candidate {
+        let mut near = candidate("nearai", BackendKind::Credits, protocol);
+        near.models = [
+            "anthropic/claude-fable-5",
+            "anthropic/claude-opus-5-5",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-sonnet-5-5",
+            "openai/gpt-5.5",
+            "qwen/qwen3.7-max",
+        ]
+        .into_iter()
+        .map(|m| (m.to_string(), ModelTier::from_model_hint(m)))
+        .collect();
+        near
+    }
+
+    /// The model a client names is a hint only when the backend cannot say
+    /// whether it serves it. A pin on the backend alone used to re-pick by
+    /// tier, so a tool's own model picker chose nothing: every request went to
+    /// `anthropic/claude-fable-5`, the first frontier model alphabetically.
+    #[test]
+    fn a_backend_pin_keeps_a_model_the_provider_lists() {
+        let mut policy = Policy::new();
+        policy.set_pin(Some(BackendId::from("nearai")), None);
+
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("anthropic/claude-opus-5-5"),
+                &[near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("a pinned backend serving the model is a route");
+        assert!(decision.translated);
+        assert_eq!(
+            decision.model.as_deref(),
+            Some("anthropic/claude-opus-5-5"),
+            "the translated body must carry the model the client chose"
+        );
+    }
+
+    /// The translated lane without a pin, which is where a Claude Code request
+    /// lands on a Chat Completions backend.
+    #[test]
+    fn the_translated_lane_keeps_a_model_the_provider_lists() {
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("qwen/qwen3.7-max"),
+                &[near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.rung, Rung::CrossFamily);
+        assert_eq!(decision.model.as_deref(), Some("qwen/qwen3.7-max"));
+    }
+
+    /// On the native lane the client's own string is forwarded untouched,
+    /// which is `None`: no body edit at all (`docs/PROTOCOL.md` §2).
+    #[test]
+    fn the_native_lane_forwards_a_model_the_provider_lists_without_an_edit() {
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::OpenAiChat,
+                &peek("anthropic/claude-sonnet-5-5"),
+                &[near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("routes");
+        assert!(!decision.translated);
+        assert_eq!(
+            decision.model, None,
+            "a tier pick replaced `anthropic/claude-sonnet-5-5` with a sibling"
+        );
+    }
+
+    /// Switching model mid-conversation keeps the conversation key, so the
+    /// sticky route answered with the model stored on the first turn.
+    #[test]
+    fn a_model_switch_mid_conversation_is_honoured() {
+        let mut policy = Policy::new();
+        let near = [near_catalogue(Protocol::OpenAiChat)];
+        let first = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("anthropic/claude-sonnet-5-5"),
+                &near,
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(first.model.as_deref(), Some("anthropic/claude-sonnet-5-5"));
+
+        let second = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("openai/gpt-5.5"),
+                &near,
+                t(5),
+            )
+            .expect("routes");
+        assert_eq!(second.backend.as_str(), "nearai");
+        assert_eq!(second.model.as_deref(), Some("openai/gpt-5.5"));
+    }
+
+    /// A pin that names a model is the user's instruction and still wins.
+    #[test]
+    fn a_pinned_model_outranks_the_requested_one() {
+        let mut policy = Policy::new();
+        policy.set_pin(
+            Some(BackendId::from("nearai")),
+            Some("qwen/qwen3.7-max".to_string()),
+        );
+        let decision = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("anthropic/claude-opus-5-5"),
+                &[near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.model.as_deref(), Some("qwen/qwen3.7-max"));
+    }
+
+    /// A compiled-in catalogue is a guess about the provider, so a name in it
+    /// is not evidence the provider serves that name. The tier pick stands.
+    #[test]
+    fn a_guessed_catalogue_still_picks_by_tier() {
+        let mut near = near_catalogue(Protocol::OpenAiChat);
+        near.catalogue_from_provider = false;
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("qwen/qwen3.7-max"),
+                &[near],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.model.as_deref(), Some("anthropic/claude-fable-5"));
+    }
+
+    /// A name the provider does not list is still a hint, mapped to a tier.
+    #[test]
+    fn an_unlisted_model_is_still_a_tier_hint() {
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-5-5"),
+                &[near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.model.as_deref(), Some("anthropic/claude-fable-5"));
     }
 }
 
