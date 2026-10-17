@@ -457,9 +457,17 @@ impl Policy {
             .as_ref()
             .or(self.pin.as_ref())
             .and_then(|(backend, model)| model.as_ref().map(|_| backend.clone()));
-        let mut decision = self.route(key, inbound, peek, candidates, now, route_override)?;
-        if forced_model.as_ref() != Some(&decision.backend) {
-            keep_listed_model(&mut decision, peek, candidates);
+        let mut decision =
+            self.route(key.clone(), inbound, peek, candidates, now, route_override)?;
+        if forced_model.as_ref() != Some(&decision.backend)
+            && keep_listed_model(&mut decision, peek, candidates)
+            && let Some(affinity) = self.affinities.get_mut(&key)
+            && affinity.backend == decision.backend
+        {
+            // Store what is actually served, so a later turn does not replay a
+            // fallback this one did not take.
+            affinity.model = decision.model.clone();
+            affinity.rung = decision.rung;
         }
         Ok(decision)
     }
@@ -1155,15 +1163,21 @@ fn usable(
 /// NEAR AI's puts almost everything at one tier, so the tier pick always
 /// landed on its first entry.
 ///
-/// A compiled-in catalogue is a guess and does not count. A deliberate
-/// descent to a smaller model is left alone, and so is a model the user
-/// forced (handled by the caller).
-fn keep_listed_model(decision: &mut RouteDecision, peek: &RequestPeek, candidates: &[Candidate]) {
-    if decision.rung == Rung::SmallerModel {
-        return;
-    }
+/// A compiled-in catalogue is a guess and does not count, and a model the
+/// user forced wins (handled by the caller). A `SmallerModel` rung is not a
+/// reason to refuse: it only ever comes from the tier pick falling back, and a
+/// priced catalogue tiers by price rather than by name, so the hinted tier can
+/// be empty on a backend that lists the exact model. Serving that model is not
+/// a descent, so the rung is put back.
+///
+/// Returns whether the decision now serves the requested model.
+fn keep_listed_model(
+    decision: &mut RouteDecision,
+    peek: &RequestPeek,
+    candidates: &[Candidate],
+) -> bool {
     let Some(requested) = peek.requested_model.as_deref() else {
-        return;
+        return false;
     };
     let listed = candidates.iter().any(|c| {
         c.id == decision.backend
@@ -1171,11 +1185,15 @@ fn keep_listed_model(decision: &mut RouteDecision, peek: &RequestPeek, candidate
             && c.models.iter().any(|(model, _)| model == requested)
     });
     if !listed {
-        return;
+        return false;
     }
     // On the native lane `None` forwards the client's own bytes untouched; a
     // translated body is rebuilt and has to be told the model.
     decision.model = decision.translated.then(|| requested.to_string());
+    if decision.rung == Rung::SmallerModel {
+        decision.rung = Rung::Preferred;
+    }
+    true
 }
 
 /// Best model this candidate offers at or below `tier`, preferring an exact
@@ -2666,6 +2684,94 @@ mod tests {
             )
             .expect("routes");
         assert_eq!(decision.model.as_deref(), Some("anthropic/claude-fable-5"));
+    }
+
+    /// A priced catalogue tiers models by price, not by name, so the tier the
+    /// request's name hints at can be empty on a backend that lists the exact
+    /// model. The fallback pick then reads as a descent, and that must not veto
+    /// serving the listed model.
+    #[test]
+    fn a_listed_model_is_served_when_its_price_tier_differs_from_its_name() {
+        let mut near = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+        near.models = vec![
+            (
+                "anthropic/claude-sonnet-5-5".to_string(),
+                ModelTier::Frontier,
+            ),
+            ("qwen/qwen3-small".to_string(), ModelTier::Fast),
+        ];
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::OpenAiChat,
+                &peek("anthropic/claude-sonnet-5-5"),
+                &[near],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.model, None, "{decision:?}");
+        assert_eq!(decision.rung, Rung::Preferred);
+    }
+
+    /// The same gap through the sticky route: a first turn that fell back to a
+    /// smaller model stored that rung, and later turns replayed it.
+    #[test]
+    fn a_fallback_on_the_first_turn_does_not_stick_to_later_listed_models() {
+        let mut sub = candidate(
+            "claude-key",
+            BackendKind::ApiKey,
+            Protocol::AnthropicMessages,
+        );
+        sub.models = vec![
+            ("claude-sonnet-4-6".to_string(), ModelTier::Balanced),
+            ("claude-haiku-4-5".to_string(), ModelTier::Fast),
+        ];
+        let mut policy = Policy::new();
+        let first = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-opus-9"),
+                std::slice::from_ref(&sub),
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(first.rung, Rung::SmallerModel);
+
+        let second = policy
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("claude-haiku-4-5"),
+                &[sub],
+                t(5),
+            )
+            .expect("routes");
+        assert_eq!(second.model, None, "{second:?}");
+        assert_eq!(second.rung, Rung::Preferred);
+    }
+
+    /// Only the chosen backend's catalogue counts. Another backend listing the
+    /// name says nothing about whether this one can serve it.
+    #[test]
+    fn a_model_listed_by_another_backend_is_not_forwarded_to_this_one() {
+        let mut key_backend = candidate(
+            "claude-key",
+            BackendKind::ApiKey,
+            Protocol::AnthropicMessages,
+        );
+        key_backend.models = vec![("claude-opus-4-6".to_string(), ModelTier::Frontier)];
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &peek("qwen/qwen3.7-max"),
+                &[key_backend, near_catalogue(Protocol::OpenAiChat)],
+                t(0),
+            )
+            .expect("routes");
+        assert_eq!(decision.backend.as_str(), "claude-key");
+        assert_eq!(decision.model.as_deref(), Some("claude-opus-4-6"));
     }
 
     /// A name the provider does not list is still a hint, mapped to a tier.
