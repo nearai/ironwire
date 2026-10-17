@@ -101,18 +101,40 @@ pub fn client_model_from_stdin() -> Option<String> {
 /// listens. A pointer naming anything other than loopback is not followed: the
 /// token goes to `127.0.0.1` or nowhere.
 ///
+/// The pointer is followed only when it names this home's token file.
+/// `ironwire serve` writes `~/.ironwire/endpoint.json` whatever
+/// `$IRONWIRE_HOME` says, so a host whose home is `~/.ironwire` can find a
+/// pointer there left by a daemon in another home. Its port is that daemon's,
+/// and sending this home's token to it would print nothing for as long as the
+/// pointer lasts; such a pointer is treated as absent.
+///
 /// The token is read, never minted. A status line that created a credential on
 /// its way to printing nothing would be a side effect on every render.
 #[must_use]
 pub fn endpoint_for_home(home: &Path) -> Option<(u16, String)> {
     let paths = PathsConfig::rooted_at(home);
-    let port = match Endpoint::read_from(&home.join("endpoint.json")) {
+    let token_file = paths.control_token_file();
+    let pointer = Endpoint::read_from(&home.join("endpoint.json"))
+        .filter(|endpoint| same_file(&endpoint.token_path, &token_file));
+    let port = match pointer {
         Some(endpoint) => loopback_port(&endpoint.control_url)?,
         None => Config::load(&paths).ok()?.server.port,
     };
-    let token = std::fs::read_to_string(paths.control_token_file()).ok()?;
+    let token = std::fs::read_to_string(&token_file).ok()?;
     let token = token.trim();
     (!token.is_empty()).then(|| (port, token.to_string()))
+}
+
+/// Whether two paths name the same file: equal as written, or equal once
+/// resolved, so a home reached through a symlink still recognises its own
+/// pointer. Resolution only reads; a path that does not resolve is compared as
+/// written and nothing else.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 fn loopback_port(control_url: &str) -> Option<u16> {

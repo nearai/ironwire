@@ -182,12 +182,67 @@ async fn a_home_with_nothing_in_it_prints_nothing_and_creates_nothing() {
 #[tokio::test]
 async fn a_pointer_that_is_not_loopback_is_not_followed() {
     let home = home_pointing_at(1);
+    // The pointer names this home's own token, so it is this home's pointer
+    // -- and still refused, because it does not name loopback.
+    let pointer = serde_json::json!({
+        "control_url": "http://example.com:8463",
+        "token_path": home.path().join("control.token"),
+    });
+    std::fs::write(home.path().join("endpoint.json"), pointer.to_string()).unwrap();
+    assert!(statusline::endpoint_for_home(home.path()).is_none());
+}
+
+/// `~/.ironwire/endpoint.json` is written by `ironwire serve` whatever
+/// `$IRONWIRE_HOME` says, so a host sharing `~/.ironwire` can find a pointer
+/// there that belongs to a daemon in another home. That pointer names the
+/// other home's token; this home's token must not be sent to its port. The
+/// line falls back to the port in this home's configuration.
+#[tokio::test]
+async fn a_pointer_left_by_another_home_is_not_followed() {
+    let ours = spawn_daemon().await;
+    let theirs = spawn_daemon().await;
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("control.token"), TOKEN).unwrap();
     std::fs::write(
-        home.path().join("endpoint.json"),
-        r#"{"control_url":"http://example.com:8463","token_path":"/x"}"#,
+        home.path().join("config.toml"),
+        format!("[server]\nport = {ours}\n"),
     )
     .unwrap();
-    assert!(statusline::endpoint_for_home(home.path()).is_none());
+    let elsewhere = tempfile::tempdir().unwrap();
+    let foreign =
+        ironwire_core::discovery::Endpoint::new(theirs, elsewhere.path().join("control.token"));
+    std::fs::write(
+        home.path().join("endpoint.json"),
+        serde_json::to_string(&foreign).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        statusline::endpoint_for_home(home.path()),
+        Some((ours, TOKEN.to_string()))
+    );
+    assert_eq!(
+        statusline::line_for_home(home.path(), None)
+            .await
+            .as_deref(),
+        Some("ironwire → nearai")
+    );
+}
+
+/// The same home spelled through a symlink is still the same home: the
+/// pointer an embedded proxy wrote is followed, not mistaken for a foreign one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pointer_naming_this_home_by_another_path_is_followed() {
+    let port = spawn_daemon().await;
+    let home = home_pointing_at(port);
+    let links = tempfile::tempdir().unwrap();
+    let alias = links.path().join("alias");
+    std::os::unix::fs::symlink(home.path(), &alias).unwrap();
+    assert_eq!(
+        statusline::endpoint_for_home(&alias),
+        Some((port, TOKEN.to_string()))
+    );
 }
 
 /// The real thing: a proxy embedded on an ephemeral port is found from its
