@@ -180,9 +180,15 @@ resetting a 200k-token cache.
 | complexity score | `ironclaw_llm::smart_routing` (optional) | weak signal, tier only |
 
 The client's model string is a **quality hint mapped to a tier**
-(frontier / balanced / fast), not a hard selection — Claude Code cannot type
-`ironwire/auto`. Escape hatches: `ironwire pin`, the `X-IronWire-Route` header,
-and `ironwire/*` slugs for clients that accept free-form model strings.
+(frontier / balanced / fast) when choosing *between* backends, not a hard
+selection — Claude Code cannot type `ironwire/auto`. Once a backend is chosen,
+a name that backend's provider reported in its own catalogue is served as
+named: it is a selection the provider can serve, and swapping it for a sibling
+of the same tier would make the tool's model picker decorative. A compiled-in
+catalogue is a guess and does not count; a deliberate descent to a smaller
+model and a model named by a pin or `X-IronWire-Route` still win. Escape
+hatches: `ironwire pin`, the `X-IronWire-Route` header, and `ironwire/*` slugs
+for clients that accept free-form model strings.
 
 ### Default policy
 
