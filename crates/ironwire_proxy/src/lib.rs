@@ -15,6 +15,7 @@ pub mod server;
 pub mod shutdown;
 pub mod spend;
 pub mod state;
+pub mod statusline;
 
 pub use server::{ServeError, serve};
 pub use state::{AppState, BackendRegistry};
