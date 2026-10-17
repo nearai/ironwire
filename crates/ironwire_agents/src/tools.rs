@@ -329,17 +329,22 @@ impl Planned {
     }
 }
 
-/// Whether this caller can honour the status line IronWire would install.
+/// Which status line, if any, a caller wants in the agent's status-line slot.
 ///
-/// The command written into Claude Code's `statusLine` is the calling binary
-/// plus a `statusline` subcommand — [`statusline_command`]. That is right for
-/// the `ironwire` CLI, which implements it. It is not right for a host that
-/// embeds this crate and has no such subcommand: Claude Code reads the
-/// command's stdout, so a binary that rejects the argument shows the user a
-/// blank line rather than an error they can act on.
+/// [`StatusLine::Offer`] writes the calling binary plus a `statusline`
+/// subcommand. That is right for the `ironwire` CLI,
+/// which implements it. It is not right for a host that embeds this crate:
+/// Claude Code reads the command's stdout, so a binary that rejects the
+/// argument shows the user a blank line rather than an error they can act on.
+/// Such a host either names the command that does serve the line
+/// ([`StatusLine::Command`]) or declines the slot ([`StatusLine::Decline`]).
+///
+/// Every variant follows the same slot rules: fill the slot only when it is
+/// empty, follow a line IronWire installed when its command moves, and never
+/// replace or remove a line the user wrote.
 ///
 /// Callers must allow future values rather than exhaustively matching today's.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StatusLine {
     /// Offer IronWire's status line, in the slot, if the user is not using it.
@@ -347,13 +352,36 @@ pub enum StatusLine {
     /// and the control API still get.
     #[default]
     Offer,
+    /// Install this command as the status line, if the user is not using the
+    /// slot. For a host that serves the line from its own executable, usually
+    /// a subcommand that calls `ironwire_proxy::statusline::line_for_home`.
+    ///
+    /// Written verbatim, so it must already be a complete command line for the
+    /// agent's shell: quote any path that contains spaces. It is marked as
+    /// IronWire's, so a later [`plan_disconnect`] removes it, and a status
+    /// line IronWire installed earlier with a different command is replaced
+    /// by this one. A blank command is treated as [`StatusLine::Decline`]: a
+    /// command that prints nothing is the failure declining exists to avoid.
+    Command(String),
     /// Install no status line, and take out one IronWire installed on an
     /// earlier connect — that command names an executable that cannot serve
     /// it, and leaving it would keep the tool invoking it. A status line the
     /// user wrote themselves is left alone, as everywhere else here. For a host
-    /// whose executable cannot serve one. Routing is unaffected: the tool is
-    /// still pointed at IronWire.
+    /// that has no command able to serve one. Routing is unaffected: the tool
+    /// is still pointed at IronWire.
     Decline,
+}
+
+impl StatusLine {
+    /// The command this choice writes into the slot, or `None` to keep the
+    /// slot free of ours.
+    fn command(&self) -> Option<String> {
+        match self {
+            Self::Offer => Some(statusline_command()),
+            Self::Command(command) if !command.trim().is_empty() => Some(command.clone()),
+            Self::Command(_) | Self::Decline => None,
+        }
+    }
 }
 
 /// What a caller chooses about an edit, beyond which tool and which port.
@@ -363,18 +391,21 @@ pub enum StatusLine {
 ///
 /// ```
 /// use ironwire_agents::tools::{ConnectOptions, StatusLine};
-/// let options = ConnectOptions::default().with_status_line(StatusLine::Decline);
+/// let declined = ConnectOptions::default().with_status_line(StatusLine::Decline);
+/// let hosted = ConnectOptions::default().with_status_line(StatusLine::Command(
+///     "/opt/host/bin/host ironwire-statusline".to_string(),
+/// ));
 /// ```
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConnectOptions {
-    /// Whether to offer IronWire's own status line. Only Claude Code has a
-    /// slot for one today; the other tools ignore this.
+    /// Which status line to install. Only Claude Code has a slot for one
+    /// today; the other tools ignore this.
     pub status_line: StatusLine,
 }
 
 impl ConnectOptions {
-    /// Say whether this caller can honour a status line.
+    /// Say which status line this caller can honour, if any.
     #[must_use]
     pub fn with_status_line(mut self, status_line: StatusLine) -> Self {
         self.status_line = status_line;
@@ -385,8 +416,8 @@ impl ConnectOptions {
 /// Work out how to point a tool at IronWire.
 ///
 /// [`ConnectOptions::default`]: the status line is offered, which is what the
-/// CLI and the control API want. A host that cannot serve one uses
-/// [`plan_connect_with`].
+/// CLI and the control API want. A host that serves it from its own command,
+/// or cannot serve one, uses [`plan_connect_with`].
 ///
 /// # Errors
 ///
@@ -415,10 +446,7 @@ pub fn plan_connect_with(
             let path = claude_settings::path().ok_or_else(|| Error::NoPath(id.to_string()))?;
             let existing = read(Some(&path));
             let url = format!("http://127.0.0.1:{port}/anthropic");
-            let command = match options.status_line {
-                StatusLine::Offer => Some(statusline_command()),
-                StatusLine::Decline => None,
-            };
+            let command = options.status_line.command();
             let edit = claude_settings::connect(&existing, command.as_deref(), Some(&url))
                 .map_err(|error| Error::Unparseable {
                     path: path.clone(),
@@ -685,6 +713,33 @@ mod tests {
     #[test]
     fn the_default_still_offers_the_status_line() {
         assert_eq!(ConnectOptions::default().status_line, StatusLine::Offer);
+    }
+
+    /// A host names the command that serves its line, and that is what goes
+    /// in the slot, byte for byte.
+    #[test]
+    fn a_host_command_is_written_as_given() {
+        let command = "/opt/host/bin/host ironwire-statusline --home '/a b'";
+        assert_eq!(
+            StatusLine::Command(command.to_string())
+                .command()
+                .as_deref(),
+            Some(command)
+        );
+        assert!(StatusLine::Decline.command().is_none());
+        assert!(
+            StatusLine::Offer
+                .command()
+                .is_some_and(|c| c.ends_with(" statusline"))
+        );
+    }
+
+    /// A blank command would print nothing on every render, which is exactly
+    /// what declining exists to prevent, so it declines.
+    #[test]
+    fn a_blank_host_command_declines_rather_than_installing_nothing() {
+        assert!(StatusLine::Command(String::new()).command().is_none());
+        assert!(StatusLine::Command("  ".to_string()).command().is_none());
     }
 
     #[test]

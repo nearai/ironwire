@@ -17,9 +17,10 @@
 //! is not, and we remove only what we put there.
 //!
 //! And either slot may be skipped, because not every caller can fill both. The
-//! status-line command names the calling binary, which is `ironwire` only when
-//! the CLI is calling; a host embedding this crate that has no `statusline`
-//! subcommand asks for the routing alone. See [`connect`].
+//! status-line command is the caller's to name: the `ironwire` CLI names its own
+//! `statusline` subcommand, a host embedding this crate names whatever command
+//! of its own serves the line, and a host with none asks for the routing alone.
+//! See [`connect`].
 
 use serde_json::{Map, Value};
 
@@ -77,11 +78,11 @@ impl Edit {
 /// `base_url` is `None` for a caller that wants only the status line — the
 /// daemon is not the only reason to touch this file. `command` is `None` for
 /// the inverse: a caller that wants only the routing, because it cannot honour
-/// a status line. The command written here is a binary plus a `statusline`
-/// subcommand, and the binary is whichever one called — which is the `ironwire`
-/// CLI for the CLI and this crate's embedding host for anyone else. A host that
-/// implements no such subcommand declines the slot rather than filling it with
-/// a command that prints nothing.
+/// a status line. The command is written verbatim and is the caller's choice:
+/// the `ironwire` CLI passes its own `statusline` subcommand, and a host that
+/// embeds this crate passes the command of its own that serves the line
+/// (`crate::tools::StatusLine::Command`). A host with no such command declines
+/// the slot rather than filling it with a command that prints nothing.
 ///
 /// Declining does not report `statusLine` as [`Occupied`]: a slot we never
 /// wanted is not one the user took from us. It does take out a status line we

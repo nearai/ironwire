@@ -223,6 +223,10 @@ IronWire fills only if you have not written your own, and removes on
 substituted model, a pool above a third used, a fallback for the ten minutes
 after it happens, and a release when one exists.
 
+A host that embeds IronWire can serve the same line from its own executable:
+the rendering lives in `ironwire_proxy::statusline`, and the host installs its
+own command in the slot under the same rules (`docs/EMBEDDING.md`).
+
 Codex has no status-line hook (`tui.status_line` exists in its config and
 renders nothing in 0.145), but it does render one line from the server on a
 usage-limit response. That is where IronWire says whether it had anywhere else

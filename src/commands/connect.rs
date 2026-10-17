@@ -283,8 +283,8 @@ pub(crate) fn wire_claude(port: u16, dry_run: bool) -> Result<()> {
     let command = format!("{} statusline", our_binary()?);
     let url = anthropic_url(port);
     // Always `Some` here: this is the `ironwire` binary, and it implements
-    // `ironwire statusline`. A host embedding the library may not, and passes
-    // `None` — see `ironwire_agents::tools::StatusLine`.
+    // `ironwire statusline`. A host embedding the library names its own
+    // command, or passes `None` — see `ironwire_agents::tools::StatusLine`.
     let edit =
         claude_settings::connect(&existing, Some(&command), Some(&url)).with_context(|| {
             format!(

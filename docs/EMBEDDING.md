@@ -325,29 +325,88 @@ concurrency, retry budget and period.
 ## Pointing a coding tool at an embedded instance
 
 `ironwire_agents::tools::plan_connect` works out the edit; the host shows it and
-`commit`s it. For Claude Code the edit fills two slots, and the second one names
-a binary:
+`commit`s it. For Claude Code the edit fills two slots: `env.ANTHROPIC_BASE_URL`,
+which routes the tool here, and `statusLine`, which runs a command on every
+render and shows its stdout in the status bar. The second one names a command,
+and `ConnectOptions` says which:
 
 ```rust
 use ironwire_agents::tools::{ConnectOptions, StatusLine};
-let options = ConnectOptions::default().with_status_line(StatusLine::Decline);
+// The host serves the line itself (below).
+let hosted = ConnectOptions::default().with_status_line(StatusLine::Command(
+    "/opt/host/bin/host ironwire-statusline --session 7".to_string(),
+));
+// The host has no command that can serve it.
+let declined = ConnectOptions::default().with_status_line(StatusLine::Decline);
 ```
 
-`statusLine` is written as `std::env::current_exe()` plus a `statusline`
-subcommand. Under the CLI that is `ironwire statusline`, which exists. Under a
-host it is the host's own executable, which may not implement the subcommand at
-all, or may be a GUI bundle with no command-line surface. Claude Code renders
-the command's stdout, so a binary that rejects the argument produces a blank
-line rather than a visible failure. A host in that position declines the slot
-with `plan_connect_with` and `StatusLine::Decline`; the routing edit is
-unchanged, and a status line the user wrote themselves is left alone either way.
+- `StatusLine::Offer` (the default, and what `plan_connect` uses) writes
+  `std::env::current_exe()` plus a `statusline` subcommand. Under the CLI that is
+  `ironwire statusline`, which exists. Under a host it is the host's own
+  executable, which may not implement the subcommand at all, or may be a GUI
+  bundle with no command-line surface. Claude Code renders the command's stdout,
+  so a binary that rejects the argument produces a blank line rather than a
+  visible failure.
+- `StatusLine::Command(String)` writes the host's own command, verbatim, so it
+  must already be a complete command line for the agent's shell (quote paths
+  with spaces). A blank command declines.
+- `StatusLine::Decline` writes none.
+
+All three follow the same slot rules. The slot is filled only when it is empty,
+and a status line the user wrote themselves is left alone and reported as
+occupied. A line IronWire installed is marked `"installedBy": "ironwire"`, which
+is how a later connect knows to replace it when the command changes and how
+`plan_disconnect` removes it and nothing else. Routing is the same edit
+whichever is chosen.
 
 Declining also removes a status line IronWire installed on an earlier connect,
 so a host that shipped `plan_connect` before adopting this fixes the
-installations it already made rather than only the next one. The `installedBy`
-marker names IronWire and not a particular binary, so in a home shared with the
-`ironwire` CLI this removes the CLI's line as well; `ironwire connect claude`
-puts it back.
+installations it already made rather than only the next one; switching to
+`Command` replaces that line with the host's. The `installedBy` marker names
+IronWire and not a particular binary, so in a home shared with the `ironwire`
+CLI either choice replaces or removes the CLI's line as well; `ironwire connect
+claude` puts it back.
+
+### Serving the status line from a host
+
+The line `ironwire statusline` prints is rendered by
+`ironwire_proxy::statusline`, so a host can print the same bytes from its own
+executable. Expose a subcommand, install it with `StatusLine::Command`, and have
+it do this:
+
+```rust
+use ironwire_proxy::statusline;
+
+// Inside the host's `ironwire-statusline` subcommand, on a Tokio runtime.
+let model = statusline::client_model_from_stdin();
+if let Some(line) = statusline::line_for_home(&session_home, model.as_deref()).await {
+    println!("{line}");
+}
+// Exit 0 either way.
+```
+
+`line_for_home` takes the IronWire home the host passed to `embed::start` for
+that session. It reads the port from `<home>/endpoint.json`, which the proxy
+publishes once it has bound (so an ephemeral port is found), falling back to
+the home's configured port when no pointer is there, and reads
+`<home>/control.token`. It creates and writes nothing: no home, no token. A
+pointer that names anything other than `127.0.0.1` is not followed. A host that
+already holds the port and token calls `statusline::line(port, &token, model)`
+instead, and one that already holds a `StatusView` calls
+`statusline::render(&status, model)`, or `render_at` with an explicit clock.
+
+The helpers keep the three properties the CLI has always had. They never block
+the render loop: the whole status request, connection included, is bounded by
+`statusline::BUDGET` (400 ms). They never invent: every value printed comes
+from the daemon's control API. They are quiet when things are normal, and every
+failure (no pointer, no token, refused, wrong token, too slow, unparseable) is
+`None`, never an error. The subcommand should therefore print nothing and exit
+0 when the helper returns `None`.
+
+The command line the host installs has to identify the session when the host
+runs one proxy per home: the stdin document names Claude Code's session, not
+IronWire's home. Put the home, or an id the host can map to one, in the
+command's arguments.
 
 ## Implementation checkpoint
 
