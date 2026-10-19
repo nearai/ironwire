@@ -385,7 +385,7 @@ None of these are refusals. They are what the rung-3 announcement is for:
 | Lost | Consequence |
 |---|---|
 | Signed thinking / encrypted reasoning | No reasoning continuity across the switch. Quality drop, no error. |
-| Prompt cache | Cold start. Refused only when the warm prefix exceeds `CACHE_SACRIFICE_THRESHOLD_TOKENS` — an economic call, not a semantic one. |
+| Prompt cache | Cold start. Refused only when the warm prefix exceeds `CACHE_SACRIFICE_THRESHOLD_TOKENS` — an economic call, not a semantic one. A prefix is warm only when the conversation's current backend caches prompts and is still connected; a cache-control breakpoint on a first turn is not a warm cache. |
 | Client-specific system-prompt tuning | The prompt was written for Claude; another model follows it less precisely. |
 
 ### What is still a hard refusal

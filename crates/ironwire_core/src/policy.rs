@@ -495,6 +495,23 @@ impl Policy {
             });
         }
 
+        // A cache-control breakpoint says a prefix *may* be cached, not that it
+        // is. Claude Code marks its system prompt on every request, the first
+        // one included, so the peek alone would call every Claude Code turn a
+        // large warm cache and refuse it any backend without prompt caching.
+        // A prefix is warm only when an earlier turn of this conversation went
+        // to a backend that caches and is still connected; otherwise there is
+        // nothing for the cache rule in `eligible` to protect.
+        let cold;
+        let peek = if self.cache_is_warm(&key, candidates) {
+            peek
+        } else {
+            let mut unwarmed = peek.clone();
+            unwarmed.requirements.cached_prefix_tokens = 0;
+            cold = unwarmed;
+            &cold
+        };
+
         let tier = peek
             .requested_model
             .as_deref()
@@ -663,6 +680,17 @@ impl Policy {
         // that `expect`.
         self.sweep(now);
         Ok(decision)
+    }
+
+    /// Whether this conversation has a prompt cache worth protecting: its
+    /// current backend caches prompts and is still among the candidates. A
+    /// backend that was removed took its cache with it.
+    fn cache_is_warm(&self, key: &ConversationKey, candidates: &[Candidate]) -> bool {
+        self.affinities.get(key).is_some_and(|affinity| {
+            candidates
+                .iter()
+                .any(|c| c.id == affinity.backend && c.caps.prompt_cache)
+        })
     }
 
     /// Climb back up the ladder, if a better rung has been available long
@@ -2787,6 +2815,114 @@ mod tests {
             )
             .expect("routes");
         assert_eq!(decision.model.as_deref(), Some("anthropic/claude-fable-5"));
+    }
+
+    /// The prompt-cache rule protects a cache that exists. A cache-control
+    /// marker says a prefix *may* be cached, not that it is: Claude Code marks
+    /// its system prompt on every request, the first one included, and that
+    /// prompt alone is far over the threshold. Reading the marker as a warm
+    /// cache refused every Claude Code request to a backend without prompt
+    /// caching, so a user whose only backend was NEAR AI got a 503 on "hello".
+    mod prompt_cache {
+        use super::*;
+
+        /// A first turn as Claude Code sends it: a large prefix behind a
+        /// breakpoint, and no turn before it to have warmed anything.
+        fn claude_code_turn() -> RequestPeek {
+            let mut p = peek("claude-sonnet-4-6");
+            p.requirements.prompt_cache = true;
+            p.requirements.cached_prefix_tokens = 30_000;
+            p
+        }
+
+        fn nearai() -> Candidate {
+            let mut c = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+            c.caps.prompt_cache = false;
+            c
+        }
+
+        fn claude_sub() -> Candidate {
+            candidate(
+                "claude-sub",
+                BackendKind::Subscription,
+                Protocol::AnthropicMessages,
+            )
+        }
+
+        fn route(
+            policy: &mut Policy,
+            candidates: &[Candidate],
+            at: DateTime<Utc>,
+        ) -> Result<RouteDecision, NoRoute> {
+            policy.decide(
+                key(),
+                Protocol::AnthropicMessages,
+                &claude_code_turn(),
+                candidates,
+                at,
+            )
+        }
+
+        #[test]
+        fn a_first_turn_reaches_a_backend_without_prompt_caching() {
+            let mut policy = Policy::new();
+            let decision = route(&mut policy, &[nearai()], t(0)).expect("nothing is cached yet");
+            assert_eq!(decision.backend.as_str(), "nearai");
+            assert_eq!(decision.rung, Rung::CrossFamily);
+            assert!(decision.translated);
+        }
+
+        #[test]
+        fn a_pinned_first_turn_reaches_a_backend_without_prompt_caching() {
+            let mut policy = Policy::new();
+            policy.set_pin(Some(BackendId::from("nearai")), None);
+            let decision =
+                route(&mut policy, &[claude_sub(), nearai()], t(0)).expect("nothing is cached yet");
+            assert_eq!(decision.backend.as_str(), "nearai");
+            assert!(decision.translated);
+        }
+
+        #[test]
+        fn a_warm_conversation_still_will_not_discard_its_cache() {
+            let mut policy = Policy::new();
+            let first = route(&mut policy, &[claude_sub(), nearai()], t(0)).expect("routes");
+            assert_eq!(first.backend.as_str(), "claude-sub");
+
+            let mut down = claude_sub();
+            down.healthy = false;
+            let refused = route(&mut policy, &[down, nearai()], t(60))
+                .expect_err("moving would discard a warm cache");
+            let NoRoute::NoneUsable { refusals } = refused else {
+                panic!("expected NoneUsable, got {refused:?}");
+            };
+            assert!(refusals.iter().any(|(id, why)| id.as_str() == "nearai"
+                && *why == Refusal::Ineligible(Ineligible::WouldDiscardLargePromptCache)));
+        }
+
+        #[test]
+        fn a_conversation_whose_cache_holder_is_gone_has_no_cache_to_protect() {
+            let mut policy = Policy::new();
+            let first = route(&mut policy, &[claude_sub(), nearai()], t(0)).expect("routes");
+            assert_eq!(first.backend.as_str(), "claude-sub");
+
+            let decision = route(&mut policy, &[nearai()], t(60))
+                .expect("the cache went with the backend that held it");
+            assert_eq!(decision.backend.as_str(), "nearai");
+        }
+
+        #[test]
+        fn a_conversation_on_a_backend_without_caching_has_nothing_to_discard() {
+            let mut policy = Policy::new();
+            let mut uncached = claude_sub();
+            uncached.caps.prompt_cache = false;
+            let first = route(&mut policy, &[uncached.clone(), nearai()], t(0)).expect("routes");
+            assert_eq!(first.backend.as_str(), "claude-sub");
+
+            uncached.healthy = false;
+            let decision =
+                route(&mut policy, &[uncached, nearai()], t(60)).expect("no cache was ever warmed");
+            assert_eq!(decision.backend.as_str(), "nearai");
+        }
     }
 }
 
