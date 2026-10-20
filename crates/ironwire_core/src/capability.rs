@@ -95,6 +95,17 @@ pub struct RequestRequirements {
     /// recorded for this replay. Set by policy, never trusted from the wire.
     #[serde(skip)]
     pub reasoning_backend: Option<String>,
+    /// No origin is recorded for this replay, and more than one account could
+    /// have minted it. Set by policy, never trusted from the wire.
+    ///
+    /// Refuses every route, translated ones included. A translated route
+    /// drops the reasoning safely, which is why a *known* origin that cannot
+    /// serve may cross families at a turn boundary; but with the origin
+    /// unknown, the account that minted it may be right there, and moving the
+    /// conversation to another model and another bill would be choosing for
+    /// the user on a guess. Starting a new session is the user's call.
+    #[serde(skip)]
+    pub reasoning_origin_ambiguous: bool,
 }
 
 /// What a backend+model can preserve.
@@ -224,6 +235,9 @@ pub fn eligible(
     cross_family: bool,
     backend: Option<(&str, crate::protocol::Protocol)>,
 ) -> Result<(), Ineligible> {
+    if req.encrypted_reasoning && req.reasoning_origin_ambiguous {
+        return Err(Ineligible::ReasoningBoundToAccount);
+    }
     if req.encrypted_reasoning
         && let Some((id, Protocol::OpenAiResponses)) = backend
         && req.reasoning_backend.as_deref() != Some(id)
@@ -293,6 +307,7 @@ mod tests {
         RequestRequirements {
             admission_backend: None,
             reasoning_backend: None,
+            reasoning_origin_ambiguous: false,
             tools: true,
             parallel_tool_calls: false,
             images: false,
@@ -318,6 +333,41 @@ mod tests {
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_replay_of_ambiguous_origin_is_refused_on_every_wire_including_translated() {
+        let req = RequestRequirements {
+            encrypted_reasoning: true,
+            reasoning_origin_ambiguous: true,
+            ..Default::default()
+        };
+        for (cross, backend) in [
+            (false, Some(("codex-sub", Protocol::OpenAiResponses))),
+            (true, Some(("nearai", Protocol::OpenAiChat))),
+            (true, Some(("anthropic-key", Protocol::AnthropicMessages))),
+            (true, None),
+        ] {
+            assert_eq!(
+                eligible(&req, &full_caps(), cross, backend),
+                Err(Ineligible::ReasoningBoundToAccount),
+                "{backend:?}"
+            );
+        }
+        // Without encrypted state there is nothing to bind, ambiguous or not.
+        let plain = RequestRequirements {
+            reasoning_origin_ambiguous: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible(
+                &plain,
+                &full_caps(),
+                true,
+                Some(("nearai", Protocol::OpenAiChat))
+            ),
+            Ok(())
+        );
     }
 
     #[test]

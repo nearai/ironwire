@@ -452,10 +452,13 @@ to one organization: IronWire has no observation establishing that equivalence.
 The sender checks that same scope against the fresh credential before sending,
 so relogging a directory between selection and send cannot move reasoning to a
 new account. The record survives provider failures and route retries, and pins
-cannot bypass it. Missing subscription account identity, restart, expiry or
-origin eviction refuses native encrypted replay instead of assuming the
-client's own login. A first turn without encrypted state can establish a new
-origin, and translation may cross families at a turn boundary where it drops
+cannot bypass it. Missing subscription account identity refuses native
+encrypted replay. After a restart, expiry or origin eviction, the origin is
+inferred only when a single account could have minted it (with cross-account
+fallback off, the client's own login); when several could, every route is
+refused, another family included, rather than guessing. A first turn without
+encrypted state can establish a new origin, and with a known origin that
+cannot serve, translation may cross families at a turn boundary where it drops
 the private reasoning. See `PROTOCOL.md` §6 for tests and state limits.
 
 Session affinity includes protocol, the client's valid session header and its

@@ -459,24 +459,43 @@ reasoning to the organization that produced it and rejects it anywhere else —
 the target organization" — and Codex asks for encrypted reasoning on every turn
 and replays it on the next. So for a Codex conversation, two ChatGPT logins are
 not interchangeable credentials on one wire: from the second turn on, any
-account but the one that minted the reasoning answers with a 400. This matters
-only once a conversation can change account at all, which takes cross-account
-fallback (`TRUST.md` §2); without it, another login is never usable to begin
-with.
+account but the one that minted the reasoning answers with a 400. Between two
+logins this matters only once a conversation can change login at all, which
+takes cross-account fallback (`TRUST.md` §2); without it, another login is
+never usable to begin with. A metered key on the same wire is another
+credential either way.
 
-The gate lives in `eligible()`, fed by the policy's recorded origin:
+The gate lives in `eligible()`, fed by the policy's recorded or inferred origin:
 
 - `RequestRequirements::encrypted_reasoning` is set when the input replays a
   `reasoning` item with non-empty `encrypted_content`. Empty or null content
   carries no private state, so a first turn can start on any eligible login.
-- Native Responses replay requires the recorded backend and its known scope
+- Native Responses replay requires the origin's backend and its known scope
   to match the current candidate. Subscriptions use a domain-separated hash
   of the provider's `chatgpt_account_id`; absent identity stays unknown.
   Metered keys use a different domain-separated hash of the actual key. That
   identifies the credential, without claiming to know its API organization.
   A changed key requires a new origin even if its organization might be the
-  same. Missing origin, unknown subscription identity or mismatch yields
-  `Ineligible::ReasoningBoundToAccount`.
+  same. Unknown subscription identity or a mismatch with the recorded origin
+  yields `Ineligible::ReasoningBoundToAccount`.
+- With no recorded origin, the origin is inferred when only one account could
+  have minted it: of the Responses-wire candidates allowed to serve this
+  client, health and quota aside, its logins, or, when it has no login here,
+  the keys and credits. With fallback off that is the client's own login, so a
+  single-login user's replay after a restart is forwarded byte-identical as it
+  was before origins were recorded
+  (`after_a_restart_a_single_logins_replay_is_served_by_that_login`,
+  `after_a_restart_with_fallback_off_each_login_replays_on_its_own`). An
+  inferred origin binds exactly as a recorded one, and the turn it serves
+  records it. A session that descended to a key before the restart is presumed
+  to be on its login, which the provider rejects; it is never moved to another
+  account. A client bound to a login that is not registered has no inferred
+  origin (`after_a_restart_a_replay_from_an_unregistered_login_is_not_given_to_a_key`).
+- With no record and more than one account that could have minted it, every
+  route is refused, translated ones included: the minting account may be
+  right there, and moving the conversation to another model on a guess is
+  not IronWire's to choose
+  (`an_unknown_origin_between_two_logins_is_refused_and_never_moved_to_another_family`).
 - The Responses sender recomputes the scope from the credential it actually
   read and refuses before HTTP if routing selected a different one. A relogin
   between status and send cannot put an old account's state on a new bearer.
@@ -518,12 +537,14 @@ Three edges:
 - **Origins are memory-only and separately bounded.** The route cache holds
   at most 512 affinities; replay origins hold at most 4,096 entries, with
   24-hour idle retention. Expiry, capacity eviction or daemon restart loses
-  knowledge, so native encrypted continuation refuses instead of assuming
-  the client's own login (`with_no_record_encrypted_reasoning_is_refused_rather_than_assigned_an_account`,
+  the record. Where one account could have minted the reasoning it is
+  inferred, as above; where several could, native encrypted continuation
+  refuses instead of guessing between them
+  (`with_no_record_encrypted_reasoning_is_refused_rather_than_assigned_an_account`,
   `an_expired_origin_refuses_a_replay_even_when_the_same_account_is_pinned`,
-  `evicting_an_origin_at_capacity_refuses_instead_of_guessing_an_account`).
-  Starting a new session or restoring authenticated origin evidence is needed
-  for native continuation; persistent origin recovery is not implemented.
+  `evicting_an_origin_at_capacity_refuses_instead_of_guessing_an_account`),
+  and starting a new session is needed. Persistent origin recovery is not
+  implemented.
 - **Provider behavior remains a live acceptance gap.** These local refusal
   gates prevent an unchecked subscription-to-key descent. They do not prove
   which real ChatGPT accounts share an organization or reproduce the reported

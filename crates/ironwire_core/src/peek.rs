@@ -206,6 +206,7 @@ impl RequestPeek {
         let mut requirements = RequestRequirements {
             admission_backend: None,
             reasoning_backend: None,
+            reasoning_origin_ambiguous: false,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)
@@ -314,6 +315,7 @@ impl RequestPeek {
         let mut requirements = RequestRequirements {
             admission_backend: None,
             reasoning_backend: None,
+            reasoning_origin_ambiguous: false,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)

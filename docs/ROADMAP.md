@@ -374,10 +374,13 @@ own (`docs/DESIGN.md` §5–§6, `docs/TRUST.md` §2).
       interactively
 - [ ] Session-state sizing beyond the current 512 affinities and 4,096 replay
       origins (24-hour idle retention). Evicting affinity costs cache warmth;
-      losing a replay origin refuses native encrypted continuation. Persistent
+      losing a replay origin refuses native encrypted continuation when more
+      than one account could have minted it. Persistent
       origins or larger bounds need a separate retention and privacy decision
 - [ ] Full-session recovery after a daemon restart without guessing encrypted
-      reasoning origin. Current native replay fails closed; resuming it would
+      reasoning origin. A single possible origin (one login, or fallback off)
+      is inferred and resumes; with several, native replay fails closed, and
+      resuming it would
       need authenticated origin evidence or a separately justified persistence
       design. This can be engineered locally, but acceptance needs a live Codex
       session that resumes after restart

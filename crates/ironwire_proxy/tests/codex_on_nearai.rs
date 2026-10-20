@@ -64,12 +64,6 @@ const CODEX_BODY: &str = concat!(
     r#""reasoning":{"effort":"high","summary":"auto"}}"#,
 );
 
-fn plain_first_turn() -> String {
-    let mut body: serde_json::Value = serde_json::from_str(CODEX_BODY).expect("fixture JSON");
-    body["input"].as_array_mut().expect("input").remove(0);
-    body.to_string()
-}
-
 async fn spawn_nearai() -> (String, Arc<Mutex<Option<Received>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -174,26 +168,10 @@ fn codex_request(body: &str) -> Request<Body> {
 #[tokio::test]
 async fn a_codex_request_reaches_near_ai_on_its_own_wire() {
     let (base, received) = spawn_nearai().await;
-    let state = state_for(&base);
-    let first_body = plain_first_turn();
-    let first = app(state.clone())
-        .oneshot(codex_request(&first_body))
-        .await
-        .expect("first turn");
-    assert_eq!(first.status(), StatusCode::OK);
-    axum::body::to_bytes(first.into_body(), 1 << 20)
-        .await
-        .expect("first stream");
-    assert_eq!(
-        received
-            .lock()
-            .expect("lock")
-            .as_ref()
-            .expect("first request")
-            .body,
-        first_body
-    );
-    let response = app(state)
+    // The first request this daemon sees replays encrypted reasoning, as any
+    // Codex turn after a restart does. NEAR AI is the only backend that could
+    // have minted it, so that is where it goes.
+    let response = app(state_for(&base))
         .oneshot(codex_request(CODEX_BODY))
         .await
         .expect("the proxy answers");

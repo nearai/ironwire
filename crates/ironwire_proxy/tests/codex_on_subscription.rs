@@ -222,23 +222,6 @@ fn codex_request(uri: &str, body: &str) -> Request<Body> {
         .expect("request builds")
 }
 
-async fn prime_native_session(state: &AppState) {
-    let mut first: serde_json::Value = serde_json::from_str(CODEX_BODY).expect("fixture JSON");
-    first["input"].as_array_mut().expect("input").remove(0);
-    let response = app(state.clone())
-        .oneshot(codex_request("/openai/v1/responses", &first.to_string()))
-        .await
-        .expect("first turn");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "plain native first turn establishes its account scope"
-    );
-    axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .expect("first stream");
-}
-
 /// The same request as a client that is not Codex would send it: no
 /// `originator`, and a body with none of Codex's own instructions.
 ///
@@ -263,7 +246,6 @@ async fn a_codex_request_reaches_chatgpt_byte_identical() {
     let (_dir, auth) = codex_auth_fixture();
 
     let state = state_for(&base_url, &auth);
-    prime_native_session(&state).await;
     let response = app(state)
         .oneshot(codex_request("/openai/v1/responses", CODEX_BODY))
         .await
@@ -298,7 +280,6 @@ async fn the_account_header_is_restored_from_our_own_credential() {
     let (_dir, auth) = codex_auth_fixture();
 
     let state = state_for(&base_url, &auth);
-    prime_native_session(&state).await;
     let response = app(state)
         .oneshot(codex_request("/openai/v1/responses", CODEX_BODY))
         .await
@@ -357,7 +338,6 @@ async fn an_account_id_the_client_sends_never_reaches_chatgpt() {
     headers.insert("x-openai-fedramp", "true".parse().expect("header value"));
 
     let state = state_for(&base_url, &auth);
-    prime_native_session(&state).await;
     let response = app(state).oneshot(request).await.expect("served");
     assert_eq!(response.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
@@ -510,7 +490,6 @@ async fn the_response_reaches_the_client_byte_identical() {
     let (_dir, auth) = codex_auth_fixture();
 
     let state = state_for(&base_url, &auth);
-    prime_native_session(&state).await;
     let response = app(state)
         .oneshot(codex_request("/openai/v1/responses", CODEX_BODY))
         .await
@@ -577,14 +556,65 @@ async fn the_model_list_offers_what_the_subscription_can_serve() {
     assert_eq!(value["object"], "list", "OpenAI clients key off this");
 }
 
+/// What a restart looks like to a Codex session: the first request this daemon
+/// sees replays encrypted reasoning, and no origin is recorded for it. With one
+/// ChatGPT login there is no other account that could have minted it, so the
+/// replay goes to that login byte-identical, as it did before origins were
+/// recorded (`docs/PROTOCOL.md` §6).
 #[tokio::test]
-async fn encrypted_reasoning_with_no_observed_native_origin_never_reaches_a_subscription() {
+async fn after_a_restart_the_only_logins_encrypted_replay_still_reaches_it() {
     let (base_url, received) = spawn_mock().await;
     let (_dir, auth) = codex_auth_fixture();
     let response = app(state_for(&base_url, &auth))
         .oneshot(codex_request("/openai/v1/responses", CODEX_BODY))
         .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+    let got = received.lock().expect("lock").clone().expect("mock saw it");
+    assert_eq!(got.body, CODEX_BODY);
+}
+
+/// With cross-account fallback on and two ChatGPT logins, an unrecorded origin
+/// could be either account. Neither is dialled: guessing would hand one
+/// account's reasoning to the other.
+#[tokio::test]
+async fn encrypted_reasoning_whose_origin_could_be_either_login_reaches_neither() {
+    let (own_url, own_received) = spawn_mock().await;
+    let (work_url, work_received) = spawn_mock().await;
+    let (_own_dir, own_auth) = codex_auth_fixture_for("own-account-0000");
+    let (work_home, _work_auth) = codex_auth_fixture_for("work-account-1111");
+    let own = ResponsesBackend::codex_subscription_at(Some(own_auth), Some(own_url), 30)
+        .expect("client builds");
+    let work = ResponsesBackend::codex_subscription_for(
+        BackendId::from("codex-work"),
+        "ChatGPT subscription (work)".to_string(),
+        Some(work_home.path().to_path_buf()),
+        Some(work_url),
+        30,
+    )
+    .expect("client builds");
+    let mut registry = BackendRegistry::new();
+    registry.push(Arc::new(own));
+    registry.push(Arc::new(work));
+    let mut consent = ConsentLedger::default();
+    consent.grant("codex-sub", chrono::Utc::now());
+    let work_home_dir = work_home.path().display().to_string();
+    consent.grant_for("codex-work", Some(&work_home_dir), chrono::Utc::now());
+    let mut config = Config::default();
+    config.subscriptions.cross_account_fallback = true;
+    let state = AppState::new(registry, config, consent, "test-token".to_string());
+    state
+        .policy
+        .lock()
+        .expect("policy lock")
+        .set_cross_account_fallback(true);
+
+    let response = app(state)
+        .oneshot(codex_request("/openai/v1/responses", CODEX_BODY))
+        .await
         .expect("served refusal");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(received.lock().expect("lock").is_none());
+    assert!(own_received.lock().expect("lock").is_none());
+    assert!(work_received.lock().expect("lock").is_none());
 }

@@ -306,9 +306,25 @@ struct Turn<'a> {
 struct Accounts<'a> {
     /// `[subscriptions] cross_account_fallback`.
     cross_account_fallback: bool,
-    /// The native Responses backend and observed scope that served this
-    /// session. A missing record makes every native encrypted replay ineligible.
-    reasoning_account: Option<&'a ReasoningAccount>,
+    /// Which account minted the encrypted reasoning this request replays:
+    /// recorded, inferred because only one account could have, or not known.
+    origin: &'a Origin,
+}
+
+/// Where a replay's encrypted reasoning came from, as far as this daemon can
+/// tell. Only consulted when the request replays some.
+#[derive(Debug, Clone)]
+enum Origin {
+    /// Recorded when a native Responses turn minted it, or, with no record,
+    /// the one account among the candidates that could have.
+    Known(ReasoningAccount),
+    /// None of the candidates could have minted it. Native replay is refused
+    /// and another family may serve at a turn boundary, as when a recorded
+    /// origin is missing from the candidates.
+    Absent,
+    /// No record, and more than one account could have minted it. Every route
+    /// is refused ([`RequestRequirements::reasoning_origin_ambiguous`]).
+    Ambiguous,
 }
 
 /// Which Responses credential scope last served a client session a native Responses
@@ -420,7 +436,8 @@ pub const AFFINITY_TTL: Duration = Duration::hours(24);
 pub const MAX_AFFINITIES: usize = 512;
 
 /// Replay origins outlive the route cache. Losing one refuses an encrypted
-/// native replay rather than guessing which account minted it.
+/// native replay unless only one account could have minted it
+/// ([`Policy::origin_of`]).
 pub const MAX_REASONING_ACCOUNTS: usize = 4096;
 
 /// Routing policy over a set of candidate backends.
@@ -429,7 +446,8 @@ pub struct Policy {
     affinities: HashMap<ConversationKey, Affinity>,
     /// The account lock's memory. Bounded by [`AFFINITY_TTL`] and
     /// [`MAX_REASONING_ACCOUNTS`], independently of route affinities. Restart,
-    /// expiry or eviction leaves an unknown origin; native replay is refused.
+    /// expiry or eviction leaves no record; [`Self::origin_of`] then infers
+    /// the origin only when a single account could have minted it.
     reasoning_accounts: HashMap<ReasoningKey, ReasoningAccount>,
     /// User-forced backend/model (`ironwire pin`). Overrides everything except
     /// eligibility — we will not serve a pin that would corrupt the request.
@@ -559,6 +577,73 @@ impl Policy {
             );
         } else if let Some(record) = self.reasoning_accounts.get_mut(&key) {
             record.last_seen = now;
+        }
+    }
+
+    /// Which account minted the encrypted reasoning this request replays.
+    ///
+    /// A record wins whenever there is one, matching the candidate or not: a
+    /// relogged or rotated credential is evidence, not a gap to fill in.
+    ///
+    /// Without one — after a restart, 24 hours idle, or eviction past
+    /// [`MAX_REASONING_ACCOUNTS`] — the account is inferred only when a single
+    /// one could have minted it, which is what `main` assumed before origins
+    /// were recorded and what keeps a single-login user's session alive across
+    /// a restart. The accounts that could have are the Responses-wire
+    /// candidates allowed to serve this client, health and quota aside (a spent
+    /// account still minted what it minted): with cross-account fallback off,
+    /// that is the client's own login. A login outranks a metered key or
+    /// credits: a session starts on its own login and reaches a key only by
+    /// descending, so counting every daemon's NEAR AI and OpenAI key would
+    /// make the inference never fire. Those are inferred only when the client
+    /// has no login here at all. The descent this leaves unrecorded — a
+    /// session that moved to a key before the restart — is replayed to the
+    /// login, which the provider rejects; it is never moved to another account.
+    fn origin_of(
+        &self,
+        key: &ConversationKey,
+        peek: &RequestPeek,
+        candidates: &[Candidate],
+        now: DateTime<Utc>,
+    ) -> Origin {
+        if let Some(recorded) = self.reasoning_accounts.get(&ReasoningKey::of(key, peek)) {
+            return Origin::Known(recorded.clone());
+        }
+        if !peek.requirements.encrypted_reasoning {
+            return Origin::Absent;
+        }
+        // A client bound to a login that is not registered was served by that
+        // login; nothing here can stand in for it.
+        if let Some(login) = &peek.client_login
+            && !candidates.iter().any(|c| c.id == *login)
+        {
+            return Origin::Absent;
+        }
+        let could_have: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|c| {
+                c.caps.wires.speaks(Protocol::OpenAiResponses)
+                    && serves_this_client(c, peek, self.cross_account_fallback).is_ok()
+            })
+            .collect();
+        let logins: Vec<&Candidate> = could_have
+            .iter()
+            .copied()
+            .filter(|c| c.required_client_identity.is_some())
+            .collect();
+        let pool = if logins.is_empty() {
+            could_have
+        } else {
+            logins
+        };
+        match pool.as_slice() {
+            [] => Origin::Absent,
+            [only] => Origin::Known(ReasoningAccount {
+                backend: only.id.clone(),
+                account_scope: only.account_scope.clone(),
+                last_seen: now,
+            }),
+            _ => Origin::Ambiguous,
         }
     }
 
@@ -727,8 +812,8 @@ impl Policy {
             // override preference, never turn a refusal into a malformed
             // request.
             let cross = !candidate.caps.wires.speaks(inbound);
-            let origin = self.reasoning_accounts.get(&ReasoningKey::of(&key, peek));
-            let requirements = requirements_for(candidate, peek, origin);
+            let origin = self.origin_of(&key, peek, candidates, now);
+            let requirements = requirements_for(candidate, peek, &origin);
             eligible(
                 &requirements,
                 &candidate.caps,
@@ -786,10 +871,7 @@ impl Policy {
         // Binds whether or not that account is among the candidates. One
         // missing from them is not known to be up or down, and not knowing is
         // no licence to send its reasoning to an account that will refuse it.
-        let reasoning_account = self
-            .reasoning_accounts
-            .get(&ReasoningKey::of(&key, peek))
-            .cloned();
+        let origin = self.origin_of(&key, peek, candidates, now);
         let turn = Turn {
             inbound,
             peek,
@@ -798,7 +880,7 @@ impl Policy {
             now,
             accounts: Accounts {
                 cross_account_fallback: self.cross_account_fallback,
-                reasoning_account: reasoning_account.as_ref(),
+                origin: &origin,
             },
         };
 
@@ -1480,7 +1562,7 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
     // the target genuinely cannot express still refuses the route, but that is
     // decided by the emitter, on the body, in `pipeline::translate_request`.
     let cross = !candidate.caps.wires.speaks(inbound);
-    let requirements = requirements_for(candidate, peek, accounts.reasoning_account);
+    let requirements = requirements_for(candidate, peek, accounts.origin);
     eligible(
         &requirements,
         &candidate.caps,
@@ -1582,15 +1664,21 @@ fn is_own_login(candidate: &Candidate, peek: &RequestPeek) -> bool {
     }
 }
 
-/// Native encrypted reasoning requires a recorded and currently observed
-/// credential scope; missing history or a relogin cannot authorize a guess.
+/// Native encrypted reasoning requires a known origin with a currently
+/// observed, matching credential scope; a relogin cannot authorize a guess,
+/// and an origin that could be either of two accounts refuses every route.
 fn requirements_for(
     candidate: &Candidate,
     peek: &RequestPeek,
-    origin: Option<&ReasoningAccount>,
+    origin: &Origin,
 ) -> RequestRequirements {
     let mut requirements = peek.requirements.clone();
-    requirements.reasoning_backend = origin
+    requirements.reasoning_origin_ambiguous = matches!(origin, Origin::Ambiguous);
+    let known = match origin {
+        Origin::Known(account) => Some(account),
+        Origin::Absent | Origin::Ambiguous => None,
+    };
+    requirements.reasoning_backend = known
         .filter(|origin| {
             origin.backend == candidate.id
                 && origin.account_scope.is_some()
@@ -2540,8 +2628,14 @@ mod tests {
                 t(0),
             )
             .expect("first turn");
+            // With a second login and fallback on, the expired origin could have
+            // been either account; with one login it could only be that one
+            // (`after_a_restart_a_single_logins_replay_is_served_by_that_login`).
+            let sibling = codex_login("codex-work", false);
             policy.set_pin(Some(own.id.clone()), None);
-            assert!(codex_route(&mut policy, &codex(None, true), &[own], t(86401)).is_err());
+            assert!(
+                codex_route(&mut policy, &codex(None, true), &[own, sibling], t(86401)).is_err()
+            );
             assert!(policy.reasoning_accounts.is_empty());
         }
 
@@ -2566,7 +2660,8 @@ mod tests {
             }
             assert_eq!(policy.reasoning_accounts.len(), MAX_REASONING_ACCOUNTS);
             original.requirements.encrypted_reasoning = true;
-            assert!(codex_route(&mut policy, &original, &[own], t(5000)).is_err());
+            let sibling = codex_login("codex-work", false);
+            assert!(codex_route(&mut policy, &original, &[own, sibling], t(5000)).is_err());
         }
 
         #[test]
@@ -3434,6 +3529,145 @@ mod tests {
                 assert_eq!(
                     *refusal,
                     Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)
+                );
+            }
+        }
+
+        /// NEAR AI with a key, which Codex reaches only by translation here.
+        fn nearai_chat() -> Candidate {
+            candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat)
+        }
+
+        /// A restart, 24 hours idle or eviction leaves no recorded origin, and
+        /// Codex replays encrypted reasoning on every turn after its first. With
+        /// one login there is no other account that could have minted it, so
+        /// the turn goes where it went before the restart, untranslated.
+        #[test]
+        fn after_a_restart_a_single_logins_replay_is_served_by_that_login() {
+            for fallback in [false, true] {
+                let mut policy = Policy::new();
+                policy.set_cross_account_fallback(fallback);
+                let decision = codex_route(
+                    &mut policy,
+                    &codex(None, true),
+                    &[codex_login("codex-sub", true), nearai_chat()],
+                    t(0),
+                )
+                .unwrap_or_else(|e| panic!("fallback {fallback}: {e}"));
+                assert_eq!(
+                    decision.backend.as_str(),
+                    "codex-sub",
+                    "fallback {fallback}"
+                );
+                assert!(!decision.translated, "fallback {fallback}");
+                assert_eq!(decision.rung, Rung::Preferred, "fallback {fallback}");
+            }
+        }
+
+        /// The inferred origin binds like a recorded one: when it is spent the
+        /// conversation may cross families at a turn boundary, which drops the
+        /// reasoning, and it is never moved to a metered key.
+        #[test]
+        fn after_a_restart_a_spent_single_login_crosses_families_but_not_to_a_key() {
+            let mut policy = Policy::new();
+            let decision = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[
+                    exhausted(codex_login("codex-sub", true), t(600)),
+                    openai_key(),
+                    anthropic_key(),
+                ],
+                t(0),
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::CrossFamily);
+        }
+
+        /// Cross-account fallback off: a client is only ever served by its own
+        /// login, so its own login is the only one that could have minted its
+        /// reasoning — for each client, with a second login beside it.
+        #[test]
+        fn after_a_restart_with_fallback_off_each_login_replays_on_its_own() {
+            let both = [
+                codex_login("codex-sub", true),
+                codex_login("codex-work", false),
+                openai_key(),
+            ];
+            let mut policy = Policy::new();
+            let plain = codex_route(&mut policy, &codex(None, true), &both, t(0))
+                .expect("the default login's own replay");
+            assert_eq!(plain.backend.as_str(), "codex-sub");
+            let mut work = codex(Some("codex-work"), true);
+            work.client_session = Some("work-session".into());
+            let bound =
+                codex_route(&mut policy, &work, &both, t(1)).expect("the bound login's own replay");
+            assert_eq!(bound.backend.as_str(), "codex-work");
+        }
+
+        /// A client bound to a login that is no longer registered was served
+        /// by that login. A metered key that happens to be the only other
+        /// Responses credential does not inherit its reasoning.
+        #[test]
+        fn after_a_restart_a_replay_from_an_unregistered_login_is_not_given_to_a_key() {
+            let decision = codex_route(
+                &mut Policy::new(),
+                &codex(Some("codex-gone"), true),
+                &[
+                    codex_login("codex-sub", true),
+                    openai_key(),
+                    anthropic_key(),
+                ],
+                t(0),
+            )
+            .expect("another family may serve at a turn boundary");
+            assert_eq!(decision.backend.as_str(), "anthropic-key");
+            assert_eq!(decision.rung, Rung::CrossFamily);
+        }
+
+        /// A pin is not the reason the replay is served; the inferred origin
+        /// is. Pinned to the only login, a replay after a restart is served.
+        #[test]
+        fn after_a_restart_a_pin_to_the_only_login_serves_its_replay() {
+            let mut policy = Policy::new();
+            policy.set_pin(Some(BackendId::from("codex-sub")), None);
+            let decision = codex_route(
+                &mut policy,
+                &codex(None, true),
+                &[codex_login("codex-sub", true)],
+                t(0),
+            )
+            .expect("routes");
+            assert_eq!(decision.backend.as_str(), "codex-sub");
+        }
+
+        /// With fallback on and two logins, either could have minted an
+        /// unrecorded replay. Every route is refused, and the one that would
+        /// look like it works — another family, at a turn boundary — most of
+        /// all: it would silently spend credits on a different model for a
+        /// conversation whose own account may be right there.
+        #[test]
+        fn an_unknown_origin_between_two_logins_is_refused_and_never_moved_to_another_family() {
+            let error = codex_route(
+                &mut with_fallback(),
+                &codex(None, true),
+                &[
+                    codex_login("codex-sub", true),
+                    codex_login("codex-work", false),
+                    nearai_chat(),
+                    anthropic_key(),
+                ],
+                t(0),
+            )
+            .expect_err("no account is known to have minted this ciphertext");
+            let refusals = refusals_by_id(error);
+            assert_eq!(refusals.len(), 4);
+            for (id, refusal) in refusals {
+                assert_eq!(
+                    refusal,
+                    Refusal::Ineligible(Ineligible::ReasoningBoundToAccount),
+                    "{id}"
                 );
             }
         }
