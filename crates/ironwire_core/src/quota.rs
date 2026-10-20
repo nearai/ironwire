@@ -72,9 +72,20 @@ impl Headroom {
     ///
     /// Deliberately conservative: descending costs a cache, so we only do it
     /// when the provider says we are genuinely near the wall.
+    ///
+    /// A reading stops counting at the reset time the provider gave with it.
+    /// Nothing refreshes a reading once traffic has left the backend it
+    /// describes, so a login that read 95% before its window rolled over
+    /// otherwise stays "pressured" indefinitely, and sorts behind a metered key
+    /// long after it reset. Past its reset the reading says nothing about
+    /// pressure, which is what `Unknown` already means.
     #[must_use]
     pub fn is_pressured(&self, now: DateTime<Utc>) -> bool {
         match self {
+            Self::Observed {
+                resets_at: Some(resets_at),
+                ..
+            } if *resets_at <= now => false,
             Self::Observed { used_pct, .. } => *used_pct >= 90.0,
             Self::Exhausted { until } => now < *until,
             Self::CapReached { resets_at, .. } => now < *resets_at,
@@ -158,6 +169,27 @@ mod tests {
         };
         assert!(!mild.is_pressured(t(0)));
         assert!(tight.is_pressured(t(0)));
+    }
+
+    /// Once traffic leaves a login at 95%, nothing refreshes its reading. If
+    /// that reading kept counting past the reset the provider announced with
+    /// it, the login would sort behind a metered key for good.
+    #[test]
+    fn an_observed_reading_past_its_own_reset_time_is_no_longer_pressure() {
+        let tight = Headroom::Observed {
+            used_pct: 95.0,
+            resets_at: Some(t(3600)),
+            observed_at: t(0),
+        };
+        assert!(tight.is_pressured(t(3599)), "still inside the window");
+        assert!(!tight.is_pressured(t(3600)), "the window reset");
+        assert!(!tight.is_pressured(t(7200)));
+        // Availability was never in question: an observation alone does not
+        // make a backend unavailable, before or after the reset.
+        assert!(tight.is_available(t(0)));
+        assert!(tight.is_available(t(7200)));
+        // And the reading is still there to show, with its age.
+        assert_eq!(tight.age(t(7200)), Some(Duration::seconds(7200)));
     }
 
     #[test]

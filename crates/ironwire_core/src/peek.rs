@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 use crate::capability::{ReasoningNeed, RequestRequirements};
-use crate::protocol::{ClientIdentity, Protocol};
+use crate::protocol::{BackendId, ClientIdentity, Protocol};
 
 /// Rough bytes-per-token used to size prompts without tokenising.
 ///
@@ -152,6 +152,23 @@ pub struct RequestPeek {
     /// value fidelity over cost for one turn — a false positive spends a little
     /// more money, a false negative gets today's behaviour.
     pub likely_compaction: bool,
+    /// The subscription login this request's client is using, when the client
+    /// was pointed at a login-bound façade URL (`/anthropic/account/{id}`).
+    /// `None` at the plain façade, which belongs to the default login of each
+    /// product.
+    ///
+    /// Set by the façade from the URL, never from the body: the body is
+    /// forwarded as-is, and nothing in it is a reliable statement of which of
+    /// the user's logins sent it.
+    pub client_login: Option<BackendId>,
+    /// The client's own session id, when it sent one (`x-ironwire-session-id`,
+    /// or its native header, such as Codex's `session-id`).
+    ///
+    /// Set by the façade from the headers; `None` from [`Self::inspect`]. The
+    /// conversation key is shared by every session of one client version, so
+    /// this is what tells two concurrent sessions apart where it matters:
+    /// which ChatGPT account minted each one's encrypted reasoning.
+    pub client_session: Option<String>,
 }
 
 impl RequestPeek {
@@ -188,6 +205,7 @@ impl RequestPeek {
 
         let mut requirements = RequestRequirements {
             admission_backend: None,
+            reasoning_backend: None,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)
@@ -208,6 +226,7 @@ impl RequestPeek {
             structured_output: false,
             min_context_tokens: estimate_tokens(raw_len),
             mid_tool_loop: anthropic_mid_tool_loop(messages),
+            encrypted_reasoning: false,
         };
 
         // A signed thinking block anywhere in the replayed history means a family
@@ -280,6 +299,8 @@ impl RequestPeek {
                 markers,
             ),
             requirements,
+            client_login: None,
+            client_session: None,
         }
     }
 
@@ -292,6 +313,7 @@ impl RequestPeek {
 
         let mut requirements = RequestRequirements {
             admission_backend: None,
+            reasoning_backend: None,
             tools: body
                 .get("tools")
                 .and_then(Value::as_array)
@@ -316,6 +338,7 @@ impl RequestPeek {
                 || body.pointer("/text/format/type").and_then(Value::as_str) == Some("json_schema"),
             min_context_tokens: estimate_tokens(raw_len),
             mid_tool_loop: openai_mid_tool_loop(items),
+            encrypted_reasoning: false,
         };
 
         if let Some(items) = items {
@@ -344,6 +367,17 @@ impl RequestPeek {
                     && item.get("encrypted_content").is_some()
                 {
                     requirements.reasoning = ReasoningNeed::LoadBearing;
+                    // Stricter than the line above: only actual content is
+                    // bound to an account. A `null` placeholder carries
+                    // nothing a provider could reject, and treating it as
+                    // bound would pin a conversation for no reason.
+                    if item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| !content.is_empty())
+                    {
+                        requirements.encrypted_reasoning = true;
+                    }
                 }
                 if json_contains_type(item, "input_image") || json_contains_type(item, "image_url")
                 {
@@ -372,6 +406,8 @@ impl RequestPeek {
                 markers,
             ),
             requirements,
+            client_login: None,
+            client_session: None,
         }
     }
 }
@@ -792,6 +828,46 @@ mod tests {
         let raw = body.to_string();
         let p = RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len());
         assert_eq!(p.requirements.reasoning, ReasoningNeed::LoadBearing);
+        assert!(
+            p.requirements.encrypted_reasoning,
+            "encrypted reasoning binds the conversation to the account that minted it"
+        );
+    }
+
+    /// The account lock keys on this flag, so it must be precise: a Codex first
+    /// turn — no reasoning replayed yet — is free to start on any account, and
+    /// a `null` placeholder carries nothing a provider could reject.
+    #[test]
+    fn only_replayed_encrypted_content_binds_a_conversation_to_an_account() {
+        for body in [
+            json!({"model": "gpt-5.6", "reasoning": {"effort": "high"},
+                   "include": ["reasoning.encrypted_content"],
+                   "input": [{"type": "message", "role": "user", "content": "hi"}]}),
+            json!({"model": "gpt-5.6",
+                   "input": [{"type": "reasoning", "summary": [], "encrypted_content": null}]}),
+            json!({"model": "gpt-5.6",
+                   "input": [{"type": "reasoning", "summary": [], "encrypted_content": ""}]}),
+        ] {
+            let raw = body.to_string();
+            let p = RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len());
+            assert!(!p.requirements.encrypted_reasoning, "{body}");
+        }
+    }
+
+    /// The peek reads the body; which login sent it is the façade's to say,
+    /// from the URL.
+    #[test]
+    fn the_peek_never_claims_a_login() {
+        let body = json!({"model": "gpt-5.6", "instructions": "You are Codex", "input": []});
+        let raw = body.to_string();
+        assert_eq!(
+            RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len()).client_login,
+            None
+        );
+        assert_eq!(
+            peek_anthropic(json!({"model": "m", "messages": []})).client_login,
+            None
+        );
     }
 
     #[test]

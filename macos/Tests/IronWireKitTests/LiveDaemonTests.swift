@@ -243,7 +243,7 @@ final class LiveDaemonTests: XCTestCase {
         XCTAssertTrue(prompt.isComplete, "the prompt has to be presentable before it is answered")
 
         guard case .success = await client.setConsent(
-            backend: service.id, granted: true, promptVersion: prompt.version)
+            backend: service.id, granted: true, promptVersion: prompt.version, binding: prompt.binding)
         else { return XCTFail("the daemon refused consent at its own current version") }
 
         let after = try XCTUnwrap(client.settings?.services.first { $0.id == service.id })

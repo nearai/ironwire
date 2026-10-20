@@ -259,3 +259,42 @@ async fn the_last_backend_standing_is_tried_even_with_its_circuit_open() {
     assert_eq!(value["type"], "error");
     assert!(value["error"]["type"].is_string());
 }
+
+/// An open circuit does not make a backend the user named one that does not
+/// exist. Dropped from the candidates, a pinned backend with an open circuit
+/// was answered "not a connected backend" about one `status` still lists. It
+/// is tried, as the last backend standing is, and the provider's own error is
+/// what comes back.
+#[tokio::test]
+async fn a_pinned_backend_with_its_circuit_open_is_tried_rather_than_called_unknown() {
+    let (dead, dials) = spawn_dead_upstream().await;
+    let healthy = spawn_healthy_upstream().await;
+    let state = state_for(&dead, &healthy, 1);
+
+    let opened = send(&state).await;
+    assert_eq!(served_by(&opened).as_deref(), Some("nearai"));
+    let before = *dials.lock().expect("lock");
+
+    let pinned = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/anthropic/v1/messages")
+                .header("content-type", "application/json")
+                .header("x-ironwire-route", "anthropic-key")
+                .body(Body::from(BODY))
+                .expect("request builds"),
+        )
+        .await
+        .expect("served");
+    assert_ne!(pinned.status(), StatusCode::OK);
+    assert!(
+        *dials.lock().expect("lock") > before,
+        "the backend the request named was not tried"
+    );
+    let body = axum::body::to_bytes(pinned.into_body(), 64 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&body);
+    assert!(!text.contains("not a connected backend"), "{text}");
+}

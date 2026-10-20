@@ -162,7 +162,7 @@ naive search would actually make.
 here" as clearly as a view can, and `.window` gives `onAppear`/`onDisappear`,
 which is how the poll rate switches between 5s closed and 1s open.
 `/_ironwire/status` does a credential check per backend — a Keychain read for
-the Claude one — so a one-second background poll would not be free.
+each Claude login — so a one-second background poll would not be free.
 
 **Notifications are off until asked for**, and authorisation is requested at the
 moment they are switched on rather than at first launch. Only the events the

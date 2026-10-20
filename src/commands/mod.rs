@@ -9,6 +9,7 @@ pub(crate) mod control_client;
 pub(crate) mod doctor;
 pub(crate) mod init;
 pub(crate) mod log;
+pub(crate) mod logins;
 pub(crate) mod pin;
 pub(crate) mod privacy;
 pub(crate) mod serve;

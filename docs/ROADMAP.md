@@ -271,6 +271,119 @@ which are routing problems.
 
 ---
 
+## More than one subscription per provider  ✅ built
+
+A work and a personal Claude login, or two `CODEX_HOME`s, each a backend of its
+own (`docs/DESIGN.md` §5–§6, `docs/TRUST.md` §2).
+
+- [x] `config_dir` on a `[[backends]]` entry. The Keychain item is derived the
+      way Claude Code derives it and pinned by its worked examples; a Codex
+      login is `<home>/auth.json`. Logins are declared, never scanned for
+- [x] A config that would build a second copy of the default login, read one
+      login twice, or put a discovered id under another kind fails at load,
+      naming the entry. Before this, a second `claude-subscription` entry
+      silently became the default login again, under the default's id
+- [x] Login-bound façade URLs, so a client says which login it is; the account
+      segment is never forwarded (`PROTOCOL.md` §1)
+- [x] A client is served by its own login. `[subscriptions]
+      cross_account_fallback` is the opt-in, off by default, and even with it a
+      Codex conversation carrying encrypted reasoning never changes ChatGPT
+      account (`PROTOCOL.md` §6). The lock reads a record of its own, kept per
+      Codex session: it used to read the affinity, which the pipeline forgets on
+      every failure, so a sibling's first 429 handed its reasoning to the
+      client's own login, and two sessions sharing a conversation key shared
+      one lock
+- [x] The plain façade belongs to the default login in its default place; a
+      default moved with `config_dir` is reached at its bound URL, and an
+      additional entry naming the default directory fails at load. Before
+      this, moving the default handed the plain URL — and whichever Claude
+      Code still used it — to the moved login's account
+- [x] `chatgpt-account-id` is always the presented token's own; a client's copy
+      is dropped (`PROTOCOL.md` §2.2)
+- [x] Consent per login and per directory, still at prompt v2 (`TRUST.md` §2
+      says why). Before the directory was recorded, moving `claude-sub`
+      carried a yes given for one account over to another
+- [x] A pin or `X-IronWire-Route` cannot reach a subscription nobody consented
+      to, nor — with the opt-in off — another login
+- [x] Every request served by a login other than the client's own is recorded
+      at rung 2; a pin, which the user chose, is the one exception
+- [x] An idle login's stale token is refused before it is sent, with the one
+      command that fixes it
+- [x] Three routing bugs that a second login would have made visible
+      everywhere: a backend that could never have served a request counted as
+      "passed over", so routes read rung 2 for good; the unrecognised-model
+      path reported a fallback as rung 0, where promotion never looks; and a
+      quota reading outlived the reset time the provider sent with it, so a
+      login that had reset still sorted behind a metered key
+- [x] A backend whose circuit is open is skipped as unhealthy rather than
+      dropped from the candidates. Dropped, a fall past an open subscription
+      read as rung 0 and was never promoted back; a client whose own login's
+      circuit was open was told it was on the wrong URL; and a pin onto it was
+      refused as naming no backend at all
+- [x] Session-aware affinity. A request with a valid client session header
+      keys its route by protocol, session and client login rather than changing
+      instructions or tools. Separate Codex sessions no longer inherit one
+      another's descent; requests without a session header retain the content
+      fallback, which cannot distinguish identical concurrent conversations
+- [x] Native Responses encrypted replay is gated on its recorded origin for
+      subscriptions and metered keys, including pins. A subscription uses its
+      provider-observed account id; an API key uses the exact credential's
+      fingerprint, not an inferred organization. The selected identity is
+      checked again against the credential actually sent. Unknown, lost or
+      expired origin state refuses native replay rather than assuming the
+      client's default account; crossing families still needs a turn boundary
+- [x] Consent grants echo the prompt's backend, version, product and actual
+      credential-source binding. A prompt fetched before relocation or restart
+      cannot authorize the new directory. The Swift client echoes the daemon's
+      binding; missing bindings refuse grants, while withdrawal stays available
+- [x] Claude directory aliases that share a settings file but name different
+      Keychain items are refused at connect. Credential reads never try a
+      trimmed alias, and a disabled relocated default is not wired by `init`
+- [x] Backend ids have indexed lookup. Status checks and probes each use a
+      shared eight-slot concurrency bound and preserve config order; startup
+      discovery is bounded too. Blocking credential reads leave the async
+      runtime available. A Keychain subprocess has a five-second deadline,
+      bounded output, and is killed and reaped on timeout
+- [x] Synthetic 1,000-backend tests cover bound routing, concurrent status and
+      probe limits, control order and passing exhausted candidates before
+      spending the upstream retry budget. This measures local mechanics, not
+      real Keychain or provider performance
+- [x] Real credential-file fixture stress: 512 Claude directories and 512 Codex
+      homes, 1,536 loopback mock turns, unique bearer/account markers and status
+      order checks. The debug run completed in 27.52 seconds at about 60 MiB
+      maximum resident memory; these are local fixture measurements, not
+      provider throughput or macOS Keychain performance
+- [x] The macOS menu uses lazy stacks and indexes services by backend id per
+      settings snapshot. All 1,024 backend rows and consent identities remain
+      available. Synthetic decode took 0.106 seconds; the offscreen menu test
+      dropped from 10.986 to 0.108 seconds after virtualization. These are local
+      test measurements, with live scrolling and provider-backed polling still
+      needing separate acceptance
+- [x] Default routing checks only the client's own subscription and applicable
+      non-subscription backends. With cross-account fallback on, it checks all
+      declared subscriptions matching that client product; control status still
+      checks every backend
+- [ ] Live verification with two real accounts per provider, including signed
+      Claude thinking across accounts and the provider's encrypted-reasoning
+      rejection. The local refusal gates do not establish provider behavior
+- [ ] Real-scale latency and contention measurements with many authenticated
+      logins, a locked Keychain and provider stalls. With cross-account fallback
+      on, routing still checks every matching subscription and waits for bounded
+      batches; full control status also scales with the registry. Fixture and
+      synthetic suites do not prove that a thousand real accounts route
+      interactively
+- [ ] Session-state sizing beyond the current 512 affinities and 4,096 replay
+      origins (24-hour idle retention). Evicting affinity costs cache warmth;
+      losing a replay origin refuses native encrypted continuation. Persistent
+      origins or larger bounds need a separate retention and privacy decision
+- [ ] Full-session recovery after a daemon restart without guessing encrypted
+      reasoning origin. Current native replay fails closed; resuming it would
+      need authenticated origin evidence or a separately justified persistence
+      design. This can be engineered locally, but acceptance needs a live Codex
+      session that resumes after restart
+
+---
+
 ## M5 — macOS menu bar app
 
 Thin SwiftUI client over `/_ironwire/status` and `/_ironwire/events`. Shows the
@@ -469,6 +582,7 @@ listing them here keeps them from looking finished when they are not.
 | ~~Verify the ChatGPT lane end to end~~ ✅ done — `scripts/acceptance.sh` completes a real task on a live ChatGPT Pro account. It found that Codex 0.145 sends no `instructions` field, that the endpoint URL was built wrongly for the real host, and that `/models` is a different document from the public API's | M2 |
 | ~~Verify the Claude lane end to end~~ ✅ done — same script, a live Claude Max account. It found the identity marker rotted, the model substituted from a stale catalogue, and the rate-limit headers read under names Anthropic does not send | M1 |
 | The Codex desktop app | the app itself, to capture its `originator` and `instructions`; the CLI is verified and the app shares its config and credentials but not its HTTP stack | M2 |
+| Two real accounts per provider | two Claude logins and two ChatGPT logins on one Mac. It would check: the Keychain item a second `CLAUDE_CONFIG_DIR` really writes (the derivation is read off Claude Code's binary and pinned by unit tests, but no machine we have tested on has had a second login); whether Anthropic accepts signed thinking minted on one account and replayed on another, which is undocumented and matters only with `cross_account_fallback` on; and the `invalid_encrypted_content` 400 the Codex account lock rests on, which is a user's report we have not reproduced — including whether two personal ChatGPT accounts count as different organizations for it, and what `codex-sub` → `openai-key` does | M2 |
 | Measure Claude Code's real stall timeout | a live session; `keepalive_secs` is currently a guess | M1 |
 | An 8-hour session including a real rate-limit descent | time, and a subscription to exhaust. Still the largest untested path: no provider has rate-limited us, so descent under real exhaustion, the cross-family lane and the climb back up are mock-only | M1 |
 | Signed releases | a real signing key, held somewhere that is not a repo | M4 |
@@ -479,6 +593,7 @@ listing them here keeps them from looking finished when they are not.
 | Menu bar app signing | an Apple Developer certificate. The app is built and ad-hoc signed, which is enough for `brew` and for a local build; a *downloaded* bundle is blocked by Gatekeeper until it is notarised | M5 |
 | Tier-3 PII classifier | a local model, and a labelled corpus to state its precision and recall against | M7 |
 
-The code paths for these exist and are tested against mocks and fixtures. What
-is missing is the last mile that only a real credential, a real key, or real
-hosting can provide.
+Completed provider and release paths have mock or fixture coverage; unchecked
+milestone work still needs implementation. Credentials, signing keys, hosting,
+and live-session time are separate acceptance prerequisites. Local engineering
+can finish the remaining code and tests, but cannot supply that external proof.

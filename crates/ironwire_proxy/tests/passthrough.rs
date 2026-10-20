@@ -257,6 +257,58 @@ async fn only_the_enumerated_headers_are_mutated() {
 }
 
 #[tokio::test]
+async fn an_account_header_the_client_sends_never_reaches_any_provider() {
+    // §2 item 2: `chatgpt-account-id` and `x-openai-fedramp` name the account a
+    // bearer belongs to, so they are stripped with the client's credential on
+    // every lane — not only on the one backend that sets its own. Forwarding a
+    // client's copy to any other provider would be handing it an identifier
+    // for an account it holds no credential for.
+    let (anthropic_url, anthropic_received) = spawn_mock().await;
+    let (chat_url, chat_received) = spawn_mock_response(ADMISSION_SSE).await;
+    let lanes = [
+        (
+            state_for(&anthropic_url),
+            "/anthropic/v1/messages",
+            CLIENT_BODY,
+            anthropic_received,
+        ),
+        (
+            admission_state(&chat_url),
+            "/openai/v1/chat/completions",
+            ADMISSION_REQUEST,
+            chat_received,
+        ),
+    ];
+
+    for (state, uri, body, received) in lanes {
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("chatgpt-account-id", "CLIENT-ACCOUNT-MUST-NOT-LEAK")
+                    .header("x-openai-fedramp", "true")
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+
+        let got = received.lock().expect("lock").clone().expect("mock saw it");
+        for name in ["chatgpt-account-id", "x-openai-fedramp"] {
+            assert!(
+                !got.headers.iter().any(|(k, _)| k == name),
+                "{name} reached the provider behind {uri}"
+            );
+        }
+        assert_eq!(got.body, body, "{uri}: only headers changed");
+    }
+}
+
+#[tokio::test]
 async fn the_response_stream_reaches_the_client_byte_identical() {
     let (base_url, _received) = spawn_mock().await;
     let response = app(state_for(&base_url))

@@ -26,6 +26,14 @@ const HOP_BY_HOP: &[&str] = &[
 /// replaced with the credential the router actually chose.
 const AUTH: &[&str] = &["authorization", "x-api-key", "api-key"];
 
+/// Headers naming the account a bearer belongs to. Stripped with the bearer,
+/// because they are only true of the credential they came with: a client's
+/// copy beside the credential the router chose — another of the user's logins,
+/// or another provider altogether — names an account that credential is not.
+/// A backend that needs one sets it from the token it is presenting
+/// (`docs/PROTOCOL.md` §2 item 2).
+pub(crate) const ACCOUNT_BOUND: &[&str] = &["chatgpt-account-id", "x-openai-fedramp"];
+
 /// Headers we replace because they describe the connection to IronWire rather
 /// than the connection to the provider.
 const REWRITTEN: &[&str] = &["host", "content-length", "accept-encoding"];
@@ -52,6 +60,7 @@ pub fn forward_request_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     !HOP_BY_HOP.contains(&lower.as_str())
         && !AUTH.contains(&lower.as_str())
+        && !ACCOUNT_BOUND.contains(&lower.as_str())
         && !REWRITTEN.contains(&lower.as_str())
         && !ADDRESSED_TO_US.contains(&lower.as_str())
 }
@@ -171,6 +180,24 @@ mod tests {
         assert!(!forward_request_header("Authorization"));
         assert!(!forward_request_header("x-api-key"));
         assert!(!forward_request_header("X-Api-Key"));
+    }
+
+    #[test]
+    fn an_account_the_client_names_never_rides_along_either() {
+        // The bearer and the account it belongs to are one fact. Stripping the
+        // first while forwarding the second would pair the client's account
+        // with whichever credential the router chose.
+        for name in [
+            "chatgpt-account-id",
+            "ChatGPT-Account-ID",
+            "x-openai-fedramp",
+            "X-OpenAI-Fedramp",
+        ] {
+            assert!(!forward_request_header(name), "{name} leaked upstream");
+        }
+        // Codex's per-session headers are not account-bound and still pass.
+        assert!(forward_request_header("x-codex-installation-id"));
+        assert!(forward_request_header("originator"));
     }
 
     #[test]

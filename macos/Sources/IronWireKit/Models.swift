@@ -227,9 +227,13 @@ public struct BackendView: Decodable, Sendable, Equatable, Identifiable {
     public let health: HealthView
     /// Models offered.
     public let models: [String]
+    /// What to run to connect this backend, verbatim from the daemon — for a
+    /// subscription, the login it reads. Absent from a daemon that predates it.
+    public let connectCommand: String?
 
     private enum CodingKeys: String, CodingKey {
         case id, name, kind, authenticated, consented, detail, headroom, health, models
+        case connectCommand
     }
 
     public init(from decoder: Decoder) throws {
@@ -243,12 +247,13 @@ public struct BackendView: Decodable, Sendable, Equatable, Identifiable {
         headroom = try c.decodeIfPresent(HeadroomView.self, forKey: .headroom) ?? .unknown
         health = try c.decodeIfPresent(HealthView.self, forKey: .health) ?? HealthView()
         models = try c.decodeIfPresent([String].self, forKey: .models) ?? []
+        connectCommand = try c.decodeIfPresent(String.self, forKey: .connectCommand)
     }
 
     public init(
         id: String, name: String, kind: String = "subscription", authenticated: Bool = true,
         consented: Bool = true, detail: String? = nil, headroom: HeadroomView = .unknown,
-        health: HealthView = HealthView(), models: [String] = []
+        health: HealthView = HealthView(), models: [String] = [], connectCommand: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -259,6 +264,7 @@ public struct BackendView: Decodable, Sendable, Equatable, Identifiable {
         self.headroom = headroom
         self.health = health
         self.models = models
+        self.connectCommand = connectCommand
     }
 }
 
@@ -424,6 +430,9 @@ public struct SpendCapView: Decodable, Sendable, Equatable {
 
 /// One subscription's consumption of its own window.
 public struct SubscriptionUse: Decodable, Sendable, Equatable, Identifiable {
+    /// Backend id, e.g. `claude-work`. Empty from a daemon that predates
+    /// several logins of one product.
+    public let backend: String
     /// Display name, e.g. `Claude subscription`.
     public let name: String
     /// Percent of the window consumed, as the provider reported it. `nil` means
@@ -432,9 +441,26 @@ public struct SubscriptionUse: Decodable, Sendable, Equatable, Identifiable {
     /// Exchanges served in the last 24 hours, from the local ledger.
     public let exchanges: Int
 
-    public var id: String { name }
+    /// The backend id, because a display name need not be unique once one
+    /// product has two logins, and `ForEach` gives undefined results for a
+    /// repeated identity. The name only stands in for a daemon that does not
+    /// send the id, which had one login per product.
+    public var id: String { backend.isEmpty ? name : backend }
 
-    public init(name: String, usedPct: Double?, exchanges: Int) {
+    private enum CodingKeys: String, CodingKey {
+        case backend, name, usedPct, exchanges
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? backend
+        usedPct = try c.decodeIfPresent(Double.self, forKey: .usedPct)
+        exchanges = try c.decodeIfPresent(Int.self, forKey: .exchanges) ?? 0
+    }
+
+    public init(backend: String = "", name: String, usedPct: Double?, exchanges: Int) {
+        self.backend = backend
         self.name = name
         self.usedPct = usedPct
         self.exchanges = exchanges

@@ -8,6 +8,10 @@
 //! So this module edits *text*, and parses only to check the result is still
 //! valid TOML before anything is written.
 
+use std::path::{Path, PathBuf};
+
+use crate::endpoint;
+
 /// The table IronWire owns. Outside it, the only lines this module writes are
 /// the `model_provider` selection — and that one only when it is empty or
 /// already ours — and the note above it recording what was selected before.
@@ -65,8 +69,8 @@ impl Edit {
     }
 }
 
-/// Produce the `[model_providers.ironwire]` block for a port.
-fn block(port: u16) -> String {
+/// Produce the `[model_providers.ironwire]` block for a base URL.
+fn block(base_url: &str) -> String {
     // `wire_api = "responses"` matters: Codex's Responses path is the one that
     // carries reasoning state, and downgrading it to chat completions would
     // quietly lose that. `env_key` is deliberately absent — IronWire supplies
@@ -75,8 +79,9 @@ fn block(port: u16) -> String {
     format!(
         "{BLOCK_HEADER}\n\
          name = \"IronWire\"\n\
-         base_url = \"http://127.0.0.1:{port}/openai/v1\"\n\
-         wire_api = \"responses\"\n"
+         base_url = {}\n\
+         wire_api = \"responses\"\n",
+        quoted(base_url)
     )
 }
 
@@ -99,11 +104,35 @@ fn block(port: u16) -> String {
 /// not append to a file we cannot read, because the user's own syntax error
 /// would then look like ours.
 pub fn connect(existing: &str, port: u16) -> Result<Edit, toml::de::Error> {
+    connect_as(existing, port, None)
+}
+
+/// [`connect`], for the Codex that runs with a `CODEX_HOME` of its own: the
+/// block's `base_url` names `account`, the login that Codex is using, so the
+/// daemon serves it from that login's subscription.
+///
+/// `None` is the plain façade — the default login. It does not unbind a block
+/// that already names a login, for the reason
+/// [`crate::claude_settings::connect`] gives: a connect that names no login
+/// moving that Codex onto the default login's subscription would be a change
+/// nobody asked for. It keeps the login and follows the port.
+///
+/// # Errors
+///
+/// As [`connect`].
+pub fn connect_as(
+    existing: &str,
+    port: u16,
+    account: Option<&str>,
+) -> Result<Edit, toml::de::Error> {
     existing.parse::<toml::Table>()?;
+
+    let kept = account.is_none().then(|| self::account(existing)).flatten();
+    let url = endpoint::openai_url(port, account.or(kept.as_deref()));
 
     let mut changes = Vec::new();
     let mut occupied = Vec::new();
-    let mut out = replace_our_block(existing, &block(port), &mut changes);
+    let mut out = replace_our_block(existing, &block(&url), &mut changes);
 
     match top_level_model_provider(&out) {
         Some(value) if value == "ironwire" => {}
@@ -359,14 +388,47 @@ fn joined(lines: &[String]) -> String {
 }
 
 /// Where Codex keeps its config. `CODEX_HOME` wins, as it does for Codex.
+///
+/// Unlike Claude Code's, the default here does follow this process's
+/// `CODEX_HOME`, and so does the default Codex login IronWire reads
+/// (`ironwire_creds::codex::auth_path`): setups and hermetic tests plant it
+/// precisely to move the default. A `CODEX_HOME` that is a login of its own is
+/// declared with `config_dir` and wired through [`path_in`].
 #[must_use]
-pub fn path() -> Option<std::path::PathBuf> {
+pub fn path() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("CODEX_HOME")
         && !home.is_empty()
     {
-        return Some(std::path::PathBuf::from(home).join("config.toml"));
+        return Some(path_in(Path::new(&home)));
     }
-    Some(dirs::home_dir()?.join(".codex").join("config.toml"))
+    Some(path_in(&dirs::home_dir()?.join(".codex")))
+}
+
+/// The config file of the Codex that runs with `CODEX_HOME=home`.
+#[must_use]
+pub fn path_in(home: &Path) -> PathBuf {
+    home.join("config.toml")
+}
+
+/// The `base_url` of IronWire's provider block, if there is one.
+#[must_use]
+pub fn base_url(existing: &str) -> Option<String> {
+    let table = existing.parse::<toml::Table>().ok()?;
+    Some(
+        table
+            .get("model_providers")?
+            .get("ironwire")?
+            .get("base_url")?
+            .as_str()?
+            .to_string(),
+    )
+}
+
+/// The login IronWire's provider block binds Codex to, when its `base_url` is
+/// a login-bound URL of ours.
+#[must_use]
+pub fn account(existing: &str) -> Option<String> {
+    endpoint::parse_openai(&base_url(existing)?)?.account
 }
 
 /// Whether this config currently routes Codex through IronWire.
@@ -479,7 +541,7 @@ theme = \"dark\"  # trailing comment
         // disconnect owes them their provider back.
         let existing = format!(
             "{PREVIOUS_MARKER} \"openai\"\nmodel_provider = \"ironwire\"\n\n{}",
-            block(8463)
+            block(&endpoint::openai_url(8463, None))
         );
         let undone = disconnect(&existing).expect("edits");
         assert_eq!(
@@ -540,7 +602,7 @@ theme = \"dark\"  # trailing comment
         // naming a provider that no longer exists.
         let existing = format!(
             "model_provider = \"ironwire\" # selected\n\n{}",
-            block(8463)
+            block(&endpoint::openai_url(8463, None))
         );
         assert!(is_wired(&existing));
 
@@ -564,7 +626,7 @@ theme = \"dark\"  # trailing comment
         // connect-and-select hand back `openai` instead of their newer choice.
         let existing = format!(
             "{PREVIOUS_MARKER} \"openai\"\nmodel_provider = \"someone-else\"\n\n{}",
-            block(8463)
+            block(&endpoint::openai_url(8463, None))
         );
         let undone = disconnect(&existing).expect("edits");
         assert_eq!(
@@ -643,7 +705,7 @@ theme = \"dark\"  # trailing comment
     fn a_block_the_user_moved_stays_where_they_put_it() {
         let existing = format!(
             "model = \"gpt-5.6\"\n\n{}\n\n[tui]\ntheme = \"dark\"\n",
-            block(8463).trim_end()
+            block(&endpoint::openai_url(8463, None)).trim_end()
         );
         let edit = connect(&existing, 9000).expect("edits");
         let block_at = edit.contents.find(BLOCK_HEADER).expect("block present");
@@ -671,5 +733,67 @@ theme = \"dark\"  # trailing comment
         // like ours, and they will delete our block trying to fix it.
         assert!(connect("this is not = = toml\n", 8463).is_err());
         assert!(disconnect("this is not = = toml\n").is_err());
+    }
+
+    const BOUND: &str = "http://127.0.0.1:8463/openai/account/codex-work/v1";
+
+    #[test]
+    fn wiring_a_codex_home_writes_its_bound_url() {
+        let edit = connect_as("", 8463, Some("codex-work")).expect("edits");
+        let parsed = table(&edit.contents);
+        assert_eq!(parsed["model_provider"].as_str(), Some("ironwire"));
+        assert_eq!(
+            parsed["model_providers"]["ironwire"]["base_url"].as_str(),
+            Some(BOUND)
+        );
+        assert!(is_wired(&edit.contents));
+        assert_eq!(account(&edit.contents).as_deref(), Some("codex-work"));
+
+        // The plain block in that file is ours, so binding replaces it in place.
+        let plain = connect("", 8463).expect("edits").contents;
+        assert_eq!(account(&plain), None);
+        let bound = connect_as(&plain, 8463, Some("codex-work")).expect("edits");
+        assert_eq!(bound.contents.matches(BLOCK_HEADER).count(), 1);
+        assert_eq!(account(&bound.contents).as_deref(), Some("codex-work"));
+        assert_eq!(bound.changes, vec![format!("{BLOCK_HEADER}: updated")]);
+    }
+
+    /// The same rule as Claude Code's settings: a connect that names no login
+    /// must not move a Codex bound to one onto the default login.
+    #[test]
+    fn a_connect_that_names_no_login_does_not_unbind_one() {
+        let bound = connect_as("", 8463, Some("codex-work"))
+            .expect("edits")
+            .contents;
+        let again = connect(&bound, 8463).expect("edits");
+        assert!(again.is_noop(), "changed: {:?}", again.changes);
+        let moved = connect(&bound, 9000).expect("edits");
+        assert_eq!(
+            base_url(&moved.contents).as_deref(),
+            Some("http://127.0.0.1:9000/openai/account/codex-work/v1")
+        );
+    }
+
+    /// A provider of the user's own is left alone whichever login is asking.
+    #[test]
+    fn a_login_never_takes_a_provider_that_is_not_ours() {
+        let edit = connect_as(
+            "model_provider = \"my-own-proxy\"\n",
+            8463,
+            Some("codex-work"),
+        )
+        .expect("edits");
+        assert_eq!(edit.occupied_slot(MODEL_PROVIDER), Some("my-own-proxy"));
+        assert!(!is_wired(&edit.contents));
+    }
+
+    #[test]
+    fn a_bound_codex_disconnects_like_any_other() {
+        let original = "model = \"gpt-5.6\"\n";
+        let connected = connect_as(original, 8463, Some("codex-work"))
+            .expect("edits")
+            .contents;
+        let restored = disconnect(&connected).expect("edits").contents;
+        assert_eq!(table(&restored), table(original));
     }
 }

@@ -56,7 +56,7 @@ struct MenuContent: View {
             Divider()
             if let status = client.status {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    LazyVStack(alignment: .leading, spacing: 14) {
                         onboarding()
                         backendSection(status)
                         toolsSection()
@@ -186,7 +186,7 @@ struct MenuContent: View {
     /// documents are joined here rather than in the daemon because they have
     /// different refresh rates: status polls, settings is fetched on open.
     private func service(for id: String) -> ServiceView? {
-        client.settings?.services.first { $0.id == id }
+        client.servicesById[id]
     }
 
     @ViewBuilder
@@ -210,6 +210,11 @@ struct MenuContent: View {
         let service = service(for: backend.id)
         let prompt = service?.consentPrompt
         let switchable = service?.canToggle == true && prompt?.isComplete == true
+            && (service?.consented == true || prompt?.binding?.isEmpty == false)
+        // The same daemon field in both documents. The row's own copy comes with
+        // every poll, so it is there before settings has been fetched; the
+        // settings copy covers a daemon from before status carried it.
+        let connectCommand = backend.connectCommand ?? service?.connectCommand
 
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -231,7 +236,7 @@ struct MenuContent: View {
                 Text(backend.detail ?? "not connected")
                     .font(.caption)
                     .foregroundStyle(.red)
-                if let command = service?.connectCommand {
+                if let command = connectCommand {
                     Text(command)
                         .font(.caption2.monospaced())
                         .textSelection(.enabled)
@@ -255,7 +260,7 @@ struct MenuContent: View {
                 // appending a flag, substituting a backend name — is how the old
                 // pane came to tell every backend to run `ironwire connect
                 // claude`.
-                if let command = service?.connectCommand {
+                if let command = connectCommand {
                     Text(command)
                         .font(.caption2.monospaced())
                         .textSelection(.enabled)
@@ -274,7 +279,7 @@ struct MenuContent: View {
         Toggle("", isOn: Binding(
             get: { service.consented },
             set: { wanted in
-                setConsent(service, granted: wanted, version: wanted ? prompt.version : 0)
+                setConsent(service, granted: wanted, version: wanted ? prompt.version : 0, binding: prompt.binding)
             }
         ))
         .labelsHidden()
@@ -298,12 +303,12 @@ struct MenuContent: View {
         ([prompt.summary] + prompt.points.map { "· \($0)" }).joined(separator: "\n")
     }
 
-    private func setConsent(_ service: ServiceView, granted: Bool, version: Int) {
+    private func setConsent(_ service: ServiceView, granted: Bool, version: Int, binding: String?) {
         busy = true
         Task {
             settingsError = nil
             let outcome = await client.setConsent(
-                backend: service.id, granted: granted, promptVersion: version)
+                backend: service.id, granted: granted, promptVersion: version, binding: binding)
             if case .failure(let failure) = outcome {
                 settingsError = failure.message
             }
@@ -865,7 +870,7 @@ struct MenuContent: View {
     private func section<Content: View>(
         _ title: String, @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        LazyVStack(alignment: .leading, spacing: 6) {
             Text(title.uppercased())
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)

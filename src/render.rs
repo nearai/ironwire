@@ -38,7 +38,7 @@ pub(crate) fn log(view: &LogView, style: Style) -> String {
     }
 
     out.push_str(&style.dim(format!(
-        "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}\n",
+        "{:<21} {:<BACKEND_WIDTH$} {:<18} {:>9} {:>8} {:>7}\n",
         "when", "backend", "model", "in/cached", "out", "took"
     )));
     for exchange in &view.exchanges {
@@ -48,6 +48,11 @@ pub(crate) fn log(view: &LogView, style: Style) -> String {
     out.push_str(&summary_block(&view.last_24h, style));
     out
 }
+
+/// Wide enough for a login's id. Ids like `claude-work` and `claude-personal`
+/// share their first dozen characters, and cut at fifteen they stop being
+/// told apart in exactly the table that says which login paid.
+const BACKEND_WIDTH: usize = 20;
 
 fn exchange_row(exchange: &Exchange, style: Style) -> String {
     let model = exchange
@@ -83,9 +88,12 @@ fn exchange_row(exchange: &Exchange, style: Style) -> String {
         .map_or_else(String::new, |n| style.dim(format!("  🔒{n}")));
 
     format!(
-        "{:<21} {:<15} {:<18} {:>9} {:>8} {:>7}{status}{filtered}\n",
+        "{:<21} {:<BACKEND_WIDTH$} {:<18} {:>9} {:>8} {:>7}{status}{filtered}\n",
         style.dim(exchange.started_at.format("%Y-%m-%d %H:%M:%S")),
-        style.name(format!("{:<15}", truncate(&exchange.backend, 15))),
+        style.name(format!(
+            "{:<BACKEND_WIDTH$}",
+            truncate(&exchange.backend, BACKEND_WIDTH)
+        )),
         truncate(model, 18),
         format!("{}{cached}{written}", tokens(exchange.input_tokens)),
         tokens(exchange.output_tokens),
@@ -236,6 +244,16 @@ pub(crate) fn status(status: &StatusView, style: Style) -> String {
     if let Some(privacy) = &status.privacy {
         out.push_str(&format!("privacy filter: {privacy}\n"));
     }
+    // Permanent for the same reason: it is a risk the user chose, the provider
+    // can see it happen, and a setting like that must not drop out of sight
+    // between the day it was turned on and the day it matters.
+    if status.cross_account_fallback {
+        out.push_str(&format!(
+            "{} — a client whose own subscription is spent may be served by another \
+             of yours (docs/TRUST.md)\n",
+            style.warn("cross-account fallback: on")
+        ));
+    }
     if status.catalog_serial > 0 {
         out.push_str(&format!(
             "provider catalog: serial {}\n",
@@ -296,7 +314,7 @@ fn backend_block(backend: &BackendView, style: Style) -> String {
         out.push_str(&format!(
             "  {} — run {}\n",
             style.warn("awaiting consent"),
-            style.action("`ironwire connect claude --subscription`")
+            style.action(format!("`{}`", consent_command(backend)))
         ));
         return out;
     }
@@ -341,6 +359,23 @@ fn backend_block(backend: &BackendView, style: Style) -> String {
         ));
     }
     out
+}
+
+/// What to run to consent to this backend's subscription.
+///
+/// From the daemon's `connect_command`, which knows which login a backend
+/// reads: with two Claude logins, a command written here from the product
+/// alone would enable the wrong one. An older daemon sends none, and had only
+/// the default logins, which the id still names.
+pub(crate) fn consent_command(backend: &BackendView) -> String {
+    let connect = backend.connect_command.clone().unwrap_or_else(|| {
+        match backend.id.as_str() {
+            "codex-sub" => "ironwire connect codex",
+            _ => "ironwire connect claude",
+        }
+        .to_string()
+    });
+    format!("{connect} --subscription")
 }
 
 /// Say a backend is being skipped, and why — a silently-skipped backend looks
@@ -875,6 +910,18 @@ mod log_tests {
         assert_eq!(compact_rate(1_500.0), "1.5k");
     }
 
+    /// Two logins' ids share a long prefix. Cut short, they would be one
+    /// backend in the table that says which login paid.
+    #[test]
+    fn login_ids_are_not_cut_into_each_other_in_the_log() {
+        let mut personal = exchange();
+        personal.backend = "claude-personal".into();
+        let mut work = exchange();
+        work.backend = "claude-personal-2".into();
+        assert!(exchange_row(&personal, Style::plain()).contains("claude-personal "));
+        assert!(exchange_row(&work, Style::plain()).contains("claude-personal-2 "));
+    }
+
     #[test]
     fn long_names_are_truncated_without_panicking_on_multibyte_text() {
         assert_eq!(truncate("short", 10), "short");
@@ -898,6 +945,7 @@ mod tests {
             headroom,
             health: HealthView::default(),
             models: vec!["claude-opus-4-6".into()],
+            connect_command: None,
         }
     }
 
@@ -914,6 +962,7 @@ mod tests {
             update: UpdateStatus::Unknown,
             last_route: None,
             usage: UsageReport::default(),
+            cross_account_fallback: false,
         }
     }
 
@@ -958,6 +1007,64 @@ mod tests {
         assert!(
             backend_block(&backend, Style::plain())
                 .contains("ironwire connect claude --subscription")
+        );
+    }
+
+    /// Two logins of one product are two backends, and the screen has to let
+    /// a person tell them apart and enable the right one. A hint composed
+    /// from the product alone would point both at the default login.
+    #[test]
+    fn two_logins_render_as_two_backends_each_with_its_own_consent_command() {
+        let mut personal = view(HeadroomView::Unknown);
+        personal.consented = false;
+        personal.connect_command = Some("ironwire connect claude".into());
+        let mut work = view(HeadroomView::Unknown);
+        work.id = "claude-work".into();
+        work.name = "Claude subscription (~/.claude-work)".into();
+        work.consented = false;
+        work.connect_command = Some("ironwire connect claude --config-dir ~/.claude-work".into());
+
+        let rendered = status(&status_view(vec![personal, work]), Style::plain());
+        assert!(
+            rendered.contains("Claude subscription\n"),
+            "the default login lost its heading: {rendered}"
+        );
+        assert!(rendered.contains("Claude subscription (~/.claude-work)\n"));
+        assert!(rendered.contains("run `ironwire connect claude --subscription`"));
+        assert!(
+            rendered.contains(
+                "run `ironwire connect claude --config-dir ~/.claude-work --subscription`"
+            )
+        );
+    }
+
+    /// The hint used to name Claude for every backend, Codex included.
+    #[test]
+    fn an_unconsented_codex_login_is_not_pointed_at_claude() {
+        let mut backend = view(HeadroomView::Unknown);
+        backend.id = "codex-sub".into();
+        backend.consented = false;
+        assert!(
+            backend_block(&backend, Style::plain())
+                .contains("`ironwire connect codex --subscription`")
+        );
+        backend.connect_command = Some("ironwire connect codex --config-dir ~/.codex-work".into());
+        assert!(
+            backend_block(&backend, Style::plain())
+                .contains("`ironwire connect codex --config-dir ~/.codex-work --subscription`")
+        );
+    }
+
+    /// A risk the user chose stays on the screen for as long as it is on.
+    #[test]
+    fn cross_account_fallback_is_said_whenever_it_is_on_and_never_otherwise() {
+        let mut view = status_view(vec![view(HeadroomView::Unknown)]);
+        assert!(!status(&view, Style::plain()).contains("cross-account"));
+        view.cross_account_fallback = true;
+        let rendered = status(&view, Style::plain());
+        assert!(
+            rendered.contains("cross-account fallback: on"),
+            "{rendered}"
         );
     }
 
@@ -1329,6 +1436,7 @@ mod preview {
             },
             health: HealthView::default(),
             models: vec!["claude-opus-4-6".into(), "claude-sonnet-4-6".into()],
+            connect_command: None,
         }]);
         view.balance = BalanceView {
             available: 2,
@@ -1341,6 +1449,7 @@ mod preview {
             cache_exchanges: 412,
             spend_cap: None,
             subscription_used: vec![ironwire_proxy::control::SubscriptionUse {
+                backend: "claude-sub".into(),
                 name: "Claude subscription".into(),
                 used_pct: Some(74.0),
                 exchanges: 128,

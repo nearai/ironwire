@@ -3,6 +3,7 @@
 //! Everything IronWire persists lives under `$IRONWIRE_HOME` (default
 //! `~/.ironwire`, mode 0700). See `docs/PACKAGING.md` for the layout.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -604,6 +605,20 @@ pub struct BackendConfig {
     /// stores no secrets in `config.toml`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Where an official client keeps this login: the value you export as
+    /// `CLAUDE_CONFIG_DIR` (`claude-subscription`) or `CODEX_HOME`
+    /// (`codex-subscription`) when you use it. Absolute, or starting with `~/`.
+    ///
+    /// Kept as the text the user wrote rather than a resolved path. Claude
+    /// Code keys its Keychain item on the exact directory string it was given,
+    /// so a value that had been canonicalised — symlinks resolved, a trailing
+    /// slash trimmed — would name a different Keychain item from the one the
+    /// client wrote. See [`expand_config_dir`].
+    ///
+    /// Required on every subscription entry except the default login
+    /// (`claude-sub`, `codex-sub`), where it relocates that login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
     /// Model slugs this backend should offer, best first. Configurable because
     /// third-party catalogues move faster than our release cadence.
     ///
@@ -681,6 +696,34 @@ fn default_true() -> bool {
     true
 }
 
+/// Resolve a `config_dir` the way a shell resolves what the user exported:
+/// a leading `~/` becomes `home`, and nothing else changes.
+///
+/// Textual on purpose, and free of I/O. Claude Code hashes the exact
+/// `CLAUDE_CONFIG_DIR` string it sees to name its Keychain item, and a shell
+/// expanding `~/.claude-work` produces exactly `<home>/.claude-work` — so this
+/// reproduces the string the client hashed. Canonicalising (resolving
+/// symlinks, trimming a trailing slash) would produce a tidier path and the
+/// wrong Keychain item. It also keeps [`Config::validate`] free of the
+/// filesystem: whether the directory exists is a question for registration,
+/// where "not there" means "not logged in", not "invalid config".
+///
+/// Concatenated rather than joined, as the credential side does it:
+/// `Path::join` treats the rest of `~//.claude-work` as an absolute path and
+/// drops the home, so the client file would be looked for under `/` while the
+/// credential is read from the home directory.
+#[must_use]
+pub fn expand_config_dir(raw: &str, home: &Path) -> PathBuf {
+    match raw.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            let mut expanded = home.as_os_str().to_os_string();
+            expanded.push(rest);
+            PathBuf::from(expanded)
+        }
+        _ => PathBuf::from(raw),
+    }
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -701,6 +744,42 @@ pub struct Config {
     pub backends: Vec<BackendConfig>,
     /// Spend caps. No cap unless the user sets one.
     pub limits: LimitsConfig,
+    /// How several subscriptions to one product relate to each other.
+    pub subscriptions: SubscriptionsConfig,
+}
+
+/// How several subscriptions to one product relate to each other.
+///
+/// Each login is its own backend, and by default a client is served only by
+/// its own: the Claude Code using `~/.claude-work` is served by that login's
+/// subscription and, under sustained quota pressure or once it runs out,
+/// descends the ordinary ladder — API key, NEAR AI, local — never onto the
+/// user's other Claude subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubscriptionsConfig {
+    /// Let a client be served by another of the user's subscriptions to the
+    /// same product when its own is under quota pressure: at least 90% used
+    /// as the provider reports it, or spent. A request choosing afresh moves
+    /// at once; a conversation already on its own login moves once the
+    /// pressure has lasted the 20-second descent debounce. That is the trigger
+    /// every rung of the ladder uses, and pressure outranks the preference for
+    /// the client's own login. It is not reserved for a subscription that has
+    /// run out.
+    ///
+    /// Off by default, and the reasons are not ours to wave away. OpenAI's
+    /// terms forbid circumventing rate limits and Anthropic's usage policy
+    /// forbids bypassing restrictions established in its products; moving to
+    /// another account after a 429 is the most direct reading of both. The
+    /// provider can also see it: Claude Code's request body names the account
+    /// it is logged in as, and would arrive on the other account's token. See
+    /// `docs/TRUST.md`.
+    ///
+    /// Even when on, a Codex conversation that replays encrypted reasoning
+    /// never changes ChatGPT account: OpenAI rejects reasoning minted under
+    /// another organization, so the move would fail the turn rather than save
+    /// it.
+    pub cross_account_fallback: bool,
 }
 
 /// What to do when a spend cap is reached.
@@ -824,6 +903,12 @@ impl Config {
     ///
     /// [`Error::ConfigInvalid`], naming the entry at fault.
     pub fn validate(&self, path: &Path) -> Result<()> {
+        // The home directory is read only to compare `~/` paths with absolute
+        // ones; nothing here touches the filesystem.
+        self.validate_with_home(path, &dirs::home_dir().unwrap_or_default())
+    }
+
+    pub(crate) fn validate_with_home(&self, path: &Path, home: &Path) -> Result<()> {
         let invalid = |id: &str, detail: String| Error::ConfigInvalid {
             path: path.to_path_buf(),
             id: id.to_string(),
@@ -885,11 +970,13 @@ impl Config {
             );
         }
 
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        // Every login directory declared so far: (kind, where it resolves, id).
+        let mut logins: HashMap<(BackendImpl, PathBuf), &str> = HashMap::new();
         for backend in &self.backends {
             // Two entries with one id means `BackendRegistry::get` answers with
             // whichever was pushed first, and the other silently does nothing.
-            if seen.contains(&backend.id.as_str()) {
+            if !seen.insert(backend.id.as_str()) {
                 return Err(invalid(
                     &backend.id,
                     "declared twice. Ids must be unique: the router looks a \
@@ -897,7 +984,6 @@ impl Config {
                         .to_string(),
                 ));
             }
-            seen.push(&backend.id);
 
             let Some(kind) = BackendImpl::parse(&backend.kind) else {
                 return Err(invalid(
@@ -925,6 +1011,123 @@ impl Config {
                      ends up in ledger rows, event payloads and the \
                      `X-IronWire-Route` header."
                         .to_string(),
+                ));
+            }
+
+            // An id discovery uses names the backend discovery builds, and an
+            // entry under it only configures that backend. A different kind
+            // here used to be accepted and silently ignored, which reads as
+            // configuration and does nothing.
+            if let Some(expected) = BackendImpl::discovered_as(&backend.id)
+                && expected != kind
+            {
+                return Err(invalid(
+                    &backend.id,
+                    format!(
+                        "`{id}` is the id IronWire gives {what}, which is always \
+                         `kind = \"{expected}\"`; `kind = \"{actual}\"` would be \
+                         ignored. Set `kind = \"{expected}\"`, or give this entry \
+                         an id of its own.",
+                        id = backend.id,
+                        what = expected.discovered_noun(),
+                        expected = expected.as_str(),
+                        actual = backend.kind,
+                    ),
+                ));
+            }
+
+            if let Some(raw) = &backend.config_dir {
+                let Some(variable) = kind.login_dir_variable() else {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`config_dir` says where an official client keeps a \
+                             login, so it applies only to `kind = \
+                             \"claude-subscription\"` and `kind = \
+                             \"codex-subscription\"`. A `{}` backend has no login \
+                             directory; remove the line.",
+                            backend.kind
+                        ),
+                    ));
+                };
+                // The daemon runs under launchd or systemd, whose working
+                // directory is not the user's shell's.
+                if !(raw.starts_with("~/") || Path::new(raw).is_absolute()) {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`config_dir = \"{raw}\"` must be an absolute path or \
+                             start with `~/`: IronWire runs as a background service \
+                             whose working directory is not your shell's, so a \
+                             relative path would point somewhere else. Use the \
+                             value you export as `{variable}` for that login, for \
+                             example `config_dir = \"{example}\"`.",
+                            example = kind.example_config_dir(),
+                        ),
+                    ));
+                }
+                // Compared as paths, so `~/.claude-work`, its absolute
+                // spelling and a trailing slash all count as one directory.
+                let resolved = expand_config_dir(raw, home);
+                if let Some(other) = logins.get(&(kind, resolved.clone())) {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`config_dir = \"{raw}\"` is the same directory as the \
+                             `{other}` entry's, so both would read one login: one \
+                             pool shown as two, and a fallback between them that \
+                             moves nothing. Remove one of the two entries."
+                        ),
+                    ));
+                }
+                // The same mistake against the default login, which has no
+                // entry to compare with. On Linux both would read one
+                // credentials file. On macOS they are two Keychain items, but
+                // both clients keep their settings in one directory, so it
+                // could only ever be wired for one of them.
+                if let (Some(default_id), Some(default_dir)) =
+                    (kind.discovered_id(), kind.default_config_dir())
+                    && backend.id != default_id
+                    && resolved == expand_config_dir(default_dir, home)
+                {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`config_dir = \"{raw}\"` is where your default \
+                             {product} login lives, which IronWire already reads \
+                             as `{default_id}`; a second entry for it is one login \
+                             counted twice. If that login is the one you meant, \
+                             remove this entry. To move the default login, set \
+                             `config_dir` on it instead: `id = \"{default_id}\"`, \
+                             `kind = \"{kind}\"`, `config_dir = \"{raw}\"`.",
+                            product = kind.product_name(),
+                            kind = kind.as_str(),
+                        ),
+                    ));
+                }
+                logins.insert((kind, resolved), &backend.id);
+            } else if let Some(variable) = kind.login_dir_variable()
+                && kind.discovered_id() != Some(backend.id.as_str())
+            {
+                // Without a directory there is nothing to tell this login
+                // from the default one, and it used to be built as exactly
+                // that: a second copy of the default login under the default's
+                // id.
+                return Err(invalid(
+                    &backend.id,
+                    format!(
+                        "An additional {product} login needs `config_dir`: the \
+                         directory you export as `{variable}` when you use it, \
+                         for example `config_dir = \"{example}\"`. Without it this \
+                         entry would be your default login again under another \
+                         name. `ironwire connect {command} --config-dir DIR` \
+                         writes the entry for you; only `{default}` means the \
+                         default login.",
+                        product = kind.product_name(),
+                        example = kind.example_config_dir(),
+                        command = kind.connect_noun(),
+                        default = kind.discovered_id().unwrap_or_default(),
+                    ),
                 ));
             }
 
@@ -968,13 +1171,15 @@ impl Config {
 /// Distinct from [`crate::protocol::BackendKind`], which is the *capacity*
 /// class a backend draws on — subscription, key, credits, local. Several impls
 /// here map to one capacity class and vice versa.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendImpl {
-    /// Claude Code's stored subscription credential.
+    /// Claude Code's stored subscription credential: the default login, or
+    /// the one in the entry's `config_dir`. One entry per login.
     ClaudeSubscription,
     /// The metered Anthropic API.
     AnthropicApi,
-    /// Codex's stored ChatGPT credential.
+    /// Codex's stored ChatGPT credential: the default login, or the one in
+    /// the entry's `config_dir`. One entry per login.
     CodexSubscription,
     /// The metered OpenAI API.
     OpenAiApi,
@@ -1010,6 +1215,116 @@ impl BackendImpl {
             "nearai" => Some(Self::NearAi),
             "openai-compatible" => Some(Self::OpenAiCompatible),
             "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
+
+    /// The `kind` spelling, as [`Self::parse`] accepts it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeSubscription => "claude-subscription",
+            Self::AnthropicApi => "anthropic-api",
+            Self::CodexSubscription => "codex-subscription",
+            Self::OpenAiApi => "openai-api",
+            Self::NearAi => "nearai",
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::Local => "local",
+        }
+    }
+
+    /// Whether this reads a login an official client stored.
+    #[must_use]
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Self::ClaudeSubscription | Self::CodexSubscription)
+    }
+
+    /// The id IronWire's own discovery registers this implementation under,
+    /// if it discovers one at all.
+    ///
+    /// For a subscription that is the *default* login's id, which never
+    /// changes: consent, persisted quota, pins, `trusted_backends`, spend caps
+    /// and ledger history are all keyed on it.
+    #[must_use]
+    pub fn discovered_id(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeSubscription => Some("claude-sub"),
+            Self::AnthropicApi => Some("anthropic-key"),
+            Self::CodexSubscription => Some("codex-sub"),
+            Self::OpenAiApi => Some("openai-key"),
+            Self::NearAi => Some("nearai"),
+            Self::OpenAiCompatible | Self::Local => None,
+        }
+    }
+
+    /// The implementation discovery builds under `id`, if `id` is one of
+    /// discovery's.
+    #[must_use]
+    pub fn discovered_as(id: &str) -> Option<Self> {
+        [
+            Self::ClaudeSubscription,
+            Self::AnthropicApi,
+            Self::CodexSubscription,
+            Self::OpenAiApi,
+            Self::NearAi,
+        ]
+        .into_iter()
+        .find(|kind| kind.discovered_id() == Some(id))
+    }
+
+    /// The environment variable a user sets to put this client's login
+    /// somewhere other than its default. `None` for anything that is not a
+    /// subscription, which is also what says `config_dir` does not apply.
+    #[must_use]
+    pub fn login_dir_variable(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeSubscription => Some("CLAUDE_CONFIG_DIR"),
+            Self::CodexSubscription => Some("CODEX_HOME"),
+            _ => None,
+        }
+    }
+
+    /// What discovery's backend of this kind is, for a sentence.
+    fn discovered_noun(self) -> &'static str {
+        match self {
+            Self::ClaudeSubscription => "your default Claude login",
+            Self::CodexSubscription => "your default ChatGPT login",
+            Self::AnthropicApi => "the Anthropic API key it finds",
+            Self::OpenAiApi => "the OpenAI API key it finds",
+            Self::NearAi => "your NEAR AI account",
+            Self::OpenAiCompatible | Self::Local => "no backend",
+        }
+    }
+
+    fn product_name(self) -> &'static str {
+        match self {
+            Self::CodexSubscription => "ChatGPT",
+            _ => "Claude",
+        }
+    }
+
+    fn connect_noun(self) -> &'static str {
+        match self {
+            Self::CodexSubscription => "codex",
+            _ => "claude",
+        }
+    }
+
+    fn example_config_dir(self) -> &'static str {
+        match self {
+            Self::CodexSubscription => "~/.codex-work",
+            _ => "~/.claude-work",
+        }
+    }
+
+    /// Where the official client keeps its login when nothing relocates it.
+    ///
+    /// For Codex the daemon honours its own `CODEX_HOME`, which validation
+    /// does not read; `~/.codex` is the default every user without one has.
+    fn default_config_dir(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeSubscription => Some("~/.claude"),
+            Self::CodexSubscription => Some("~/.codex"),
             _ => None,
         }
     }
@@ -1352,6 +1667,349 @@ mod tests {
         assert!(BackendImpl::parse("not-a-kind").is_none());
     }
 
+    /// Every spelling a message names must be one `parse` accepts.
+    #[test]
+    fn every_kind_names_itself_the_way_it_is_parsed() {
+        for kind in BackendImpl::ALL {
+            let parsed = BackendImpl::parse(kind).expect("advertised");
+            assert_eq!(parsed.as_str(), *kind);
+        }
+    }
+
+    /// The default logins keep the ids everything persisted is keyed on.
+    #[test]
+    fn discovery_ids_and_kinds_map_both_ways() {
+        for (id, kind) in [
+            ("claude-sub", BackendImpl::ClaudeSubscription),
+            ("codex-sub", BackendImpl::CodexSubscription),
+            ("anthropic-key", BackendImpl::AnthropicApi),
+            ("openai-key", BackendImpl::OpenAiApi),
+            ("nearai", BackendImpl::NearAi),
+        ] {
+            assert_eq!(BackendImpl::discovered_as(id), Some(kind));
+            assert_eq!(kind.discovered_id(), Some(id));
+        }
+        assert_eq!(BackendImpl::discovered_as("claude-work"), None);
+        assert_eq!(BackendImpl::Local.discovered_id(), None);
+    }
+
+    /// Cross-account fallback is an opt-in, with the terms risk stated where
+    /// it is turned on. A config that never mentions it must not have it.
+    #[test]
+    fn cross_account_fallback_is_off_unless_the_user_turns_it_on() {
+        assert!(!Config::default().subscriptions.cross_account_fallback);
+        assert!(
+            !load("[server]\nport = 8463\n")
+                .expect("valid")
+                .subscriptions
+                .cross_account_fallback
+        );
+        assert!(
+            load("[subscriptions]\ncross_account_fallback = true\n")
+                .expect("valid")
+                .subscriptions
+                .cross_account_fallback
+        );
+        assert!(
+            toml::from_str::<Config>("[subscriptions]\ncross_acount_fallback = true\n").is_err(),
+            "a misspelled opt-in must not silently stay off"
+        );
+    }
+
+    #[test]
+    fn an_additional_login_entry_is_accepted() {
+        let config = load(
+            r#"
+            [[backends]]
+            id = "claude-work"
+            kind = "claude-subscription"
+            config_dir = "~/.claude-work"
+
+            [[backends]]
+            id = "codex-work"
+            kind = "codex-subscription"
+            config_dir = "/Users/alice/.codex-work"
+            "#,
+        )
+        .expect("an additional login with its directory is valid");
+        assert_eq!(
+            config.backends[0].config_dir.as_deref(),
+            Some("~/.claude-work"),
+            "kept as written: the Keychain item is keyed on the exact string"
+        );
+    }
+
+    /// Rule 1: only a subscription has a login directory.
+    #[test]
+    fn a_config_dir_on_a_backend_without_a_login_is_refused() {
+        let message = rejection(
+            r#"
+            [[backends]]
+            id = "anthropic-key"
+            kind = "anthropic-api"
+            config_dir = "~/.claude-work"
+            "#,
+        );
+        assert!(message.contains("anthropic-key"), "{message}");
+        assert!(message.contains("config_dir"), "{message}");
+        assert!(message.contains("remove the line"), "{message}");
+    }
+
+    /// Rule 2: the daemon's working directory is not the user's.
+    #[test]
+    fn a_relative_config_dir_is_refused() {
+        for relative in [".claude-work", "work/.claude", "~", "~alice/.claude", ""] {
+            let message = rejection(&format!(
+                "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+                 config_dir = \"{relative}\"\n"
+            ));
+            assert!(message.contains("claude-work"), "{message}");
+            assert!(message.contains("~/"), "{message}");
+            assert!(message.contains("CLAUDE_CONFIG_DIR"), "{message}");
+        }
+    }
+
+    /// Rule 3, and the bug it closes: such an entry used to build a second
+    /// copy of the *default* login under the default's id.
+    #[test]
+    fn an_additional_login_without_its_directory_is_refused() {
+        let claude = rejection(
+            r#"
+            [[backends]]
+            id = "claude-work"
+            kind = "claude-subscription"
+            "#,
+        );
+        assert!(claude.contains("claude-work"), "{claude}");
+        assert!(claude.contains("CLAUDE_CONFIG_DIR"), "{claude}");
+        assert!(
+            claude.contains("ironwire connect claude --config-dir"),
+            "{claude}"
+        );
+
+        let codex = rejection(
+            r#"
+            [[backends]]
+            id = "codex-work"
+            kind = "codex-subscription"
+            enabled = false
+            "#,
+        );
+        assert!(codex.contains("codex-work"), "{codex}");
+        assert!(codex.contains("CODEX_HOME"), "{codex}");
+        assert!(
+            codex.contains("ironwire connect codex --config-dir"),
+            "{codex}"
+        );
+    }
+
+    /// Rule 4: an id discovery uses names discovery's backend, so a different
+    /// kind under it would be silently ignored.
+    #[test]
+    fn a_discovered_id_with_another_kind_is_refused() {
+        for (id, kind, expected) in [
+            ("claude-sub", "anthropic-api", "claude-subscription"),
+            ("codex-sub", "claude-subscription", "codex-subscription"),
+            ("anthropic-key", "claude-subscription", "anthropic-api"),
+            ("openai-key", "nearai", "openai-api"),
+            ("nearai", "openai-api", "nearai"),
+        ] {
+            let message = rejection(&format!(
+                "[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\nconfig_dir = \"~/.x\"\n"
+            ));
+            assert!(message.contains(&format!("`{id}`")), "{message}");
+            assert!(
+                message.contains(&format!("kind = \"{expected}\"")),
+                "the fix must be spelled out: {message}"
+            );
+        }
+    }
+
+    /// Rule 5: the default login may be relocated, and needs nothing else.
+    #[test]
+    fn the_default_login_may_be_relocated_or_left_alone() {
+        let config = load(
+            r#"
+            [[backends]]
+            id = "claude-sub"
+            kind = "claude-subscription"
+            config_dir = "~/.claude-personal"
+
+            [[backends]]
+            id = "codex-sub"
+            kind = "codex-subscription"
+            "#,
+        )
+        .expect("valid");
+        assert_eq!(
+            config.backends[0].config_dir.as_deref(),
+            Some("~/.claude-personal")
+        );
+        assert_eq!(config.backends[1].config_dir, None);
+    }
+
+    /// Rule 6: one login counted twice is one pool shown as two.
+    #[test]
+    fn two_entries_for_one_login_directory_are_refused() {
+        let home = Path::new("/Users/alice");
+        let config_with = |first: &str, second: &str| -> Config {
+            toml::from_str(&format!(
+                "[[backends]]\nid = \"claude-a\"\nkind = \"claude-subscription\"\n\
+                 config_dir = \"{first}\"\n\
+                 [[backends]]\nid = \"claude-b\"\nkind = \"claude-subscription\"\n\
+                 config_dir = \"{second}\"\n"
+            ))
+            .expect("parses")
+        };
+        for (first, second) in [
+            ("~/.claude-work", "~/.claude-work"),
+            ("~/.claude-work", "/Users/alice/.claude-work"),
+            ("/Users/alice/.claude-work/", "~/.claude-work"),
+        ] {
+            let message = config_with(first, second)
+                .validate_with_home(Path::new("config.toml"), home)
+                .expect_err("one login, two entries")
+                .to_string();
+            assert!(message.contains("claude-b"), "{message}");
+            assert!(message.contains("claude-a"), "{message}");
+        }
+        // Different directories are different logins.
+        config_with("~/.claude-work", "~/.claude-personal")
+            .validate_with_home(Path::new("config.toml"), home)
+            .expect("two logins");
+
+        // The same directory under two *products* is two logins: Claude Code
+        // and Codex never read each other's files.
+        let mixed: Config = toml::from_str(
+            "[[backends]]\nid = \"claude-a\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.work\"\n\
+             [[backends]]\nid = \"codex-a\"\nkind = \"codex-subscription\"\n\
+             config_dir = \"~/.work\"\n",
+        )
+        .expect("parses");
+        mixed
+            .validate_with_home(Path::new("config.toml"), home)
+            .expect("one directory, two products");
+    }
+
+    /// The expansion reproduces what a shell hands the client, character for
+    /// character, because Claude Code hashes that string to name its Keychain
+    /// item.
+    #[test]
+    fn a_config_dir_expands_exactly_as_a_shell_would() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_config_dir("~/.claude-work", home),
+            Path::new("/Users/alice/.claude-work")
+        );
+        assert_eq!(
+            expand_config_dir("~/.claude-work/", home)
+                .to_string_lossy()
+                .as_ref(),
+            "/Users/alice/.claude-work/",
+            "a trailing slash is a different Keychain item and must survive"
+        );
+        assert_eq!(
+            expand_config_dir("/opt/claude", home),
+            Path::new("/opt/claude")
+        );
+        assert_eq!(expand_config_dir("~", home), home);
+        assert_eq!(
+            expand_config_dir("~alice/x", home),
+            Path::new("~alice/x"),
+            "only the current user's home is expanded"
+        );
+    }
+
+    /// `~//x` is what a shell makes of `~/x` under a `HOME` ending in `/`, and
+    /// what the CLI stores for `$HOME//x`. It is still under the home; joining
+    /// instead of concatenating read the rest as absolute and dropped it.
+    #[test]
+    fn a_doubled_slash_after_the_tilde_keeps_the_home() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_config_dir("~//.claude-work", home)
+                .to_string_lossy()
+                .as_ref(),
+            "/Users/alice//.claude-work",
+            "the same string the credential side hashes"
+        );
+        assert_eq!(
+            expand_config_dir("~/.claude-work", Path::new("/Users/alice/"))
+                .to_string_lossy()
+                .as_ref(),
+            "/Users/alice//.claude-work"
+        );
+    }
+
+    /// Rule 7: an additional entry for the default login's own directory is
+    /// that login counted twice; moving the default is done on its own entry.
+    #[test]
+    fn an_additional_login_in_the_default_directory_is_refused_in_favour_of_relocating_the_default()
+    {
+        let home = Path::new("/Users/alice");
+        let validate = |text: String| {
+            toml::from_str::<Config>(&text)
+                .expect("parses")
+                .validate_with_home(Path::new("config.toml"), home)
+        };
+        for (id, kind, dir, default_id) in [
+            (
+                "claude-main",
+                "claude-subscription",
+                "~/.claude",
+                "claude-sub",
+            ),
+            (
+                "claude-main",
+                "claude-subscription",
+                "~/.claude/",
+                "claude-sub",
+            ),
+            (
+                "claude-main",
+                "claude-subscription",
+                "/Users/alice/.claude",
+                "claude-sub",
+            ),
+            ("codex-main", "codex-subscription", "~/.codex", "codex-sub"),
+        ] {
+            let message = validate(format!(
+                "[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\nconfig_dir = \"{dir}\"\n"
+            ))
+            .expect_err("the default login, declared again")
+            .to_string();
+            assert!(message.contains(id), "{message}");
+            assert!(message.contains(&format!("`{default_id}`")), "{message}");
+            assert!(
+                message.contains(&format!("`id = \"{default_id}\"`")),
+                "the fix must be spelled out: {message}"
+            );
+        }
+
+        // Relocating the default login onto it is not a second login.
+        validate(
+            "[[backends]]\nid = \"claude-sub\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.claude\"\n"
+                .to_string(),
+        )
+        .expect("the default login, in its own directory");
+        // Nor is a directory that merely starts the same way.
+        validate(
+            "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.claude-work\"\n"
+                .to_string(),
+        )
+        .expect("an additional login");
+        // And the other product's default directory is not this one's.
+        validate(
+            "[[backends]]\nid = \"codex-claude\"\nkind = \"codex-subscription\"\n\
+             config_dir = \"~/.claude\"\n"
+                .to_string(),
+        )
+        .expect("Codex never reads Claude Code's directory");
+    }
+
     #[test]
     fn a_missing_config_yields_defaults_rather_than_failing() {
         let cfg = Config::load_from(Path::new("/nonexistent/ironwire/config.toml"))
@@ -1394,15 +2052,28 @@ mod tests {
             updates: UpdateConfig { check: false },
             resilience: ResilienceConfig::default(),
             privacy: PrivacyConfig::default(),
-            backends: vec![BackendConfig {
-                id: "claude-sub".into(),
-                kind: "claude-subscription".into(),
-                enabled: true,
-                base_url: None,
-                api_key_env: None,
-                refuse_model_aliases: false,
-                models: None,
-            }],
+            backends: vec![
+                BackendConfig {
+                    id: "claude-sub".into(),
+                    kind: "claude-subscription".into(),
+                    enabled: true,
+                    base_url: None,
+                    api_key_env: None,
+                    config_dir: None,
+                    refuse_model_aliases: false,
+                    models: None,
+                },
+                BackendConfig {
+                    id: "claude-work".into(),
+                    kind: "claude-subscription".into(),
+                    enabled: true,
+                    base_url: None,
+                    api_key_env: None,
+                    config_dir: Some("~/.claude-work".into()),
+                    refuse_model_aliases: false,
+                    models: None,
+                },
+            ],
             limits: LimitsConfig {
                 daily_spend_usd: Some(10.0),
                 on_breach: BreachAction::Refuse,
@@ -1411,10 +2082,17 @@ mod tests {
                     daily_spend_usd: 5.0,
                 }],
             },
+            subscriptions: SubscriptionsConfig {
+                cross_account_fallback: true,
+            },
         };
         let text = toml::to_string(&cfg).expect("serializes");
         let back: Config = toml::from_str(&text).expect("deserializes");
         assert_eq!(cfg, back);
+        // And what was written is something `load` accepts, not merely
+        // something serde can read back.
+        back.validate(Path::new("config.toml"))
+            .expect("a round-tripped config still validates");
     }
 
     /// `capture.logprobs` was added after the first release. A config written
@@ -1443,6 +2121,48 @@ mod tests {
             paths.control_token_file(),
             Path::new("/tmp/iw-test/control.token")
         );
+    }
+}
+
+#[cfg(test)]
+mod bulk_config_tests {
+    use super::*;
+
+    #[test]
+    fn ten_thousand_distinct_logins_validate_and_a_late_duplicate_is_rejected() {
+        let mut config = Config {
+            backends: (0..10_000)
+                .map(|index| BackendConfig {
+                    id: format!("claude-{index}"),
+                    kind: "claude-subscription".into(),
+                    enabled: true,
+                    base_url: None,
+                    api_key_env: None,
+                    config_dir: Some(format!("/fixtures/login-{index}")),
+                    refuse_model_aliases: false,
+                    models: None,
+                })
+                .collect(),
+            ..Config::default()
+        };
+        let path = Path::new("/fixtures/config.toml");
+        let home = Path::new("/fixtures/home");
+        config
+            .validate_with_home(path, home)
+            .expect("all logins distinct");
+        let mut duplicate = config.backends[0].clone();
+        duplicate.id = "claude-extra".into();
+        config.backends.push(duplicate);
+        let error = config
+            .validate_with_home(path, home)
+            .expect_err("duplicate directory");
+        assert!(error.to_string().contains("same directory"), "{error}");
+        config.backends.pop();
+        config.backends.push(config.backends[0].clone());
+        let error = config
+            .validate_with_home(path, home)
+            .expect_err("duplicate id");
+        assert!(error.to_string().contains("declared twice"), "{error}");
     }
 }
 
