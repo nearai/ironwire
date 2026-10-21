@@ -361,9 +361,12 @@ enum Minted {
     /// concurrent sessionless conversations of one client open on different
     /// accounts. Whichever wrote last says nothing about whose reasoning the
     /// next replay carries, so a replay that has only this key to go on is
-    /// refused ([`Origin::Ambiguous`]) until the record expires. A
-    /// conversation that has already replayed once is unaffected: its
-    /// reasoning is recorded under [`ReasoningKey::Reasoning`].
+    /// refused ([`Origin::Ambiguous`]). Every sessionless opening under the
+    /// key refreshes the record, so it clears only after [`AFFINITY_TTL`]
+    /// with no opening, or by eviction: letting it age out while openings
+    /// continue would bind a conversation opened just before to whichever
+    /// account wrote next. A conversation that has already replayed once is
+    /// unaffected: its reasoning is recorded under [`ReasoningKey::Reasoning`].
     Contended { last_seen: DateTime<Utc> },
 }
 

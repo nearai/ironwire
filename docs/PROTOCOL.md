@@ -537,7 +537,11 @@ reasoning a replay carries. Two records stand in for the session:
   records its account under the conversation key and login, which bridges a
   conversation's opening to its first replay. A different account writing
   there does not overwrite it: the record becomes contended, and a first
-  replay that has only it to go on is refused on every route until it expires.
+  replay that has only it to go on is refused on every route. Each opening
+  under the key refreshes the record, so it clears only after `AFFINITY_TTL`
+  with no sessionless opening there, or by eviction. Until then every new
+  sessionless conversation of that client is refused at its first replay;
+  one that has already replayed is bound by its reasoning and unaffected.
   Which conversation wrote last says nothing about which one is replaying
   (`a_sessionless_conversation_on_another_key_does_not_take_over_the_replay_origin`,
   `interleaved_sessionless_conversations_on_two_keys_refuse_rather_than_guess`,
