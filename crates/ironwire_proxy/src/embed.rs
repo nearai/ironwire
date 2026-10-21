@@ -1196,6 +1196,21 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
     Ok(registry)
 }
 
+/// Whether the default Claude login's first read means there is one to register.
+///
+/// A store that could not be asked -- a Keychain locked at start, with no
+/// credentials file to fall back to -- is not an absent login. It is
+/// registered, unauthenticated, and its backend re-reads the credential on
+/// every request, so it recovers once the Keychain unlocks instead of staying
+/// unregistered for the life of the process. Only a login that is not there,
+/// or one that is there but unrecognisable, leaves it out, as before.
+fn claude_default_is_there<T>(read: &ironwire_creds::Result<T>) -> bool {
+    matches!(
+        read,
+        Ok(_) | Err(ironwire_creds::CredentialError::Io { .. })
+    )
+}
+
 /// The default login of `product`, if it is to be registered.
 ///
 /// Discovered where the client keeps it unprompted, and registered only when
@@ -1219,7 +1234,7 @@ fn default_login(
     let entry = config.backends.iter().find(|entry| entry.id == id);
     let relocated = entry.and_then(|entry| entry.config_dir.as_deref());
     let present = || match product {
-        SubscriptionProduct::Claude => ClaudeCodeCredentials::discover().is_ok(),
+        SubscriptionProduct::Claude => claude_default_is_there(&ClaudeCodeCredentials::discover()),
         // An `auth.json` holding an API key is the metered key, not a plan.
         SubscriptionProduct::ChatGpt => {
             CodexCredentials::discover().is_ok_and(|c| c.mode == CodexMode::ChatGpt)
@@ -1684,6 +1699,38 @@ fn apply_token_capture_override(
 
 #[cfg(test)]
 mod tests {
+    /// A default login whose store could not be asked at start is registered
+    /// anyway. Its backend re-reads the credential on every request, so it
+    /// recovers the moment the Keychain is unlocked; left out of the registry,
+    /// it would stay out until the daemon restarted. Only "nothing is there"
+    /// leaves it out.
+    #[test]
+    fn a_default_login_the_keychain_could_not_answer_for_is_still_registered() {
+        let locked: ironwire_creds::Result<()> = Err(ironwire_creds::CredentialError::Io {
+            product: "Claude Code",
+            path: "Keychain:Claude Code-credentials".into(),
+            source: std::io::Error::other("locked"),
+        });
+        assert!(
+            claude_default_is_there(&locked),
+            "a locked Keychain dropped the login"
+        );
+
+        let absent: ironwire_creds::Result<()> =
+            Err(ironwire_creds::CredentialError::NotLoggedIn {
+                product: "Claude Code",
+                location: None,
+                looked: "Keychain:Claude Code-credentials".into(),
+                command: "claude".into(),
+                note: None,
+            });
+        assert!(
+            !claude_default_is_there(&absent),
+            "someone never logged in got a backend"
+        );
+        assert!(claude_default_is_there(&Ok(())));
+    }
+
     #[test]
     fn host_capture_override_preserves_targets_and_requires_explicit_configuration() {
         use ironwire_core::config::{Config, TokenCaptureConfig, TokenCaptureTarget};

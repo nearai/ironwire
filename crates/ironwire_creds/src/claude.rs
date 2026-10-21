@@ -171,19 +171,24 @@ impl ClaudeLogin {
 
     /// Read this login's credential.
     ///
-    /// Same order as Claude Code: the Keychain (on macOS), and the file only
-    /// when no Keychain item exists. An item that exists but holds something
-    /// unrecognisable is reported, not skipped — Claude Code would use it, so
-    /// falling through to a stale file would read a login Claude Code is not
-    /// using.
+    /// Same order as Claude Code: the Keychain (on macOS), then the file. An
+    /// item that exists but holds something unrecognisable is reported, not
+    /// skipped — Claude Code would use it, so falling through to a stale file
+    /// would read a login Claude Code is not using.
+    ///
+    /// A Keychain that cannot be asked — locked, or `security` not answering
+    /// within its deadline — falls back to the file, as reading the default
+    /// login always has: the file is this login's own, written by Claude Code.
+    /// Only when there is no file either is the Keychain's failure reported.
     ///
     /// # Errors
     ///
     /// [`CredentialError::NotLoggedIn`] when this login holds no credential,
     /// [`CredentialError::Malformed`] when the store holds something we do not
-    /// recognise, [`CredentialError::Io`] when the Keychain cannot be checked
-    /// or the file cannot be read. Only an absent Keychain item permits a file
-    /// fallback; a locked or failed store may still contain the active login.
+    /// recognise, [`CredentialError::Io`] when the file cannot be read, or when
+    /// the Keychain cannot be checked and there is no file — the login may
+    /// still be in the item that could not be read, so it is not reported as
+    /// absent.
     pub fn read(&self) -> Result<ClaudeCodeCredentials> {
         if cfg!(target_os = "macos") && self.keychain {
             self.read_with(Some(&read_keychain))
@@ -198,16 +203,24 @@ impl ClaudeLogin {
         let command = self.login_command();
         let mut looked = Vec::new();
 
+        let mut unanswered = None;
         if let Some(keychain) = keychain {
             for service in self.keychain_services() {
                 let label = format!("Keychain:{service}");
-                let entry = keychain(&service).map_err(|_| CredentialError::Io {
-                    product: PRODUCT,
-                    path: label.clone(),
-                    source: keychain_error(),
-                })?;
-                if let Some(json) = entry {
-                    return ClaudeCodeCredentials::parse_for(&json, label, Some(command));
+                match keychain(&service) {
+                    Ok(Some(json)) => {
+                        return ClaudeCodeCredentials::parse_for(&json, label, Some(command));
+                    }
+                    Ok(None) => {}
+                    // Never the lookup's own error: it can carry what the
+                    // subprocess printed, which is credential data.
+                    Err(_) => {
+                        unanswered.get_or_insert(CredentialError::Io {
+                            product: PRODUCT,
+                            path: label.clone(),
+                            source: keychain_error(),
+                        });
+                    }
                 }
                 looked.push(label);
             }
@@ -219,6 +232,9 @@ impl ClaudeLogin {
         match std::fs::read_to_string(&path) {
             Ok(json) => ClaudeCodeCredentials::parse_for(&json, shown, Some(command)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(unanswered) = unanswered {
+                    return Err(unanswered);
+                }
                 Err(CredentialError::NotLoggedIn {
                     product: PRODUCT,
                     location: self.location(),
@@ -481,8 +497,8 @@ fn keychain_error() -> std::io::Error {
     // Never repeat subprocess output: it is credential data, including on an
     // unsuccessful command. The user needs the recovery action, not stderr.
     std::io::Error::other(
-        "the Keychain lookup failed or timed out; unlock your macOS Keychain and \
-         retry `ironwire doctor`; a credentials file was not used as a fallback",
+        "the Keychain lookup failed or timed out, and there is no credentials file \
+         to fall back to; unlock your macOS Keychain and retry `ironwire doctor`",
     )
 }
 
@@ -679,20 +695,26 @@ mod login_tests {
         }
     }
 
+    /// A Keychain that is locked, or that `security` could not answer within
+    /// its deadline, is not a reason to go without a login the file still
+    /// holds: Claude Code writes that file itself, and `main` read it in this
+    /// case. Without the fallback a locked Keychain at start costs the user
+    /// their subscription until they unlock it and restart.
     #[test]
-    fn a_failed_keychain_lookup_never_uses_a_stale_file_login() {
+    fn a_failed_keychain_lookup_falls_back_to_the_logins_own_file() {
         let dir = tempfile::tempdir().expect("login directory");
-        std::fs::write(dir.path().join(".credentials.json"), SAMPLE).expect("stale login");
+        std::fs::write(dir.path().join(".credentials.json"), SAMPLE).expect("file login");
         let login = ClaudeLogin::with_home(Some(dir.path().display().to_string()), None);
         let unavailable = |_: &str| -> std::io::Result<Option<String>> {
             Err(std::io::Error::other("inert-secret-in-subprocess-error"))
         };
-        let error = login
+        let credential = login
             .read_with(Some(&unavailable))
-            .expect_err("Keychain refused");
-        assert!(matches!(error, CredentialError::Io { .. }));
-        assert!(error.to_string().contains("unlock your macOS Keychain"));
-        assert!(!error.to_string().contains("inert-secret"));
+            .expect("an unanswered Keychain falls back to the file");
+        assert_eq!(
+            credential.source,
+            login.credentials_path().display().to_string()
+        );
 
         let absent = |_: &str| -> std::io::Result<Option<String>> { Ok(None) };
         let credential = login
@@ -702,6 +724,24 @@ mod login_tests {
             credential.source,
             login.credentials_path().display().to_string()
         );
+    }
+
+    /// With no file to fall back to, the Keychain's failure is the answer, not
+    /// "not logged in": the login may well be in the item it could not read,
+    /// and telling the user to log in again would be the wrong fix.
+    #[test]
+    fn a_failed_keychain_lookup_with_no_file_says_to_unlock_not_to_log_in() {
+        let dir = tempfile::tempdir().expect("login directory");
+        let login = ClaudeLogin::with_home(Some(dir.path().display().to_string()), None);
+        let unavailable = |_: &str| -> std::io::Result<Option<String>> {
+            Err(std::io::Error::other("inert-secret-in-subprocess-error"))
+        };
+        let error = login
+            .read_with(Some(&unavailable))
+            .expect_err("nothing could be read");
+        assert!(matches!(error, CredentialError::Io { .. }), "{error:?}");
+        assert!(error.to_string().contains("unlock your macOS Keychain"));
+        assert!(!error.to_string().contains("inert-secret"));
     }
 
     #[test]

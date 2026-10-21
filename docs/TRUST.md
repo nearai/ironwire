@@ -201,12 +201,17 @@ additional login and the default, that are one directory on disk
 `ironwire_core` does no I/O, so its loaders take that comparison as a
 `DirIdentity` argument.
 
-On macOS, only a Keychain lookup reporting the item absent (`security` exit 44)
-permits a credentials-file fallback. A locked store, failed command, timeout,
-or malformed result refuses the login and asks the user to unlock the Keychain
-and retry. An inaccessible active Keychain account must never silently become
-the stale account left in a credentials file. The lookup has a five-second
-deadline and a bounded output; tests pin absence, failure, and timeout separately.
+On macOS the Keychain is read first, and the login's own credentials file is
+the fallback, as it was before several logins existed: when the item is absent
+(`security` exit 44), and when the lookup fails or times out. Without that, a
+Keychain locked when the daemon starts would cost the user their subscription
+until they unlocked it and restarted. The file is the one Claude Code writes for
+that same login directory, never another login's, and the credential's source
+names it, so `ironwire connect` says which store answered. A failed lookup with
+no file is reported as the Keychain's failure, asking the user to unlock it, not
+as "not logged in". An item that exists but is malformed is still refused, not
+skipped: Claude Code would use it. The lookup has a five-second deadline and a
+bounded output; tests pin absence, failure, and timeout separately.
 
 **The daemon does not follow its own `CLAUDE_CONFIG_DIR`.** Under launchd or
 systemd it has none of your shell's variables, so a daemon that followed one

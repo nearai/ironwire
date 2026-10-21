@@ -45,8 +45,9 @@ Other regression tests cover:
 Registry status and probe work each have eight shared slots. Actual blocking
 credential reads have eight shared slots too, held until the read finishes even
 if its caller is cancelled. A macOS Keychain subprocess has a five-second
-budget and bounded output, and is killed and reaped on timeout. Only an absent Keychain
-item permits credential-file fallback; a lock, error or timeout refuses it. First-party
+budget and bounded output, and is killed and reaped on timeout. An absent Keychain
+item, a lock, an error or a timeout falls back to the login's own credentials
+file; with no file, a failed lookup is reported as the Keychain's failure. First-party
 backends with the same read timeout share their HTTP client and TLS root store;
 authentication remains on each individual request. The shared timeout cache
 retains at most 16 clients; additional distinct timeouts are uncached.
