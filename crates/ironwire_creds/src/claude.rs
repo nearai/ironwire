@@ -442,12 +442,17 @@ fn keychain_output(
 ) -> std::io::Result<Option<String>> {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = command
+    let mut child = match command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| keychain_error())?;
+    {
+        Ok(child) => child,
+        // No `security` tool is no Keychain to ask, which is an absent item.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(keychain_error()),
+    };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
@@ -678,9 +683,22 @@ mod login_tests {
         );
     }
 
+    /// No `security` tool is no Keychain: there is nothing to unlock, so it is
+    /// an absent item, not a failed lookup -- as it was before several logins
+    /// existed. Otherwise a machine where nobody ever ran Claude Code would be
+    /// shown a Claude login asking to have its Keychain unlocked.
+    #[test]
+    fn a_missing_security_tool_is_no_keychain_not_a_locked_one() {
+        let mut command = std::process::Command::new("/nonexistent/ironwire-test/security");
+        assert!(matches!(
+            keychain_output(&mut command, std::time::Duration::from_secs(1)),
+            Ok(None)
+        ));
+    }
+
     #[test]
     #[cfg(unix)]
-    fn only_an_absent_keychain_item_allows_a_file_fallback() {
+    fn only_an_absent_keychain_item_reads_as_absent() {
         for (code, absent) in [(44, true), (1, false)] {
             let mut command = std::process::Command::new("/bin/sh");
             command.args(["-c", &format!("printf inert-keychain-secret; exit {code}")]);

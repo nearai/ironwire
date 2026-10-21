@@ -1484,34 +1484,58 @@ fn doctor_reports_a_login_awaiting_consent_once_and_not_as_a_failure() {
     assert!(said.contains("All connected backends answered."), "{said}");
 }
 
-/// A stale file is not an alternative account when the active Keychain cannot
-/// be read, including when the security process stops answering.
+/// A Keychain that fails or stops answering falls back to the login's own
+/// credentials file, as reading a Claude login did before several logins
+/// existed, and says which store answered. Consent is still asked: the file is
+/// a login like any other, not a grant. With no file, the Keychain's failure
+/// is the answer, and the user is told to unlock it rather than to log in.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_failed_or_stalled_keychain_lookup_never_grants_consent_to_a_stale_file_login() {
+fn a_failed_or_stalled_keychain_lookup_falls_back_to_the_logins_own_file() {
     for script in ["exit 1", "exec /bin/sleep 10"] {
-        let machine = Machine::new();
-        machine.security_script(script);
-        let work = machine.home().join(".claude-work");
-        machine.log_in_claude(&work, "sk-ant-oat01-OLD");
-        let started = std::time::Instant::now();
-        let output = machine
-            .command(&[
-                "connect",
-                "claude",
-                "--config-dir",
-                "~/.claude-work",
-                "--subscription",
-            ])
-            .output()
-            .expect("runs");
-        let why = format!("{}{}", stdout(&output), stderr(&output));
-        assert!(why.contains("unlock your macOS Keychain"), "{why}");
-        assert!(!why.contains("sk-ant-oat01-OLD"), "{why}");
-        assert!(machine.consented().is_empty(), "{:?}", machine.consented());
-        assert!(!why.contains("Enable the Claude subscription"), "{why}");
-        // Resolving the declaration and checking the selected login can each
-        // consult Keychain; both lookups have their own five-second deadline.
-        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        for has_file in [true, false] {
+            let machine = Machine::new();
+            machine.security_script(script);
+            let work = machine.home().join(".claude-work");
+            if has_file {
+                machine.log_in_claude(&work, "sk-ant-oat01-FILE");
+            } else {
+                std::fs::create_dir_all(&work).expect("mkdir");
+            }
+            let started = std::time::Instant::now();
+            let output = machine
+                .command(&[
+                    "connect",
+                    "claude",
+                    "--config-dir",
+                    "~/.claude-work",
+                    "--subscription",
+                ])
+                .output()
+                .expect("runs");
+            let why = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(!why.contains("sk-ant-oat01-FILE"), "{why}");
+            if has_file {
+                let file = work.join(".credentials.json");
+                assert!(
+                    why.contains(&format!(
+                        "Found a Claude Code login (max) at {}",
+                        file.display()
+                    )),
+                    "{script}: {why}"
+                );
+            } else {
+                assert!(
+                    why.contains("unlock your macOS Keychain"),
+                    "{script}: {why}"
+                );
+                assert!(!why.contains("Enable the Claude subscription"), "{why}");
+            }
+            // Nothing answered yes, so nothing is granted either way.
+            assert!(machine.consented().is_empty(), "{:?}", machine.consented());
+            // Resolving the declaration and checking the selected login can each
+            // consult Keychain; both lookups have their own five-second deadline.
+            assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        }
     }
 }
