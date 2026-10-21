@@ -421,17 +421,22 @@ about a typo:
 
 - an unknown kind, or a duplicate id;
 - an `openai-compatible` entry without both `base_url` and `api_key_env`;
-- one of discovery's ids under a kind discovery does not build for it, which
-  used to be accepted and ignored;
 - a `config_dir` on anything but a subscription, or one that is neither
   absolute nor `~/…` — the daemon's working directory is not the user's shell's;
-- an additional login without a `config_dir`, which used to build a silent
-  second copy of the default login under the default's id;
 - two logins of one kind whose directories are the same path, which would show
   one pool as two;
 - an additional login whose directory is the product's default one (`~/.claude`,
   `~/.codex`): that is the default login moved there, so the message says to put
   `config_dir` on `claude-sub` or `codex-sub` instead.
+
+Two shapes that main accepted still load, with a warning, and configure
+nothing: one of discovery's ids under a kind discovery does not build for it,
+and an additional subscription login without a `config_dir`. The registry
+skips both rather than building a second copy of the default login. The refusal
+for a mismatched kind under a discovered id that carries `config_dir` stays
+(main's `BackendConfig` had no such field), and so do the `openai-compatible`
+and `local` `base_url` checks under a discovered id. See
+`a_host_still_starts_on_config_shapes_main_accepted`.
 
 Two backends under one id are refused again at registration
 (`BackendRegistry::try_push`), so nothing that slipped past validation can

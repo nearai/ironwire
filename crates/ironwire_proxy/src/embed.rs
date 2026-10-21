@@ -1333,10 +1333,11 @@ fn backend_from_config(
                 if !credentials.discovers_files() {
                     return Ok(None);
                 }
-                // Unreachable for a config that came through `Config::validate`,
-                // which requires a directory on every login but the default's.
-                // Building one without would be the default login again under
-                // another id — the copy this entry used to silently become.
+                // `Config::validate` accepts an entry without a directory, with
+                // a warning, because main accepted that shape. The registry
+                // deliberately builds nothing for it: building one would be the
+                // default login again under another id — the copy this entry
+                // used to silently become.
                 let Some(config_dir) = entry.config_dir.as_deref() else {
                     return Ok(None);
                 };
