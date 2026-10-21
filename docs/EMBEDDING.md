@@ -244,19 +244,26 @@ own, as above — and finds it in the control API's status beside the rest, with
 the `connect_command` that sets it up. `StartupProbes::Configured` probes it
 once it has consent, because an entry names it.
 
-**Two config shapes load and configure nothing.** A `claude-subscription` or
+**Two config shapes still load, with a warning.** A `claude-subscription` or
 `codex-subscription` entry under an id of its own with no `config_dir`, and an
 entry under one of discovery's own ids (`claude-sub`, `codex-sub`, `nearai`,
 `anthropic-key`, `openai-key`) whose `kind` is another kind, were accepted
 before logins could be declared and are still accepted: `Config::validate` logs
-a warning naming the entry and the fix, and the registry builds no backend for
-it. They do not make a start fail with `EmbedError::Config`, so a host's proxy
-keeps starting for a user whose file worked
-(`a_host_still_starts_on_config_shapes_main_accepted`). The first is not built
-as the default login again under another id, which is the copy it used to
-become; add `config_dir`, or use `ironwire connect claude --config-dir DIR` to
-write the entry. Real errors still refuse: a duplicate id, an unknown `kind`, a
-`config_dir` shared by two entries or equal to the default's directory.
+a warning naming the entry and the fix. They do not make a start fail with
+`EmbedError::Config`, so a host's proxy keeps starting for a user whose file
+worked (`a_host_still_starts_on_config_shapes_main_accepted`).
+
+The first configures nothing: the registry builds no backend for it, and it is
+not built as the default login again under another id, which is the copy it
+used to become. Add `config_dir`, or use `ironwire connect claude --config-dir
+DIR` to write the entry. The second is not built either, but the backend
+discovery builds under that id still reads the entry's `enabled`, `base_url`,
+`api_key_env` and `models`, as it did on main, so `enabled = false` there
+still switches that backend off. It may not carry a `config_dir`: main could
+not load that shape, and honouring it would move the default login to a
+directory no check had seen, so it is refused. Real errors still refuse: a
+duplicate id, an unknown `kind`, a `config_dir` shared by two entries or equal
+to the default's directory.
 
 Supplying no source is the default and discovers credentials exactly as before,
 from the same places, at the same points, so the CLI and every existing

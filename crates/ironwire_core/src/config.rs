@@ -1056,18 +1056,37 @@ impl Config {
             }
 
             // An id discovery uses names the backend discovery builds, and an
-            // entry under it only configures that backend. A different kind
-            // here has always been accepted and ignored, and an embedding
-            // host's proxy must not stop starting over a file that worked, so
-            // it is a warning and the entry is skipped: nothing below applies
-            // to an entry that configures nothing.
+            // entry under it configures that backend. A different kind here
+            // has always been accepted, and an embedding host's proxy must not
+            // stop starting over a file that worked, so it is a warning and
+            // the entry is skipped. Main's `BackendConfig` had no `config_dir`,
+            // so a mismatched entry that carries one never loaded: refuse it,
+            // because the default login is found by id alone and would
+            // otherwise be moved to a directory no check below has seen.
             if let Some(expected) = BackendImpl::discovered_as(&backend.id)
                 && expected != kind
             {
+                if backend.config_dir.is_some() {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`{id}` is the id IronWire gives {what}, which is always \
+                             `kind = \"{expected}\"`, so `kind = \"{actual}\"` cannot \
+                             carry a `config_dir`. Remove the line, set `kind = \
+                             \"{expected}\"`, or give this entry an id of its own.",
+                            id = backend.id,
+                            what = expected.discovered_noun(),
+                            expected = expected.as_str(),
+                            actual = backend.kind,
+                        ),
+                    ));
+                }
                 tracing::warn!(
                     "[[backends]] `{id}` is the id IronWire gives {what}, which is always \
-                     `kind = \"{expected}\"`; `kind = \"{actual}\"` is ignored. Set \
-                     `kind = \"{expected}\"`, or give this entry an id of its own.",
+                     `kind = \"{expected}\"`; `kind = \"{actual}\"` is not built, and only \
+                     its `enabled`, `base_url`, `api_key_env` and `models` still apply to \
+                     that backend. Set `kind = \"{expected}\"`, or give this entry an id of \
+                     its own.",
                     id = backend.id,
                     what = expected.discovered_noun(),
                     expected = expected.as_str(),
@@ -1844,10 +1863,30 @@ mod tests {
             ("openai-key", "nearai"),
             ("nearai", "openai-api"),
         ] {
-            load(&format!(
-                "[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\nconfig_dir = \"~/.x\"\n"
+            load(&format!("[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\n"))
+                .unwrap_or_else(|e| panic!("`{id}` as `{kind}` must still load: {e}"));
+        }
+    }
+
+    /// Main's `BackendConfig` had no `config_dir`, so that shape never loaded.
+    /// Accepting it would let an entry the warning calls ignored still move the
+    /// default login (`default_login` finds the entry by id) to a path none of
+    /// the checks below ever looked at.
+    #[test]
+    fn a_discovered_id_with_another_kind_and_a_config_dir_is_refused() {
+        for (id, kind, dir) in [
+            ("claude-sub", "anthropic-api", "relative/dir"),
+            ("nearai", "openai-api", "also-relative"),
+            ("codex-sub", "claude-subscription", "~/.x"),
+        ] {
+            let err = load(&format!(
+                "[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\nconfig_dir = \"{dir}\"\n"
             ))
-            .unwrap_or_else(|e| panic!("`{id}` as `{kind}` must still load: {e}"));
+            .expect_err(&format!(
+                "`{id}` as `{kind}` with a config_dir must be refused"
+            ));
+            let text = err.to_string();
+            assert!(text.contains(id) && text.contains("config_dir"), "{text}");
         }
     }
 
