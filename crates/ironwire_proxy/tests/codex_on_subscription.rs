@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ironwire_core::config::Config;
-use ironwire_core::protocol::BackendId;
+use ironwire_core::protocol::{BackendId, ModelTier};
 use ironwire_creds::ConsentLedger;
 use ironwire_proxy::server::app;
 use ironwire_proxy::state::{AppState, BackendRegistry};
+use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use ironwire_upstream::openai_responses::ResponsesBackend;
 use ironwire_upstream::{Backend, Observation};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -582,6 +583,11 @@ async fn after_a_restart_the_only_logins_encrypted_replay_still_reaches_it() {
 async fn encrypted_reasoning_whose_origin_could_be_either_login_reaches_neither() {
     let (own_url, own_received) = spawn_mock().await;
     let (work_url, work_received) = spawn_mock().await;
+    // A Chat-only backend, reachable from Codex only by translation. The
+    // native logins refuse a replay without a known origin on their own; this
+    // is what pins the other half, that an ambiguous one is never moved to
+    // another family either.
+    let (local_url, local_received) = spawn_mock().await;
     let (_own_dir, own_auth) = codex_auth_fixture_for("own-account-0000");
     let (work_home, _work_auth) = codex_auth_fixture_for("work-account-1111");
     let own = ResponsesBackend::codex_subscription_at(Some(own_auth), Some(own_url), 30)
@@ -597,6 +603,17 @@ async fn encrypted_reasoning_whose_origin_could_be_either_login_reaches_neither(
     let mut registry = BackendRegistry::new();
     registry.push(Arc::new(own));
     registry.push(Arc::new(work));
+    registry.push(Arc::new(
+        ChatCompletionsBackend::local(
+            BackendId::from("local"),
+            "Local model",
+            format!("{local_url}/v1"),
+            None,
+            vec![("gpt-5".to_string(), ModelTier::Frontier)],
+            30,
+        )
+        .expect("client builds"),
+    ));
     let mut consent = ConsentLedger::default();
     consent.grant("codex-sub", chrono::Utc::now());
     let work_home_dir = work_home.path().display().to_string();
@@ -617,4 +634,5 @@ async fn encrypted_reasoning_whose_origin_could_be_either_login_reaches_neither(
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(own_received.lock().expect("lock").is_none());
     assert!(work_received.lock().expect("lock").is_none());
+    assert!(local_received.lock().expect("lock").is_none());
 }
