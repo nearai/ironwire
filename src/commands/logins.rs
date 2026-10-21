@@ -161,7 +161,7 @@ impl Login {
             ..self.clone()
         }
         .client_config()?;
-        (self.client_config().as_ref() != Some(&unmoved)).then_some(unmoved)
+        moved_away_from(self.client_config(), unmoved)
     }
 
     /// The client, named so two of its logins read apart: `Claude Code`,
@@ -173,6 +173,13 @@ impl Login {
             Some(location) => format!("{client} ({location})"),
         }
     }
+}
+
+/// `unmoved`, unless `moved` is that file on disk: a default moved into its
+/// own directory, under any spelling of it, leaves nothing behind.
+fn moved_away_from(moved: Option<PathBuf>, unmoved: PathBuf) -> Option<PathBuf> {
+    let same = moved.is_some_and(|moved| dir_identity(&moved) == dir_identity(&unmoved));
+    (!same).then_some(unmoved)
 }
 
 /// Every login config.toml knows about: the two defaults, then each
@@ -772,5 +779,43 @@ mod tests {
                 home.path()
             ));
         }
+    }
+
+    /// The default moved to `~/.Claude` on a case-insensitive volume, or to a
+    /// symlink to `~/.claude`, is still in the file plain `claude` reads:
+    /// nothing is left behind to warn about.
+    #[test]
+    fn a_default_moved_to_another_spelling_of_its_directory_leaves_nothing_behind() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let usual = home.path().join(".claude");
+        std::fs::create_dir(&usual).expect("dir");
+        let unmoved = usual.join("settings.json");
+        let folds = folds_case(home.path());
+        assert_eq!(
+            moved_away_from(
+                Some(home.path().join(".Claude").join("settings.json")),
+                unmoved.clone()
+            )
+            .is_none(),
+            folds
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&usual, home.path().join("cl")).expect("symlink");
+            assert_eq!(
+                moved_away_from(
+                    Some(home.path().join("cl").join("settings.json")),
+                    unmoved.clone()
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            moved_away_from(
+                Some(home.path().join(".claude-main").join("settings.json")),
+                unmoved.clone()
+            ),
+            Some(unmoved)
+        );
     }
 }
