@@ -690,17 +690,27 @@ pub(crate) fn warn_shared_settings(login: &Login) {
     println!();
 }
 
-/// Say so when moving the default login leaves another client on IronWire.
+/// Say so when moving a login leaves another client on IronWire.
 ///
 /// The client still started without a directory of its own keeps reading the
-/// file the default used to be wired in. On the plain URL it gets no
-/// subscription once the default has moved; on the URL naming the moved login
-/// it would get another account's.
+/// file a moved default used to be wired in. On the plain URL it gets no
+/// subscription once the default has moved. On the URL naming the moved login
+/// — there, or in whatever directory the login's consent was given in before
+/// it moved ([`Login::left_behind`]) — it would get another account's.
+///
+/// Warned, never rewritten: the file is that client's, and taking it off
+/// IronWire is a command of its own.
 pub(crate) fn warn_left_behind(login: &Login) {
-    let Some(path) = login.left_behind() else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let ledger = paths()
+        .map(|paths| ConsentLedger::load(&paths.consent_file()))
+        .unwrap_or_default();
+    for path in login.left_behind(&ledger) {
+        warn_left_behind_in(login, &path);
+    }
+}
+
+fn warn_left_behind_in(login: &Login, path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
     let ours = match login.product {
@@ -715,9 +725,14 @@ pub(crate) fn warn_left_behind(login: &Login) {
     let Some(ours) = ours else {
         return;
     };
-    let file = logins::shown(&path);
+    let file = logins::shown(path);
     let dir = path.parent().map(logins::shown).unwrap_or_default();
     let client = login.product.client();
+    // The plain URL is the unmoved default's: it serves a client anywhere
+    // else from no subscription only while the default is moved.
+    if ours.account.is_none() && (!login.is_default() || login.owns_the_plain_url()) {
+        return;
+    }
     println!();
     let undo = Verb::Disconnect {
         subscription: false,

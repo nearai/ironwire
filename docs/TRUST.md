@@ -252,7 +252,12 @@ says so and names the command that takes that client off, leaving the file for
 the user to decide
 (`moving_the_default_login_warns_about_the_client_still_pointed_at_the_plain_url`);
 `ironwire doctor` flags the same state, for either product
-(`doctor_flags_each_client_a_moved_default_login_left_on_the_plain_url`). A
+(`doctor_flags_each_client_a_moved_default_login_left_on_the_plain_url`).
+A client left bound to a login's id in the directory the login's consent was
+given in, after that login moved — a default moved back, or an additional login
+given another directory — is warned about the same way by `connect` and
+`doctor`, because the daemon would serve it from the directory the id reads now
+(`moving_a_login_back_warns_about_the_client_still_bound_to_it_in_the_old_directory`). A
 `config_dir` that names the product's default directory itself — `~/.claude`,
 `~/.codex` — is the default moved there, never a second login: `connect
 --config-dir ~/.claude` moves `claude-sub`, and an additional entry for it

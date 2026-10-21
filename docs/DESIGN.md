@@ -491,6 +491,19 @@ command that takes it off
 and `doctor` flags the same state
 (`a_client_left_on_ironwire_by_a_moved_default_login_is_flagged`).
 
+Any move leaves the client file it was wired in still holding the URL that
+names the login, and the daemon resolves that URL by id alone — so whatever
+directory the id reads now would serve that client: a default moved back by
+taking `config_dir` off it, or an additional login given another directory.
+The consent ledger records the directory each consent answered, which is the
+one record of where a login was. `connect` and `doctor` read it and warn about
+a client there still bound to the login, naming the command that takes it off,
+and leave the file alone
+(`moving_a_login_back_warns_about_the_client_still_bound_to_it_in_the_old_directory`,
+`doctor_flags_a_client_still_bound_to_a_login_that_moved_away`). A consent
+given in the new place replaces that record, which is why `connect` says this
+before it asks.
+
 Writing a bound URL replaces a plain URL of ours in that file, and never a URL
 that is not ours. The reverse never happens: a connect that names no login —
 plain `ironwire connect claude`, `init`, the menu bar app — keeps a file's

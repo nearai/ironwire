@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 use ironwire_agents::{claude_settings, codex_config, endpoint};
 use ironwire_core::config::{BackendImpl, Config, expand_config_dir};
 use ironwire_creds::codex::CodexMode;
+use ironwire_creds::consent::ConsentLedger;
 use ironwire_creds::login::dir_identity;
 use ironwire_creds::{ClaudeLogin, CodexLogin, SubscriptionLogin, SubscriptionProduct};
 
@@ -148,20 +149,47 @@ impl Login {
         }
     }
 
-    /// For a default login moved with `config_dir`, the config file of the
-    /// client it moved away from — the Claude Code or Codex still started
-    /// without a directory of its own, which no subscription serves now.
-    /// `None` for anything else, and for a move into that very directory.
-    pub(crate) fn left_behind(&self) -> Option<PathBuf> {
-        if !self.is_default() || self.config_dir.is_none() {
-            return None;
+    /// The config files of clients this login moved away from, which may still
+    /// be pointed at IronWire for it.
+    ///
+    /// For a default login moved with `config_dir`, the client still started
+    /// without a directory of its own, which no subscription serves now. And
+    /// for any login, the directory `ledger` recorded its consent in, when the
+    /// login reads somewhere else now: a client there still bound to this id is
+    /// served by whatever directory the id reads today, because the daemon
+    /// resolves a bound URL by id alone. That includes a default moved back by
+    /// taking `config_dir` off it. Empty for a login that has not moved, and
+    /// for a move into that very directory.
+    ///
+    /// The ledger is the only record of where a login was, and a consent given
+    /// in the new place replaces it — so this is said before that happens.
+    pub(crate) fn left_behind(&self, ledger: &ConsentLedger) -> Vec<PathBuf> {
+        let here = self.client_config();
+        let elsewhere = |config_dir: Option<String>| {
+            Self {
+                config_dir,
+                ..self.clone()
+            }
+            .client_config()
+        };
+        let mut left: Vec<PathBuf> = Vec::new();
+        if self.is_default()
+            && self.config_dir.is_some()
+            && let Some(unmoved) = elsewhere(None)
+        {
+            left.extend(moved_away_from(here.clone(), unmoved));
         }
-        let unmoved = Self {
-            config_dir: None,
-            ..self.clone()
+        if let Some(then) = ledger
+            .recorded_location(&self.id)
+            .and_then(|dir| elsewhere(Some(dir.to_string())))
+            .and_then(|then| moved_away_from(here, then))
+            && !left
+                .iter()
+                .any(|path| dir_identity(path) == dir_identity(&then))
+        {
+            left.push(then);
         }
-        .client_config()?;
-        moved_away_from(self.client_config(), unmoved)
+        left
     }
 
     /// The client, named so two of its logins read apart: `Claude Code`,
@@ -560,21 +588,57 @@ mod tests {
         );
 
         let home = dirs::home_dir().expect("a home directory");
+        let none = ConsentLedger::default();
         assert_eq!(
-            logins[0].left_behind(),
-            Some(home.join(".claude").join("settings.json"))
+            logins[0].left_behind(&none),
+            [home.join(".claude").join("settings.json")]
         );
 
         // Left in place, the default keeps the plain URL and leaves nothing
         // behind; an additional login never has anything to leave.
         let unmoved = configured(&Config::default());
         assert_eq!(unmoved[0].url(8463), "http://127.0.0.1:8463/anthropic");
-        assert_eq!(unmoved[0].left_behind(), None);
+        assert!(unmoved[0].left_behind(&none).is_empty());
         let work = config(
             "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
              config_dir = \"~/.claude-work\"\n",
         );
-        assert_eq!(configured(&work)[2].left_behind(), None);
+        assert!(configured(&work)[2].left_behind(&none).is_empty());
+    }
+
+    /// The daemon resolves a bound URL by id alone, so a client still bound to
+    /// a login in the directory it moved away from is served by whichever
+    /// directory that id reads now. The consent ledger is where the login was:
+    /// a default moved back to its usual place, and an additional login moved
+    /// to another directory, each name the file they left.
+    #[test]
+    fn a_login_that_moved_away_from_its_consented_directory_names_the_file_it_left() {
+        let home = dirs::home_dir().expect("a home directory");
+        let old = home.join(".claude-old-place");
+        let mut ledger = ConsentLedger::default();
+        let now = chrono::Utc::now();
+        ledger.grant_for("claude-sub", Some(&old.display().to_string()), now);
+        ledger.grant_for("claude-work", Some(&old.display().to_string()), now);
+
+        let moved_back = configured(&Config::default());
+        assert_eq!(
+            moved_back[0].left_behind(&ledger),
+            [old.join("settings.json")]
+        );
+
+        let work = configured(&config(
+            "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.claude-new-place\"\n",
+        ));
+        assert_eq!(work[2].left_behind(&ledger), [old.join("settings.json")]);
+
+        // Still where its consent was given: nothing left behind, under any
+        // spelling of that directory.
+        let unmoved = configured(&config(
+            "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"~/.claude-old-place/\"\n",
+        ));
+        assert!(unmoved[2].left_behind(&ledger).is_empty());
     }
 
     /// Moved into its own usual directory, the default leaves no other
@@ -585,7 +649,7 @@ mod tests {
             "[[backends]]\nid = \"claude-sub\"\nkind = \"claude-subscription\"\n\
              config_dir = \"~/.claude/\"\n",
         ));
-        assert_eq!(logins[0].left_behind(), None);
+        assert!(logins[0].left_behind(&ConsentLedger::default()).is_empty());
         assert!(is_default_dir(SubscriptionProduct::Claude, "~/.claude/"));
         assert!(is_default_dir(SubscriptionProduct::ChatGpt, "~/.codex"));
         assert!(!is_default_dir(SubscriptionProduct::Claude, "~/.codex"));

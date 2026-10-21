@@ -207,15 +207,17 @@ fn check_clients(port: u16, declared: &[Login]) {
     println!();
 }
 
-/// The client a moved default login left behind, when it is still pointed
-/// here.
+/// The clients a moved login left behind, when they are still pointed here.
 fn report_left_behind(declared: &[Login], product: SubscriptionProduct, port: u16) {
+    let ledger = super::paths()
+        .map(|paths| ironwire_creds::consent::ConsentLedger::load(&paths.consent_file()))
+        .unwrap_or_default();
     for login in declared.iter().filter(|l| l.product == product) {
-        if let Some(path) = login.left_behind()
-            && let Some(lines) = left_behind_finding(login, &path, port)
-        {
-            for line in lines {
-                println!("{line}");
+        for path in login.left_behind(&ledger) {
+            if let Some(lines) = left_behind_finding(login, &path, port) {
+                for line in lines {
+                    println!("{line}");
+                }
             }
         }
     }
@@ -238,10 +240,16 @@ fn left_behind_finding(login: &Login, path: &std::path::Path, port: u16) -> Opti
     let id = login.id.as_str();
     let location = login.location();
     let problem = match state {
-        ClientState::PointedHere { account: None } => format!(
-            "{label:<14}{shown} points here, and no subscription serves the plain URL \
+        // The plain URL is the unmoved default's, so it is left behind only
+        // while the default is moved.
+        ClientState::PointedHere { account: None }
+            if login.is_default() && !login.owns_the_plain_url() =>
+        {
+            format!(
+                "{label:<14}{shown} points here, and no subscription serves the plain URL \
              since `{id}` moved to {location}"
-        ),
+            )
+        }
         ClientState::PointedHere {
             account: Some(account),
         } if account == id => format!(

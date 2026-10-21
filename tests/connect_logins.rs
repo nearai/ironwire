@@ -729,6 +729,101 @@ fn moving_the_default_login_warns_about_the_client_still_pointed_at_the_plain_ur
     );
 }
 
+/// Moving a login leaves the client file it was wired in still naming it, and
+/// the daemon resolves that URL by id alone: whatever directory the id reads
+/// now would serve that client. Taking `config_dir` back off a moved default
+/// is the case `warn_left_behind` itself recommends, so it has to be said
+/// then too, while the consent ledger still remembers where the login was.
+#[test]
+fn moving_a_login_back_warns_about_the_client_still_bound_to_it_in_the_old_directory() {
+    let machine = Machine::new();
+    let main = machine.home().join(".claude-main");
+    machine.log_in_claude(&main, "sk-ant-oat01-main");
+    machine.answering(
+        &[
+            "connect",
+            "claude",
+            "--config-dir",
+            "~/.claude-main",
+            "--id",
+            "claude-sub",
+            "--subscription",
+            "--port",
+            "8463",
+        ],
+        "y\n",
+    );
+    assert_eq!(
+        machine.base_url_in(&main).as_deref(),
+        Some("http://127.0.0.1:8463/anthropic/account/claude-sub")
+    );
+
+    // The default moved back, by the edit the earlier note names.
+    std::fs::write(
+        machine.runtime().join("config.toml"),
+        "[[backends]]\nid = \"claude-sub\"\nkind = \"claude-subscription\"\n",
+    )
+    .expect("write config");
+    let said = stdout(&machine.run(&["connect", "claude", "--port", "8463"]));
+
+    assert!(
+        said.contains(
+            "~/.claude-main/settings.json still points Claude Code at the URL naming \
+             `claude-sub`"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("`ironwire disconnect claude --config-dir ~/.claude-main`"),
+        "{said}"
+    );
+    // Left alone: the note is the answer, not an edit nobody asked for.
+    assert_eq!(
+        machine.base_url_in(&main).as_deref(),
+        Some("http://127.0.0.1:8463/anthropic/account/claude-sub")
+    );
+}
+
+/// The same state, seen by `doctor`: an additional login moved to another
+/// directory leaves its old client bound to its id.
+#[test]
+fn doctor_flags_a_client_still_bound_to_a_login_that_moved_away() {
+    let machine = Machine::new();
+    let old = machine.home().join(".claude-old");
+    std::fs::create_dir_all(&old).expect("mkdir");
+    machine.consented_in("claude-work", &old);
+    std::fs::write(
+        machine.runtime().join("config.toml"),
+        "[updates]\ncheck = false\n\n\
+         [[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+         config_dir = \"~/.claude-new\"\n",
+    )
+    .expect("write config");
+    let daemon = machine.daemon();
+    let port = daemon.port;
+    std::fs::write(
+        old.join("settings.json"),
+        format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"http://127.0.0.1:{port}/anthropic/account/claude-work"}}}}"#
+        ),
+    )
+    .expect("write settings");
+
+    let said = stdout(&machine.run(&["doctor", "--port", &port.to_string()]));
+
+    assert!(
+        said.contains(
+            "~/.claude-old/settings.json points here as `claude-work`, which now reads \
+             ~/.claude-new"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("fix:  ironwire disconnect claude --config-dir ~/.claude-old\n"),
+        "{said}"
+    );
+}
+
 /// `~/.claude` and `~/.codex` are the default login's own directories. A
 /// second login there would share the default's settings file, so naming one
 /// moves the default there — and asking for a second login there by name is

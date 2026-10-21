@@ -265,6 +265,18 @@ impl ConsentLedger {
         );
     }
 
+    /// Where the login `backend_id`'s recorded consent answered, when that
+    /// was a directory of its own ([`ConsentRecord::location`]), current or
+    /// not.
+    ///
+    /// Not a grant: a consent for a directory the id no longer reads answers
+    /// nothing. It is the one record of where a moved login used to be, so a
+    /// client still wired there can be found.
+    #[must_use]
+    pub fn recorded_location(&self, backend_id: &str) -> Option<&str> {
+        self.entries.get(backend_id)?.location.as_deref()
+    }
+
     /// Withdraw consent for `backend_id`, whichever login it was given for.
     ///
     /// Deliberately not location-bound: a user taking consent back must never
