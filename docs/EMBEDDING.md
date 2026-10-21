@@ -244,6 +244,20 @@ own, as above — and finds it in the control API's status beside the rest, with
 the `connect_command` that sets it up. `StartupProbes::Configured` probes it
 once it has consent, because an entry names it.
 
+**Two config shapes load and configure nothing.** A `claude-subscription` or
+`codex-subscription` entry under an id of its own with no `config_dir`, and an
+entry under one of discovery's own ids (`claude-sub`, `codex-sub`, `nearai`,
+`anthropic-key`, `openai-key`) whose `kind` is another kind, were accepted
+before logins could be declared and are still accepted: `Config::validate` logs
+a warning naming the entry and the fix, and the registry builds no backend for
+it. They do not make a start fail with `EmbedError::Config`, so a host's proxy
+keeps starting for a user whose file worked
+(`a_host_still_starts_on_config_shapes_main_accepted`). The first is not built
+as the default login again under another id, which is the copy it used to
+become; add `config_dir`, or use `ironwire connect claude --config-dir DIR` to
+write the entry. Real errors still refuse: a duplicate id, an unknown `kind`, a
+`config_dir` shared by two entries or equal to the default's directory.
+
 Supplying no source is the default and discovers credentials exactly as before,
 from the same places, at the same points, so the CLI and every existing
 embedder are unaffected. Carrying a host's closure costs `EmbedOptions` its

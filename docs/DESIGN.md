@@ -477,7 +477,13 @@ discovered by scanning — that is a destination the user did not choose. A
 `--config-dir` naming a directory an entry already declares reuses that entry
 as declared, spelling included, so the CLI checks, and asks consent for, the
 same Keychain item the daemon will read
-(`a_declared_login_typed_another_way_is_consented_to_as_declared`).
+(`a_codex_home_in_the_shell_naming_a_declared_login_means_that_login`). The
+exception is Claude Code on macOS, whose Keychain item is named after the exact
+directory string: a spelling that reaches the same directory on disk (a
+trailing slash, a symlink, a case variant) but names a different Keychain item
+is refused, not reused, because both would write one `settings.json` and one
+client would be served the other's token
+(`a_shell_using_an_alias_of_a_declared_claude_directory_is_refused`).
 
 Moving the default is the same command with `--id claude-sub` (or
 `codex-sub`), and a `--config-dir` that names the default directory itself
@@ -542,7 +548,13 @@ GET  /_ironwire/events          SSE: route decisions, quota changes, errors
 GET  /_ironwire/health          liveness. The one route with no token
 POST /_ironwire/pin             { backend, model } — no backend clears the pin
 POST /_ironwire/privacy         { mode }
-POST /_ironwire/consent         { backend, granted, prompt_version }
+POST /_ironwire/consent         { backend, granted, prompt_version, binding }
+                                `binding` is the opaque string the consent
+                                prompt carried, echoed back. A grant without
+                                it, or with one that no longer matches the
+                                login the prompt names, is refused (400); a
+                                withdrawal (`granted: false`) needs neither
+                                `binding` nor a current `prompt_version`
 POST /_ironwire/tools           { id, connect } — point a coding agent here,
                                 also { dry_run } to be told the change without
                                 making it, and { as_previewed } to make only

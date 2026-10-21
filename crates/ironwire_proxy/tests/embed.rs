@@ -1219,3 +1219,24 @@ async fn an_embedded_start_can_be_spawned_onto_a_multi_thread_runtime() {
 
     assert_ne!(started, 0, "the spawned start bound a real port");
 }
+
+/// Shapes `main` accepted must not stop an embedding host's proxy: a login
+/// entry under an id of its own with no `config_dir`, and an entry under a
+/// discovered id that names another kind. Both are ignored with a warning.
+#[tokio::test]
+async fn a_host_still_starts_on_config_shapes_main_accepted() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[updates]\ncheck = false\n\
+         [[backends]]\nid = 'claude-work'\nkind = 'claude-subscription'\n\
+         [[backends]]\nid = 'codex-work'\nkind = 'codex-subscription'\nenabled = false\n\
+         [[backends]]\nid = 'claude-sub'\nkind = 'anthropic-api'\nenabled = false\n\
+         [[backends]]\nid = 'nearai'\nkind = 'openai-api'\nenabled = false\n",
+    )
+    .unwrap();
+    let proxy = start(home.path(), Some(0))
+        .await
+        .expect("a config main accepted still starts");
+    proxy.shutdown().await;
+}

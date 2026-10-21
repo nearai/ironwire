@@ -1057,24 +1057,23 @@ impl Config {
 
             // An id discovery uses names the backend discovery builds, and an
             // entry under it only configures that backend. A different kind
-            // here used to be accepted and silently ignored, which reads as
-            // configuration and does nothing.
+            // here has always been accepted and ignored, and an embedding
+            // host's proxy must not stop starting over a file that worked, so
+            // it is a warning and the entry is skipped: nothing below applies
+            // to an entry that configures nothing.
             if let Some(expected) = BackendImpl::discovered_as(&backend.id)
                 && expected != kind
             {
-                return Err(invalid(
-                    &backend.id,
-                    format!(
-                        "`{id}` is the id IronWire gives {what}, which is always \
-                         `kind = \"{expected}\"`; `kind = \"{actual}\"` would be \
-                         ignored. Set `kind = \"{expected}\"`, or give this entry \
-                         an id of its own.",
-                        id = backend.id,
-                        what = expected.discovered_noun(),
-                        expected = expected.as_str(),
-                        actual = backend.kind,
-                    ),
-                ));
+                tracing::warn!(
+                    "[[backends]] `{id}` is the id IronWire gives {what}, which is always \
+                     `kind = \"{expected}\"`; `kind = \"{actual}\"` is ignored. Set \
+                     `kind = \"{expected}\"`, or give this entry an id of its own.",
+                    id = backend.id,
+                    what = expected.discovered_noun(),
+                    expected = expected.as_str(),
+                    actual = backend.kind,
+                );
+                continue;
             }
 
             if let Some(raw) = &backend.config_dir {
@@ -1152,25 +1151,23 @@ impl Config {
                 && kind.discovered_id() != Some(backend.id.as_str())
             {
                 // Without a directory there is nothing to tell this login
-                // from the default one, and it used to be built as exactly
-                // that: a second copy of the default login under the default's
-                // id.
-                return Err(invalid(
-                    &backend.id,
-                    format!(
-                        "An additional {product} login needs `config_dir`: the \
-                         directory you export as `{variable}` when you use it, \
-                         for example `config_dir = \"{example}\"`. Without it this \
-                         entry would be your default login again under another \
-                         name. `ironwire connect {command} --config-dir DIR` \
-                         writes the entry for you; only `{default}` means the \
-                         default login.",
-                        product = kind.product_name(),
-                        example = kind.example_config_dir(),
-                        command = kind.connect_noun(),
-                        default = kind.discovered_id().unwrap_or_default(),
-                    ),
-                ));
+                // from the default one. It used to be built as exactly that,
+                // a second copy of the default login under the default's id;
+                // the registry now builds nothing for it. Still accepted, so
+                // a config that loaded before keeps loading.
+                tracing::warn!(
+                    "[[backends]] `{id}`: an additional {product} login needs \
+                     `config_dir`, the directory you export as `{variable}` when you \
+                     use it, for example `config_dir = \"{example}\"`. Without it \
+                     this entry is ignored. `ironwire connect {command} --config-dir \
+                     DIR` writes the entry for you; only `{default}` means the \
+                     default login.",
+                    id = backend.id,
+                    product = kind.product_name(),
+                    example = kind.example_config_dir(),
+                    command = kind.connect_noun(),
+                    default = kind.discovered_id().unwrap_or_default(),
+                );
             }
 
             // Neither kind has a host to fall back on: there is no canonical
@@ -1815,58 +1812,42 @@ mod tests {
     }
 
     /// Rule 3, and the bug it closes: such an entry used to build a second
-    /// copy of the *default* login under the default's id.
+    /// copy of the *default* login under the default's id. The registry now
+    /// builds nothing for it, and the file still loads: refusing it made an
+    /// embedding host's proxy stop starting over a config that worked.
     #[test]
-    fn an_additional_login_without_its_directory_is_refused() {
-        let claude = rejection(
+    fn an_additional_login_without_its_directory_loads_and_configures_nothing() {
+        let config = load(
             r#"
             [[backends]]
             id = "claude-work"
             kind = "claude-subscription"
-            "#,
-        );
-        assert!(claude.contains("claude-work"), "{claude}");
-        assert!(claude.contains("CLAUDE_CONFIG_DIR"), "{claude}");
-        assert!(
-            claude.contains("ironwire connect claude --config-dir"),
-            "{claude}"
-        );
 
-        let codex = rejection(
-            r#"
             [[backends]]
             id = "codex-work"
             kind = "codex-subscription"
             enabled = false
             "#,
-        );
-        assert!(codex.contains("codex-work"), "{codex}");
-        assert!(codex.contains("CODEX_HOME"), "{codex}");
-        assert!(
-            codex.contains("ironwire connect codex --config-dir"),
-            "{codex}"
-        );
+        )
+        .expect("a shape main accepted still loads");
+        assert_eq!(config.backends.len(), 2);
     }
 
     /// Rule 4: an id discovery uses names discovery's backend, so a different
-    /// kind under it would be silently ignored.
+    /// kind under it is ignored. It always was; the file still loads.
     #[test]
-    fn a_discovered_id_with_another_kind_is_refused() {
-        for (id, kind, expected) in [
-            ("claude-sub", "anthropic-api", "claude-subscription"),
-            ("codex-sub", "claude-subscription", "codex-subscription"),
-            ("anthropic-key", "claude-subscription", "anthropic-api"),
-            ("openai-key", "nearai", "openai-api"),
-            ("nearai", "openai-api", "nearai"),
+    fn a_discovered_id_with_another_kind_loads_and_is_ignored() {
+        for (id, kind) in [
+            ("claude-sub", "anthropic-api"),
+            ("codex-sub", "claude-subscription"),
+            ("anthropic-key", "claude-subscription"),
+            ("openai-key", "nearai"),
+            ("nearai", "openai-api"),
         ] {
-            let message = rejection(&format!(
+            load(&format!(
                 "[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\nconfig_dir = \"~/.x\"\n"
-            ));
-            assert!(message.contains(&format!("`{id}`")), "{message}");
-            assert!(
-                message.contains(&format!("kind = \"{expected}\"")),
-                "the fix must be spelled out: {message}"
-            );
+            ))
+            .unwrap_or_else(|e| panic!("`{id}` as `{kind}` must still load: {e}"));
         }
     }
 
