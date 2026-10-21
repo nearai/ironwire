@@ -1797,7 +1797,15 @@ fn requirements_for(
     origin: &Origin,
 ) -> RequestRequirements {
     let mut requirements = peek.requirements.clone();
-    requirements.reasoning_origin_ambiguous = matches!(origin, Origin::Ambiguous);
+    // An origin with no observed scope is a login whose token names no
+    // account. It cannot authorize a native replay, and the account that
+    // minted the reasoning may well be that login, healthy and right here, so
+    // it is not grounds to move the conversation to another family either.
+    requirements.reasoning_origin_ambiguous = match origin {
+        Origin::Ambiguous => true,
+        Origin::Known(account) => account.account_scope.is_none(),
+        Origin::Absent => false,
+    };
     let known = match origin {
         Origin::Known(account) => Some(account),
         Origin::Absent | Origin::Ambiguous => None,
@@ -3944,6 +3952,47 @@ mod tests {
                 );
                 assert!(!decision.translated, "fallback {fallback}");
                 assert_eq!(decision.rung, Rung::Preferred, "fallback {fallback}");
+            }
+        }
+
+        /// A ChatGPT token whose claims name no account gives its login no
+        /// scope, so nothing can show that the reasoning a replay carries is
+        /// still that login's, and native replay is refused. The login that
+        /// minted it may be right there and healthy, so the conversation must
+        /// not be handed to another family on that guess either, spending
+        /// credits on another model and dropping its reasoning: recorded on
+        /// its opening turn or inferred after a restart, every route refuses.
+        #[test]
+        fn a_scopeless_logins_replay_is_refused_everywhere_rather_than_moved_to_another_family() {
+            for fallback in [false, true] {
+                let mut login = codex_login("codex-sub", true);
+                login.account_scope = None;
+                let candidates = [login, anthropic_key()];
+                for recorded in [false, true] {
+                    let mut policy = Policy::new();
+                    policy.set_cross_account_fallback(fallback);
+                    if recorded {
+                        let opening =
+                            codex_route(&mut policy, &codex(None, false), &candidates, t(0))
+                                .expect("an opening turn replays nothing");
+                        assert_eq!(opening.backend.as_str(), "codex-sub");
+                    }
+                    let error = codex_route(&mut policy, &codex(None, true), &candidates, t(1))
+                        .expect_err("an unverifiable origin is not a reason to change families");
+                    let refusals = refusals_by_id(error);
+                    assert_eq!(
+                        refusals.len(),
+                        2,
+                        "fallback {fallback}, recorded {recorded}"
+                    );
+                    for (id, refusal) in refusals {
+                        assert_eq!(
+                            refusal,
+                            Refusal::Ineligible(Ineligible::ReasoningBoundToAccount),
+                            "fallback {fallback}, recorded {recorded}: {id}"
+                        );
+                    }
+                }
             }
         }
 

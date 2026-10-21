@@ -485,7 +485,11 @@ The gate lives in `eligible()`, fed by the policy's recorded or inferred origin:
   identifies the credential, without claiming to know its API organization.
   A changed key requires a new origin even if its organization might be the
   same. Unknown subscription identity or a mismatch with the recorded origin
-  yields `Ineligible::ReasoningBoundToAccount`.
+  yields `Ineligible::ReasoningBoundToAccount`. An origin whose login has no
+  known identity refuses every route, translated ones included: that login
+  may be the minting account, healthy and right here, so it is no reason to
+  move the conversation to another family
+  (`a_scopeless_logins_replay_is_refused_everywhere_rather_than_moved_to_another_family`).
 - With no recorded origin, the origin is inferred when only one account could
   have minted it: of the Responses-wire candidates allowed to serve this
   client, health and quota aside, its logins, or, when it has no login here,
