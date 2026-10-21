@@ -193,8 +193,10 @@ consent question. The daemon reads its logins when it starts, so restart it
 once; then run the agent as you already do:
 `CLAUDE_CONFIG_DIR=~/.claude-work claude`. In a shell where `CLAUDE_CONFIG_DIR`
 is already set, plain `ironwire connect claude` means that login. `CODEX_HOME`
-keeps meaning the default Codex login, as it always has, so a second Codex home
-always takes `--config-dir`. `ironwire disconnect claude --subscription
+keeps meaning the default Codex login, as it always has, unless config.toml
+already declares a login in that directory: then plain `ironwire connect codex`
+means that login, and the first connect of a second Codex home takes
+`--config-dir`. `ironwire disconnect claude --subscription
 --config-dir ~/.claude-work` (or `--id claude-work`) withdraws one login's
 consent and leaves the others alone.
 

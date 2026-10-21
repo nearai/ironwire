@@ -135,7 +135,8 @@ struct Chosen {
     /// Whether config.toml already says what `login` says. A default login in
     /// its usual place needs no entry, so it always is.
     declared: bool,
-    /// `CLAUDE_CONFIG_DIR`, when that is what chose the login.
+    /// The product's login-directory variable (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`), when that is what chose the login.
     from_environment: bool,
 }
 
@@ -169,11 +170,14 @@ impl Verb {
 /// Claude Code that would run here — a login of its own, because Claude Code
 /// keys its credential to that directory — and otherwise it is the default.
 ///
-/// `CODEX_HOME` is deliberately not read the same way. The default Codex login
-/// already follows it, in the daemon as here (`ironwire_creds::codex::auth_path`),
-/// and setups and hermetic tests plant it to mean exactly that; reading it as
-/// a second login would make one directory two logins. [`connect_login`] says
-/// so in a line instead.
+/// `CODEX_HOME` is read more narrowly. The default Codex login already follows
+/// it, in the daemon as here (`ironwire_creds::codex::auth_path`), and setups
+/// and hermetic tests plant it to mean exactly that; reading every one as a
+/// second login would make one directory two logins. So it chooses a login
+/// only when config.toml already declares one in that directory — the Codex
+/// started from this shell reads that login's credential, and pointing it at
+/// the default's plain URL would have it served by another account. Any other
+/// `CODEX_HOME` is the default, and [`connect_login`] says so in a line.
 fn resolve(
     product: SubscriptionProduct,
     args: &LoginArgs,
@@ -190,10 +194,14 @@ fn resolve(
         (Some(dir), _) => Some(dir.clone()),
         (None, Some(_)) => None,
         (None, None) => {
-            let exported = (product == SubscriptionProduct::Claude)
-                .then(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
-                .flatten()
-                .filter(|dir| !dir.is_empty());
+            let exported = std::env::var(variable)
+                .ok()
+                .filter(|dir| !dir.is_empty())
+                .filter(|dir| match product {
+                    SubscriptionProduct::Claude => true,
+                    SubscriptionProduct::ChatGpt => logins::stored_form(dir, variable)
+                        .is_ok_and(|stored| logins::by_dir(&known, product, &stored).is_some()),
+                });
             from_environment = exported.is_some();
             exported
         }
@@ -381,14 +389,24 @@ fn connect_target(product: SubscriptionProduct) -> &'static str {
 /// Say which login the environment chose, so nobody connects one while
 /// believing they connected the other.
 fn announce(chosen: &Chosen) {
-    if chosen.from_environment {
-        println!(
+    if !chosen.from_environment {
+        return;
+    }
+    let login = &chosen.login;
+    match login.product {
+        SubscriptionProduct::Claude => println!(
             "CLAUDE_CONFIG_DIR is set to {}, so this is about the Claude Code that uses \
              it — a login of its own. Unset it to mean your default login.",
-            chosen.login.location()
-        );
-        println!();
+            login.location()
+        ),
+        SubscriptionProduct::ChatGpt => println!(
+            "CODEX_HOME is set to {}, which config.toml declares as the login `{}`, so \
+             this is about the Codex that uses it. Unset it to mean your default login.",
+            login.location(),
+            login.id
+        ),
     }
+    println!();
 }
 
 /// `connect claude` / `connect codex`, for one login.
@@ -415,6 +433,7 @@ fn connect_login(
     warn_shared_settings(login);
     if product == SubscriptionProduct::ChatGpt
         && !args.names_one()
+        && !chosen.from_environment
         && let Ok(home) = std::env::var("CODEX_HOME")
         && !home.is_empty()
     {
@@ -767,8 +786,9 @@ fn default_still_consented(chosen: &Chosen, config: &Config, ledger: &ConsentLed
     if ledger.is_granted_for(&default.id, default.describe().consent_location()) {
         println!(
             "Your default login (`{id}`, {location}) still holds consent. To withdraw it, \
-             run `{command}`, or unset CLAUDE_CONFIG_DIR and run this again.",
+             run `{command}`, or unset {variable} and run this again.",
             id = default.id,
+            variable = default.kind().login_dir_variable().unwrap_or_default(),
             location = default.location(),
             command = Verb::Disconnect { subscription: true }
                 .command(default.product, &format!(" --id {}", default.id)),

@@ -408,6 +408,47 @@ fn a_codex_home_in_the_shell_still_means_the_default_login() {
     );
 }
 
+/// `CODEX_HOME` naming a directory config.toml already declares as a login of
+/// its own means that login: the Codex started from this shell reads that
+/// login's credential, so its config file gets the URL naming it, never the
+/// default's plain one.
+#[test]
+fn a_codex_home_in_the_shell_naming_a_declared_login_means_that_login() {
+    let machine = Machine::new();
+    let work = machine.home().join(".codex-work");
+    std::fs::create_dir_all(&work).expect("mkdir");
+    std::fs::write(
+        machine.runtime().join("config.toml"),
+        "[[backends]]\nid = \"codex-work\"\nkind = \"codex-subscription\"\n\
+         config_dir = \"~/.codex-work\"\n",
+    )
+    .expect("write config");
+    let before = machine.config();
+
+    let output = machine
+        .command(&["connect", "codex", "--port", "8463"])
+        .env("CODEX_HOME", &work)
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "{output:?}");
+    let said = stdout(&output);
+
+    assert_eq!(machine.config(), before);
+    let written = std::fs::read_to_string(work.join("config.toml")).expect("wired");
+    assert!(
+        written.contains("base_url = \"http://127.0.0.1:8463/openai/account/codex-work/v1\""),
+        "{written}"
+    );
+    assert!(
+        !said.contains("treats it as your default Codex login"),
+        "{said}"
+    );
+    assert!(
+        said.contains("CODEX_HOME is set to ~/.codex-work"),
+        "{said}"
+    );
+}
+
 #[test]
 fn a_codex_home_named_on_the_command_line_is_its_own_login() {
     let machine = Machine::new();
