@@ -225,6 +225,15 @@ pub(crate) fn configured(config: &Config) -> Vec<Login> {
         if entry.id == product.default_backend_id() {
             continue;
         }
+        // The registry builds nothing for these, so neither does the CLI:
+        // built here, each would read the default login's credential and
+        // wire the default client to an account id no daemon registers.
+        let kind = BackendImpl::parse(&entry.kind);
+        if entry.config_dir.is_none()
+            || BackendImpl::discovered_as(&entry.id).is_some_and(|k| Some(k) != kind)
+        {
+            continue;
+        }
         logins.push(Login {
             id: entry.id.clone(),
             product,

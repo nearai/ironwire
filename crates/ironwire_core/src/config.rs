@@ -1055,6 +1055,37 @@ impl Config {
                 ));
             }
 
+            // Neither kind has a host to fall back on: there is no canonical
+            // address for "some OpenAI-compatible server", and building one
+            // against nothing yields a backend that fails every request.
+            if matches!(kind, BackendImpl::OpenAiCompatible | BackendImpl::Local) {
+                if backend.base_url.is_none() {
+                    return Err(invalid(
+                        &backend.id,
+                        format!(
+                            "`kind = \"{}\"` needs a `base_url`; there is no \
+                             default host to assume. For a local server it must \
+                             include the OpenAI-compatible prefix, usually \
+                             `/v1` — Ollama's native `/api/*` is a different \
+                             protocol and is not supported.",
+                            backend.kind
+                        ),
+                    ));
+                }
+                // A key is required for a hosted endpoint and optional for a
+                // local one: most local servers take no auth at all, and
+                // demanding a variable that holds nothing would be ceremony.
+                if kind == BackendImpl::OpenAiCompatible && backend.api_key_env.is_none() {
+                    return Err(invalid(
+                        &backend.id,
+                        "`kind = \"openai-compatible\"` needs an `api_key_env` \
+                         naming the environment variable that holds its key. \
+                         IronWire keeps no secrets in config.toml."
+                            .to_string(),
+                    ));
+                }
+            }
+
             // An id discovery uses names the backend discovery builds, and an
             // entry under it configures that backend. A different kind here
             // has always been accepted, and an embedding host's proxy must not
@@ -1187,37 +1218,6 @@ impl Config {
                     command = kind.connect_noun(),
                     default = kind.discovered_id().unwrap_or_default(),
                 );
-            }
-
-            // Neither kind has a host to fall back on: there is no canonical
-            // address for "some OpenAI-compatible server", and building one
-            // against nothing yields a backend that fails every request.
-            if matches!(kind, BackendImpl::OpenAiCompatible | BackendImpl::Local) {
-                if backend.base_url.is_none() {
-                    return Err(invalid(
-                        &backend.id,
-                        format!(
-                            "`kind = \"{}\"` needs a `base_url`; there is no \
-                             default host to assume. For a local server it must \
-                             include the OpenAI-compatible prefix, usually \
-                             `/v1` — Ollama's native `/api/*` is a different \
-                             protocol and is not supported.",
-                            backend.kind
-                        ),
-                    ));
-                }
-                // A key is required for a hosted endpoint and optional for a
-                // local one: most local servers take no auth at all, and
-                // demanding a variable that holds nothing would be ceremony.
-                if kind == BackendImpl::OpenAiCompatible && backend.api_key_env.is_none() {
-                    return Err(invalid(
-                        &backend.id,
-                        "`kind = \"openai-compatible\"` needs an `api_key_env` \
-                         naming the environment variable that holds its key. \
-                         IronWire keeps no secrets in config.toml."
-                            .to_string(),
-                    ));
-                }
             }
         }
         Ok(())
@@ -1887,6 +1887,21 @@ mod tests {
             ));
             let text = err.to_string();
             assert!(text.contains(id) && text.contains("config_dir"), "{text}");
+        }
+    }
+
+    /// Main refused an `openai-compatible` or `local` entry with no `base_url`
+    /// whatever its id; a discovered id must not buy it out of that.
+    #[test]
+    fn a_discovered_id_does_not_excuse_a_missing_base_url() {
+        for (id, kind) in [
+            ("nearai", "local"),
+            ("openai-key", "openai-compatible"),
+            ("claude-sub", "local"),
+        ] {
+            load(&format!("[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\n")).expect_err(
+                &format!("`{id}` as `{kind}` with no base_url must be refused"),
+            );
         }
     }
 

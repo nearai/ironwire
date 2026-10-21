@@ -580,6 +580,45 @@ fn init_asks_once_about_every_login_and_wires_each_to_its_own_url() {
     assert!(machine.consented().is_empty());
 }
 
+/// An entry the daemon registry builds nothing for must not become a login
+/// the CLI wires a client to: it would read the default login's credential
+/// and point the default client at an account id nobody registers.
+#[test]
+fn init_does_not_wire_a_client_to_a_subscription_entry_the_daemon_ignores() {
+    for (id, kind, extra) in [
+        ("claude-work", "claude-subscription", ""),
+        ("codex-sub", "claude-subscription", ""),
+    ] {
+        let machine = Machine::new();
+        machine.log_in_claude(&machine.home().join(".claude"), "sk-ant-oat01-personal");
+        std::fs::write(
+            machine.runtime().join("config.toml"),
+            format!(
+                "[updates]\ncheck = false\n\n[[backends]]\nid = \"{id}\"\nkind = \"{kind}\"\n{extra}"
+            ),
+        )
+        .expect("write config");
+
+        let said = stdout(&machine.run(&["init", "--dry-run", "--no-service", "--port", "9"]));
+
+        assert_eq!(
+            said.matches("Claude Code login").count(),
+            1,
+            "`{id}` as `{kind}` listed a phantom login:\n{said}"
+        );
+        assert!(!said.contains(&format!("/account/{id}")), "{said}");
+
+        let written = machine.answering(&["init", "--no-service", "--port", "9"], "y\n");
+        let _ = written;
+        let url = machine.base_url_in(&machine.home().join(".claude"));
+        assert!(
+            url.as_deref()
+                .is_none_or(|url| !url.contains(&format!("/account/{id}"))),
+            "the default Claude Code was bound to `{id}`: {url:?}"
+        );
+    }
+}
+
 /// `eval "$(ironwire env)"` in a shell that runs a declared login's Claude
 /// Code points it at that login, not at the default one.
 #[test]
