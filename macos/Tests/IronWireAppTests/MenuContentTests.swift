@@ -84,6 +84,13 @@ final class MenuContentTests: XCTestCase {
         return rendered.size.height
     }
 
+    /// A thousand logins under one display name. Identity is what the rows are
+    /// keyed and joined on: every row the menu draws must find its own
+    /// settings record, and so its own consent binding, by id. Joined on the
+    /// shared name, all of them would answer with one login's switch.
+    ///
+    /// Asserted on the client the menu rendered from, after it rendered, rather
+    /// than on the fixture: the fixture's ids are distinct by construction.
     func test_a_menu_with_a_thousand_logins_renders_offscreen_without_losing_identity() throws {
         let backends = (0..<1024).map { BackendView(id: "claude-\($0)", name: "Claude subscription") }
         let services = backends.map { backend in
@@ -92,11 +99,26 @@ final class MenuContentTests: XCTestCase {
                     summary: "Read this login", points: ["Private auth risk"], question: "Enable?",
                     binding: "opaque-\(backend.id)"))
         }
-        let rendered = try XCTUnwrap(render(status(backends: backends), settings: settings(services: services)))
-        XCTAssertEqual(Set(backends.map(\.id)).count, 1024)
+        let client = ControlClient.fixture(
+            status: status(backends: backends), settings: settings(services: services))
+        let renderer = ImageRenderer(
+            content: MenuContent(client: client, notifier: Notifier(), loginItem: LoginItem()))
+        renderer.scale = 2
+        let rendered = try XCTUnwrap(renderer.nsImage)
         XCTAssertTrue(rendered.size.width.isFinite && rendered.size.height.isFinite)
         XCTAssertGreaterThan(rendered.size.width, 0)
         XCTAssertGreaterThan(rendered.size.height, 0)
+
+        let rows = try XCTUnwrap(client.status).backends
+        XCTAssertEqual(Set(rows.map(\.id)).count, 1024, "rows collapsed onto a shared identity")
+        XCTAssertEqual(client.servicesById.count, 1024, "logins collapsed in the settings join")
+        for row in rows {
+            let service = client.servicesById[row.id]
+            XCTAssertEqual(service?.id, row.id, "\(row.id) joined another login's record")
+            XCTAssertEqual(
+                service?.consentPrompt?.binding, "opaque-\(row.id)",
+                "\(row.id) would grant with another login's binding")
+        }
     }
 
     // MARK: - The bar
@@ -266,6 +288,56 @@ final class MenuContentTests: XCTestCase {
             try height(shortStatus, settings: shortSettings),
             try height(longStatus, settings: longSettings),
             "the row grows with the consent text, so it is being drawn")
+    }
+
+    /// `docs/TRUST.md`: the menu offers a grant switch only when the prompt
+    /// carries the opaque binding the grant must echo. A grant sent without one
+    /// is refused by the daemon, so a switch for it would be a control that
+    /// cannot work. Missing and empty both mean no binding, and both rows are
+    /// the switchless one -- "not enabled" and the command -- which lays out
+    /// taller than a row with a switch.
+    func test_a_grant_switch_is_offered_only_when_the_prompt_has_a_binding() throws {
+        func unbound(_ binding: String?) -> ConsentPromptView {
+            ConsentPromptView(
+                version: 2, backendId: "claude-sub", product: "Claude",
+                summary: prompt().summary, points: prompt().points,
+                question: prompt().question, binding: binding)
+        }
+        let (bound, boundSettings) = unconsented(prompt: prompt())
+        let (noSwitch, noSwitchSettings) = unconsented(prompt: nil)
+        let withSwitch = try height(bound, settings: boundSettings)
+        let without = try height(noSwitch, settings: noSwitchSettings)
+        for binding: String? in [nil, ""] {
+            let (status, settings) = unconsented(prompt: unbound(binding))
+            let measured = try height(status, settings: settings)
+            XCTAssertGreaterThan(
+                measured, withSwitch,
+                "a prompt with binding \(String(describing: binding)) is offered a grant switch")
+            XCTAssertEqual(measured, without)
+        }
+    }
+
+    /// The binding gates the *grant*. A login already consented to keeps its
+    /// switch without one, because turning it off is a revocation, and a menu
+    /// that could grant but not take back would be the worse failure.
+    func test_a_consented_login_keeps_its_switch_without_a_binding() throws {
+        let unbound = ConsentPromptView(
+            version: 2, backendId: "claude-sub", product: "Claude",
+            summary: prompt().summary, points: prompt().points,
+            question: prompt().question, binding: nil)
+        func consented(_ prompt: ConsentPromptView?) throws -> CGFloat {
+            try height(
+                status(backends: [
+                    BackendView(id: "claude-sub", name: "Claude subscription", consented: true)
+                ]),
+                settings: settings(services: [
+                    ServiceView(
+                        id: "claude-sub", name: "Claude subscription", authenticated: true,
+                        requiresConsent: true, consented: true, consentPrompt: prompt,
+                        connectCommand: "ironwire connect claude")
+                ]))
+        }
+        XCTAssertEqual(try consented(unbound), try consented(prompt()))
     }
 
     /// A switch that is off already reads "off", so the row does not say it
