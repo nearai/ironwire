@@ -6,8 +6,8 @@
 //! IronWire's own: fill only an empty slot, follow our own line when it moves,
 //! and take out only what IronWire put there.
 //!
-//! In a child process because the settings file is found through
-//! `CLAUDE_CONFIG_DIR`, which is process-global.
+//! In a child process because the default login's home is process-global.
+//! A custom CLAUDE_CONFIG_DIR must not redirect an edit of the plain facade.
 
 use ironwire_agents::tools::{
     ConnectOptions, StatusLine, commit, plan_connect_with, plan_disconnect,
@@ -88,7 +88,11 @@ fn scenario(dir: &std::path::Path) {
 #[test]
 fn a_host_installs_its_own_status_line_command_under_the_same_rules() {
     if let Some(dir) = std::env::var_os(CHILD) {
-        scenario(std::path::Path::new(&dir));
+        let home = std::path::Path::new(&dir);
+        let default = home.join(".claude");
+        std::fs::create_dir_all(&default).unwrap();
+        scenario(&default);
+        assert!(!home.join("other-login/settings.json").exists());
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -100,7 +104,7 @@ fn a_host_installs_its_own_status_line_command_under_the_same_rules() {
         ])
         .env_clear()
         .env(CHILD, dir.path())
-        .env("CLAUDE_CONFIG_DIR", dir.path())
+        .env("CLAUDE_CONFIG_DIR", dir.path().join("other-login"))
         .env("HOME", dir.path())
         .env("USERPROFILE", dir.path())
         .env("PATH", "")

@@ -15,12 +15,16 @@ use futures_util::StreamExt;
 use ironwire_core::capability::Capabilities;
 use ironwire_core::protocol::{BackendId, BackendKind, ClientIdentity, ModelTier, Protocol, Wires};
 use ironwire_core::quota::{Headroom, QuotaSnapshot};
-use ironwire_creds::codex::{CHATGPT_BASE_URL, CHATGPT_HOST, CodexCredentials, OPENAI_HOST};
-use ironwire_creds::{Bearer, CredentialError};
+use ironwire_creds::codex::{
+    CHATGPT_BASE_URL, CHATGPT_HOST, CodexCredentials, CodexLogin, CodexMode, OPENAI_HOST,
+};
+use ironwire_creds::{Bearer, CredentialError, SubscriptionLogin, SubscriptionProduct};
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::backend::{Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse};
-use crate::headers::forward_response_header;
+use crate::backend::{
+    Backend, BackendStatus, UpstreamError, UpstreamRequest, UpstreamResponse, unusable_login,
+};
+use crate::headers::{ACCOUNT_BOUND, forward_response_header};
 use crate::observe::{Observation, RateLimitReading, retry_after};
 
 /// Default metered OpenAI endpoint.
@@ -29,14 +33,16 @@ pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// How a Responses backend authenticates.
 #[derive(Clone)]
 pub enum ResponsesAuth {
-    /// A ChatGPT subscription credential, re-read from `auth.json` on every
-    /// request so a background refresh by Codex is picked up.
-    ///
-    /// The path is explicit rather than implicit so the conformance harness can
-    /// run against a fixture instead of whoever's login happens to be on the
-    /// machine (`docs/PROTOCOL.md` §7.2). `None` means the real one.
+    /// One Codex login's ChatGPT subscription credential, re-read from its
+    /// `auth.json` on every request so a background refresh by Codex is
+    /// picked up.
     Subscription {
-        /// Override for the `auth.json` location.
+        /// Which login: the `CODEX_HOME` it was made under.
+        login: CodexLogin,
+        /// An exact `auth.json` to read instead of the login's own, so the
+        /// conformance harness can run against a fixture rather than whoever's
+        /// login happens to be on the machine (`docs/PROTOCOL.md` §7.2).
+        /// `None` in production.
         auth_path: Option<std::path::PathBuf>,
     },
     /// A metered OpenAI API key.
@@ -101,7 +107,8 @@ pub struct ResponsesBackend {
 }
 
 impl ResponsesBackend {
-    /// Build the ChatGPT/Codex subscription backend.
+    /// Build the subscription backend for the default Codex login, as
+    /// `codex-sub`.
     ///
     /// # Errors
     ///
@@ -113,7 +120,7 @@ impl ResponsesBackend {
         Self::codex_subscription_at(None, base_url, timeout_secs)
     }
 
-    /// Build the ChatGPT/Codex subscription backend against a specific
+    /// Build the default login's backend, `codex-sub`, against a specific
     /// `auth.json`. Used by the conformance harness.
     ///
     /// # Errors
@@ -124,13 +131,65 @@ impl ResponsesBackend {
         base_url: Option<String>,
         timeout_secs: u64,
     ) -> reqwest::Result<Self> {
+        Self::subscription_with(
+            BackendId::from(SubscriptionProduct::ChatGpt.default_backend_id()),
+            "ChatGPT subscription".to_string(),
+            ResponsesAuth::Subscription {
+                login: CodexLogin::default_login(),
+                auth_path,
+            },
+            base_url,
+            timeout_secs,
+        )
+    }
+
+    /// Build the subscription backend for one Codex login: the one made under
+    /// `CODEX_HOME=home`, or the default login for `None`.
+    ///
+    /// `id` is the backend's identity everywhere — consent, quota, ledger — so
+    /// it must stay attached to this login across restarts: `codex-sub` for
+    /// the default login (relocated or not), the config entry's id otherwise.
+    /// `name` is what `ironwire status` shows; for a login other than the
+    /// default that is normally its [`SubscriptionLogin::label`]. A leading
+    /// `~` in `home` is expanded against the user's home.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a reqwest client build failure.
+    pub fn codex_subscription_for(
+        id: BackendId,
+        name: String,
+        home: Option<std::path::PathBuf>,
+        base_url: Option<String>,
+        timeout_secs: u64,
+    ) -> reqwest::Result<Self> {
+        let login = home.map_or_else(CodexLogin::default_login, CodexLogin::in_home);
+        Self::subscription_with(
+            id,
+            name,
+            ResponsesAuth::Subscription {
+                login,
+                auth_path: None,
+            },
+            base_url,
+            timeout_secs,
+        )
+    }
+
+    fn subscription_with(
+        id: BackendId,
+        name: String,
+        auth: ResponsesAuth,
+        base_url: Option<String>,
+        timeout_secs: u64,
+    ) -> reqwest::Result<Self> {
         Ok(Self {
-            id: BackendId::from("codex-sub"),
-            name: "ChatGPT subscription".to_string(),
+            id,
+            name,
             kind: BackendKind::Subscription,
-            auth: ResponsesAuth::Subscription { auth_path },
+            auth,
             base_url: normalize(base_url, CHATGPT_BASE_URL),
-            client: build_client(timeout_secs)?,
+            client: crate::first_party_client::build(timeout_secs)?,
             capabilities: responses_capabilities(),
             models: responses_models(),
             discovered: Arc::new(Mutex::new(None)),
@@ -155,7 +214,7 @@ impl ResponsesBackend {
             kind: BackendKind::ApiKey,
             auth: ResponsesAuth::ApiKey(key),
             base_url: normalize(base_url, OPENAI_DEFAULT_BASE_URL),
-            client: build_client(timeout_secs)?,
+            client: crate::first_party_client::build(timeout_secs)?,
             capabilities: responses_capabilities(),
             models: responses_models(),
             discovered: Arc::new(Mutex::new(None)),
@@ -174,23 +233,37 @@ impl ResponsesBackend {
     }
 
     /// The credential and, for the subscription, the account it belongs to.
-    fn credential(&self) -> Result<(Bearer, Option<String>), CredentialError> {
-        match &self.auth {
-            ResponsesAuth::Subscription { auth_path } => {
-                let creds = CodexCredentials::from_path(auth_path.clone())?;
+    fn credential(auth: &ResponsesAuth) -> Result<(Bearer, Option<String>), CredentialError> {
+        match auth {
+            ResponsesAuth::Subscription { login, auth_path } => {
+                let creds = match auth_path {
+                    Some(path) => CodexCredentials::from_path(Some(path.clone()))?,
+                    None => login.read()?,
+                };
+                // An API key in a subscription's home is not this backend's to
+                // present: its bearer is bound to the metered host, so going
+                // on would end in a host mismatch — which is never retried, and
+                // would stop the router trying anything else.
+                if creds.mode != CodexMode::ChatGpt {
+                    return Err(CredentialError::NotLoggedIn {
+                        product: "Codex",
+                        location: login.describe(false).location,
+                        looked: creds.source,
+                        command: login.login_command(),
+                        note: Some(
+                            "That auth.json holds an OpenAI API key rather than a ChatGPT login"
+                                .to_string(),
+                        ),
+                    });
+                }
                 if creds.is_expired(Utc::now()) {
                     // Named plainly, because the fix is one command and a bare
                     // 401 would send the user looking at IronWire instead.
                     // IronWire does not refresh this itself — see
                     // `CodexCredentials::is_expired` for why.
-                    return Err(CredentialError::NotFound {
+                    return Err(CredentialError::Expired {
                         product: "Codex",
-                        locations: format!(
-                            "{} — the stored ChatGPT token has expired. \
-                             Run `codex` once to refresh it; IronWire will pick \
-                             up the new token on the next request.",
-                            creds.source
-                        ),
+                        command: login.login_command(),
                     });
                 }
                 Ok((creds.bearer(), creds.account_id()))
@@ -203,6 +276,20 @@ impl ResponsesBackend {
                 None,
             )),
         }
+    }
+
+    /// The credential, or the reason it cannot be used ending in what to run.
+    async fn credential_or_detail(&self) -> Result<(Bearer, Option<String>), String> {
+        let auth = self.auth.clone();
+        crate::credential_read::read(move || {
+            Self::credential(&auth).map_err(|err| match &auth {
+                ResponsesAuth::Subscription { login, .. } => {
+                    unusable_login(&err, &login.login_command())
+                }
+                ResponsesAuth::ApiKey(_) => err.to_string(),
+            })
+        })
+        .await
     }
 
     /// The `/models` URL for this backend.
@@ -253,26 +340,28 @@ impl ResponsesBackend {
         }
     }
 
+    /// What to say when the provider rejected the credential: which login it
+    /// was, and the command that logs that one in.
+    fn rejected_credential_detail(&self) -> String {
+        match &self.auth {
+            ResponsesAuth::Subscription { login, .. } => {
+                let whose = match login.describe(false).location {
+                    None => String::new(),
+                    Some(location) => format!(" for {location}"),
+                };
+                format!(
+                    "the stored ChatGPT token{whose} was rejected; run `{}` to log in again",
+                    login.login_command()
+                )
+            }
+            ResponsesAuth::ApiKey(_) => "the OpenAI API key was rejected".to_string(),
+        }
+    }
+
     /// Assert the credential is going to the host that issued it
     /// (`docs/TRUST.md` I2). A guard against our own bugs.
     fn check_host(&self, bearer: &Bearer) -> Result<(), UpstreamError> {
-        let target = self
-            .base_url
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or_default();
-        if target == bearer.issuer_host
-            || target.starts_with("127.0.0.1")
-            || target.starts_with("localhost")
-            || target.starts_with("[::1]")
-        {
-            return Ok(());
-        }
-        Err(UpstreamError::CredentialHostMismatch {
-            issuer: bearer.issuer_host,
-            attempted: target.to_string(),
-        })
+        crate::credential_host::check(&self.base_url, bearer.issuer_host)
     }
 }
 
@@ -311,16 +400,35 @@ impl Backend for ResponsesBackend {
         matches!(self.auth, ResponsesAuth::Subscription { .. }).then_some(ClientIdentity::Codex)
     }
 
+    fn login(&self) -> Option<SubscriptionLogin> {
+        match &self.auth {
+            // The default backend id is the default login even when relocated
+            // to a home of its own: everything recorded under `codex-sub` is
+            // about it.
+            ResponsesAuth::Subscription { login, .. } => {
+                Some(login.describe(
+                    self.id.as_str() == SubscriptionProduct::ChatGpt.default_backend_id(),
+                ))
+            }
+            ResponsesAuth::ApiKey(_) => None,
+        }
+    }
+
     async fn status(&self) -> BackendStatus {
-        let (authenticated, detail) = match self.credential() {
-            Ok(_) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
+        let (authenticated, account_scope, detail) = match self.credential_or_detail().await {
+            Ok((bearer, account_id)) => (
+                true,
+                credential_scope(&self.auth, &bearer, account_id.as_deref()),
+                None,
+            ),
+            Err(detail) => (false, None, Some(detail)),
         };
         BackendStatus {
             id: self.id.clone(),
             name: self.name.clone(),
             kind: self.kind,
             authenticated,
+            account_scope,
             detail,
             quota: self.quota(),
             models: self.effective_models(),
@@ -328,10 +436,28 @@ impl Backend for ResponsesBackend {
     }
 
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
-        let (bearer, account_id) = self.credential().map_err(|e| UpstreamError::NeedsAuth {
-            backend: self.id.clone(),
-            detail: e.to_string(),
-        })?;
+        let (bearer, account_id) =
+            self.credential_or_detail()
+                .await
+                .map_err(|detail| UpstreamError::NeedsAuth {
+                    backend: self.id.clone(),
+                    detail,
+                })?;
+        if request
+            .expected_account_scope
+            .as_ref()
+            .is_some_and(|expected| {
+                credential_scope(&self.auth, &bearer, account_id.as_deref()).as_ref()
+                    != Some(expected)
+            })
+        {
+            return Err(UpstreamError::NeedsAuth {
+                backend: self.id.clone(),
+                detail: "the ChatGPT account changed after routing selected this login; \
+                         log in to the account this session used, or start a new session"
+                    .to_string(),
+            });
+        }
         self.check_host(&bearer)?;
 
         let mut builder = self
@@ -345,24 +471,18 @@ impl Backend for ResponsesBackend {
         }
         for (name, value) in &request.headers {
             // Replaced above; forwarding the client's copy would double them.
-            if name == "content-type" || name == "accept" || name == "authorization" {
+            // The account-bound ones never reach here from a façade; skipping
+            // them again keeps the rule true for any other caller too.
+            if name == "content-type"
+                || name == "accept"
+                || name == "authorization"
+                || ACCOUNT_BOUND.contains(&name.as_str())
+            {
                 continue;
             }
             builder = builder.header(name, value);
         }
-        // Codex sends this on its own provider path but not through a custom
-        // one, so the header has to be restored here or the subscription
-        // request is rejected. It is read from the credential we are presenting
-        // (`ironwire_creds::codex::account_id`), never from the request — and
-        // never overwritten if the client did supply its own.
-        if let Some(account_id) = account_id
-            && !request
-                .headers
-                .iter()
-                .any(|(name, _)| name == "chatgpt-account-id")
-        {
-            builder = builder.header("chatgpt-account-id", account_id);
-        }
+        builder = with_account(builder, account_id.as_deref());
 
         let response =
             builder
@@ -492,13 +612,14 @@ impl Backend for ResponsesBackend {
         // Not fetched yet — a client can ask for this before any probe has run,
         // and answering "here is my own idea of your models" would be worse
         // than the round trip.
-        let (bearer, _) = self.credential().ok()?;
+        let (bearer, account_id) = self.credential_or_detail().await.ok()?;
         self.check_host(&bearer).ok()?;
-        let response = self
+        let builder = self
             .client
             .get(self.models_url().await)
             .bearer_auth(bearer.token.expose_secret())
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(15));
+        let response = with_account(builder, account_id.as_deref())
             .send()
             .await
             .ok()?;
@@ -511,10 +632,13 @@ impl Backend for ResponsesBackend {
     }
 
     async fn probe(&self) -> Result<(), UpstreamError> {
-        let (bearer, _) = self.credential().map_err(|e| UpstreamError::NeedsAuth {
-            backend: self.id.clone(),
-            detail: e.to_string(),
-        })?;
+        let (bearer, account_id) =
+            self.credential_or_detail()
+                .await
+                .map_err(|detail| UpstreamError::NeedsAuth {
+                    backend: self.id.clone(),
+                    detail,
+                })?;
         self.check_host(&bearer)?;
         // Auth-only, for the same reason as the Anthropic probe: a real request
         // against the subscription would have to carry Codex's identity, and
@@ -526,11 +650,12 @@ impl Backend for ResponsesBackend {
         // for the same account (`crate::codex_version`).
         let url = self.models_url().await;
 
-        let response = self
+        let builder = self
             .client
             .get(url)
             .bearer_auth(bearer.token.expose_secret())
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(15));
+        let response = with_account(builder, account_id.as_deref())
             .send()
             .await
             .map_err(|e| UpstreamError::Transport {
@@ -547,7 +672,7 @@ impl Backend for ResponsesBackend {
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(UpstreamError::NeedsAuth {
                 backend: self.id.clone(),
-                detail: "the stored credential was rejected; re-run `codex login`".to_string(),
+                detail: self.rejected_credential_detail(),
             });
         }
         Err(UpstreamError::Upstream {
@@ -709,20 +834,62 @@ fn serves_text_chat(item: &serde_json::Value) -> bool {
         && declares("output_modalities", "text").unwrap_or(true)
 }
 
+/// Name the account the presented bearer belongs to, when it says.
+///
+/// Codex sends this on its own provider path but not through a custom one, and
+/// the subscription refuses inference without it. The probe and the `/models`
+/// fetch carry it too: one ChatGPT login can belong to several workspaces, and
+/// an auth check or catalogue answered for another one would describe
+/// something other than what inference will use. The value is read from the
+/// token being presented (`CodexCredentials::account_id`), so it cannot name an
+/// account other than the one that owns that token (`docs/PROTOCOL.md` §2
+/// item 2).
+fn with_account(
+    builder: reqwest::RequestBuilder,
+    account_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match account_id {
+        Some(account_id) => builder.header("chatgpt-account-id", account_id),
+        None => builder,
+    }
+}
+
+/// Subscription identity comes from the provider. For a metered backend we
+/// know only the actual key, so bind to that credential without claiming to
+/// know its organization; rotating it requires a new reasoning origin.
+fn credential_scope(
+    auth: &ResponsesAuth,
+    bearer: &Bearer,
+    account_id: Option<&str>,
+) -> Option<String> {
+    match auth {
+        ResponsesAuth::Subscription { .. } => observed_account_scope(account_id),
+        ResponsesAuth::ApiKey(_) => {
+            use sha2::{Digest, Sha256};
+            let mut hash = Sha256::new();
+            hash.update(b"ironwire:openai-api-credential:v1\0");
+            hash.update(bearer.token.expose_secret().as_bytes());
+            Some(format!("{:x}", hash.finalize()))
+        }
+    }
+}
+
+/// The provider's account id is identity, not a credential; hashing it keeps
+/// that identifying value out of routing diagnostics while token refreshes
+/// remain the same scope. Missing identity stays unknown.
+fn observed_account_scope(account_id: Option<&str>) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let account_id = account_id.filter(|id| !id.is_empty())?;
+    let mut hash = Sha256::new();
+    hash.update(b"ironwire:chatgpt-account:v1\0");
+    hash.update(account_id.as_bytes());
+    Some(format!("{:x}", hash.finalize()))
+}
+
 fn normalize(base: Option<String>, default: &str) -> String {
     base.unwrap_or_else(|| default.to_string())
         .trim_end_matches('/')
         .to_string()
-}
-
-fn build_client(timeout_secs: u64) -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        // No total-request timeout: a coding agent legitimately generates for
-        // many minutes. The read timeout catches a genuinely dead connection.
-        .read_timeout(std::time::Duration::from_secs(timeout_secs))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .build()
 }
 
 /// The host a ChatGPT subscription credential belongs to.
@@ -832,6 +999,88 @@ mod tests {
             backend.check_host(&bearer),
             Err(UpstreamError::CredentialHostMismatch { .. })
         ));
+    }
+
+    /// Whether this backend would attach its ChatGPT token to `base`.
+    fn sends_the_token_to(base: &str) -> bool {
+        let bearer = Bearer {
+            token: SecretString::from("eyJACCESS"),
+            issuer_host: CHATGPT_HOST,
+        };
+        subscription(base).check_host(&bearer).is_ok()
+    }
+
+    /// TRUST.md I2. Everything before the `@` is userinfo; the request goes to
+    /// what follows it.
+    #[tokio::test]
+    async fn an_api_key_has_a_stable_credential_identity_that_changes_with_the_key() {
+        let backend = |key: &str| {
+            ResponsesBackend::openai_api_key(SecretString::from(key), None, 5).expect("backend")
+        };
+        let one = backend("inert-api-key-one")
+            .status()
+            .await
+            .account_scope
+            .expect("known key identity");
+        let repeated = backend("inert-api-key-one").status().await.account_scope;
+        let changed = backend("inert-api-key-two").status().await.account_scope;
+        assert_eq!(Some(one.clone()), repeated);
+        assert_ne!(Some(one.clone()), changed);
+        assert!(!one.contains("inert-api-key"));
+        assert!(observed_account_scope(None).is_none());
+        assert!(observed_account_scope(Some("")).is_none());
+    }
+
+    #[test]
+    fn userinfo_cannot_dress_a_foreign_host_as_loopback_or_the_issuer() {
+        for base in [
+            "https://127.0.0.1@evil.example/backend-api/codex",
+            "https://localhost:443@evil.example/backend-api/codex",
+            "https://chatgpt.com@evil.example/backend-api/codex",
+            "https://user:pw@chatgpt.com/backend-api/codex",
+        ] {
+            assert!(!sends_the_token_to(base), "{base} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_host_that_merely_begins_like_loopback_or_the_issuer_is_neither() {
+        for base in [
+            "https://localhost.evil.example/backend-api/codex",
+            "https://127.0.0.1.evil.example/backend-api/codex",
+            "https://chatgpt.com.evil.example/backend-api/codex",
+            "https://chatgpt.com./backend-api/codex",
+        ] {
+            assert!(!sends_the_token_to(base), "{base} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_real_provider_is_never_sent_the_token_in_cleartext() {
+        assert!(!sends_the_token_to("http://chatgpt.com/backend-api/codex"));
+    }
+
+    #[test]
+    fn the_issuers_host_is_recognised_however_it_is_spelled() {
+        for base in [
+            CHATGPT_BASE_URL,
+            "https://ChatGPT.com/backend-api/codex",
+            "https://chatgpt.com:443/backend-api/codex/",
+        ] {
+            assert!(sends_the_token_to(base), "{base} is the issuer");
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_this_machine_is_loopback() {
+        for base in [
+            "http://127.0.0.1:1234",
+            "http://[::1]:1234",
+            "http://localhost:9",
+            "http://127.0.0.2",
+        ] {
+            assert!(sends_the_token_to(base), "{base} is loopback");
+        }
     }
 
     #[test]

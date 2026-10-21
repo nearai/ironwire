@@ -336,9 +336,9 @@ async fn consent_is_recorded_against_the_version_that_was_answered() {
     let dir = home();
     let state = state_in(dir.path(), PrivacyConfig::default());
 
-    let body = format!(
-        r#"{{"backend":"claude-sub","granted":true,"prompt_version":{CONSENT_PROMPT_VERSION}}}"#
-    );
+    let body = serde_json::json!({"backend":"claude-sub", "granted":true,
+        "prompt_version":CONSENT_PROMPT_VERSION,
+        "binding":ironwire_creds::consent::ConsentPrompt::for_backend("claude-sub").unwrap().binding}).to_string();
     let (status, _) = call(&state, "POST", "/consent", Some(&body)).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -432,7 +432,8 @@ async fn consent_that_cannot_be_written_is_not_granted() {
         &state,
         "POST",
         "/consent",
-        Some(r#"{"backend":"claude-sub","granted":true,"prompt_version":2}"#),
+        Some(&serde_json::json!({"backend":"claude-sub", "granted":true, "prompt_version":2,
+            "binding":ironwire_creds::consent::ConsentPrompt::for_backend("claude-sub").unwrap().binding}).to_string()),
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -453,4 +454,17 @@ async fn the_settings_endpoint_carries_the_exact_consent_question() {
     // shape is asserted at the source; `settings_view` copies it verbatim.
     let (_, body) = call(&state, "GET", "/settings", None).await;
     assert!(body["services"].is_array(), "{body}");
+}
+
+#[tokio::test]
+async fn a_consent_grant_without_the_prompt_login_binding_is_refused() {
+    let dir = home();
+    let state = state_in(dir.path(), PrivacyConfig::default());
+    let body = format!(
+        r#"{{"backend":"claude-sub","granted":true,"prompt_version":{CONSENT_PROMPT_VERSION}}}"#
+    );
+    let (status, _) = call(&state, "POST", "/consent", Some(&body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!state.consent_snapshot().is_granted("claude-sub"));
+    assert!(!dir.path().join("consent.json").exists());
 }

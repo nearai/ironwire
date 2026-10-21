@@ -33,6 +33,7 @@ fn status(port: u16) -> StatusView {
             },
             health: HealthView::default(),
             models: vec![],
+            connect_command: None,
         }],
         balance: BalanceView::default(),
         privacy: None,
@@ -46,6 +47,7 @@ fn status(port: u16) -> StatusView {
             at: chrono::Utc::now(),
         }),
         usage: ironwire_usage::UsageReport::default(),
+        cross_account_fallback: false,
     }
 }
 

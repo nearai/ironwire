@@ -1,16 +1,19 @@
 //! Daemon state: the backend registry, the routing policy, and consent.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use futures_util::{FutureExt, StreamExt, stream};
 
 use ironwire_catalog::CatalogStore;
 use ironwire_core::config::Config;
-use ironwire_core::peek::IdentityMarkers;
+use ironwire_core::peek::{IdentityMarkers, RequestPeek};
 use ironwire_core::policy::{Candidate, Policy};
 use ironwire_core::protocol::BackendId;
 use ironwire_creds::ConsentLedger;
 use ironwire_ledger::Ledger;
 use ironwire_update::UpdateStatus;
-use ironwire_upstream::backend::{Backend, BackendStatus};
+use ironwire_upstream::backend::{Backend, BackendStatus, UpstreamError};
 use ironwire_upstream::breaker::BreakerBoard;
 use ironwire_usage::UsageReport;
 
@@ -30,10 +33,45 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+/// Whether consent lets `backend` be used.
+///
+/// A backend that reads a login is asked about that login, by the directory
+/// it reads now: a yes recorded for `claude-sub` in `~/.claude` is not a yes to
+/// the account `claude-sub` reads once `config_dir` moves it
+/// (`docs/TRUST.md` §2). Everything else that needs consent keeps the plain
+/// per-id answer.
+#[must_use]
+pub fn consents_to(consent: &ConsentLedger, backend: &dyn Backend) -> bool {
+    if !backend.kind().requires_consent() {
+        return true;
+    }
+    let id = backend.id().as_str();
+    match backend.login() {
+        Some(login) => consent.is_granted_for(id, login.consent_location()),
+        None => consent.is_granted(id),
+    }
+}
+
+/// A second backend was registered under an id that is already taken.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "two backends would be registered as `{0}`; every `[[backends]]` id in config.toml must \
+     be unique, and must not reuse one IronWire discovers (claude-sub, anthropic-key, codex-sub, \
+     openai-key, nearai) for anything else"
+)]
+pub struct DuplicateBackend(pub BackendId);
+
+/// Maximum simultaneous credential checks, and separately network probes.
+/// Shared by registry clones so concurrent requests cannot multiply the limit.
+pub const BACKEND_CHECK_CONCURRENCY: usize = 8;
+
 /// The set of backends this daemon can route to.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BackendRegistry {
     backends: Vec<Arc<dyn Backend>>,
+    positions: HashMap<BackendId, usize>,
+    status_slots: Arc<tokio::sync::Semaphore>,
+    probe_slots: Arc<tokio::sync::Semaphore>,
     /// The privacy config, for the trusted-backend constraint. `None` until
     /// state is built, which is only the case in tests that never route.
     ///
@@ -44,6 +82,18 @@ pub struct BackendRegistry {
     privacy_policy: Arc<Mutex<Option<Arc<ironwire_core::config::PrivacyConfig>>>>,
 }
 
+impl Default for BackendRegistry {
+    fn default() -> Self {
+        Self {
+            backends: Vec::new(),
+            positions: HashMap::new(),
+            status_slots: Arc::new(tokio::sync::Semaphore::new(BACKEND_CHECK_CONCURRENCY)),
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(BACKEND_CHECK_CONCURRENCY)),
+            privacy_policy: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 impl BackendRegistry {
     /// Empty registry.
     #[must_use]
@@ -52,8 +102,37 @@ impl BackendRegistry {
     }
 
     /// Add a backend. Order is the tie-break for equally-preferred candidates.
+    ///
+    /// # Panics
+    ///
+    /// When a backend with the same id is already registered. That is a bug
+    /// in whoever built the registry, never a state to route around — see
+    /// [`Self::try_push`], which is what startup uses.
     pub fn push(&mut self, backend: Arc<dyn Backend>) {
+        if let Err(duplicate) = self.try_push(backend) {
+            panic!("{duplicate}");
+        }
+    }
+
+    /// Add a backend, refusing one whose id is already taken.
+    ///
+    /// Consent, quota, the circuit breaker, pins and ledger rows are all keyed
+    /// by id, and every lookup takes the first match. A second backend under
+    /// one id would therefore be unreachable and would share the first one's
+    /// consent and quota — the way a second subscription entry used to become
+    /// a silent copy of the default login.
+    ///
+    /// # Errors
+    ///
+    /// [`DuplicateBackend`], naming the id, when one is already registered.
+    pub fn try_push(&mut self, backend: Arc<dyn Backend>) -> Result<(), DuplicateBackend> {
+        if self.get(backend.id()).is_some() {
+            return Err(DuplicateBackend(backend.id().clone()));
+        }
+        self.positions
+            .insert(backend.id().clone(), self.backends.len());
         self.backends.push(backend);
+        Ok(())
     }
 
     /// Install the privacy config, so `candidates` can mark what may be routed
@@ -89,13 +168,23 @@ impl BackendRegistry {
     /// Look up by id.
     #[must_use]
     pub fn get(&self, id: &BackendId) -> Option<&Arc<dyn Backend>> {
-        self.backends.iter().find(|b| b.id() == id)
+        self.positions
+            .get(id)
+            .map(|&position| &self.backends[position])
     }
 
     /// All backends.
     #[must_use]
     pub fn all(&self) -> &[Arc<dyn Backend>] {
         &self.backends
+    }
+
+    /// [`consents_to`] for the backend registered as `id`; false for an id
+    /// nothing is registered under.
+    #[must_use]
+    pub fn consented(&self, id: &BackendId, consent: &ConsentLedger) -> bool {
+        self.get(id)
+            .is_some_and(|backend| consents_to(consent, backend.as_ref()))
     }
 
     /// Whether anything is registered.
@@ -106,11 +195,95 @@ impl BackendRegistry {
 
     /// Snapshot every backend's status, including a fresh credential check.
     pub async fn statuses(&self) -> Vec<BackendStatus> {
-        let mut out = Vec::with_capacity(self.backends.len());
-        for backend in &self.backends {
-            out.push(backend.status().await);
+        let checks: Vec<_> = self
+            .backends
+            .iter()
+            .cloned()
+            .map(|backend| self.checked_status(backend))
+            .collect();
+        stream::iter(checks)
+            .buffered(BACKEND_CHECK_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    /// Credentials for subscriptions another client cannot use are not read on
+    /// its request. Control status still observes every registered backend.
+    pub async fn routing_statuses(
+        &self,
+        peek: &RequestPeek,
+        cross_account_fallback: bool,
+    ) -> Vec<BackendStatus> {
+        let checks: Vec<_> = self
+            .backends
+            .iter()
+            .filter(|backend| {
+                let Some(identity) = backend.required_client_identity() else {
+                    return true;
+                };
+                if peek.client_identity != Some(identity) {
+                    return false;
+                }
+                cross_account_fallback
+                    || match &peek.client_login {
+                        Some(id) => backend.id() == id,
+                        None => backend
+                            .login()
+                            .is_some_and(|login| login.default && login.location.is_none()),
+                    }
+            })
+            .cloned()
+            .map(|backend| self.checked_status(backend))
+            .collect();
+        stream::iter(checks)
+            .buffered(BACKEND_CHECK_CONCURRENCY)
+            .collect()
+            .await
+    }
+
+    async fn checked_status(&self, backend: Arc<dyn Backend>) -> BackendStatus {
+        // Backends offload their own blocking I/O. Nesting this whole async
+        // operation in spawn_blocking deadlocks hosts with one blocking worker:
+        // that worker waits for the credential read queued behind itself.
+        let _permit = Arc::clone(&self.status_slots)
+            .acquire_owned()
+            .await
+            .expect("status semaphore is never closed");
+        match std::panic::AssertUnwindSafe(backend.status())
+            .catch_unwind()
+            .await
+        {
+            Ok(status) => status,
+            Err(_) => BackendStatus {
+                id: backend.id().clone(),
+                name: backend.name().to_string(),
+                kind: backend.kind(),
+                authenticated: false,
+                account_scope: None,
+                detail: Some("credential check failed; run `ironwire doctor`".to_string()),
+                quota: backend.quota(),
+                models: backend.models(),
+            },
         }
-        out
+    }
+
+    /// Probe a backend without blocking request workers on credential discovery.
+    /// Probe capacity is separate so a slow provider cannot delay status reads.
+    pub async fn probe(&self, backend: Arc<dyn Backend>) -> Result<(), UpstreamError> {
+        let _permit = Arc::clone(&self.probe_slots)
+            .acquire_owned()
+            .await
+            .expect("probe semaphore is never closed");
+        let id = backend.id().clone();
+        std::panic::AssertUnwindSafe(backend.probe())
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(UpstreamError::Transport {
+                    backend: id,
+                    detail: "backend probe failed; run `ironwire doctor`".to_string(),
+                })
+            })
     }
 
     /// Build the candidate list the router sees.
@@ -144,18 +317,19 @@ impl BackendRegistry {
         // against the same policy — a mode changed mid-scan would otherwise
         // produce a candidate set that never existed.
         let privacy_policy = self.privacy_policy();
+        let statuses: HashMap<_, _> = statuses.iter().map(|status| (&status.id, status)).collect();
         self.backends
             .iter()
             .map(|backend| {
-                let status = statuses.iter().find(|s| s.id == *backend.id());
+                let status = statuses.get(backend.id()).copied();
                 Candidate {
                     id: backend.id().clone(),
                     kind: backend.kind(),
                     caps: backend.capabilities().clone(),
                     quota: cap(backend, backend.quota()),
-                    healthy: status.is_none_or(|s| s.authenticated),
-                    consented: !backend.kind().requires_consent()
-                        || consent.is_granted(backend.id().as_str()),
+                    healthy: status.is_some_and(|s| s.authenticated),
+                    account_scope: status.and_then(|s| s.account_scope.clone()),
+                    consented: consents_to(consent, backend.as_ref()),
                     // Beside `consented` because it is the same shape of fact:
                     // a user instruction, read from config, that the router
                     // must obey without knowing where it came from.
@@ -163,6 +337,15 @@ impl BackendRegistry {
                         .as_ref()
                         .is_none_or(|privacy| privacy.trusts(backend.id().as_str())),
                     required_client_identity: backend.required_client_identity(),
+                    // Only the default login where the client keeps it
+                    // unprompted. A relocated `claude-sub` reads another
+                    // directory's token, while the client still using the
+                    // default directory goes on calling the plain façade —
+                    // possibly logged in as someone else. The relocated login
+                    // is reached through its bound URL instead.
+                    default_login: backend
+                        .login()
+                        .is_some_and(|login| login.default && login.location.is_none()),
                     models: backend.models(),
                     catalogue_from_provider: backend.catalogue_from_provider(),
                 }
@@ -299,9 +482,11 @@ impl AppState {
         // backends may be routed to, and this is the one place both are in
         // scope.
         backends.set_privacy(Arc::new(config.privacy.clone()));
+        let mut policy = Policy::new();
+        policy.set_cross_account_fallback(config.subscriptions.cross_account_fallback);
         Self {
             backends,
-            policy: Arc::new(Mutex::new(Policy::new())),
+            policy: Arc::new(Mutex::new(policy)),
             admission_bindings: Arc::new(Mutex::new(
                 ironwire_core::admission::AdmissionBindings::default(),
             )),
@@ -340,6 +525,17 @@ impl AppState {
     #[must_use]
     pub fn privacy(&self) -> Option<Arc<PrivacyFilter>> {
         lock(&self.privacy).clone()
+    }
+
+    /// Whether a client whose own subscription is spent may be served by
+    /// another of the user's subscriptions to the same product.
+    ///
+    /// Read from the policy rather than from `config`, because the policy is
+    /// what routing obeys: anything that lists what a client could be served
+    /// by has to agree with where its requests will actually go.
+    #[must_use]
+    pub fn cross_account_fallback(&self) -> bool {
+        lock(&self.policy).cross_account_fallback()
     }
 
     /// The privacy settings currently in force.
@@ -538,6 +734,9 @@ impl AppState {
     /// rolls the in-memory change back and reports the failure: consent we
     /// could not record must never be treated as granted.
     ///
+    /// A grant is recorded for the login the backend reads now, which is the
+    /// one its prompt named ([`consents_to`]).
+    ///
     /// # Errors
     ///
     /// A message naming what could not be written.
@@ -546,12 +745,20 @@ impl AppState {
             return Err("this daemon was not started from a home directory".to_string());
         };
         let path = paths.consent_file();
+        let login = self
+            .backends
+            .get(&BackendId::from(backend_id))
+            .and_then(|backend| backend.login());
 
         let previous = self.consent_snapshot();
         {
             let mut ledger = lock(&self.consent);
             if granted {
-                ledger.grant(backend_id, chrono::Utc::now());
+                ledger.grant_for(
+                    backend_id,
+                    login.as_ref().and_then(|login| login.consent_location()),
+                    chrono::Utc::now(),
+                );
             } else {
                 ledger.revoke(backend_id);
             }
@@ -597,6 +804,7 @@ mod tests {
             name: id.to_string(),
             kind: BackendKind::Subscription,
             authenticated,
+            account_scope: None,
             detail: None,
             quota: QuotaSnapshot::default(),
             models: anthropic_models(),
@@ -636,6 +844,177 @@ mod tests {
         assert!(registry.get(&BackendId::from("claude-sub")).is_some());
         assert!(registry.get(&BackendId::from("nope")).is_none());
         assert!(!registry.is_empty());
+    }
+
+    /// A Claude subscription backend for the login in `dir` (`None` for the
+    /// default), never reading this machine's Keychain.
+    fn claude_login(id: &str, dir: Option<&str>) -> Arc<dyn Backend> {
+        let login = ironwire_creds::ClaudeLogin::with_home(
+            dir.map(ToString::to_string),
+            Some(std::path::PathBuf::from("/home/alice")),
+        )
+        .without_keychain();
+        Arc::new(
+            AnthropicBackend::subscription_for(
+                BackendId::from(id),
+                id.to_string(),
+                login,
+                None,
+                60,
+            )
+            .expect("client builds"),
+        )
+    }
+
+    /// Every lookup takes the first match, so a second backend under one id
+    /// would be unreachable and would share the first one's consent and quota.
+    #[test]
+    fn a_second_backend_under_a_taken_id_is_refused_by_name() {
+        let mut registry = BackendRegistry::new();
+        registry
+            .try_push(claude_login(
+                "claude-work",
+                Some("/home/alice/.claude-work"),
+            ))
+            .expect("the first is registered");
+        let refused = registry
+            .try_push(claude_login(
+                "claude-work",
+                Some("/home/alice/.claude-other"),
+            ))
+            .expect_err("the id is taken");
+        assert_eq!(refused.0.as_str(), "claude-work");
+        assert!(refused.to_string().contains("`claude-work`"), "{refused}");
+        assert_eq!(registry.all().len(), 1, "the first one is left alone");
+    }
+
+    #[test]
+    #[should_panic(expected = "claude-sub")]
+    fn pushing_a_duplicate_is_a_bug_not_a_shadow() {
+        let mut registry = registry();
+        registry.push(claude_login("claude-sub", None));
+    }
+
+    /// The plain façade belongs to the client that keeps its login where the
+    /// client puts it unprompted, and so to the default login in that place.
+    /// Relocated, the default reads another directory's token, which the
+    /// client still on the default directory may not be logged in as; it is
+    /// reached through its bound URL like any additional login. A metered key
+    /// is not a login at all.
+    #[test]
+    fn the_plain_facade_belongs_only_to_a_default_login_left_in_its_place() {
+        let candidates_with = |default_dir: Option<&str>| {
+            let mut registry = BackendRegistry::new();
+            registry.push(claude_login("claude-sub", default_dir));
+            registry.push(claude_login(
+                "claude-work",
+                Some("/home/alice/.claude-work"),
+            ));
+            registry.push(Arc::new(
+                AnthropicBackend::api_key(secrecy::SecretString::from("sk-ant-test"), None, 60)
+                    .expect("client builds"),
+            ));
+            registry.candidates(&[], &ConsentLedger::default())
+        };
+        let default_login = |candidates: &[Candidate], id: &str| {
+            candidates
+                .iter()
+                .find(|c| c.id.as_str() == id)
+                .expect("registered")
+                .default_login
+        };
+
+        let in_place = candidates_with(None);
+        assert!(default_login(&in_place, "claude-sub"), "the default");
+        assert!(
+            !default_login(&in_place, "claude-work"),
+            "an additional login"
+        );
+        assert!(!default_login(&in_place, "anthropic-key"), "not a login");
+
+        let moved = candidates_with(Some("/home/alice/.claude-moved"));
+        assert!(
+            !default_login(&moved, "claude-sub"),
+            "a relocated default is not the plain façade's"
+        );
+        assert!(!default_login(&moved, "claude-work"));
+    }
+
+    /// Consent answers the login it was given for. The id stays when
+    /// `config_dir` moves a login, the account does not, so a yes recorded for
+    /// the old place is no yes at all.
+    #[test]
+    fn consent_given_for_another_directory_does_not_make_a_login_usable() {
+        let mut registry = BackendRegistry::new();
+        registry.push(claude_login(
+            "claude-sub",
+            Some("/home/alice/.claude-moved"),
+        ));
+        registry.push(claude_login(
+            "claude-work",
+            Some("/home/alice/.claude-work"),
+        ));
+        let consented = |consent: &ConsentLedger| -> Vec<(String, bool)> {
+            registry
+                .candidates(&[], consent)
+                .into_iter()
+                .map(|c| (c.id.to_string(), c.consented))
+                .collect()
+        };
+
+        // A file written before the move: it answered for `~/.claude`.
+        let mut before = ConsentLedger::default();
+        before.grant("claude-sub", Utc::now());
+        before.grant_for("claude-work", Some("/home/alice/.claude-old"), Utc::now());
+        assert_eq!(
+            consented(&before),
+            vec![
+                ("claude-sub".to_string(), false),
+                ("claude-work".to_string(), false)
+            ]
+        );
+        assert!(!registry.consented(&BackendId::from("claude-sub"), &before));
+
+        let mut now = ConsentLedger::default();
+        now.grant_for("claude-sub", Some("/home/alice/.claude-moved"), Utc::now());
+        now.grant_for("claude-work", Some("/home/alice/.claude-work"), Utc::now());
+        assert_eq!(
+            consented(&now),
+            vec![
+                ("claude-sub".to_string(), true),
+                ("claude-work".to_string(), true)
+            ]
+        );
+        assert!(registry.consented(&BackendId::from("claude-work"), &now));
+        assert!(
+            !registry.consented(&BackendId::from("claude-play"), &now),
+            "nothing is registered there"
+        );
+    }
+
+    #[test]
+    fn cross_account_fallback_follows_the_configuration_into_routing() {
+        let off = AppState::new(
+            BackendRegistry::new(),
+            Config::default(),
+            ConsentLedger::default(),
+            "t".to_string(),
+        );
+        assert!(!off.cross_account_fallback(), "off unless the user says so");
+
+        let mut config = Config::default();
+        config.subscriptions.cross_account_fallback = true;
+        let on = AppState::new(
+            BackendRegistry::new(),
+            config,
+            ConsentLedger::default(),
+            "t".to_string(),
+        );
+        assert!(on.cross_account_fallback());
+        assert!(
+            on.policy.lock().expect("policy").cross_account_fallback(),
+            "the policy is what routing obeys, so that is where it has to land"
+        );
     }
 }
 

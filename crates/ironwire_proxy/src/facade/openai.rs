@@ -6,17 +6,23 @@
 //! Two native lanes live here, not one. Responses and Chat Completions are the
 //! same *family* but different wires, so each gets a backend that speaks it
 //! natively and neither is translated into the other.
+//!
+//! Every route also exists under `/openai/account/{id}`, for a Codex bound to
+//! one ChatGPT login. The account segment is IronWire's: it says whose request
+//! this is, and is never forwarded.
 
 use super::client_session_id;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ironwire_core::peek::RequestPeek;
 use ironwire_core::policy::ConversationKey;
-use ironwire_core::protocol::{ClientIdentity, Protocol};
+use ironwire_core::protocol::{BackendId, ClientIdentity, Protocol};
+use ironwire_creds::SubscriptionProduct;
 use ironwire_upstream::headers::{forward_request_header, forward_response_header};
 
 use crate::facade::error::FacadeError;
@@ -30,6 +36,12 @@ pub fn router() -> Router<AppState> {
         .route("/v1/responses", post(responses))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
+        .route("/account/{account}/v1/responses", post(bound_responses))
+        .route(
+            "/account/{account}/v1/chat/completions",
+            post(bound_chat_completions),
+        )
+        .route("/account/{account}/v1/models", get(bound_models))
 }
 
 async fn responses(
@@ -43,6 +55,7 @@ async fn responses(
         body,
         "/v1/responses",
         Protocol::OpenAiResponses,
+        None,
     )
     .await
 }
@@ -58,8 +71,64 @@ async fn chat_completions(
         body,
         "/v1/chat/completions",
         Protocol::OpenAiChat,
+        None,
     )
     .await
+}
+
+async fn bound_responses(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    forward(
+        state,
+        headers,
+        body,
+        "/v1/responses",
+        Protocol::OpenAiResponses,
+        Some(login),
+    )
+    .await
+}
+
+async fn bound_chat_completions(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    forward(
+        state,
+        headers,
+        body,
+        "/v1/chat/completions",
+        Protocol::OpenAiChat,
+        Some(login),
+    )
+    .await
+}
+
+async fn bound_models(
+    State(state): State<AppState>,
+    account: Result<Path<String>, PathRejection>,
+    headers: HeaderMap,
+) -> Result<Response, FacadeError> {
+    let login = bound(&state, &super::account_segment(account))?;
+    Ok(list_models(state, headers, Some(login)).await)
+}
+
+/// The ChatGPT login a bound URL names, or the refusal for one that names none.
+fn bound(state: &AppState, account: &str) -> Result<BackendId, FacadeError> {
+    super::bound_login(state, account, SubscriptionProduct::ChatGpt)
+        .map_err(|message| FacadeError::unknown_login(message, true))
+}
+
+async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    list_models(state, headers, None).await
 }
 
 /// `/v1/models`, in whichever of its two shapes the caller is actually asking
@@ -76,12 +145,16 @@ async fn chat_completions(
 /// For Codex we therefore forward the provider's own document, by the same rule
 /// as the native lane. For every other OpenAI-compatible client we synthesize
 /// the public shape from the backends that are actually eligible.
-async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_models(
+    state: AppState,
+    headers: HeaderMap,
+    client_login: Option<BackendId>,
+) -> Response {
     let markers = state.identity_markers();
     if ironwire_core::peek::originator_names_codex(
         headers.get("originator").and_then(|v| v.to_str().ok()),
         &markers.codex_originator_prefix,
-    ) && let Some(document) = codex_models_document(&state).await
+    ) && let Some(document) = codex_models_document(&state, client_login.as_ref()).await
     {
         return (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -89,16 +162,33 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
         )
             .into_response();
     }
-    openai_shaped_models(state).await
+    openai_shaped_models(state, client_login).await
 }
 
 /// The models document from a consented ChatGPT subscription, if there is one.
-async fn codex_models_document(state: &AppState) -> Option<Vec<u8>> {
+///
+/// The client's own login's: two ChatGPT plans can carry different models, and
+/// a Codex shown another account's catalogue would pick models its own
+/// requests are then refused. Another login's only with cross-account fallback
+/// on, and after the client's own — the order the router would serve it in.
+async fn codex_models_document(
+    state: &AppState,
+    client_login: Option<&BackendId>,
+) -> Option<Vec<u8>> {
     let consent = state.consent_snapshot();
-    for backend in state.backends.all() {
-        if backend.kind().requires_consent() && !consent.is_granted(backend.id().as_str()) {
-            continue;
-        }
+    let fallback = state.cross_account_fallback();
+    let mut offered: Vec<_> = state
+        .backends
+        .all()
+        .iter()
+        .filter(|backend| crate::state::consents_to(&consent, backend.as_ref()))
+        .filter(|backend| super::offered_to(backend.as_ref(), client_login, fallback))
+        .collect();
+    offered.sort_by_key(|backend| match backend.login() {
+        Some(_) => u8::from(!super::offered_to(backend.as_ref(), client_login, false)),
+        None => 2,
+    });
+    for backend in offered {
         if let Some(document) = backend.models_document().await {
             return Some(document);
         }
@@ -106,15 +196,21 @@ async fn codex_models_document(state: &AppState) -> Option<Vec<u8>> {
     None
 }
 
-async fn openai_shaped_models(state: AppState) -> Response {
+async fn openai_shaped_models(state: AppState, client_login: Option<BackendId>) -> Response {
     let statuses = state.backends.statuses().await;
     let consent = state.consent_snapshot();
+    let fallback = state.cross_account_fallback();
     let mut data = Vec::new();
     for status in &statuses {
         if !status.authenticated {
             continue;
         }
-        if status.kind.requires_consent() && !consent.is_granted(status.id.as_str()) {
+        if !state.backends.consented(&status.id, &consent) {
+            continue;
+        }
+        if !state.backends.get(&status.id).is_none_or(|backend| {
+            super::offered_to(backend.as_ref(), client_login.as_ref(), fallback)
+        }) {
             continue;
         }
         for (model, _) in &status.models {
@@ -137,6 +233,7 @@ async fn forward(
     body: Bytes,
     path: &str,
     protocol: Protocol,
+    client_login: Option<BackendId>,
 ) -> Result<Response, FacadeError> {
     let started_at = chrono::Utc::now();
     let started = std::time::Instant::now();
@@ -159,8 +256,27 @@ async fn forward(
     {
         peek.client_identity = Some(ClientIdentity::Codex);
     }
+    peek.client_login = client_login;
+    // Which ChatGPT account minted a session's encrypted reasoning is recorded
+    // per session: every Codex session of one version shares a conversation
+    // key, and one of them moving to another login moves no one else's.
+    peek.client_session = client_session_id(&headers, protocol);
+    let key = peek.client_session.as_deref().map_or_else(
+        || {
+            super::key_for_login(
+                conversation_key(protocol, &parsed),
+                peek.client_login.as_ref(),
+            )
+        },
+        |session| {
+            ironwire_core::policy::ConversationKey::for_session(
+                protocol,
+                session,
+                peek.client_login.as_ref(),
+            )
+        },
+    );
     let peek = peek;
-    let key = conversation_key(protocol, &parsed);
     let conversation = key.0;
 
     // The privacy filter is the one documented exception to byte-identical
@@ -205,8 +321,9 @@ async fn forward(
         // Codex renders a line from us on a limit response, and this is the
         // moment it is worth using: the user has just been stopped and has no
         // way to tell whether IronWire had somewhere else to go.
-        let rendered = FacadeError::from_pipeline(&e)
-            .on_openai_facade(peek.client_identity == Some(ClientIdentity::Codex));
+        let rendered =
+            FacadeError::from_pipeline_naming(&e, &|id| super::connect_command(&state, id))
+                .on_openai_facade(peek.client_identity == Some(ClientIdentity::Codex));
         if let Some(ledger) = state.ledger.as_ref() {
             pipeline::Refusal {
                 started_at,
@@ -214,7 +331,7 @@ async fn forward(
                 facade: "openai",
                 path: path.to_string(),
                 conversation: conversation.to_string(),
-                client_session_id: client_session_id(&headers, protocol),
+                client_session_id: peek.client_session.clone(),
                 requested_model: peek.requested_model.clone(),
                 status: rendered.status().as_u16(),
             }
@@ -251,7 +368,7 @@ async fn forward(
         facade: "openai",
         path: path.to_string(),
         conversation: conversation.to_string(),
-        client_session_id: client_session_id(&headers, protocol),
+        client_session_id: peek.client_session.clone(),
         backend: routed.decision.backend.to_string(),
         backend_is_local,
         backend_is_metered,

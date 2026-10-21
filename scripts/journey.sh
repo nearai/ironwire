@@ -32,10 +32,25 @@ export CODEX_HOME="${work}/codex"
 # `init` now writes to the agents' own config files and installs a service.
 # Every path it can touch has to land inside $work, or running this script
 # would reconfigure the machine it is testing on.
-export CLAUDE_CONFIG_DIR="${work}/claude"
+#
+# That means HOME, not CLAUDE_CONFIG_DIR. A CLAUDE_CONFIG_DIR is a Claude login
+# of its own, and the default login's settings live in `~/.claude` whatever the
+# shell exports — so a CLAUDE_CONFIG_DIR here would leave `init` wiring the real
+# `~/.claude/settings.json`. Unset, so one inherited from the developer's shell
+# does not turn this journey into a second login's. `~/.claude` exists because
+# `init` only wires a Claude Code that has run on the machine.
+export HOME="${work}/user"
+unset CLAUDE_CONFIG_DIR
+claude_dir="${HOME}/.claude"
 export ANTHROPIC_API_KEY="sk-ant-journey-test"
 export IRONWIRE_ANTHROPIC_BASE_URL="http://127.0.0.1:${mock_port}"
-mkdir -p "$IRONWIRE_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
+mkdir -p "$IRONWIRE_HOME" "$CODEX_HOME" "$claude_dir"
+# A private HOME does not isolate the macOS Keychain. The mock journey must
+# explicitly report an absent item and never launch the real security tool.
+mkdir -p "${work}/bin"
+printf '#!/bin/sh\nexit 44\n' >"${work}/bin/security"
+chmod 700 "${work}/bin/security"
+export PATH="${work}/bin:${PATH}"
 
 pass=0
 fail=0
@@ -149,7 +164,10 @@ grep -q "Point your agents at it" "${work}/serve.log" \
     || bad "startup tells you how to point a client at it" "$(cat "${work}/serve.log")"
 
 step "3. doctor, before anything is pointed here"
-says "doctor notices no client is pointed here" "not pointed here" "$bin" doctor --port "$port"
+# The diagnostic deliberately abbreviates HOME with a literal tilde.
+# shellcheck disable=SC2088
+says "doctor notices no client is pointed here" "~/.claude/settings.json does not point here" \
+    "$bin" doctor --port "$port"
 says "doctor gives the fix" "ironwire init" "$bin" doctor --port "$port"
 
 step "4. init points the agents at it, for real"
@@ -157,11 +175,11 @@ says "init writes a config on request" "Wrote" \
     "$bin" init --port "$port" --write --no-service
 says "init does not clobber an existing config" "leaving it alone" \
     "$bin" init --port "$port" --write --no-service
-[ -f "${CLAUDE_CONFIG_DIR}/settings.json" ] \
-    && grep -q "127.0.0.1:${port}/anthropic" "${CLAUDE_CONFIG_DIR}/settings.json" \
+[ -f "${claude_dir}/settings.json" ] \
+    && grep -q "127.0.0.1:${port}/anthropic" "${claude_dir}/settings.json" \
     && ok "the setting survives in the file, not just in this shell" \
     || bad "the setting survives in the file, not just in this shell" \
-        "$(cat "${CLAUDE_CONFIG_DIR}/settings.json" 2>&1)"
+        "$(cat "${claude_dir}/settings.json" 2>&1)"
 says "doctor now sees the client" "claude code   pointed here" "$bin" doctor --port "$port"
 says "doctor names where it read that from" "settings.json" "$bin" doctor --port "$port"
 says "doctor probes the backend" "anthropic-key" "$bin" doctor --port "$port"

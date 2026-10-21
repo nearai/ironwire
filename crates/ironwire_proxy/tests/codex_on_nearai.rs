@@ -73,41 +73,44 @@ async fn spawn_nearai() -> (String, Arc<Mutex<Option<Received>>>) {
     let sink = Arc::clone(&received);
 
     tokio::spawn(async move {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
         loop {
-            let Ok(n) = socket.read(&mut chunk).await else {
+            let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(split) = find_head_end(&buf) {
-                let head = String::from_utf8_lossy(&buf[..split]).to_string();
-                let length = content_length(&head).unwrap_or(0);
-                if buf.len() - split >= length {
-                    *sink.lock().expect("lock") = Some(Received {
-                        request_line: head.lines().next().unwrap_or_default().to_string(),
-                        body: String::from_utf8_lossy(&buf[split..split + length]).to_string(),
-                    });
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let Ok(n) = socket.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
                     break;
                 }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(split) = find_head_end(&buf) {
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let length = content_length(&head).unwrap_or(0);
+                    if buf.len() - split >= length {
+                        *sink.lock().expect("lock") = Some(Received {
+                            request_line: head.lines().next().unwrap_or_default().to_string(),
+                            body: String::from_utf8_lossy(&buf[split..split + length]).to_string(),
+                        });
+                        break;
+                    }
+                }
             }
-        }
 
-        let head = format!(
-            "HTTP/1.1 200 OK\r\n\
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
              content-type: text/event-stream\r\n\
+             connection: close\r\n\
              content-length: {}\r\n\r\n",
-            UPSTREAM_SSE.len()
-        );
-        let _ = socket.write_all(head.as_bytes()).await;
-        let _ = socket.write_all(UPSTREAM_SSE.as_bytes()).await;
-        let _ = socket.flush().await;
+                UPSTREAM_SSE.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(UPSTREAM_SSE.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
     });
 
     // `/v1` included, because that is the shape of the real base URL
@@ -150,22 +153,26 @@ fn state_for(base_url: &str) -> AppState {
     )
 }
 
-fn codex_request() -> Request<Body> {
+fn codex_request(body: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/openai/v1/responses")
         .header("content-type", "application/json")
         .header("authorization", "Bearer sk-the-clients-own-key")
         .header("originator", "codex_cli_rs")
-        .body(Body::from(CODEX_BODY))
+        .header("session-id", "nearai-native-session")
+        .body(Body::from(body.to_string()))
         .expect("request builds")
 }
 
 #[tokio::test]
 async fn a_codex_request_reaches_near_ai_on_its_own_wire() {
     let (base, received) = spawn_nearai().await;
+    // The first request this daemon sees replays encrypted reasoning, as any
+    // Codex turn after a restart does. NEAR AI is the only backend that could
+    // have minted it, so that is where it goes.
     let response = app(state_for(&base))
-        .oneshot(codex_request())
+        .oneshot(codex_request(CODEX_BODY))
         .await
         .expect("the proxy answers");
 
@@ -223,7 +230,7 @@ async fn a_chat_only_backend_receives_a_translated_request() {
     );
 
     let response = app(state)
-        .oneshot(codex_request())
+        .oneshot(codex_request(CODEX_BODY))
         .await
         .expect("the proxy answers");
     assert_eq!(response.status(), StatusCode::OK);

@@ -43,7 +43,9 @@ pub(crate) fn run(action: &str, path: Option<PathBuf>, mode: Option<String>) -> 
 
 fn load() -> Result<ironwire_core::config::PrivacyConfig> {
     let paths = paths()?;
-    Ok(Config::load(&paths).context("loading config.toml")?.privacy)
+    Ok(Config::load(&paths, ironwire_creds::login::dir_identity)
+        .context("loading config.toml")?
+        .privacy)
 }
 
 fn status() -> Result<()> {

@@ -79,6 +79,33 @@ pub struct RequestRequirements {
     /// there is no in-flight state to be missing, so the switch is clean.
     /// See `docs/PROTOCOL.md` §6.
     pub mid_tool_loop: bool,
+    /// The history replays a Responses `reasoning` item carrying
+    /// `encrypted_content`.
+    ///
+    /// Narrower than [`ReasoningNeed::LoadBearing`], and kept separate because
+    /// it answers a different question. `LoadBearing` is about continuity
+    /// across a *family* change, where the foreign provider simply never sees
+    /// the state. This is about an *account* change on the same wire: OpenAI
+    /// rejects encrypted content minted under another organization
+    /// (`invalid_encrypted_content`), so a conversation carrying it can only
+    /// be replayed to the ChatGPT account that produced it.
+    #[serde(default)]
+    pub encrypted_reasoning: bool,
+    /// The native backend whose observed credential scope matches the origin
+    /// recorded for this replay. Set by policy, never trusted from the wire.
+    #[serde(skip)]
+    pub reasoning_backend: Option<String>,
+    /// No origin is recorded for this replay, and more than one account could
+    /// have minted it. Set by policy, never trusted from the wire.
+    ///
+    /// Refuses every route, translated ones included. A translated route
+    /// drops the reasoning safely, which is why a *known* origin that cannot
+    /// serve may cross families at a turn boundary; but with the origin
+    /// unknown, the account that minted it may be right there, and moving the
+    /// conversation to another model and another bill would be choosing for
+    /// the user on a guess. Starting a new session is the user's call.
+    #[serde(skip)]
+    pub reasoning_origin_ambiguous: bool,
 }
 
 /// What a backend+model can preserve.
@@ -174,6 +201,14 @@ pub enum Ineligible {
     /// around. Expressed as a preference it would be one exhausted backend away
     /// from being silently ignored.
     NotTrustedUnderFullPrivacy,
+    /// The conversation replays encrypted reasoning, which is bound to the
+    /// ChatGPT account that produced it, and this is a different account.
+    ///
+    /// Like [`Self::MidToolLoop`], a fact about where the conversation has
+    /// been rather than about this backend: it stays on the account it is on,
+    /// or crosses to another family at a turn boundary. A new conversation is
+    /// free to start anywhere.
+    ReasoningBoundToAccount,
 }
 
 /// The tokens-of-warm-cache threshold above which discarding the cache makes a
@@ -200,6 +235,15 @@ pub fn eligible(
     cross_family: bool,
     backend: Option<(&str, crate::protocol::Protocol)>,
 ) -> Result<(), Ineligible> {
+    if req.encrypted_reasoning && req.reasoning_origin_ambiguous {
+        return Err(Ineligible::ReasoningBoundToAccount);
+    }
+    if req.encrypted_reasoning
+        && let Some((id, Protocol::OpenAiResponses)) = backend
+        && req.reasoning_backend.as_deref() != Some(id)
+    {
+        return Err(Ineligible::ReasoningBoundToAccount);
+    }
     if req
         .admission_backend
         .as_deref()
@@ -262,6 +306,8 @@ mod tests {
     fn claude_code_turn() -> RequestRequirements {
         RequestRequirements {
             admission_backend: None,
+            reasoning_backend: None,
+            reasoning_origin_ambiguous: false,
             tools: true,
             parallel_tool_calls: false,
             images: false,
@@ -271,6 +317,7 @@ mod tests {
             structured_output: false,
             min_context_tokens: 40_000,
             mid_tool_loop: false,
+            encrypted_reasoning: false,
         }
     }
 
@@ -286,6 +333,41 @@ mod tests {
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_replay_of_ambiguous_origin_is_refused_on_every_wire_including_translated() {
+        let req = RequestRequirements {
+            encrypted_reasoning: true,
+            reasoning_origin_ambiguous: true,
+            ..Default::default()
+        };
+        for (cross, backend) in [
+            (false, Some(("codex-sub", Protocol::OpenAiResponses))),
+            (true, Some(("nearai", Protocol::OpenAiChat))),
+            (true, Some(("anthropic-key", Protocol::AnthropicMessages))),
+            (true, None),
+        ] {
+            assert_eq!(
+                eligible(&req, &full_caps(), cross, backend),
+                Err(Ineligible::ReasoningBoundToAccount),
+                "{backend:?}"
+            );
+        }
+        // Without encrypted state there is nothing to bind, ambiguous or not.
+        let plain = RequestRequirements {
+            reasoning_origin_ambiguous: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible(
+                &plain,
+                &full_caps(),
+                true,
+                Some(("nearai", Protocol::OpenAiChat))
+            ),
+            Ok(())
+        );
     }
 
     #[test]

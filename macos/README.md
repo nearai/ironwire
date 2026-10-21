@@ -75,8 +75,10 @@ Three things it deliberately will not do:
   switch, and one flip is the whole action — but the daemon's summary and every
   one of its points are on that switch as its tooltip and its VoiceOver hint, in
   the daemon's order and never reworded. The answer is sent with the
-  `prompt_version` that was on screen, so it can be checked against the question
-  it answered. `docs/TRUST.md` §2 records what this trades away relative to the
+  `prompt_version` and the `binding` that were on screen, so it can be checked
+  against the question it answered and the login it named; the daemon refuses a
+  grant whose binding is missing or no longer matches (400), so the app offers
+  the switch only when the prompt carries one. Withdrawing needs neither. `docs/TRUST.md` §2 records what this trades away relative to the
   CLI's two-step gate, which is unchanged.
 - **Log you in.** A credential comes from you logging into Claude Code or Codex,
   or exporting an API key. A menu cannot conjure one, so a service without a
@@ -162,7 +164,7 @@ naive search would actually make.
 here" as clearly as a view can, and `.window` gives `onAppear`/`onDisappear`,
 which is how the poll rate switches between 5s closed and 1s open.
 `/_ironwire/status` does a credential check per backend — a Keychain read for
-the Claude one — so a one-second background poll would not be free.
+each Claude login — so a one-second background poll would not be free.
 
 **Notifications are off until asked for**, and authorisation is requested at the
 moment they are switched on rather than at first launch. Only the events the

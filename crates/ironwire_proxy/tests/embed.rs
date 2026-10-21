@@ -1064,6 +1064,113 @@ fn a_host_can_own_credentials_and_still_permit_the_credential_files() {
     }
 }
 
+/// A login declared in `config.toml` is registered before anyone has logged in
+/// to it, and `status` says what to run — for that login, not the default one.
+///
+/// In a child process because the Claude half reads the macOS Keychain first:
+/// with `PATH` empty there is no `security` to ask, so the answer is the same on
+/// every machine and nobody's real Keychain is touched. `HOME` is a temporary
+/// directory, so the default logins are absent too.
+#[test]
+fn a_declared_login_nobody_has_logged_in_to_yet_says_how_to_log_in() {
+    const CHILD: &str = "IRONWIRE_DECLARED_LOGIN_TEST";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use ironwire_proxy::embed::{
+                    EmbedOptions, StartupProbes, UpdateChecks, start_with_options,
+                };
+                let claude_dir = tempfile::tempdir().unwrap();
+                let codex_dir = tempfile::tempdir().unwrap();
+                let home = tempfile::tempdir().unwrap();
+                std::fs::write(
+                    home.path().join("config.toml"),
+                    format!(
+                        "[updates]\ncheck = false\n\
+                         [[backends]]\nid = 'nearai'\nkind = 'nearai'\nenabled = false\n\
+                         [[backends]]\nid = 'claude-work'\nkind = 'claude-subscription'\n\
+                         config_dir = '{}'\n\
+                         [[backends]]\nid = 'codex-work'\nkind = 'codex-subscription'\n\
+                         config_dir = '{}'\n",
+                        claude_dir.path().display(),
+                        codex_dir.path().display()
+                    ),
+                )
+                .unwrap();
+                let proxy = start_with_options(
+                    home.path(),
+                    Some(0),
+                    EmbedOptions::default()
+                        .with_update_checks(UpdateChecks::Off)
+                        .with_startup_probes(StartupProbes::Off),
+                    |_, _| {},
+                )
+                .await
+                .expect("starts");
+                let backends = backends_reported_by(home.path(), proxy.port()).await;
+                proxy.shutdown().await;
+
+                let ids: Vec<&str> = backends
+                    .iter()
+                    .map(|backend| backend["id"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec!["claude-work", "codex-work"],
+                    "registered though nobody is logged in, and no default login appeared"
+                );
+                for (id, command) in [
+                    ("claude-work", "CLAUDE_CONFIG_DIR="),
+                    ("codex-work", "CODEX_HOME="),
+                ] {
+                    let backend = backends.iter().find(|b| b["id"] == id).unwrap();
+                    assert_eq!(backend["kind"], "subscription");
+                    assert_eq!(backend["authenticated"], false, "{backend}");
+                    let detail = backend["detail"].as_str().unwrap_or_default();
+                    assert!(
+                        detail.contains(command),
+                        "{id} names the command for its own login: {detail}"
+                    );
+                    assert!(
+                        backend["connect_command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("--config-dir")),
+                        "{backend}"
+                    );
+                }
+            });
+        return;
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_declared_login_nobody_has_logged_in_to_yet_says_how_to_log_in",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(CHILD, "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("CODEX_HOME", home.path())
+        .env("PATH", "")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "127.0.0.1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// An embedded start must be `tokio::spawn`-able, which is to say its future
 /// must be `Send`.
 ///
@@ -1111,4 +1218,25 @@ async fn an_embedded_start_can_be_spawned_onto_a_multi_thread_runtime() {
     .expect("the spawned start did not panic");
 
     assert_ne!(started, 0, "the spawned start bound a real port");
+}
+
+/// Shapes `main` accepted must not stop an embedding host's proxy: a login
+/// entry under an id of its own with no `config_dir`, and an entry under a
+/// discovered id that names another kind. Both are ignored with a warning.
+#[tokio::test]
+async fn a_host_still_starts_on_config_shapes_main_accepted() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[updates]\ncheck = false\n\
+         [[backends]]\nid = 'claude-work'\nkind = 'claude-subscription'\n\
+         [[backends]]\nid = 'codex-work'\nkind = 'codex-subscription'\nenabled = false\n\
+         [[backends]]\nid = 'claude-sub'\nkind = 'anthropic-api'\nenabled = false\n\
+         [[backends]]\nid = 'nearai'\nkind = 'openai-api'\nenabled = false\n",
+    )
+    .unwrap();
+    let proxy = start(home.path(), Some(0))
+        .await
+        .expect("a config main accepted still starts");
+    proxy.shutdown().await;
 }

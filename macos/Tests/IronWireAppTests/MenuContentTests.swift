@@ -84,6 +84,43 @@ final class MenuContentTests: XCTestCase {
         return rendered.size.height
     }
 
+    /// A thousand logins under one display name. Identity is what the rows are
+    /// keyed and joined on: every row the menu draws must find its own
+    /// settings record, and so its own consent binding, by id. Joined on the
+    /// shared name, all of them would answer with one login's switch.
+    ///
+    /// Asserted on the client the menu rendered from, after it rendered, rather
+    /// than on the fixture: the fixture's ids are distinct by construction.
+    func test_a_menu_with_a_thousand_logins_renders_offscreen_without_losing_identity() throws {
+        let backends = (0..<1024).map { BackendView(id: "claude-\($0)", name: "Claude subscription") }
+        let services = backends.map { backend in
+            ServiceView(id: backend.id, name: backend.name, requiresConsent: true, consented: false,
+                consentPrompt: ConsentPromptView(version: 2, backendId: backend.id, product: "Claude",
+                    summary: "Read this login", points: ["Private auth risk"], question: "Enable?",
+                    binding: "opaque-\(backend.id)"))
+        }
+        let client = ControlClient.fixture(
+            status: status(backends: backends), settings: settings(services: services))
+        let renderer = ImageRenderer(
+            content: MenuContent(client: client, notifier: Notifier(), loginItem: LoginItem()))
+        renderer.scale = 2
+        let rendered = try XCTUnwrap(renderer.nsImage)
+        XCTAssertTrue(rendered.size.width.isFinite && rendered.size.height.isFinite)
+        XCTAssertGreaterThan(rendered.size.width, 0)
+        XCTAssertGreaterThan(rendered.size.height, 0)
+
+        let rows = try XCTUnwrap(client.status).backends
+        XCTAssertEqual(Set(rows.map(\.id)).count, 1024, "rows collapsed onto a shared identity")
+        XCTAssertEqual(client.servicesById.count, 1024, "logins collapsed in the settings join")
+        for row in rows {
+            let service = client.servicesById[row.id]
+            XCTAssertEqual(service?.id, row.id, "\(row.id) joined another login's record")
+            XCTAssertEqual(
+                service?.consentPrompt?.binding, "opaque-\(row.id)",
+                "\(row.id) would grant with another login's binding")
+        }
+    }
+
     // MARK: - The bar
 
     /// The acceptance criterion the issue calls the single most likely place for
@@ -190,7 +227,7 @@ final class MenuContentTests: XCTestCase {
             summary: "IronWire will read the OAuth token that Claude Code stores on this machine "
                 + "and send requests to api.anthropic.com with it, from this computer only.",
             points: (0..<points).map { "Point number \($0), which is a whole sentence about a real cost." },
-            question: "Enable the Claude subscription backend?")
+            question: "Enable the Claude subscription backend?", binding: "test-login")
     }
 
     private func settings(
@@ -246,11 +283,61 @@ final class MenuContentTests: XCTestCase {
                 version: 2, backendId: "claude-sub", product: "Claude",
                 summary: String(repeating: "A very long summary sentence. ", count: 12),
                 points: (0..<12).map { "Point \($0), which is a whole sentence about a real cost." },
-                question: "Enable the Claude subscription backend?"))
+                question: "Enable the Claude subscription backend?", binding: "test-login"))
         XCTAssertEqual(
             try height(shortStatus, settings: shortSettings),
             try height(longStatus, settings: longSettings),
             "the row grows with the consent text, so it is being drawn")
+    }
+
+    /// `docs/TRUST.md`: the menu offers a grant switch only when the prompt
+    /// carries the opaque binding the grant must echo. A grant sent without one
+    /// is refused by the daemon, so a switch for it would be a control that
+    /// cannot work. Missing and empty both mean no binding, and both rows are
+    /// the switchless one -- "not enabled" and the command -- which lays out
+    /// taller than a row with a switch.
+    func test_a_grant_switch_is_offered_only_when_the_prompt_has_a_binding() throws {
+        func unbound(_ binding: String?) -> ConsentPromptView {
+            ConsentPromptView(
+                version: 2, backendId: "claude-sub", product: "Claude",
+                summary: prompt().summary, points: prompt().points,
+                question: prompt().question, binding: binding)
+        }
+        let (bound, boundSettings) = unconsented(prompt: prompt())
+        let (noSwitch, noSwitchSettings) = unconsented(prompt: nil)
+        let withSwitch = try height(bound, settings: boundSettings)
+        let without = try height(noSwitch, settings: noSwitchSettings)
+        for binding: String? in [nil, ""] {
+            let (status, settings) = unconsented(prompt: unbound(binding))
+            let measured = try height(status, settings: settings)
+            XCTAssertGreaterThan(
+                measured, withSwitch,
+                "a prompt with binding \(String(describing: binding)) is offered a grant switch")
+            XCTAssertEqual(measured, without)
+        }
+    }
+
+    /// The binding gates the *grant*. A login already consented to keeps its
+    /// switch without one, because turning it off is a revocation, and a menu
+    /// that could grant but not take back would be the worse failure.
+    func test_a_consented_login_keeps_its_switch_without_a_binding() throws {
+        let unbound = ConsentPromptView(
+            version: 2, backendId: "claude-sub", product: "Claude",
+            summary: prompt().summary, points: prompt().points,
+            question: prompt().question, binding: nil)
+        func consented(_ prompt: ConsentPromptView?) throws -> CGFloat {
+            try height(
+                status(backends: [
+                    BackendView(id: "claude-sub", name: "Claude subscription", consented: true)
+                ]),
+                settings: settings(services: [
+                    ServiceView(
+                        id: "claude-sub", name: "Claude subscription", authenticated: true,
+                        requiresConsent: true, consented: true, consentPrompt: prompt,
+                        connectCommand: "ironwire connect claude")
+                ]))
+        }
+        XCTAssertEqual(try consented(unbound), try consented(prompt()))
     }
 
     /// A switch that is off already reads "off", so the row does not say it
@@ -282,6 +369,57 @@ final class MenuContentTests: XCTestCase {
             ]),
             settings: settings(services: [service]))
         XCTAssertNotNil(rendered)
+    }
+
+    /// The status document is polled and settings is fetched on open, so the
+    /// row's own copy of the command is the one that is there first.
+    func test_a_backend_with_no_credential_names_its_command_before_settings_arrive() throws {
+        let withCommand = try height(
+            status(backends: [
+                BackendView(
+                    id: "claude-work", name: "Claude subscription (~/.claude-work)",
+                    authenticated: false, consented: false,
+                    detail: "Claude Code is not logged in for ~/.claude-work",
+                    connectCommand: "ironwire connect claude --config-dir ~/.claude-work")
+            ]))
+        let without = try height(
+            status(backends: [
+                BackendView(
+                    id: "claude-work", name: "Claude subscription (~/.claude-work)",
+                    authenticated: false, consented: false,
+                    detail: "Claude Code is not logged in for ~/.claude-work")
+            ]))
+        XCTAssertGreaterThan(withCommand, without, "the row's own connect command is not being drawn")
+    }
+
+    // MARK: - Several logins of one product
+
+    /// Two Claude logins under one display name. The daemon names them apart,
+    /// but a name is for reading: this is the case where rows keyed on it
+    /// would collapse.
+    private func twoClaudeLogins(_ uses: [SubscriptionUse]) -> StatusView {
+        status(
+            backends: [
+                BackendView(id: "claude-sub", name: "Claude subscription"),
+                BackendView(id: "claude-work", name: "Claude subscription"),
+            ],
+            balance: BalanceView(available: 2, freeAvailable: 2, subscriptionUsed: uses))
+    }
+
+    private let personal = SubscriptionUse(
+        backend: "claude-sub", name: "Claude subscription", usedPct: 82, exchanges: 41)
+    private let work = SubscriptionUse(
+        backend: "claude-work", name: "Claude subscription", usedPct: nil, exchanges: 3)
+
+    /// Identity is asserted directly as well as by height: an off-screen render
+    /// draws both rows even when they share an id. It is a live list being
+    /// updated that goes wrong, and that is not something a render can catch.
+    func test_two_logins_with_one_display_name_are_two_rows_in_the_balance() throws {
+        XCTAssertNotEqual(personal.id, work.id, "two logins share one row identity")
+
+        let both = try height(twoClaudeLogins([personal, work]))
+        let one = try height(twoClaudeLogins([personal]))
+        XCTAssertGreaterThan(both, one, "the second login's row is not being drawn")
     }
 
     // MARK: - The window
@@ -456,11 +594,12 @@ final class MenuContentTests: XCTestCase {
     func test_the_pin_control_offers_every_backend_the_daemon_reported() {
         let status = status(backends: [
             BackendView(id: "claude-sub", name: "Claude subscription"),
+            BackendView(id: "claude-work", name: "Claude subscription (~/.claude-work)"),
             BackendView(id: "codex-sub", name: "ChatGPT subscription", authenticated: false),
             BackendView(id: "nearai", name: "NEAR AI", health: HealthView(circuit: "open")),
         ])
         // The menu is built straight off this list, so the list is the
         // assertion: no filtering, no ranking, no opinion.
-        XCTAssertEqual(status.backends.map(\.id), ["claude-sub", "codex-sub", "nearai"])
+        XCTAssertEqual(status.backends.map(\.id), ["claude-sub", "claude-work", "codex-sub", "nearai"])
     }
 }

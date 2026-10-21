@@ -8,6 +8,8 @@
 //! exposes the ledger and can change where a user's requests go, so it also
 //! requires the token in `$IRONWIRE_HOME/control.token` (mode 0600).
 
+use futures_util::{StreamExt, stream};
+
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -17,8 +19,8 @@ use chrono::{DateTime, Utc};
 use ironwire_core::config::PrivacyMode;
 use ironwire_core::protocol::BackendId;
 use ironwire_core::quota::Headroom;
-use ironwire_creds::ConsentLedger;
 use ironwire_creds::consent::ConsentPrompt;
+use ironwire_creds::{ConsentLedger, SubscriptionLogin, SubscriptionProduct};
 use ironwire_ledger::{Exchange, Summary};
 use ironwire_update::UpdateStatus;
 use ironwire_usage::UsageReport;
@@ -50,6 +52,13 @@ pub struct BackendView {
     pub health: HealthView,
     /// Models offered.
     pub models: Vec<String>,
+    /// What to run to connect this backend — for a subscription, the login it
+    /// reads (`ironwire connect claude --config-dir ~/.claude-work`).
+    ///
+    /// Carried so a client never composes the command from an id: with two
+    /// logins of one product, the hardcoded form names the wrong one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_command: Option<String>,
 }
 
 /// A backend's circuit state, flattened for display.
@@ -177,6 +186,15 @@ pub struct StatusView {
     /// is no open window. Defaulted so an older daemon still parses.
     #[serde(default)]
     pub usage: UsageReport,
+    /// Whether a client whose own subscription is spent may be served by
+    /// another of the user's subscriptions to the same product
+    /// (`[subscriptions] cross_account_fallback`).
+    ///
+    /// On the status screen because it is a risk the user took on and should
+    /// never lose sight of: the provider can see the switch (`docs/TRUST.md`).
+    /// Defaulted so an older daemon — which had no such setting — reads as off.
+    #[serde(default)]
+    pub cross_account_fallback: bool,
 }
 
 /// The most recent routing decision.
@@ -277,6 +295,10 @@ pub struct SpendCapView {
 /// One subscription's consumption of its own window.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionUse {
+    /// Backend id, e.g. `claude-work` — what tells two logins of one product
+    /// apart. Empty from a daemon that predates several logins.
+    #[serde(default)]
+    pub backend: String,
     /// Display name, e.g. `Claude subscription`.
     pub name: String,
     /// Percent of the window consumed, as the provider reported it. `None`
@@ -412,6 +434,10 @@ pub struct ConsentRequest {
     /// to the new question on the strength of the old one having been shown —
     /// which is exactly what versioning the prompt exists to prevent.
     pub prompt_version: u32,
+    /// The login binding carried by the prompt that was presented. Required
+    /// for grants; withdrawals must remain available to older clients.
+    #[serde(default)]
+    pub binding: Option<String>,
 }
 
 /// Body of `POST /_ironwire/pin`.
@@ -430,12 +456,30 @@ pub struct ProbeView {
     pub id: String,
     /// Display name.
     pub name: String,
-    /// Whether the probe succeeded.
+    /// Whether the probe succeeded. False when it was not sent ([`Self::probed`]).
     pub ok: bool,
     /// Round-trip milliseconds.
     pub latency_ms: u64,
     /// What went wrong, when it did.
     pub error: Option<String>,
+    /// Whether a request went out at all. False for a subscription awaiting
+    /// consent: probing it would send its token before the user said yes.
+    /// Defaults to true for a daemon that predates the field, which probed
+    /// everything.
+    #[serde(default = "probed_by_default")]
+    pub probed: bool,
+    /// Not probed because this subscription is awaiting consent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_consent: bool,
+    /// What to run to connect this backend, as in [`BackendView`]; set when it
+    /// is awaiting consent, where the answer is that command with
+    /// `--subscription`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_command: Option<String>,
+}
+
+fn probed_by_default() -> bool {
+    true
 }
 
 /// Query for `GET /_ironwire/log`.
@@ -688,6 +732,26 @@ async fn tools(
         }
     };
 
+    if request.connect
+        && let Some(login) = plain_url_into_a_login_directory(&state, &request.id, &planned)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": format!(
+                    "{} belongs to your {}, which IronWire serves only at the URL \
+                     naming it; the plain URL this would write is served by no \
+                     subscription. Run `{}` to wire it",
+                    planned.path.display(),
+                    login.label(),
+                    login.connect_command(),
+                ),
+                "reason": "login-directory",
+            })),
+        )
+            .into_response();
+    }
+
     let digest = planned.digest();
     let confirming = request.as_previewed.is_some() && !request.dry_run;
     if let Some(shown) = &request.as_previewed
@@ -797,6 +861,7 @@ fn settings_view(
         .iter()
         .map(|status| {
             let requires_consent = status.kind.requires_consent();
+            let login = login_of(state, status.id.as_str());
             ServiceView {
                 id: status.id.to_string(),
                 name: status.name.clone(),
@@ -804,9 +869,9 @@ fn settings_view(
                 authenticated: status.authenticated,
                 detail: status.detail.clone(),
                 requires_consent,
-                consented: !requires_consent || consent.is_granted(status.id.as_str()),
-                consent_prompt: ConsentPrompt::for_backend(status.id.as_str()),
-                connect_command: connect_command(status.id.as_str()),
+                consented: state.backends.consented(&status.id, consent),
+                consent_prompt: consent_prompt(login.as_ref(), status.id.as_str()),
+                connect_command: connect_command(login.as_ref(), status.id.as_str()),
             }
         })
         .collect();
@@ -835,6 +900,28 @@ fn settings_view(
     }
 }
 
+/// The login a registered backend reads, if it reads one.
+fn login_of(state: &AppState, backend_id: &str) -> Option<SubscriptionLogin> {
+    state
+        .backends
+        .get(&BackendId::from(backend_id))
+        .and_then(|backend| backend.login())
+}
+
+/// The consent question for a backend.
+///
+/// From the login it reads, so a second Claude login is asked about by its
+/// directory — "enable the Claude subscription" does not say which account is
+/// being handed over. A default id with no backend behind it (not logged in
+/// yet) still gets the default login's question, so consent can be recorded
+/// before the login exists, as it always could.
+fn consent_prompt(login: Option<&SubscriptionLogin>, backend_id: &str) -> Option<ConsentPrompt> {
+    match login {
+        Some(login) => Some(ConsentPrompt::for_login(login, backend_id)),
+        None => ConsentPrompt::for_backend(backend_id),
+    }
+}
+
 /// What to run for the parts a GUI has no business doing.
 ///
 /// Pointing Claude Code at IronWire means an environment variable in the user's
@@ -842,12 +929,17 @@ fn settings_view(
 /// are files the user owns, and `ironwire connect` already shows the change
 /// before making it (`docs/TRUST.md`). A menu offering to do it silently would
 /// be the wrong end of that trade.
-fn connect_command(backend_id: &str) -> Option<String> {
+///
+/// A subscription's command comes from its login, which is the only thing that
+/// knows whether a `--config-dir` belongs in it.
+fn connect_command(login: Option<&SubscriptionLogin>, backend_id: &str) -> Option<String> {
+    if let Some(login) = login {
+        return Some(login.connect_command());
+    }
     match backend_id {
-        "claude-sub" => Some("ironwire connect claude".to_string()),
-        "codex-sub" => Some("ironwire connect codex".to_string()),
         "nearai" => Some("ironwire connect near".to_string()),
-        _ => None,
+        id => SubscriptionProduct::for_default_backend_id(id)
+            .map(|product| SubscriptionLogin::default_for(product).connect_command()),
     }
 }
 
@@ -968,10 +1060,26 @@ async fn consent(
         return *response;
     }
 
-    let Some(prompt) = ConsentPrompt::for_backend(&request.backend) else {
+    // The question this backend's login is asked — the same one `GET
+    // /settings` handed the client — so the version checked below is the
+    // version of what the user actually read.
+    let login = login_of(&state, &request.backend);
+    let Some(prompt) = consent_prompt(login.as_ref(), &request.backend) else {
+        let logins: Vec<String> = state
+            .backends
+            .all()
+            .iter()
+            .filter(|backend| backend.login().is_some())
+            .map(|backend| backend.id().to_string())
+            .collect();
         return bad_request(format!(
-            "`{}` is not a backend that consent applies to",
-            request.backend
+            "`{}` is not a backend that consent applies to. It applies to subscription logins{}.",
+            request.backend,
+            if logins.is_empty() {
+                ", and none is registered; `ironwire status` lists every backend".to_string()
+            } else {
+                format!(": {}", logins.join(", "))
+            }
         ));
     };
 
@@ -984,6 +1092,14 @@ async fn consent(
              Re-read it and answer again — a newer question is a different question.",
             request.prompt_version, prompt.version
         ));
+    }
+
+    if request.granted && request.binding.as_deref() != Some(prompt.binding.as_str()) {
+        return bad_request(
+            "the login named by this consent question has changed or was not echoed. \
+            Refresh settings and answer the current question again."
+                .to_string(),
+        );
     }
 
     let recorded = state.set_consent(&request.backend, request.granted);
@@ -1045,6 +1161,50 @@ fn conflict(message: String) -> Response {
         axum::Json(serde_json::json!({ "error": message })),
     )
         .into_response()
+}
+
+/// The login whose directory `planned` would leave holding the plain URL,
+/// when that login is not the one the plain URL belongs to.
+///
+/// The tools path writes Claude Code's `~/.claude` and Codex's `CODEX_HOME`,
+/// and config can move a login into either — a default relocated there, say.
+/// That login is served only at the URL naming it, so the plain one would
+/// quietly take its client off its subscription. A file already bound stays
+/// bound through a plain connect (`claude_settings::connect`), so only an
+/// unbound one is refused.
+fn plain_url_into_a_login_directory(
+    state: &AppState,
+    tool: &str,
+    planned: &ironwire_agents::tools::Planned,
+) -> Option<SubscriptionLogin> {
+    let (product, bound): (_, fn(&str) -> Option<String>) = match tool {
+        "claude" => (
+            SubscriptionProduct::Claude,
+            ironwire_agents::claude_settings::account,
+        ),
+        "codex" => (
+            SubscriptionProduct::ChatGpt,
+            ironwire_agents::codex_config::account,
+        ),
+        _ => return None,
+    };
+    let dir = planned.path.parent()?;
+    let existing = std::fs::read_to_string(&planned.path).unwrap_or_default();
+    if bound(&existing).is_some() {
+        return None;
+    }
+    state
+        .backends
+        .all()
+        .iter()
+        .filter_map(|backend| backend.login())
+        .find(|login| {
+            login.product == product
+                && login
+                    .config_dir
+                    .as_deref()
+                    .is_some_and(|read| std::path::Path::new(read) == dir)
+        })
 }
 
 fn bad_request(message: String) -> Response {
@@ -1138,6 +1298,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let consent = state.consent_snapshot();
 
     let health = state.breakers.statuses();
+    let health_by_id: std::collections::HashMap<_, _> =
+        health.iter().map(|h| (&h.backend, h)).collect();
     let backends: Vec<BackendView> = statuses
         .iter()
         .map(|s| BackendView {
@@ -1152,31 +1314,34 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 .and_then(|value| value.as_str().map(ToString::to_string))
                 .unwrap_or_else(|| format!("{:?}", s.kind).to_lowercase()),
             authenticated: s.authenticated,
-            consented: !s.kind.requires_consent() || consent.is_granted(s.id.as_str()),
+            consented: state.backends.consented(&s.id, &consent),
             detail: s.detail.clone(),
             headroom: HeadroomView::from(&s.quota.primary, now),
-            health: health.iter().find(|h| h.backend == s.id).map_or_else(
-                HealthView::default,
-                |h| HealthView {
+            health: health_by_id
+                .get(&s.id)
+                .map_or_else(HealthView::default, |h| HealthView {
                     circuit: format!("{:?}", h.state).to_lowercase(),
                     consecutive_failures: h.consecutive_failures,
                     retry_in_secs: h.retry_at.map(|at| (at - now).num_seconds().max(0)),
-                },
-            ),
+                }),
             models: s.models.iter().map(|(m, _)| m.clone()).collect(),
+            connect_command: connect_command(
+                login_of(&state, s.id.as_str()).as_ref(),
+                s.id.as_str(),
+            ),
         })
         .collect();
 
     let balance = balance(
         &statuses,
-        &consent,
+        &|id| state.backends.consented(id, &consent),
         &health,
         state.ledger.as_ref(),
         &state.config.limits,
         now,
     );
 
-    let (tracked, pin) = {
+    let (tracked, pin, cross_account_fallback) = {
         let policy = match state.policy.lock() {
             Ok(p) => p,
             Err(poisoned) => poisoned.into_inner(),
@@ -1187,6 +1352,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 Some(model) => format!("{b}:{model}"),
                 None => b.to_string(),
             }),
+            policy.cross_account_fallback(),
         )
     };
 
@@ -1208,6 +1374,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
             at: route.at,
         }),
         usage: usage(&state, now),
+        cross_account_fallback,
     })
     .into_response()
 }
@@ -1273,7 +1440,7 @@ fn build_usage(
 /// counts pools instead of summing them.
 fn balance(
     statuses: &[ironwire_upstream::backend::BackendStatus],
-    consent: &ConsentLedger,
+    consented: &dyn Fn(&BackendId) -> bool,
     health: &[ironwire_upstream::breaker::BreakerStatus],
     ledger: Option<&ironwire_ledger::Ledger>,
     limits: &ironwire_core::config::LimitsConfig,
@@ -1285,6 +1452,17 @@ fn balance(
     // 24 hours and a calendar day disagreeing about "today" on the one screen
     // that reports both would be indefensible.
     let summary = ledger.and_then(|l| l.summary(crate::spend::window_start(now)).ok());
+    let health_by_id: std::collections::HashMap<_, _> =
+        health.iter().map(|h| (&h.backend, h)).collect();
+    let exchanges_by_id: std::collections::HashMap<_, _> = summary
+        .as_ref()
+        .map(|sum| {
+            sum.by_backend
+                .iter()
+                .map(|(id, count)| (id.as_str(), *count))
+                .collect()
+        })
+        .unwrap_or_default();
     // Which backend is metered is knowable only here, where the registry is —
     // the ledger stores an id, not a kind. Everything else is priced but not
     // billed, and must not be added up as though it were.
@@ -1318,23 +1496,15 @@ fn balance(
             }),
         subscription_used: statuses
             .iter()
-            .filter(|s| {
-                s.kind.requires_consent() && s.authenticated && consent.is_granted(s.id.as_str())
-            })
+            .filter(|s| s.kind.requires_consent() && s.authenticated && consented(&s.id))
             .map(|s| SubscriptionUse {
+                backend: s.id.to_string(),
                 name: s.name.clone(),
                 used_pct: match s.quota.primary {
                     Headroom::Observed { used_pct, .. } => Some(used_pct),
                     _ => None,
                 },
-                exchanges: summary
-                    .as_ref()
-                    .and_then(|sum| {
-                        sum.by_backend
-                            .iter()
-                            .find(|(backend, _)| backend == s.id.as_str())
-                    })
-                    .map_or(0, |(_, count)| *count),
+                exchanges: exchanges_by_id.get(s.id.as_str()).copied().unwrap_or(0),
             })
             .collect(),
         ..BalanceView::default()
@@ -1345,23 +1515,16 @@ fn balance(
         // A backend the user has not logged into, or not consented to, is not a
         // pool that is *down* — it is one they have not opted into. Counting it
         // as unavailable would make a working setup look half-broken.
-        if !status.authenticated
-            || (status.kind.requires_consent() && !consent.is_granted(status.id.as_str()))
-        {
+        if !status.authenticated || !consented(&status.id) {
             continue;
         }
 
-        let circuit_open = health
-            .iter()
-            .find(|h| h.backend == status.id)
+        let circuit_open = health_by_id
+            .get(&status.id)
             .is_some_and(|h| h.state == CircuitState::Open);
         if circuit_open {
             view.unavailable += 1;
-            if let Some(at) = health
-                .iter()
-                .find(|h| h.backend == status.id)
-                .and_then(|h| h.retry_at)
-            {
+            if let Some(at) = health_by_id.get(&status.id).and_then(|h| h.retry_at) {
                 resets.push(at);
             }
             continue;
@@ -1552,23 +1715,60 @@ async fn pin(
 
 /// Hit every backend for real. This is what makes `ironwire doctor` worth
 /// running: a credential that parses proves nothing.
+///
+/// Every backend the user has allowed, that is. A subscription awaiting consent
+/// is reported unprobed with the command that grants it: the probe would send
+/// its OAuth token, and running `doctor` is not saying yes (`docs/TRUST.md`
+/// §2).
 async fn probe(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    let mut views = Vec::new();
-    for backend in state.backends.all() {
-        let started = std::time::Instant::now();
-        let outcome = backend.probe().await;
-        let latency = started.elapsed();
-        views.push(ProbeView {
-            id: backend.id().to_string(),
-            name: backend.name().to_string(),
-            ok: outcome.is_ok(),
-            latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
-            error: outcome.err().map(|e| e.to_string()),
+    let consent = state.consent_snapshot();
+    let mut checks = Vec::new();
+    for backend in state.backends.all().iter().cloned() {
+        let state = &state;
+        let consent = &consent;
+        checks.push(async move {
+            if !crate::state::consents_to(consent, backend.as_ref()) {
+                let command = connect_command(backend.login().as_ref(), backend.id().as_str());
+                let run = command.as_deref().map_or_else(
+                    || "grant it consent".to_string(),
+                    |command| format!("run `{command} --subscription`"),
+                );
+                return ProbeView {
+                    id: backend.id().to_string(),
+                    name: backend.name().to_string(),
+                    ok: false,
+                    latency_ms: 0,
+                    error: Some(format!(
+                        "not probed: awaiting your consent to use this subscription — {run}"
+                    )),
+                    probed: false,
+                    awaiting_consent: true,
+                    connect_command: command,
+                };
+            }
+            let id = backend.id().to_string();
+            let name = backend.name().to_string();
+            let started = std::time::Instant::now();
+            let outcome = state.backends.probe(backend).await;
+            ProbeView {
+                id,
+                name,
+                ok: outcome.is_ok(),
+                latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error: outcome.err().map(|e| e.to_string()),
+                probed: true,
+                awaiting_consent: false,
+                connect_command: None,
+            }
         });
     }
+    let views: Vec<ProbeView> = stream::iter(checks)
+        .buffered(crate::state::BACKEND_CHECK_CONCURRENCY)
+        .collect()
+        .await;
     axum::Json(views).into_response()
 }
 

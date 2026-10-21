@@ -10,7 +10,8 @@
 use axum::Json;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use ironwire_core::policy::NoRoute;
+use ironwire_core::policy::{NoRoute, Refusal};
+use ironwire_core::protocol::BackendId;
 use ironwire_upstream::backend::UpstreamError;
 use serde_json::json;
 
@@ -69,6 +70,30 @@ impl FacadeError {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request_error", message)
     }
 
+    /// A login-bound URL naming a login IronWire does not have.
+    ///
+    /// 404, because the URL names a resource that is not there, and a status
+    /// every client already treats as final: retrying will not make the login
+    /// exist. Each envelope spells it the way its provider does — Anthropic as
+    /// `not_found_error`, OpenAI as `invalid_request_error`.
+    #[must_use]
+    pub fn unknown_login(message: impl Into<String>, openai: bool) -> Self {
+        let error = Self::new(
+            StatusCode::NOT_FOUND,
+            if openai {
+                "invalid_request_error"
+            } else {
+                "not_found_error"
+            },
+            message,
+        );
+        if openai {
+            error.on_openai_facade(false)
+        } else {
+            error
+        }
+    }
+
     /// Render this error the way the OpenAI façade's clients expect it.
     ///
     /// The envelope is not cosmetic. Every error here was leaving on the
@@ -108,8 +133,23 @@ impl FacadeError {
     /// Render a pipeline failure.
     #[must_use]
     pub fn from_pipeline(error: &PipelineError) -> Self {
+        Self::from_pipeline_naming(error, &|_| None)
+    }
+
+    /// [`Self::from_pipeline`], with what to run to connect each login the
+    /// refusal names.
+    ///
+    /// The router knows a subscription belongs to another login, but not where
+    /// that login lives, so its refusal can only say `--config-dir DIR`. The
+    /// façade can ask the backend, and a command the user can paste is the
+    /// difference between an instruction and a riddle.
+    #[must_use]
+    pub fn from_pipeline_naming(
+        error: &PipelineError,
+        connect: &dyn Fn(&BackendId) -> Option<String>,
+    ) -> Self {
         match error {
-            PipelineError::NoRoute(no_route) => Self::from_no_route(no_route),
+            PipelineError::NoRoute(no_route) => Self::from_no_route(no_route, connect),
             PipelineError::Admission(_) => Self::invalid_request(error.to_string()),
             PipelineError::Upstream(upstream) | PipelineError::AllFailed { last: upstream, .. } => {
                 Self::from_upstream(upstream)
@@ -117,7 +157,7 @@ impl FacadeError {
         }
     }
 
-    fn from_no_route(no_route: &NoRoute) -> Self {
+    fn from_no_route(no_route: &NoRoute, connect: &dyn Fn(&BackendId) -> Option<String>) -> Self {
         match no_route {
             NoRoute::NoBackendsConfigured => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -138,7 +178,12 @@ impl FacadeError {
                 // never the sentence a user can act on.
                 let detail = refusals
                     .iter()
-                    .map(|(id, why)| format!("{id}: {}", why.describe()))
+                    .map(|(id, why)| match (why, connect(id)) {
+                        (Refusal::AnotherLogin { .. }, Some(command)) => {
+                            format!("{id}: {} (for this login: `{command}`)", why.describe())
+                        }
+                        _ => format!("{id}: {}", why.describe()),
+                    })
                     .collect::<Vec<_>>()
                     .join("; ");
                 Self::new(
@@ -300,8 +345,6 @@ impl IntoResponse for FacadeError {
 mod tests {
     use super::*;
     use ironwire_core::capability::Ineligible;
-    use ironwire_core::policy::Refusal;
-    use ironwire_core::protocol::BackendId;
 
     #[test]
     fn a_rate_limit_reaches_the_client_as_a_rate_limit() {

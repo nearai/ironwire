@@ -36,7 +36,7 @@ use ironwire_core::config::{Config, PathsConfig};
 use ironwire_core::discovery::Endpoint;
 use ironwire_update::UpdateStatus;
 
-use crate::control::{HeadroomView, StatusView};
+use crate::control::{BackendView, HeadroomView, StatusView};
 
 /// How long the daemon gets before we give up and print nothing. Chosen
 /// against the render loop this sits in, not against the network.
@@ -118,7 +118,12 @@ pub fn endpoint_for_home(home: &Path) -> Option<(u16, String)> {
         .filter(|endpoint| same_file(&endpoint.token_path, &token_file));
     let port = match pointer {
         Some(endpoint) => loopback_port(&endpoint.control_url)?,
-        None => Config::load(&paths).ok()?.server.port,
+        None => {
+            Config::load(&paths, ironwire_creds::login::dir_identity)
+                .ok()?
+                .server
+                .port
+        }
     };
     let token = std::fs::read_to_string(&token_file).ok()?;
     let token = token.trim();
@@ -264,22 +269,44 @@ fn routing(status: &StatusView, asked: Option<&str>) -> Option<String> {
 /// Capacity, but only for the pools that have actually reported one, and only
 /// when there is something to say about them.
 fn capacity(status: &StatusView) -> Vec<String> {
-    status
+    let serving: Vec<&BackendView> = status
         .backends
         .iter()
         .filter(|b| b.authenticated && b.consented)
-        .filter_map(|backend| match backend.headroom {
-            // Below a third used is not news. A status line that always shows a
-            // number teaches people to stop seeing it.
-            HeadroomView::Observed { used_pct, .. } if used_pct >= 33.0 => {
-                Some(format!("{} {used_pct:.0}%", short_name(&backend.name)))
+        .collect();
+    serving
+        .iter()
+        .filter_map(|backend| {
+            let name = label(backend, &serving);
+            match backend.headroom {
+                // Below a third used is not news. A status line that always
+                // shows a number teaches people to stop seeing it.
+                HeadroomView::Observed { used_pct, .. } if used_pct >= 33.0 => {
+                    Some(format!("{name} {used_pct:.0}%"))
+                }
+                HeadroomView::Exhausted { .. } => Some(format!("{name} exhausted")),
+                _ => None,
             }
-            HeadroomView::Exhausted { .. } => {
-                Some(format!("{} exhausted", short_name(&backend.name)))
-            }
-            _ => None,
         })
         .collect()
+}
+
+/// A backend's name on the line: the short one, unless another backend that
+/// could appear beside it shortens the same way.
+///
+/// Two Claude logins are both "Claude", and "Claude 95% · Claude exhausted"
+/// says nothing about which is which. The id is the next-shortest thing that
+/// tells them apart, and the one `ironwire pin` takes. Decided over every
+/// serving backend rather than the ones with news, so a label does not change
+/// under the user as one window fills.
+fn label<'a>(backend: &'a BackendView, serving: &[&BackendView]) -> &'a str {
+    let short = short_name(&backend.name);
+    let shared = serving
+        .iter()
+        .filter(|other| short_name(&other.name) == short)
+        .count()
+        > 1;
+    if shared { &backend.id } else { short }
 }
 
 /// Notify-only, exactly as everywhere else: say a release exists, never act
@@ -302,7 +329,7 @@ fn short_name(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{BackendView, HealthView, LastRouteView};
+    use crate::control::{HealthView, LastRouteView};
 
     #[test]
     fn a_client_document_we_do_not_fully_model_still_yields_its_model() {
@@ -337,7 +364,7 @@ mod tests {
         assert_eq!(short_name("ChatGPT subscription"), "ChatGPT");
     }
 
-    fn status_with(last_route: Option<LastRouteView>) -> StatusView {
+    pub(super) fn status_with(last_route: Option<LastRouteView>) -> StatusView {
         StatusView {
             version: "0.1.0".into(),
             port: 8463,
@@ -350,6 +377,7 @@ mod tests {
             update: UpdateStatus::UpToDate,
             last_route,
             usage: ironwire_usage::UsageReport::default(),
+            cross_account_fallback: false,
         }
     }
 
@@ -415,6 +443,7 @@ mod tests {
             headroom,
             health: HealthView::default(),
             models: vec![],
+            connect_command: None,
         }
     }
 
@@ -514,5 +543,45 @@ mod tests {
         assert_eq!(loopback_port("http://example.com:8463"), None);
         assert_eq!(loopback_port("http://127.0.0.1.example.com:8463"), None);
         assert_eq!(loopback_port("https://127.0.0.1:8463"), None);
+    }
+}
+
+#[cfg(test)]
+mod multi_login_tests {
+    use super::*;
+
+    fn backend(id: &str, name: &str, used_pct: f32) -> BackendView {
+        BackendView {
+            id: id.into(),
+            name: name.into(),
+            kind: "subscription".into(),
+            authenticated: true,
+            consented: true,
+            detail: None,
+            headroom: HeadroomView::Observed {
+                used_pct,
+                observed_secs_ago: 10,
+                resets_in_secs: None,
+            },
+            health: crate::control::HealthView::default(),
+            models: vec![],
+            connect_command: None,
+        }
+    }
+
+    #[test]
+    fn two_logins_that_shorten_alike_are_shown_by_id() {
+        let mut status = super::tests::status_with(None);
+        status.backends = vec![
+            backend("claude-sub", "Claude subscription", 80.0),
+            backend("claude-work", "Claude subscription (~/.claude-work)", 95.0),
+            backend("codex-sub", "ChatGPT subscription", 50.0),
+        ];
+        assert_eq!(
+            capacity(&status),
+            vec!["claude-sub 80%", "claude-work 95%", "ChatGPT 50%"]
+        );
+        status.backends[0].headroom = HeadroomView::Unknown;
+        assert_eq!(capacity(&status), vec!["claude-work 95%", "ChatGPT 50%"]);
     }
 }
