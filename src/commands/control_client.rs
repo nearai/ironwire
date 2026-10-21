@@ -20,7 +20,8 @@ impl ControlClient {
     /// Build a client for the daemon on `port`.
     pub(crate) fn new(port: Option<u16>) -> Result<Self> {
         let paths = paths()?;
-        let config = ironwire_core::config::Config::load(&paths)?;
+        let config =
+            ironwire_core::config::Config::load(&paths, ironwire_creds::login::dir_identity)?;
         let port = port.unwrap_or(config.server.port);
         Ok(Self {
             base: format!("http://127.0.0.1:{port}/_ironwire"),
@@ -121,7 +122,7 @@ impl ControlClient {
 /// would cut off.
 pub(crate) fn endpoint(port: Option<u16>) -> Result<(String, String)> {
     let paths = paths()?;
-    let config = ironwire_core::config::Config::load(&paths)?;
+    let config = ironwire_core::config::Config::load(&paths, ironwire_creds::login::dir_identity)?;
     let port = port.unwrap_or(config.server.port);
     Ok((format!("http://127.0.0.1:{port}"), control_token(&paths)?))
 }

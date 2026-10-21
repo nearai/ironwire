@@ -460,11 +460,12 @@ pub(crate) async fn run(
     let paths = paths()?;
     // A config the daemon would refuse still leaves everything else here worth
     // doing, so it is said and set aside rather than ending the run.
-    let config = Config::load(&paths).unwrap_or_else(|error| {
-        println!("{error}");
-        println!();
-        Config::default()
-    });
+    let config =
+        Config::load(&paths, ironwire_creds::login::dir_identity).unwrap_or_else(|error| {
+            println!("{error}");
+            println!();
+            Config::default()
+        });
     let port = port.unwrap_or(config.server.port);
 
     println!("IronWire — one local endpoint for the AI capacity you already have");
@@ -1076,7 +1077,8 @@ mod tests {
         let paths = ironwire_core::config::PathsConfig::rooted_at(dir.path());
         std::fs::write(paths.config_file(), config_template(DEFAULT_PORT)).expect("write");
 
-        let mut loaded = Config::load(&paths).expect("the generated config parses");
+        let mut loaded = Config::load(&paths, ironwire_creds::login::dir_identity)
+            .expect("the generated config parses");
         // The template states `mode = "off"` where the struct default leaves it
         // unset. That is the one intentional difference: the file exists to
         // *document* the ladder, and a commented-out mode teaches nothing. It
@@ -1144,7 +1146,10 @@ mod tests {
             Some("~/.claude-work")
         );
         declared
-            .validate(std::path::Path::new("config.toml"))
+            .validate(
+                std::path::Path::new("config.toml"),
+                ironwire_creds::login::dir_identity,
+            )
             .expect("the example is a valid login");
     }
 

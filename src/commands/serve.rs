@@ -92,7 +92,7 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
                 );
             }
             let requested = port_override.or_else(|| {
-                ironwire_core::config::Config::load(&paths)
+                ironwire_core::config::Config::load(&paths, ironwire_creds::login::dir_identity)
                     .ok()
                     .map(|config| config.server.port)
             });
@@ -107,7 +107,8 @@ pub(crate) async fn run(port_override: Option<u16>) -> Result<()> {
         }
         Err(EmbedError::Config) => {
             let config =
-                ironwire_core::config::Config::load(&paths).context("loading config.toml")?;
+                ironwire_core::config::Config::load(&paths, ironwire_creds::login::dir_identity)
+                    .context("loading config.toml")?;
             if config.limits.any_cap() && !config.capture.enabled {
                 anyhow::bail!(
                     "[limits] sets a spend cap, but [capture] enabled = false.\n\n\

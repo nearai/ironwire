@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use crate::config::{BackendImpl, Config, PrivacyMode, expand_config_dir};
+use crate::config::{BackendImpl, Config, DirIdentity, PrivacyMode, expand_config_dir};
 
 /// Why an edit could not be made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,11 +71,15 @@ impl std::fmt::Display for EditError {
 /// directory is already declared under another id, and
 /// [`EditError::WouldCorrupt`] when the result would not parse, would not carry
 /// the entry, or would fail [`Config::validate`].
+///
+/// `same_dir` decides whether two directories are one, as it does for
+/// [`Config::validate`]; see [`DirIdentity`].
 pub fn ensure_subscription_entry(
     existing: &str,
     id: &str,
     kind: BackendImpl,
     config_dir: &str,
+    same_dir: DirIdentity,
 ) -> Result<String, EditError> {
     ensure_subscription_entry_in(
         existing,
@@ -83,6 +87,7 @@ pub fn ensure_subscription_entry(
         kind,
         config_dir,
         &dirs::home_dir().unwrap_or_default(),
+        same_dir,
     )
 }
 
@@ -94,6 +99,7 @@ fn ensure_subscription_entry_in(
     kind: BackendImpl,
     config_dir: &str,
     home: &Path,
+    same_dir: DirIdentity,
 ) -> Result<String, EditError> {
     let parsed: Config = if existing.trim().is_empty() {
         Config::default()
@@ -101,18 +107,30 @@ fn ensure_subscription_entry_in(
         toml::from_str(existing).map_err(|e| EditError::Unparseable(e.to_string()))?
     };
 
-    // Compared as paths, as `Config::validate` compares them, so the absolute
-    // spelling of a `~/` directory is the same login and not a second one.
+    // The entry already there is the answer only for the same spelling, once
+    // `~/` is expanded: another spelling of the directory is another Keychain
+    // item, so another login.
     let wanted = expand_config_dir(config_dir, home);
-    let same_dir = |entry: &crate::config::BackendConfig| {
+    let spelled_alike = |entry: &crate::config::BackendConfig| {
         entry
             .config_dir
             .as_deref()
             .is_some_and(|dir| expand_config_dir(dir, home) == wanted)
     };
+    // Compared as directories, as `Config::validate` compares them, so the
+    // absolute spelling of a `~/` directory, a symlink to it or a case variant
+    // of it on a case-insensitive volume is the same directory and not a
+    // second one.
+    let wanted_on_disk = same_dir(&wanted);
+    let one_directory = |entry: &crate::config::BackendConfig| {
+        entry
+            .config_dir
+            .as_deref()
+            .is_some_and(|dir| same_dir(&expand_config_dir(dir, home)) == wanted_on_disk)
+    };
     for entry in &parsed.backends {
         if entry.id == id {
-            if entry.kind == kind.as_str() && same_dir(entry) {
+            if entry.kind == kind.as_str() && spelled_alike(entry) {
                 return Ok(existing.to_string());
             }
             let declared = match &entry.config_dir {
@@ -124,7 +142,7 @@ fn ensure_subscription_entry_in(
                  `--id`, or change that entry by hand if it is the one you meant"
             )));
         }
-        if BackendImpl::parse(&entry.kind) == Some(kind) && same_dir(entry) {
+        if BackendImpl::parse(&entry.kind) == Some(kind) && one_directory(entry) {
             return Err(EditError::Conflicts(format!(
                 "`{config_dir}` is already declared as `{other}`, and one login \
                  declared twice would be one pool counted twice. Run the command \
@@ -161,7 +179,7 @@ fn ensure_subscription_entry_in(
     // The checks a daemon start would make. Failing them here is the
     // difference between a refusal now and a daemon that will not start.
     reparsed
-        .validate_with_home(Path::new("config.toml"), home)
+        .validate_with(Path::new("config.toml"), home, same_dir)
         .map_err(|error| match error {
             crate::Error::ConfigInvalid { detail, .. } => EditError::WouldCorrupt(detail),
             other => EditError::WouldCorrupt(other.to_string()),
@@ -458,7 +476,14 @@ enabled = true
         kind: BackendImpl,
         dir: &str,
     ) -> Result<String, EditError> {
-        ensure_subscription_entry_in(existing, id, kind, dir, Path::new(HOME))
+        ensure_subscription_entry_in(
+            existing,
+            id,
+            kind,
+            dir,
+            Path::new(HOME),
+            crate::config::lexical_dir_identity,
+        )
     }
 
     fn backends_of(text: &str) -> Vec<crate::config::BackendConfig> {

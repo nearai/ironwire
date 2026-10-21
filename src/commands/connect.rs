@@ -114,7 +114,7 @@ pub(crate) fn disconnect(target: &str, subscription: bool, login: LoginArgs) -> 
 /// be used. Undoing a connect must not depend on a file the user may be in
 /// the middle of fixing; an edit to it is refused later on its own terms.
 fn load_config(paths: &ironwire_core::config::PathsConfig) -> Config {
-    Config::load(paths).unwrap_or_else(|error| {
+    Config::load(paths, ironwire_creds::login::dir_identity).unwrap_or_else(|error| {
         println!("{error}");
         println!();
         Config::default()
@@ -576,6 +576,7 @@ fn declare(
         &login.id,
         login.kind(),
         dir,
+        ironwire_creds::login::dir_identity,
     )
     .map_err(|e| anyhow!("{}: {e}", path.display()))?;
     if edited == existing {
@@ -812,7 +813,7 @@ pub(crate) fn print_env(port: Option<u16>, shell: Option<String>) -> Result<()> 
         Ok(dir) if !dir.is_empty() => {
             let config = ironwire_core::config::PathsConfig::resolve()
                 .ok()
-                .and_then(|paths| Config::load(&paths).ok())
+                .and_then(|paths| Config::load(&paths, ironwire_creds::login::dir_identity).ok())
                 .unwrap_or_default();
             let known = logins::configured(&config);
             if let Some(login) = logins::by_dir(&known, SubscriptionProduct::Claude, &dir) {

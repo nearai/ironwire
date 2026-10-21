@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 use ironwire_agents::{claude_settings, codex_config, endpoint};
 use ironwire_core::config::{BackendImpl, Config, expand_config_dir};
 use ironwire_creds::codex::CodexMode;
+use ironwire_creds::login::dir_identity;
 use ironwire_creds::{ClaudeLogin, CodexLogin, SubscriptionLogin, SubscriptionProduct};
 
 /// One login, as config.toml declares it.
@@ -201,20 +202,23 @@ pub(crate) fn configured(config: &Config) -> Vec<Login> {
 
 /// The configured login whose directory is `dir`, if any.
 ///
-/// Matched as paths, so `~/.claude-work` and its absolute spelling are one
-/// login. A default login only matches once config.toml has moved it.
+/// Matched as directories on disk, so `~/.claude-work`, its absolute
+/// spelling, a symlink to it and a case variant on a case-insensitive volume
+/// are one directory; where Claude Code names its Keychain item after the
+/// exact string, that string has to match too. A default login only matches
+/// once config.toml has moved it.
 pub(crate) fn by_dir<'a>(
     logins: &'a [Login],
     product: SubscriptionProduct,
     dir: &str,
 ) -> Option<&'a Login> {
-    let wanted = expand(dir)?;
+    let wanted = on_disk(dir)?;
     logins.iter().find(|login| {
         login.product == product
             && login
                 .config_dir
                 .as_deref()
-                .and_then(expand)
+                .and_then(on_disk)
                 .is_some_and(|theirs| {
                     theirs == wanted
                         && (product != SubscriptionProduct::Claude
@@ -227,17 +231,21 @@ pub(crate) fn by_dir<'a>(
 
 /// A shared settings directory whose macOS Keychain identity differs.
 /// Registering an alias cannot help: both clients would read the same URL.
+///
+/// Shared on disk, not by spelling: a symlink to the directory, or
+/// `~/.Claude-Work` beside `~/.claude-work` on a case-insensitive volume,
+/// reads the same `settings.json` under another Keychain item.
 pub(crate) fn claude_directory_alias<'a>(logins: &'a [Login], dir: &str) -> Option<&'a Login> {
     if !KEYCHAIN_PER_DIRECTORY {
         return None;
     }
-    let wanted = expand(dir)?;
+    let wanted = on_disk(dir)?;
     logins.iter().find(|login| {
         login.product == SubscriptionProduct::Claude
             && login
                 .config_dir
                 .as_deref()
-                .and_then(expand)
+                .and_then(on_disk)
                 .is_some_and(|theirs| theirs == wanted)
             && login.claude().keychain_services() != ClaudeLogin::in_dir(dir).keychain_services()
     })
@@ -245,13 +253,21 @@ pub(crate) fn claude_directory_alias<'a>(logins: &'a [Login], dir: &str) -> Opti
 
 /// Whether `dir` is where a product's client keeps its default login:
 /// `~/.claude`, or `~/.codex` whatever `CODEX_HOME` says — the directories
-/// `Config::validate` refuses an additional login in.
+/// `Config::validate` refuses an additional login in. Compared on disk, so
+/// a symlink to `~/.claude`, or `~/.Claude` on a case-insensitive volume, is
+/// that directory too.
 pub(crate) fn is_default_dir(product: SubscriptionProduct, dir: &str) -> bool {
+    dirs::home_dir().is_some_and(|home| is_default_dir_under(product, dir, &home))
+}
+
+/// [`is_default_dir`] against a given home, so it can be tested without
+/// changing this process's `HOME`.
+fn is_default_dir_under(product: SubscriptionProduct, dir: &str, home: &Path) -> bool {
     let usual = match product {
-        SubscriptionProduct::Claude => claude_settings::default_dir(),
-        SubscriptionProduct::ChatGpt => dirs::home_dir().map(|home| home.join(".codex")),
+        SubscriptionProduct::Claude => home.join(".claude"),
+        SubscriptionProduct::ChatGpt => home.join(".codex"),
     };
-    usual.is_some_and(|usual| expand(dir).is_some_and(|dir| dir == usual))
+    dir_identity(&expand_config_dir(dir, home)) == dir_identity(&usual)
 }
 
 /// The `CLAUDE_CONFIG_DIR` this shell exports, when the Claude Code it starts
@@ -392,6 +408,12 @@ fn abbreviate(dir: &str, home: Option<&Path>) -> String {
 
 fn expand(dir: &str) -> Option<PathBuf> {
     Some(expand_config_dir(dir, &dirs::home_dir()?))
+}
+
+/// Which directory on disk `dir` is: only for comparing two login
+/// directories, never for naming a Keychain item, which takes the exact string.
+fn on_disk(dir: &str) -> Option<PathBuf> {
+    Some(dir_identity(&expand_config_dir(dir, &dirs::home_dir()?)))
 }
 
 /// The id a login gets when nobody chose one: its directory's name, without
@@ -649,6 +671,106 @@ mod tests {
                 kept.starts_with("~/") || Path::new(&kept).is_absolute(),
                 "{kept} is not a form config.toml accepts"
             );
+        }
+    }
+
+    /// Whether the volume holding `dir` folds case, asked of the volume
+    /// itself rather than assumed from the platform.
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        std::fs::create_dir(&probe).expect("probe");
+        let folds = dir.join("CASE-PROBE").exists();
+        std::fs::remove_dir(&probe).expect("probe removed");
+        folds
+    }
+
+    /// A Claude login declared in `dir`, as config.toml would hold it.
+    fn work_login_in(dir: &Path) -> Vec<Login> {
+        configured(&config(&format!(
+            "[[backends]]\nid = \"claude-work\"\nkind = \"claude-subscription\"\n\
+             config_dir = \"{}\"\n",
+            dir.display()
+        )))
+    }
+
+    /// What `ironwire connect claude --config-dir <alias>` finds for a second
+    /// spelling of a declared directory. With a Keychain the spelling is
+    /// another login reading the same `settings.json`, so it is refused as an
+    /// alias; without one it is the declared login itself.
+    fn assert_is_the_declared_directory(logins: &[Login], alias: &Path) {
+        let alias = alias.display().to_string();
+        let found = by_dir(logins, SubscriptionProduct::Claude, &alias).map(|l| l.id.as_str());
+        let refused = claude_directory_alias(logins, &alias).map(|l| l.id.as_str());
+        if KEYCHAIN_PER_DIRECTORY {
+            assert_eq!((found, refused), (None, Some("claude-work")), "{alias}");
+        } else {
+            assert_eq!((found, refused), (Some("claude-work"), None), "{alias}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_declared_login_directory_is_that_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join(".claude-work");
+        std::fs::create_dir(&real).expect("dir");
+        let link = root.path().join("cw-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_is_the_declared_directory(&work_login_in(&real), &link);
+    }
+
+    #[test]
+    fn a_case_variant_of_a_declared_login_directory_is_that_directory_where_case_folds() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join(".claude-work");
+        std::fs::create_dir(&real).expect("dir");
+        let logins = work_login_in(&real);
+        let variant = root.path().join(".Claude-Work");
+        if folds_case(root.path()) {
+            assert_is_the_declared_directory(&logins, &variant);
+        } else {
+            let variant = variant.display().to_string();
+            assert!(by_dir(&logins, SubscriptionProduct::Claude, &variant).is_none());
+            assert!(claude_directory_alias(&logins, &variant).is_none());
+        }
+    }
+
+    /// `~/.Claude` on a case-insensitive volume, or a symlink to `~/.claude`,
+    /// reads the default login's `settings.json`: it is the default directory,
+    /// not an additional login beside it.
+    #[test]
+    fn another_spelling_of_the_default_directory_is_the_default_directory() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(home.path().join(".claude")).expect("dir");
+        std::fs::create_dir(home.path().join(".codex")).expect("dir");
+        let folds = folds_case(home.path());
+        assert_eq!(
+            is_default_dir_under(SubscriptionProduct::Claude, "~/.Claude", home.path()),
+            folds
+        );
+        assert_eq!(
+            is_default_dir_under(SubscriptionProduct::ChatGpt, "~/.CODEX", home.path()),
+            folds
+        );
+        assert!(is_default_dir_under(
+            SubscriptionProduct::Claude,
+            "~/.claude/",
+            home.path()
+        ));
+        assert!(!is_default_dir_under(
+            SubscriptionProduct::Claude,
+            "~/.claude-work",
+            home.path()
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.path().join(".claude"), home.path().join("cl"))
+                .expect("symlink");
+            assert!(is_default_dir_under(
+                SubscriptionProduct::Claude,
+                "~/cl",
+                home.path()
+            ));
         }
     }
 }

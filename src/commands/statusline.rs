@@ -25,7 +25,8 @@ async fn line(port: Option<u16>) -> Option<String> {
     // The same daemon every other subcommand reaches: `--port`, or the port in
     // `$IRONWIRE_HOME/config.toml`.
     let paths = paths().ok()?;
-    let config = ironwire_core::config::Config::load(&paths).ok()?;
+    let config =
+        ironwire_core::config::Config::load(&paths, ironwire_creds::login::dir_identity).ok()?;
     let port = port.unwrap_or(config.server.port);
     let token = control_token(&paths).ok()?;
     statusline::line(port, &token, client_model.as_deref()).await

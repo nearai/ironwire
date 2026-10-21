@@ -118,7 +118,12 @@ pub fn endpoint_for_home(home: &Path) -> Option<(u16, String)> {
         .filter(|endpoint| same_file(&endpoint.token_path, &token_file));
     let port = match pointer {
         Some(endpoint) => loopback_port(&endpoint.control_url)?,
-        None => Config::load(&paths).ok()?.server.port,
+        None => {
+            Config::load(&paths, ironwire_creds::login::dir_identity)
+                .ok()?
+                .server
+                .port
+        }
     };
     let token = std::fs::read_to_string(&token_file).ok()?;
     let token = token.trim();

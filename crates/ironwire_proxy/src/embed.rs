@@ -659,7 +659,8 @@ pub async fn start_with_options(
     std::fs::create_dir_all(home).map_err(|_| EmbedError::Paths)?;
     files::restrict_permissions(home, 0o700).map_err(|_| EmbedError::Paths)?;
     let paths = PathsConfig::rooted_at(std::fs::canonicalize(home).map_err(|_| EmbedError::Paths)?);
-    let mut config = Config::load(&paths).map_err(|_| EmbedError::Config)?;
+    let mut config = Config::load(&paths, ironwire_creds::login::dir_identity)
+        .map_err(|_| EmbedError::Config)?;
     apply_token_capture_override(&mut config, options.token_capture_enabled)?;
     // A host that supplies an attestor has decided receipts are checked.
     if options.signer_attestor.is_some() {

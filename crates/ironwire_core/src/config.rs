@@ -724,6 +724,29 @@ pub fn expand_config_dir(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// Which directory on disk a login directory is, for telling whether two
+/// `config_dir`s are one: the expanded path in, a key out, and two directories
+/// are one exactly when their keys are equal.
+///
+/// Passed in because answering it takes the filesystem — a symlink, or a
+/// case-variant spelling on a case-insensitive volume, is the same directory
+/// under another name — and this crate does no I/O of its own. The daemon and
+/// the CLI pass `ironwire_creds::login::dir_identity`.
+///
+/// Only for comparing. The key is never stored, shown, or used to name a
+/// Keychain item: Claude Code names that after the exact string it was given,
+/// so two spellings of one directory are still two logins to the Keychain,
+/// and one `settings.json` to the client.
+pub type DirIdentity = fn(&Path) -> PathBuf;
+
+/// A [`DirIdentity`] that consults nothing: two directories are one only when
+/// they are spelled alike once `~/` is expanded. Blind to symlinks and to case,
+/// so only for tests and for callers with no filesystem to ask.
+#[must_use]
+pub fn lexical_dir_identity(dir: &Path) -> PathBuf {
+    dir.to_path_buf()
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -861,8 +884,10 @@ impl Config {
     /// Returns [`Error::ConfigRead`] or [`Error::ConfigParse`] when the file
     /// exists but cannot be used. A missing file is not an error — a fresh
     /// install must start.
-    pub fn load(paths: &PathsConfig) -> Result<Self> {
-        Self::load_from(&paths.config_file())
+    ///
+    /// `same_dir` decides which login directories are one; see [`DirIdentity`].
+    pub fn load(paths: &PathsConfig, same_dir: DirIdentity) -> Result<Self> {
+        Self::load_from(&paths.config_file(), same_dir)
     }
 
     /// Load from an explicit path.
@@ -870,7 +895,7 @@ impl Config {
     /// # Errors
     ///
     /// As [`Config::load`].
-    pub fn load_from(path: &Path) -> Result<Self> {
+    pub fn load_from(path: &Path, same_dir: DirIdentity) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let config: Self = toml::from_str(&text).map_err(|detail| Error::ConfigParse {
@@ -880,7 +905,7 @@ impl Config {
                 // Only for a file that exists and parsed. A missing config must
                 // still start a fresh install, which is the commonest case of
                 // all.
-                config.validate(path)?;
+                config.validate(path, same_dir)?;
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -902,13 +927,29 @@ impl Config {
     /// # Errors
     ///
     /// [`Error::ConfigInvalid`], naming the entry at fault.
-    pub fn validate(&self, path: &Path) -> Result<()> {
+    ///
+    /// Two login directories are compared through `same_dir`, so a symlink or
+    /// a case-variant spelling of a directory already declared is refused like
+    /// the directory itself; see [`DirIdentity`].
+    pub fn validate(&self, path: &Path, same_dir: DirIdentity) -> Result<()> {
         // The home directory is read only to compare `~/` paths with absolute
-        // ones; nothing here touches the filesystem.
-        self.validate_with_home(path, &dirs::home_dir().unwrap_or_default())
+        // ones; nothing here touches the filesystem except through `same_dir`.
+        self.validate_with(path, &dirs::home_dir().unwrap_or_default(), same_dir)
     }
 
+    /// [`Config::validate`] against an explicit home, comparing directories
+    /// as spelled.
+    #[cfg(test)]
     pub(crate) fn validate_with_home(&self, path: &Path, home: &Path) -> Result<()> {
+        self.validate_with(path, home, lexical_dir_identity)
+    }
+
+    pub(crate) fn validate_with(
+        &self,
+        path: &Path,
+        home: &Path,
+        same_dir: DirIdentity,
+    ) -> Result<()> {
         let invalid = |id: &str, detail: String| Error::ConfigInvalid {
             path: path.to_path_buf(),
             id: id.to_string(),
@@ -1066,9 +1107,10 @@ impl Config {
                         ),
                     ));
                 }
-                // Compared as paths, so `~/.claude-work`, its absolute
-                // spelling and a trailing slash all count as one directory.
-                let resolved = expand_config_dir(raw, home);
+                // Compared as directories, so `~/.claude-work`, its absolute
+                // spelling, a trailing slash, a symlink to it and, on a
+                // case-insensitive volume, `~/.Claude-Work` all count as one.
+                let resolved = same_dir(&expand_config_dir(raw, home));
                 if let Some(other) = logins.get(&(kind, resolved.clone())) {
                     return Err(invalid(
                         &backend.id,
@@ -1088,7 +1130,7 @@ impl Config {
                 if let (Some(default_id), Some(default_dir)) =
                     (kind.discovered_id(), kind.default_config_dir())
                     && backend.id != default_id
-                    && resolved == expand_config_dir(default_dir, home)
+                    && resolved == same_dir(&expand_config_dir(default_dir, home))
                 {
                     return Err(invalid(
                         &backend.id,
@@ -1338,7 +1380,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, toml).expect("write");
-        Config::load_from(&path)
+        Config::load_from(&path, lexical_dir_identity)
     }
 
     /// The error has to name the entry. "invalid config" against a file with
@@ -1510,13 +1552,16 @@ mod tests {
         for bad in ["has space", "quote\"d", "semi;colon", ""] {
             let toml = format!("[[backends]]\nid = \"{bad}\"\nkind = \"nearai\"\n");
             assert!(
-                Config::load_from(&{
-                    let dir = tempfile::tempdir().expect("tempdir");
-                    let path = dir.path().join("config.toml");
-                    std::fs::write(&path, &toml).expect("write");
-                    std::mem::forget(dir);
-                    path
-                })
+                Config::load_from(
+                    &{
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let path = dir.path().join("config.toml");
+                        std::fs::write(&path, &toml).expect("write");
+                        std::mem::forget(dir);
+                        path
+                    },
+                    lexical_dir_identity
+                )
                 .is_err(),
                 "accepted id {bad:?}"
             );
@@ -1892,6 +1937,37 @@ mod tests {
             .expect("one directory, two products");
     }
 
+    /// Both directory checks ask the injected [`DirIdentity`], not the
+    /// spelling: whatever it says is one directory is one login. Here a fake
+    /// that folds case stands in for a case-insensitive volume, with no I/O.
+    #[test]
+    fn both_directory_checks_compare_through_the_injected_identity() {
+        let home = Path::new("/Users/alice");
+        let folding: DirIdentity = |dir| PathBuf::from(dir.to_string_lossy().to_lowercase());
+        let validate = |text: &str, same_dir: DirIdentity| {
+            toml::from_str::<Config>(text)
+                .expect("parses")
+                .validate_with(Path::new("config.toml"), home, same_dir)
+        };
+        let two = "[[backends]]\nid = \"claude-a\"\nkind = \"claude-subscription\"\n\
+                   config_dir = \"~/.claude-work\"\n\
+                   [[backends]]\nid = \"claude-b\"\nkind = \"claude-subscription\"\n\
+                   config_dir = \"~/.Claude-Work\"\n";
+        validate(two, lexical_dir_identity).expect("spelled apart");
+        let message = validate(two, folding)
+            .expect_err("one directory on disk")
+            .to_string();
+        assert!(message.contains("same directory"), "{message}");
+
+        let default = "[[backends]]\nid = \"claude-main\"\nkind = \"claude-subscription\"\n\
+                       config_dir = \"~/.Claude\"\n";
+        validate(default, lexical_dir_identity).expect("spelled apart");
+        let message = validate(default, folding)
+            .expect_err("the default directory on disk")
+            .to_string();
+        assert!(message.contains("`claude-sub`"), "{message}");
+    }
+
     /// The expansion reproduces what a shell hands the client, character for
     /// character, because Claude Code hashes that string to name its Keychain
     /// item.
@@ -2012,8 +2088,11 @@ mod tests {
 
     #[test]
     fn a_missing_config_yields_defaults_rather_than_failing() {
-        let cfg = Config::load_from(Path::new("/nonexistent/ironwire/config.toml"))
-            .expect("a fresh install must start");
+        let cfg = Config::load_from(
+            Path::new("/nonexistent/ironwire/config.toml"),
+            lexical_dir_identity,
+        )
+        .expect("a fresh install must start");
         assert_eq!(cfg.server.port, DEFAULT_PORT);
         assert!(cfg.capture.enabled);
         assert!(!cfg.capture.bodies, "bodies contain user source code");
@@ -2091,7 +2170,7 @@ mod tests {
         assert_eq!(cfg, back);
         // And what was written is something `load` accepts, not merely
         // something serde can read back.
-        back.validate(Path::new("config.toml"))
+        back.validate(Path::new("config.toml"), lexical_dir_identity)
             .expect("a round-tripped config still validates");
     }
 

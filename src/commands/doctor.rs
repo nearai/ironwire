@@ -24,7 +24,7 @@ pub(crate) async fn run(port: Option<u16>) -> Result<()> {
     // problem to report, so this falls back rather than failing the check.
     let config = super::paths()
         .ok()
-        .and_then(|paths| Config::load(&paths).ok())
+        .and_then(|paths| Config::load(&paths, ironwire_creds::login::dir_identity).ok())
         .unwrap_or_default();
     let declared = logins::configured(&config);
 

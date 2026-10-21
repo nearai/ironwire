@@ -182,12 +182,24 @@ directory"; the derivation itself is read off Claude Code's binary and pinned by
 its worked examples (`a_config_dir_keys_its_own_keychain_item_exactly_as_claude_code_does`,
 `an_explicitly_exported_default_dir_is_not_the_default_logins_keychain_item`).
 
-Filesystem aliases such as a trailing slash can name different Keychain
-accounts while sharing one settings file. Credential reads never try a trimmed
-alias, and `connect` refuses an alias of a declared login whose Keychain identity
-differs, naming the exact `CLAUDE_CONFIG_DIR` to export instead
+Filesystem aliases such as a trailing slash, a symlink, or a case variant on a
+case-insensitive volume (`~/.Claude-Work` beside `~/.claude-work`, `~/.Claude`
+beside `~/.claude`) can name different Keychain accounts while sharing one
+settings file. Credential reads never try a trimmed alias. Whether two
+directories are one is decided on disk, not by spelling
+(`ironwire_creds::login::dir_identity`: the existing part canonicalised, the
+whole key case-folded where the volume folds case): `connect` refuses an alias
+of a declared login whose Keychain identity differs, naming the exact
+`CLAUDE_CONFIG_DIR` to export instead, treats another spelling of `~/.claude` as
+the default directory, and `Config::validate` refuses two entries, or an
+additional login and the default, that are one directory on disk
 (`a_trailing_slash_dir_never_reads_another_logins_keychain_item`,
-`a_shell_using_an_alias_of_a_declared_claude_directory_is_refused`).
+`a_shell_using_an_alias_of_a_declared_claude_directory_is_refused`,
+`a_symlink_to_a_declared_login_directory_is_that_directory`,
+`a_case_variant_of_a_declared_login_directory_is_that_directory_where_case_folds`,
+`another_spelling_of_the_default_directory_is_the_default_directory`).
+`ironwire_core` does no I/O, so its loaders take that comparison as a
+`DirIdentity` argument.
 
 On macOS, only a Keychain lookup reporting the item absent (`security` exit 44)
 permits a credentials-file fallback. A locked store, failed command, timeout,

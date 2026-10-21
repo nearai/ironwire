@@ -7,7 +7,7 @@
 //! different names for the same login.
 
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -234,6 +234,101 @@ fn single_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Which directory on disk `dir` is, as a key two spellings of one directory
+/// share: the [`ironwire_core::config::DirIdentity`] the daemon and the CLI
+/// compare login directories with.
+///
+/// Two spellings of one directory read one `settings.json`, and the URL in it
+/// is all IronWire knows a client's login by — so a symlink to a declared
+/// directory, or `~/.Claude-Work` beside `~/.claude-work` on a
+/// case-insensitive volume, has to compare equal, or each is wired as a login
+/// of its own and one is served with the other's token.
+///
+/// The longest part of `dir` that exists is canonicalised, which resolves
+/// symlinks and, where the platform reports it, the case the directory was
+/// created with; the rest, not made yet, is appended as written. On a volume
+/// that folds case the whole key is then lower-cased, so the answer does not
+/// depend on whether the directory exists yet.
+///
+/// Only for comparing. Claude Code names its Keychain item after the exact
+/// string it was given, so this key is never stored or used to name a login.
+/// A path that cannot be examined — unreadable, a symlink loop, `..` past a
+/// missing directory — is its own spelling: as distinct as it was before.
+#[must_use]
+pub fn dir_identity(dir: &Path) -> PathBuf {
+    let mut existing = dir;
+    let mut missing = Vec::new();
+    let canonical = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(canonical) => break canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return dir.to_path_buf();
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(_) => return dir.to_path_buf(),
+        }
+    };
+    let folds = folds_case(&canonical);
+    let mut key = canonical;
+    key.extend(missing.iter().rev());
+    if folds && let Some(text) = key.to_str() {
+        return PathBuf::from(text.to_lowercase());
+    }
+    key
+}
+
+/// Whether the volume holding `canonical`, an existing canonical path, folds
+/// case: whether the nearest component with a letter in it is still the same
+/// file spelled in the other case. No component to ask (`/`) answers no.
+fn folds_case(canonical: &Path) -> bool {
+    for ancestor in canonical.ancestors() {
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            continue;
+        };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let swapped: String = name
+            .chars()
+            .map(|c| {
+                if c.is_lowercase() {
+                    c.to_uppercase().next().unwrap_or(c)
+                } else {
+                    c.to_lowercase().next().unwrap_or(c)
+                }
+            })
+            .collect();
+        if swapped == name {
+            continue;
+        }
+        return same_file(ancestor, &parent.join(swapped));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Without an inode to compare, the canonical paths: Windows reports the case
+/// a file was created with, so another spelling canonicalises to this one
+/// only where the volume folds case.
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,5 +498,70 @@ mod tests {
         assert_eq!(shell_word("~/my claude"), "~/'my claude'");
         assert_eq!(shell_word("/srv/it's here"), r"'/srv/it'\''s here'");
         assert_eq!(shell_word("~/zoë"), "~/zoë");
+    }
+}
+
+#[cfg(test)]
+mod dir_identity_tests {
+    use super::dir_identity;
+    use std::path::Path;
+
+    /// Whether the volume holding `dir` folds case, asked of the volume
+    /// itself rather than assumed from the platform.
+    fn folds_case(dir: &Path) -> bool {
+        let probe = dir.join("case-probe");
+        std::fs::create_dir(&probe).expect("probe");
+        let folds = dir.join("CASE-PROBE").exists();
+        std::fs::remove_dir(&probe).expect("probe removed");
+        folds
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_the_directory_it_points_at() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join(".claude-work");
+        std::fs::create_dir(&real).expect("dir");
+        let link = root.path().join("cw-link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(dir_identity(&link), dir_identity(&real));
+        // Also for a directory not made yet, under the link.
+        assert_eq!(
+            dir_identity(&link.join("later")),
+            dir_identity(&real.join("later"))
+        );
+    }
+
+    #[test]
+    fn a_case_variant_is_one_directory_exactly_where_the_volume_folds_case() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let folds = folds_case(root.path());
+        let real = root.path().join(".claude-work");
+        std::fs::create_dir(&real).expect("dir");
+        assert_eq!(
+            dir_identity(&root.path().join(".Claude-Work")) == dir_identity(&real),
+            folds,
+            "existing directory, case-folding volume: {folds}"
+        );
+        // Neither made yet: the volume decides, not whether it exists.
+        assert_eq!(
+            dir_identity(&root.path().join(".codex-x"))
+                == dir_identity(&root.path().join(".CODEX-X")),
+            folds,
+            "missing directory, case-folding volume: {folds}"
+        );
+    }
+
+    #[test]
+    fn different_directories_stay_different() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let work = root.path().join(".claude-work");
+        let personal = root.path().join(".claude-personal");
+        std::fs::create_dir(&work).expect("dir");
+        assert_ne!(dir_identity(&work), dir_identity(&personal));
+        assert_eq!(
+            dir_identity(&work),
+            dir_identity(&root.path().join(".claude-work/"))
+        );
     }
 }
