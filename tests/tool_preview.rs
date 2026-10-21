@@ -93,6 +93,17 @@ async fn start_moving(
     })
     .await
     .unwrap();
+    // Keep both pipes open and read for the daemon's lifetime: it prints more
+    // after the banner, and a write to a pipe nobody holds can end the process
+    // between the banner and the first request. Its stderr is echoed so a
+    // daemon that did die says why in the failing test's output.
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    let mut errors = BufReader::new(child.stderr.take().unwrap()).lines();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = errors.next_line().await {
+            eprintln!("daemon stderr: {line}");
+        }
+    });
     let token = std::fs::read_to_string(paths.control_token_file()).unwrap();
     Daemon {
         child,
