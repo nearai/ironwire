@@ -344,6 +344,45 @@ struct ReasoningAccount {
     last_seen: DateTime<Utc>,
 }
 
+impl ReasoningAccount {
+    /// The same credential: the same backend with the same observed scope.
+    fn same_account(&self, other: &Self) -> bool {
+        self.backend == other.backend && self.account_scope == other.account_scope
+    }
+}
+
+/// What one [`ReasoningKey`] remembers.
+#[derive(Debug, Clone)]
+enum Minted {
+    /// One account minted everything recorded under this key.
+    By(ReasoningAccount),
+    /// Two different accounts minted under one key that cannot tell their
+    /// conversations apart: [`ReasoningKey::Conversation`], when two
+    /// concurrent sessionless conversations of one client open on different
+    /// accounts. Whichever wrote last says nothing about whose reasoning the
+    /// next replay carries, so a replay that has only this key to go on is
+    /// refused ([`Origin::Ambiguous`]) until the record expires. A
+    /// conversation that has already replayed once is unaffected: its
+    /// reasoning is recorded under [`ReasoningKey::Reasoning`].
+    Contended { last_seen: DateTime<Utc> },
+}
+
+impl Minted {
+    fn last_seen(&self) -> DateTime<Utc> {
+        match self {
+            Self::By(account) => account.last_seen,
+            Self::Contended { last_seen } => *last_seen,
+        }
+    }
+
+    fn touch(&mut self, now: DateTime<Utc>) {
+        match self {
+            Self::By(account) => account.last_seen = now,
+            Self::Contended { last_seen } => *last_seen = now,
+        }
+    }
+}
+
 /// Whose [`ReasoningAccount`] a request reads and writes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ReasoningKey {
@@ -352,9 +391,16 @@ enum ReasoningKey {
     /// concurrent Codex sessions apart, and when one of them moves to a
     /// sibling the other's reasoning has not moved with it.
     Session(String, Option<BackendId>),
-    /// No session id: the conversation key and the login, the best a request
-    /// that names no session allows.
+    /// No session id: the conversation key and the login. Every concurrent
+    /// conversation of one client version shares it, so it only bridges a
+    /// conversation's opening turns to its first replay, and a second
+    /// account writing to it contends it ([`Minted::Contended`]) rather
+    /// than taking it over.
     Conversation(ConversationKey, Option<BackendId>),
+    /// One replayed ciphertext, by digest ([`RequestPeek::replayed_reasoning`]).
+    /// Unique to the conversation that carries it, so concurrency cannot
+    /// confuse it. Used only when the client names no session.
+    Reasoning(u64),
 }
 
 impl ReasoningKey {
@@ -448,7 +494,7 @@ pub struct Policy {
     /// [`MAX_REASONING_ACCOUNTS`], independently of route affinities. Restart,
     /// expiry or eviction leaves no record; [`Self::origin_of`] then infers
     /// the origin only when a single account could have minted it.
-    reasoning_accounts: HashMap<ReasoningKey, ReasoningAccount>,
+    reasoning_accounts: HashMap<ReasoningKey, Minted>,
     /// User-forced backend/model (`ironwire pin`). Overrides everything except
     /// eligibility — we will not serve a pin that would corrupt the request.
     pin: Option<(BackendId, Option<String>)>,
@@ -536,48 +582,80 @@ impl Policy {
             &mut self.reasoning_accounts,
             now,
             MAX_REASONING_ACCOUNTS,
-            |record| record.last_seen,
+            Minted::last_seen,
         );
     }
 
     /// Record the native Responses credential scope that served this turn.
     /// Cross-family turns leave its origin intact because earlier encrypted
     /// history can still be replayed. Unknown scopes never authorize a replay.
+    ///
+    /// A sessionless turn that replays reasoning records the newest
+    /// ciphertext it carries: what it mints now is first replayed beside it,
+    /// and the gate already held this turn to that ciphertext's account. A
+    /// sessionless turn that replays none writes the shared conversation
+    /// slot, which a different account contends instead of overwriting.
     fn note_reasoning_account(
         &mut self,
         key: ReasoningKey,
+        peek: &RequestPeek,
         inbound: Protocol,
         decision: &RouteDecision,
         candidates: &[Candidate],
         now: DateTime<Utc>,
     ) {
+        let sessionless = matches!(key, ReasoningKey::Conversation(..));
+        let replayed: &[u64] = if sessionless {
+            &peek.replayed_reasoning
+        } else {
+            &[]
+        };
+        for digest in replayed {
+            if let Some(record) = self
+                .reasoning_accounts
+                .get_mut(&ReasoningKey::Reasoning(*digest))
+            {
+                record.touch(now);
+            }
+        }
         let minted_here = inbound == Protocol::OpenAiResponses
             && !decision.translated
             && candidates
                 .iter()
                 .find(|c| c.id == decision.backend)
                 .is_some_and(|candidate| candidate.caps.wires.speaks(Protocol::OpenAiResponses));
-        if minted_here {
-            self.reasoning_accounts.insert(
-                key,
-                ReasoningAccount {
-                    backend: decision.backend.clone(),
-                    account_scope: candidates
-                        .iter()
-                        .find(|c| c.id == decision.backend)
-                        .and_then(|c| c.account_scope.clone()),
-                    last_seen: now,
-                },
-            );
-            bound(
-                &mut self.reasoning_accounts,
-                now,
-                MAX_REASONING_ACCOUNTS,
-                |record| record.last_seen,
-            );
-        } else if let Some(record) = self.reasoning_accounts.get_mut(&key) {
-            record.last_seen = now;
+        if !minted_here {
+            if let Some(record) = self.reasoning_accounts.get_mut(&key) {
+                record.touch(now);
+            }
+            return;
         }
+        let account = ReasoningAccount {
+            backend: decision.backend.clone(),
+            account_scope: candidates
+                .iter()
+                .find(|c| c.id == decision.backend)
+                .and_then(|c| c.account_scope.clone()),
+            last_seen: now,
+        };
+        let (key, contend) = match replayed.last() {
+            Some(newest) => (ReasoningKey::Reasoning(*newest), true),
+            None => (key, sessionless),
+        };
+        let record = match self.reasoning_accounts.get(&key) {
+            Some(Minted::By(existing)) if contend && !existing.same_account(&account) => {
+                Minted::Contended { last_seen: now }
+            }
+            Some(Minted::Contended { .. }) if contend => Minted::Contended { last_seen: now },
+            _ => Minted::By(account),
+        };
+        self.reasoning_accounts.insert(key, record);
+        bound(
+            &mut self.reasoning_accounts,
+            now,
+            MAX_REASONING_ACCOUNTS,
+            Minted::last_seen,
+        );
     }
 
     /// Which account minted the encrypted reasoning this request replays.
@@ -606,8 +684,32 @@ impl Policy {
         candidates: &[Candidate],
         now: DateTime<Utc>,
     ) -> Origin {
-        if let Some(recorded) = self.reasoning_accounts.get(&ReasoningKey::of(key, peek)) {
-            return Origin::Known(recorded.clone());
+        if peek.client_session.is_none() {
+            let mut carried: Option<&ReasoningAccount> = None;
+            for digest in &peek.replayed_reasoning {
+                match self
+                    .reasoning_accounts
+                    .get(&ReasoningKey::Reasoning(*digest))
+                {
+                    None => {}
+                    Some(Minted::Contended { .. }) => return Origin::Ambiguous,
+                    Some(Minted::By(account)) => match carried {
+                        Some(earlier) if !earlier.same_account(account) => {
+                            return Origin::Ambiguous;
+                        }
+                        Some(_) => {}
+                        None => carried = Some(account),
+                    },
+                }
+            }
+            if let Some(account) = carried {
+                return Origin::Known(account.clone());
+            }
+        }
+        match self.reasoning_accounts.get(&ReasoningKey::of(key, peek)) {
+            Some(Minted::By(recorded)) => return Origin::Known(recorded.clone()),
+            Some(Minted::Contended { .. }) => return Origin::Ambiguous,
+            None => {}
         }
         if !peek.requirements.encrypted_reasoning {
             return Origin::Absent;
@@ -715,7 +817,7 @@ impl Policy {
             affinity.rung = decision.rung;
         }
         // Pins and overrides passed the same origin gate before reaching here.
-        self.note_reasoning_account(reasoning_key, inbound, &decision, candidates, now);
+        self.note_reasoning_account(reasoning_key, peek, inbound, &decision, candidates, now);
         Ok(decision)
     }
 
@@ -1820,6 +1922,7 @@ mod tests {
             likely_compaction: false,
             client_login: None,
             client_session: None,
+            replayed_reasoning: Vec::new(),
         }
     }
 
@@ -3455,6 +3558,181 @@ mod tests {
             assert_eq!(decision.backend.as_str(), "codex-work");
         }
 
+        fn openai_key_named(id: &str) -> Candidate {
+            let mut key = candidate(id, BackendKind::ApiKey, Protocol::OpenAiResponses);
+            key.models = vec![("gpt-5".to_string(), ModelTier::Frontier)];
+            key
+        }
+
+        /// The owner's reproduction of the shared sessionless slot. A client
+        /// that names no session gives every conversation of one client
+        /// version the same conversation key. Conversation 1 mints on key A;
+        /// while A is exhausted conversation 2 starts on key B. Conversation
+        /// 1's next replay is A's reasoning, and B must not be handed it.
+        #[test]
+        fn a_sessionless_conversation_on_another_key_does_not_take_over_the_replay_origin() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            let mut policy = Policy::new();
+
+            let first = codex_route(&mut policy, &codex(None, false), &[a(), b()], t(0))
+                .expect("conversation 1 starts");
+            assert_eq!(first.backend.as_str(), "openai-a");
+
+            let spent = [exhausted(a(), t(3600)), b()];
+            let second = codex_route(&mut policy, &codex(None, false), &spent, t(1))
+                .expect("conversation 2 starts on the other key");
+            assert_eq!(second.backend.as_str(), "openai-b");
+
+            let replay = codex_route(&mut policy, &codex(None, true), &spent, t(2));
+            match replay {
+                Ok(decision) => panic!(
+                    "conversation 1's replay of openai-a's reasoning was routed to {}",
+                    decision.backend
+                ),
+                Err(error) => assert_eq!(
+                    refusals_by_id(error).get("openai-b"),
+                    Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)),
+                ),
+            }
+        }
+
+        /// A sessionless Codex turn replaying these ciphertexts.
+        fn codex_replaying(blobs: &[&str]) -> RequestPeek {
+            let mut request = codex(None, !blobs.is_empty());
+            request.replayed_reasoning = blobs
+                .iter()
+                .map(|blob| crate::peek::reasoning_digest(blob))
+                .collect();
+            request
+        }
+
+        /// Once a conversation has replayed reasoning, that reasoning itself
+        /// says which account minted it, whatever another conversation of
+        /// the same client did to the shared key since.
+        #[test]
+        fn a_sessionless_replay_is_bound_by_the_reasoning_it_carries() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            let spent = || [exhausted(a(), t(3600)), b()];
+            let mut policy = Policy::new();
+
+            for (request, at) in [
+                (codex_replaying(&[]), t(0)),
+                (codex_replaying(&["one-1"]), t(1)),
+            ] {
+                let decision =
+                    codex_route(&mut policy, &request, &[a(), b()], at).expect("conversation 1");
+                assert_eq!(decision.backend.as_str(), "openai-a");
+            }
+
+            let second = codex_route(&mut policy, &codex_replaying(&[]), &spent(), t(2))
+                .expect("conversation 2 starts on the other key");
+            assert_eq!(second.backend.as_str(), "openai-b");
+
+            let error = codex_route(
+                &mut policy,
+                &codex_replaying(&["one-1", "one-2"]),
+                &spent(),
+                t(3),
+            )
+            .expect_err("conversation 1's reasoning is openai-a's, which is spent");
+            assert_eq!(
+                refusals_by_id(error).get("openai-b"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)),
+            );
+            let back = codex_route(
+                &mut policy,
+                &codex_replaying(&["one-1", "one-2"]),
+                &[a(), b()],
+                t(3601),
+            )
+            .expect("openai-a is back");
+            assert_eq!(back.backend.as_str(), "openai-a");
+
+            // Conversation 2's first replay came after two accounts opened
+            // conversations under one key, so nothing says whose it is.
+            let error = codex_route(
+                &mut policy,
+                &codex_replaying(&["two-1"]),
+                &[a(), b()],
+                t(3602),
+            )
+            .expect_err("either key could have minted it");
+            for (id, refusal) in refusals_by_id(error) {
+                assert_eq!(
+                    refusal,
+                    Refusal::Ineligible(Ineligible::ReasoningBoundToAccount),
+                    "{id}"
+                );
+            }
+        }
+
+        /// A request whose replayed ciphertexts were minted by two different
+        /// accounts fits neither.
+        #[test]
+        fn a_replay_mixing_two_accounts_reasoning_is_refused() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            let mut policy = Policy::new();
+            codex_route(&mut policy, &codex_replaying(&[]), &[a()], t(0)).expect("opens on a");
+            codex_route(&mut policy, &codex_replaying(&["a-1"]), &[a()], t(1)).expect("a");
+            // A second daemon state, so b-1 is bound without contending the
+            // opening slot the first conversation used.
+            let mut other = Policy::new();
+            codex_route(&mut other, &codex_replaying(&[]), &[b()], t(2)).expect("opens on b");
+            codex_route(&mut other, &codex_replaying(&["b-1"]), &[b()], t(3)).expect("b");
+            policy.reasoning_accounts.extend(other.reasoning_accounts);
+            assert!(
+                codex_route(
+                    &mut policy,
+                    &codex_replaying(&["a-1", "b-1"]),
+                    &[a(), b()],
+                    t(4)
+                )
+                .is_err()
+            );
+        }
+
+        /// The same race with the opening turns interleaved and nothing yet
+        /// replayed: which conversation wrote last must not decide whose
+        /// reasoning a replay is. With no way to tell the two apart, neither
+        /// key may take either replay.
+        #[test]
+        fn interleaved_sessionless_conversations_on_two_keys_refuse_rather_than_guess() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            for order in [["openai-a", "openai-b"], ["openai-b", "openai-a"]] {
+                let mut policy = Policy::new();
+                for (index, id) in order.iter().enumerate() {
+                    let candidates = if *id == "openai-a" {
+                        [a(), exhausted(b(), t(3600))]
+                    } else {
+                        [exhausted(a(), t(3600)), b()]
+                    };
+                    let decision = codex_route(
+                        &mut policy,
+                        &codex(None, false),
+                        &candidates,
+                        t(index as i64),
+                    )
+                    .expect("opening turn");
+                    assert_eq!(decision.backend.as_str(), *id);
+                }
+                for at in [t(10), t(11)] {
+                    let error = codex_route(&mut policy, &codex(None, true), &[a(), b()], at)
+                        .expect_err("the replay could be either key's");
+                    for (id, refusal) in refusals_by_id(error) {
+                        assert_eq!(
+                            refusal,
+                            Refusal::Ineligible(Ineligible::ReasoningBoundToAccount),
+                            "{order:?}: {id}"
+                        );
+                    }
+                }
+            }
+        }
+
         /// A conversation that crossed to another family at a turn boundary
         /// still replays the reasoning its own login minted; the other family
         /// minted none. When that backend drops out of the candidates — its
@@ -5076,6 +5354,7 @@ mod compaction_tests {
             likely_compaction: compaction,
             client_login: None,
             client_session: None,
+            replayed_reasoning: Vec::new(),
         }
     }
 

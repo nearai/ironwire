@@ -169,6 +169,14 @@ pub struct RequestPeek {
     /// this is what tells two concurrent sessions apart where it matters:
     /// which ChatGPT account minted each one's encrypted reasoning.
     pub client_session: Option<String>,
+    /// A digest of each non-empty `encrypted_content` the request replays, in
+    /// history order. Never the content itself: the digest is all policy
+    /// needs to remember which account minted it, and the ciphertext stays
+    /// in the body that is forwarded.
+    ///
+    /// Empty for every protocol but OpenAI's, and for a request that replays
+    /// nothing.
+    pub replayed_reasoning: Vec<u64>,
 }
 
 impl RequestPeek {
@@ -302,6 +310,7 @@ impl RequestPeek {
             requirements,
             client_login: None,
             client_session: None,
+            replayed_reasoning: Vec::new(),
         }
     }
 
@@ -343,6 +352,7 @@ impl RequestPeek {
             encrypted_reasoning: false,
         };
 
+        let mut replayed_reasoning = Vec::new();
         if let Some(items) = items {
             let mut pending_calls = 0usize;
             for item in items {
@@ -373,12 +383,13 @@ impl RequestPeek {
                     // bound to an account. A `null` placeholder carries
                     // nothing a provider could reject, and treating it as
                     // bound would pin a conversation for no reason.
-                    if item
+                    if let Some(content) = item
                         .get("encrypted_content")
                         .and_then(Value::as_str)
-                        .is_some_and(|content| !content.is_empty())
+                        .filter(|content| !content.is_empty())
                     {
                         requirements.encrypted_reasoning = true;
+                        replayed_reasoning.push(reasoning_digest(content));
                     }
                 }
                 if json_contains_type(item, "input_image") || json_contains_type(item, "image_url")
@@ -410,8 +421,20 @@ impl RequestPeek {
             requirements,
             client_login: None,
             client_session: None,
+            replayed_reasoning,
         }
     }
+}
+
+/// What [`RequestPeek::replayed_reasoning`] remembers of one encrypted
+/// reasoning item: a 64-bit digest, never the ciphertext. The client is the
+/// user's own tool, not an adversary of the gate, and policy holds a bounded
+/// number of digests, so an accidental collision is out of reach.
+pub(crate) fn reasoning_digest(content: &str) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Whether this request reads as "summarize what we have said so far".
@@ -853,7 +876,37 @@ mod tests {
             let raw = body.to_string();
             let p = RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len());
             assert!(!p.requirements.encrypted_reasoning, "{body}");
+            assert!(p.replayed_reasoning.is_empty(), "{body}");
         }
+    }
+
+    /// Each replayed ciphertext is remembered by a digest, in history order,
+    /// so policy can tell whose reasoning a request replays when the client
+    /// names no session. The ciphertext itself is never kept.
+    #[test]
+    fn replayed_reasoning_is_remembered_by_digest_only() {
+        let body = |blobs: &[&str]| {
+            let input: Vec<serde_json::Value> = blobs
+                .iter()
+                .map(|blob| json!({"type": "reasoning", "summary": [], "encrypted_content": blob}))
+                .collect();
+            json!({"model": "gpt-5.6", "input": input})
+        };
+        let digests = |blobs: &[&str]| {
+            let body = body(blobs);
+            let raw = body.to_string();
+            RequestPeek::inspect(Protocol::OpenAiResponses, &body, raw.len()).replayed_reasoning
+        };
+        let one = digests(&["gAAAA-first"]);
+        assert_eq!(one.len(), 1);
+        let two = digests(&["gAAAA-first", "gAAAA-second"]);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0], one[0], "the same ciphertext digests the same");
+        assert_ne!(two[0], two[1]);
+        assert!(
+            !format!("{two:?}").contains("gAAAA"),
+            "the peek must not carry the ciphertext"
+        );
     }
 
     /// The peek reads the body; which login sent it is the façade's to say,

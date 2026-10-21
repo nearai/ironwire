@@ -518,11 +518,31 @@ memory and are never a substitute for provider quota observations.
 A valid client session header keys affinity by protocol, session and client
 login, so changing instructions or tools during one session does not move its
 route and a new session does not inherit a sibling's descent. Origin records
-also include the client session and login. With no header, the content-derived
-conversation key is the fallback and cannot distinguish identical concurrent
-conversations. Tests include
+also include the client session and login. Tests include
 `a_session_that_moves_to_the_sibling_does_not_take_another_sessions_reasoning_with_it`
 and `one_codex_session_moving_to_another_login_takes_no_other_sessions_reasoning_with_it`.
+
+With no header, the content-derived conversation key is shared by every
+concurrent conversation of one client version, so it cannot say whose
+reasoning a replay carries. Two records stand in for the session:
+
+- **The replayed reasoning itself.** The peek keeps a 64-bit digest of each
+  non-empty `encrypted_content` the request replays, never the ciphertext. A
+  native Responses turn that replays reasoning records its newest digest
+  against the account that served it, and a later replay carrying any recorded
+  digest is bound to that account. Digests recorded by two different accounts
+  in one request fit neither, and it is refused. Bounded with the other origin
+  records by `MAX_REASONING_ACCOUNTS` and `AFFINITY_TTL`.
+- **The shared key, for the first replay only.** A turn that replays nothing
+  records its account under the conversation key and login, which bridges a
+  conversation's opening to its first replay. A different account writing
+  there does not overwrite it: the record becomes contended, and a first
+  replay that has only it to go on is refused on every route until it expires.
+  Which conversation wrote last says nothing about which one is replaying
+  (`a_sessionless_conversation_on_another_key_does_not_take_over_the_replay_origin`,
+  `interleaved_sessionless_conversations_on_two_keys_refuse_rather_than_guess`,
+  `a_sessionless_replay_is_bound_by_the_reasoning_it_carries`,
+  `a_replay_mixing_two_accounts_reasoning_is_refused`).
 
 The recorded origin remains binding whether its backend is healthy, absent
 from the candidates, or currently rate limited. If it cannot serve, the request
