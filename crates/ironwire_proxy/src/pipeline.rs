@@ -518,6 +518,18 @@ async fn dispatch_inner(
             }
         };
 
+        // Only a forced route can hand back a backend this request already
+        // excluded: `usable()` refuses an unhealthy candidate, and a pin or
+        // `X-IronWire-Route` deliberately does not look, so that a named
+        // backend whose circuit is open is still tried. Once it has failed
+        // here, though, there is nowhere else the request may go, and asking
+        // again only dials it again -- up to `max_attempts`, which scales with
+        // the number of backends, not with the one that was named. The
+        // same-backend retries below are the whole of its second chances.
+        if excluded.contains(&decision.backend) {
+            break;
+        }
+
         let Some(backend) = state.backends.get(&decision.backend) else {
             excluded.insert(decision.backend.clone());
             continue;
