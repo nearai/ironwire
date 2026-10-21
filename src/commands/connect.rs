@@ -1182,23 +1182,37 @@ fn wire_codex(
 /// The backup is what makes an automatic edit defensible: the user can always
 /// get back exactly what they had, without us having to be right about what
 /// mattered in it.
+///
+/// Both writes are atomic, so a crash leaves the old file or the new one and
+/// never a truncated config. Both keep the mode the file had: a `settings.json`
+/// can hold `env.ANTHROPIC_AUTH_TOKEN`, and one the user made owner-only must
+/// not reappear, or have its copy appear, readable by another local user. A
+/// file that did not exist is created owner-only. A symlinked file -- a
+/// dotfiles checkout -- is written through to its target, as before, rather
+/// than replaced by a plain file.
 fn write_with_backup(
     path: &std::path::Path,
     existing: &str,
     contents: &str,
     extension: &str,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?
+        }
+        _ => path.to_path_buf(),
+    };
+    let permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|meta| meta.permissions());
     if !existing.is_empty() {
         let backup = path.with_extension(format!("{extension}.ironwire-backup"));
-        std::fs::write(&backup, existing)
+        ironwire_core::atomic::write_with_permissions(&backup, existing, permissions.clone())
             .with_context(|| format!("writing {}", backup.display()))?;
         println!("  (previous contents saved to {})", backup.display());
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+    ironwire_core::atomic::write_with_permissions(&target, contents, permissions)
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Whether Claude Code is on this machine at all.
@@ -1373,4 +1387,125 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leftovers(dir: &Path, keep: &[&str]) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| !keep.contains(&name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_client_config_is_replaced_whole_and_its_old_contents_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"old\":true}").expect("plants");
+
+        write_with_backup(&path, "{\"old\":true}", "{\"new\":true}", "json").expect("writes");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "{\"new\":true}"
+        );
+        let backup = dir.path().join("settings.json.ironwire-backup");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("reads"),
+            "{\"old\":true}"
+        );
+        let litter = leftovers(
+            dir.path(),
+            &["settings.json", "settings.json.ironwire-backup"],
+        );
+        assert!(litter.is_empty(), "left behind: {litter:?}");
+    }
+
+    /// A per-login `settings.json` can hold `env.ANTHROPIC_AUTH_TOKEN`. The
+    /// user made it owner-only; neither the rewrite nor the copy of what it
+    /// held may hand it to another local user.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_only_settings_file_and_its_backup_stay_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"env\":{}}").expect("plants");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        write_with_backup(&path, "{\"env\":{}}", "{\"env\":{},\"x\":1}", "json").expect("writes");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        let backup = dir.path().join("settings.json.ironwire-backup");
+        assert_eq!(
+            mode(&backup),
+            0o600,
+            "the backup of an owner-only file is readable"
+        );
+        assert_eq!(mode(&path), 0o600, "the rewrite widened an owner-only file");
+    }
+
+    /// Replaced by rename, never truncated in place: a crash between
+    /// truncate and write would leave the agent an empty config. Observed as
+    /// a new inode, because a rename is the only way the name gets one.
+    #[cfg(unix)]
+    #[test]
+    fn a_client_config_is_renamed_into_place_not_truncated() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").expect("plants");
+        let before = std::fs::metadata(&path).expect("stat").ino();
+
+        write_with_backup(&path, "{}", "{\"x\":1}", "json").expect("writes");
+
+        let after = std::fs::metadata(&path).expect("stat").ino();
+        assert_ne!(before, after, "the file was rewritten in place");
+    }
+
+    /// The mode is the user's, not ours: a file they left world-readable is
+    /// rewritten as it was, not quietly tightened or widened.
+    #[cfg(unix)]
+    #[test]
+    fn a_client_config_keeps_the_mode_it_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "a = 1\n").expect("plants");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        write_with_backup(&path, "a = 1\n", "a = 2\n", "toml").expect("writes");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    /// A settings file managed as a dotfile symlink is written through, as
+    /// `std::fs::write` always did. Renaming over the link would replace it
+    /// with a plain file and silently detach the user's dotfiles.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_client_config_is_written_through_not_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("dotfiles-settings.json");
+        std::fs::write(&real, "{}").expect("plants");
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).expect("links");
+
+        write_with_backup(&link, "{}", "{\"x\":1}", "json").expect("writes");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the symlink was replaced by a plain file"
+        );
+        assert_eq!(std::fs::read_to_string(&real).expect("reads"), "{\"x\":1}");
+    }
 }

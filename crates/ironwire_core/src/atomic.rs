@@ -26,6 +26,25 @@ use std::path::Path;
 /// Propagates any I/O failure. A caller that could not persist must not carry
 /// on as though it had.
 pub fn write(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_with_permissions(path, contents, None)
+}
+
+/// [`write`], with the permissions the new file gets: `None` is owner-only.
+///
+/// For a file that is not IronWire's own -- an agent's config the user may
+/// have given a mode of their choosing -- the caller passes the mode the file
+/// had, so the rewrite neither widens nor tightens it. The permissions are on
+/// the temp file before any byte is written and before the rename, so there is
+/// no moment when the name holds the contents under some other mode.
+///
+/// # Errors
+///
+/// As [`write`].
+pub fn write_with_permissions(
+    path: &Path,
+    contents: &str,
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
 
@@ -37,6 +56,9 @@ pub fn write(path: &Path, contents: &str) -> std::io::Result<()> {
     let result = (|| {
         let mut file = std::fs::File::create(&temp)?;
         restrict(&file)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(contents.as_bytes())?;
         // Durability before visibility: without this the rename can land while
         // the contents are still in the page cache, so a power loss leaves an
@@ -118,6 +140,18 @@ mod tests {
             0o600,
             "another local user could rewrite what this user authorised"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stated_mode_is_the_one_the_file_gets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        write_with_permissions(&path, "a", Some(std::fs::Permissions::from_mode(0o640)))
+            .expect("writes");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
     }
 
     #[test]
