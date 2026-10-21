@@ -481,8 +481,8 @@ inferred only when a single account could have minted it (with cross-account
 fallback off, the client's own login; a key or credit backend counts only
 while it holds a credential); when several could, every route is
 refused, another family included, rather than guessing. A first turn without
-encrypted state can establish a new origin, and with a known origin that
-cannot serve, translation may cross families at a turn boundary where it drops
+encrypted state can establish a new origin, and with a known, identified
+origin that cannot serve, translation may cross families at a turn boundary where it drops
 the private reasoning. See `PROTOCOL.md` §6 for tests and state limits.
 
 Session affinity includes protocol, the client's valid session header and its

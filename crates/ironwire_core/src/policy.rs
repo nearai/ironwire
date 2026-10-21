@@ -3996,6 +3996,29 @@ mod tests {
             }
         }
 
+        /// A login whose credential cannot be read reports no scope either.
+        /// After a restart it is still the only account that could have minted
+        /// the replay, so the replay waits for it to be readable again rather
+        /// than being translated away from it on a guess.
+        #[test]
+        fn after_a_restart_an_unreadable_single_logins_replay_is_refused_everywhere() {
+            let mut login = codex_login("codex-sub", true);
+            login.account_scope = None;
+            login.healthy = false;
+            let error = codex_route(
+                &mut Policy::new(),
+                &codex(None, true),
+                &[login, anthropic_key()],
+                t(0),
+            )
+            .expect_err("no account identity to bind the replay to");
+            let refusals = refusals_by_id(error);
+            assert_eq!(
+                refusals.get("anthropic-key"),
+                Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount))
+            );
+        }
+
         /// A Codex user on an OpenAI API key with no ChatGPT login, beside the
         /// NEAR AI entry every daemon registers without a key. NEAR AI speaks
         /// Responses, but with no credential it cannot have minted anything,
