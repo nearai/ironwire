@@ -1214,8 +1214,9 @@ fn claude_default_is_there<T>(read: &ironwire_creds::Result<T>) -> bool {
 /// The default login of `product`, if it is to be registered.
 ///
 /// Discovered where the client keeps it unprompted, and registered only when
-/// a login is there: someone who never ran Claude Code should not be shown a
-/// Claude subscription. An entry for the default id with a `config_dir` moves
+/// a login is there, or for Claude when its store could not be asked (see
+/// [`claude_default_is_there`]): someone who never ran Claude Code should not
+/// be shown a Claude subscription. An entry for the default id with a `config_dir` moves
 /// the login, and then the user has named the directory — so, like every login
 /// a config declares, it is registered whether or not it holds a login yet.
 ///
