@@ -533,20 +533,27 @@ reasoning a replay carries. Two records stand in for the session:
   digest is bound to that account. Digests recorded by two different accounts
   in one request fit neither, and it is refused. Bounded with the other origin
   records by `MAX_REASONING_ACCOUNTS` and `AFFINITY_TTL`.
-- **The shared key, for the first replay only.** A turn that replays nothing
-  records its account under the conversation key and login, which bridges a
-  conversation's opening to its first replay. A different account writing
-  there does not overwrite it: the record becomes contended, and a first
-  replay that has only it to go on is refused on every route. Each opening
-  under the key refreshes the record, so it clears only after `AFFINITY_TTL`
-  with no sessionless opening there, or by eviction. Until then every new
-  sessionless conversation of that client is refused at its first replay;
-  one that has already replayed is bound by its reasoning and unaffected.
-  Which conversation wrote last says nothing about which one is replaying
+- **The shared key, when no carried digest is recorded.** A turn that replays
+  nothing records its account under the conversation key and login, which
+  bridges a conversation's opening to its first replay. A client that replays
+  only its latest reasoning item never carries a recorded digest (that item
+  was minted by the previous turn), so every one of its replays rests on this
+  record. A different account writing there does not overwrite it: the record
+  becomes contended, and a replay that has only it to go on is refused on
+  every route. Every sessionless turn under the key refreshes the record
+  without rewriting it, so it lives as long as any conversation of that
+  client still uses it, and clears only after `AFFINITY_TTL` with no
+  sessionless turn there, or by eviction. Until then every new sessionless
+  conversation of that client is refused at its first replay, and so is every
+  replay of a latest-item-only client; a conversation whose replay carries a
+  recorded digest is bound by its reasoning and unaffected. Which
+  conversation wrote last says nothing about which one is replaying
   (`a_sessionless_conversation_on_another_key_does_not_take_over_the_replay_origin`,
   `interleaved_sessionless_conversations_on_two_keys_refuse_rather_than_guess`,
   `a_sessionless_replay_is_bound_by_the_reasoning_it_carries`,
-  `a_replay_mixing_two_accounts_reasoning_is_refused`).
+  `a_replay_mixing_two_accounts_reasoning_is_refused`,
+  `a_long_sessionless_conversation_is_still_served_past_the_affinity_ttl`,
+  `a_sessionless_opening_after_the_ttl_does_not_take_over_a_live_conversation`).
 
 The recorded origin remains binding whether its backend is healthy, absent
 from the candidates, or currently rate limited. If it cannot serve, the request

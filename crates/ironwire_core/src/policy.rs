@@ -361,12 +361,14 @@ enum Minted {
     /// concurrent sessionless conversations of one client open on different
     /// accounts. Whichever wrote last says nothing about whose reasoning the
     /// next replay carries, so a replay that has only this key to go on is
-    /// refused ([`Origin::Ambiguous`]). Every sessionless opening under the
-    /// key refreshes the record, so it clears only after [`AFFINITY_TTL`]
-    /// with no opening, or by eviction: letting it age out while openings
-    /// continue would bind a conversation opened just before to whichever
-    /// account wrote next. A conversation that has already replayed once is
-    /// unaffected: its reasoning is recorded under [`ReasoningKey::Reasoning`].
+    /// refused ([`Origin::Ambiguous`]). Every sessionless turn under the key
+    /// refreshes the record, so it clears only after [`AFFINITY_TTL`] with no
+    /// sessionless turn, or by eviction: letting it age out while a
+    /// conversation still depends on it would bind that conversation to
+    /// whichever account wrote next. A conversation whose replay carries a
+    /// recorded digest is unaffected: its reasoning is recorded under
+    /// [`ReasoningKey::Reasoning`]. One whose client replays only its latest
+    /// reasoning item never does, and is refused with the rest.
     Contended { last_seen: DateTime<Utc> },
 }
 
@@ -598,6 +600,7 @@ impl Policy {
     /// and the gate already held this turn to that ciphertext's account. A
     /// sessionless turn that replays none writes the shared conversation
     /// slot, which a different account contends instead of overwriting.
+    /// Every sessionless turn refreshes that slot without rewriting it.
     fn note_reasoning_account(
         &mut self,
         key: ReasoningKey,
@@ -608,6 +611,14 @@ impl Policy {
         now: DateTime<Utc>,
     ) {
         let sessionless = matches!(key, ReasoningKey::Conversation(..));
+        if sessionless && let Some(record) = self.reasoning_accounts.get_mut(&key) {
+            // A client that replays only its latest reasoning never carries a
+            // recorded digest, so every one of its replays rests on this slot.
+            // Keep it alive, By or Contended, while any conversation still
+            // uses it; a later opening on another account then contends it
+            // instead of taking it over once the opening's record ages out.
+            record.touch(now);
+        }
         let replayed: &[u64] = if sessionless {
             &peek.replayed_reasoning
         } else {
@@ -3733,6 +3744,83 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+
+        /// A client that replays only its latest reasoning item never carries
+        /// a digest that was recorded: what it replays was minted by the
+        /// previous turn, and only the ciphertexts a turn carries are known.
+        /// Every replay therefore rests on the shared conversation slot, so
+        /// the slot must live as long as the conversation does, not
+        /// [`AFFINITY_TTL`] past its opening.
+        #[test]
+        fn a_long_sessionless_conversation_is_still_served_past_the_affinity_ttl() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            let hour = 3600;
+            let mut policy = Policy::new();
+
+            let opening = codex_route(&mut policy, &codex_replaying(&[]), &[a(), b()], t(0))
+                .expect("the conversation opens");
+            assert_eq!(opening.backend.as_str(), "openai-a");
+            for turn in 1..=26 {
+                let latest = format!("one-{turn}");
+                let decision = codex_route(
+                    &mut policy,
+                    &codex_replaying(&[latest.as_str()]),
+                    &[a(), b()],
+                    t(turn * hour),
+                )
+                .unwrap_or_else(|e| panic!("turn {turn} was refused: {e}"));
+                assert_eq!(decision.backend.as_str(), "openai-a", "turn {turn}");
+            }
+        }
+
+        /// The same client, with a second conversation opening on another
+        /// key more than [`AFFINITY_TTL`] after the first one opened. The
+        /// first conversation still depends on the shared slot, so the
+        /// second must contend it, not take it over.
+        #[test]
+        fn a_sessionless_opening_after_the_ttl_does_not_take_over_a_live_conversation() {
+            let a = || openai_key_named("openai-a");
+            let b = || openai_key_named("openai-b");
+            let hour = 3600;
+            let mut policy = Policy::new();
+
+            codex_route(&mut policy, &codex_replaying(&[]), &[a(), b()], t(0))
+                .expect("conversation 1 opens");
+            for turn in 1..=23 {
+                let latest = format!("one-{turn}");
+                let decision = codex_route(
+                    &mut policy,
+                    &codex_replaying(&[latest.as_str()]),
+                    &[a(), b()],
+                    t(turn * hour),
+                )
+                .unwrap_or_else(|e| panic!("turn {turn} was refused: {e}"));
+                assert_eq!(decision.backend.as_str(), "openai-a", "turn {turn}");
+            }
+
+            let later = AFFINITY_TTL.num_seconds() + 1;
+            let spent = [exhausted(a(), t(later + hour)), b()];
+            let second = codex_route(&mut policy, &codex_replaying(&[]), &spent, t(later))
+                .expect("conversation 2 opens on the other key");
+            assert_eq!(second.backend.as_str(), "openai-b");
+
+            match codex_route(
+                &mut policy,
+                &codex_replaying(&["one-24"]),
+                &spent,
+                t(later + 1),
+            ) {
+                Ok(decision) => panic!(
+                    "conversation 1's replay of openai-a's reasoning was routed to {}",
+                    decision.backend
+                ),
+                Err(error) => assert_eq!(
+                    refusals_by_id(error).get("openai-b"),
+                    Some(&Refusal::Ineligible(Ineligible::ReasoningBoundToAccount)),
+                ),
             }
         }
 
