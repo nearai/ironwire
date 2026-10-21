@@ -631,8 +631,16 @@ impl Policy {
             .copied()
             .filter(|c| c.required_client_identity.is_some())
             .collect();
+        // Keys and credits count only while they hold a credential. A metered
+        // credential's scope is a hash of the key, so a backend with none, such
+        // as the NEAR AI entry every daemon registers without a key, has no
+        // scope and cannot have minted anything. A login keeps its place
+        // without one: a ChatGPT token need not name its account.
         let pool = if logins.is_empty() {
             could_have
+                .into_iter()
+                .filter(|c| c.account_scope.is_some())
+                .collect()
         } else {
             logins
         };
@@ -2720,11 +2728,22 @@ mod tests {
             key
         }
 
-        /// NEAR AI as every daemon registers it unless the user disabled it:
-        /// present without a key, and so unhealthy to the router.
-        fn nearai_without_a_key() -> Candidate {
+        /// NEAR AI with a key, as `nearai_capabilities` describes it: Chat
+        /// first, and Responses forwarded as-is.
+        fn nearai_chat() -> Candidate {
             let mut nearai = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+            nearai.caps.wires = Wires::new(Protocol::OpenAiChat, &[Protocol::OpenAiResponses]);
+            nearai
+        }
+
+        /// NEAR AI as every daemon registers it unless the user disabled it:
+        /// present without a key, and so unhealthy to the router. It speaks
+        /// Responses as well as Chat (`nearai_capabilities`), and a keyless
+        /// backend reports no account scope.
+        fn nearai_without_a_key() -> Candidate {
+            let mut nearai = nearai_chat();
             nearai.healthy = false;
+            nearai.account_scope = None;
             nearai
         }
 
@@ -3533,11 +3552,6 @@ mod tests {
             }
         }
 
-        /// NEAR AI with a key, which Codex reaches only by translation here.
-        fn nearai_chat() -> Candidate {
-            candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat)
-        }
-
         /// A restart, 24 hours idle or eviction leaves no recorded origin, and
         /// Codex replays encrypted reasoning on every turn after its first. With
         /// one login there is no other account that could have minted it, so
@@ -3561,6 +3575,49 @@ mod tests {
                 );
                 assert!(!decision.translated, "fallback {fallback}");
                 assert_eq!(decision.rung, Rung::Preferred, "fallback {fallback}");
+            }
+        }
+
+        /// A Codex user on an OpenAI API key with no ChatGPT login, beside the
+        /// NEAR AI entry every daemon registers without a key. NEAR AI speaks
+        /// Responses, but with no credential it cannot have minted anything,
+        /// so after a restart the key is the only account that could have and
+        /// the replay goes to it untranslated, as it did before origins were
+        /// tracked.
+        #[test]
+        fn after_a_restart_a_keys_replay_is_not_made_ambiguous_by_a_keyless_nearai() {
+            let decision = codex_route(
+                &mut Policy::new(),
+                &codex(None, true),
+                &[openai_key(), nearai_without_a_key()],
+                t(0),
+            )
+            .expect("the key is the only credential that could have minted it");
+            assert_eq!(decision.backend.as_str(), "openai-key");
+            assert!(!decision.translated);
+        }
+
+        /// The counterpart: NEAR AI with a key serves a Codex turn natively on
+        /// its Responses wire, so it is recorded as a minter like any other
+        /// account. With no record, either credential could have minted the
+        /// replay, and every route is refused rather than guessed.
+        #[test]
+        fn after_a_restart_a_replay_between_a_key_and_keyed_nearai_is_refused() {
+            let error = codex_route(
+                &mut Policy::new(),
+                &codex(None, true),
+                &[openai_key(), nearai_chat()],
+                t(0),
+            )
+            .expect_err("two credentials could have minted it");
+            let refusals = refusals_by_id(error);
+            assert_eq!(refusals.len(), 2);
+            for (id, refusal) in refusals {
+                assert_eq!(
+                    refusal,
+                    Refusal::Ineligible(Ineligible::ReasoningBoundToAccount),
+                    "{id}"
+                );
             }
         }
 

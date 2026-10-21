@@ -481,7 +481,15 @@ The gate lives in `eligible()`, fed by the policy's recorded or inferred origin:
 - With no recorded origin, the origin is inferred when only one account could
   have minted it: of the Responses-wire candidates allowed to serve this
   client, health and quota aside, its logins, or, when it has no login here,
-  the keys and credits. With fallback off that is the client's own login, so a
+  the keys and credits that hold a credential now. A keyless backend has no
+  account scope and cannot have minted anything, so the NEAR AI entry every
+  daemon registers without a key does not make a lone OpenAI key's replay
+  ambiguous
+  (`after_a_restart_a_keys_replay_is_not_made_ambiguous_by_a_keyless_nearai`);
+  NEAR AI with a key serves Responses natively and counts like any other
+  credential
+  (`after_a_restart_a_replay_between_a_key_and_keyed_nearai_is_refused`).
+  With fallback off that is the client's own login, so a
   single-login user's replay after a restart is forwarded byte-identical as it
   was before origins were recorded
   (`after_a_restart_a_single_logins_replay_is_served_by_that_login`,
