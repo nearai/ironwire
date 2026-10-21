@@ -95,7 +95,8 @@ For a native-lane request, IronWire performs exactly these mutations:
    the `/account/{id}` segment is part of the façade prefix, not the suffix, so
    it never reaches the provider (§1).
 2. **Auth headers**: strip inbound `authorization` / `x-api-key` / `api-key`
-   and the account-bound `chatgpt-account-id` / `x-openai-fedramp`; attach the
+   and the account-bound `chatgpt-account-id` / `x-openai-fedramp` /
+   `openai-organization` / `openai-project`; attach the
    chosen backend's credential. For a ChatGPT subscription that credential
    includes `chatgpt-account-id`, read from the `chatgpt_account_id` claim of
    the very token being presented and attached to every request made with it
@@ -103,9 +104,16 @@ For a native-lane request, IronWire performs exactly these mutations:
    the workspace a bearer belongs to, so a client's copy sent beside another
    login's bearer would be credential drift (`AGENTS.md` rule 4); it is
    dropped even when it happens to match. `x-openai-fedramp` is not
-   re-attached, because no credential IronWire reads states it. Codex sends
-   neither header to a custom provider, so stripping them costs a Codex
-   client nothing.
+   re-attached, because no credential IronWire reads states it.
+   `openai-organization` and `openai-project` are account-bound for the same
+   reason: they select the organization and project a key is authorized for
+   and billed to, so a client's copy (an SDK sets them from `OPENAI_ORG_ID` /
+   `OPENAI_PROJECT_ID`) beside the key the router chose names an organization
+   that key may not belong to — rejected by the provider, or billed to the
+   client's organization instead of the one the key is under. Neither is
+   re-attached, because no credential IronWire reads states an organization or
+   a project. Codex sends neither `chatgpt-account-id` nor `x-openai-fedramp`
+   to a custom provider, so stripping those two costs a Codex client nothing.
 3. **Host-ish headers**: strip hop-by-hop headers (`connection`,
    `transfer-encoding`, `keep-alive`, `upgrade`, `proxy-*`), set `host`.
 4. **`model`**: rewritten *only* when policy selected a different model, via a

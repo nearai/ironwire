@@ -30,9 +30,17 @@ const AUTH: &[&str] = &["authorization", "x-api-key", "api-key"];
 /// because they are only true of the credential they came with: a client's
 /// copy beside the credential the router chose — another of the user's logins,
 /// or another provider altogether — names an account that credential is not.
-/// A backend that needs one sets it from the token it is presenting
-/// (`docs/PROTOCOL.md` §2 item 2).
-pub(crate) const ACCOUNT_BOUND: &[&str] = &["chatgpt-account-id", "x-openai-fedramp"];
+/// `openai-organization` and `openai-project` are the same fact for an API key:
+/// they select the organization and project the key is billed to, so a
+/// client's `OPENAI_ORG_ID` beside IronWire's key is rejected or billed to an
+/// organization that key is not under. A backend that needs one sets it from
+/// the token it is presenting (`docs/PROTOCOL.md` §2 item 2).
+pub(crate) const ACCOUNT_BOUND: &[&str] = &[
+    "chatgpt-account-id",
+    "x-openai-fedramp",
+    "openai-organization",
+    "openai-project",
+];
 
 /// Headers we replace because they describe the connection to IronWire rather
 /// than the connection to the provider.
@@ -192,6 +200,10 @@ mod tests {
             "ChatGPT-Account-ID",
             "x-openai-fedramp",
             "X-OpenAI-Fedramp",
+            "openai-organization",
+            "OpenAI-Organization",
+            "openai-project",
+            "OpenAI-Project",
         ] {
             assert!(!forward_request_header(name), "{name} leaked upstream");
         }

@@ -258,9 +258,10 @@ async fn only_the_enumerated_headers_are_mutated() {
 
 #[tokio::test]
 async fn an_account_header_the_client_sends_never_reaches_any_provider() {
-    // §2 item 2: `chatgpt-account-id` and `x-openai-fedramp` name the account a
-    // bearer belongs to, so they are stripped with the client's credential on
-    // every lane — not only on the one backend that sets its own. Forwarding a
+    // §2 item 2: `chatgpt-account-id`, `x-openai-fedramp`, `openai-organization`
+    // and `openai-project` name the account a bearer belongs to (or the
+    // organization and project a key is billed to), so they are stripped with
+    // the client's credential on every lane — not only on the one backend that sets its own. Forwarding a
     // client's copy to any other provider would be handing it an identifier
     // for an account it holds no credential for.
     let (anthropic_url, anthropic_received) = spawn_mock().await;
@@ -289,6 +290,8 @@ async fn an_account_header_the_client_sends_never_reaches_any_provider() {
                     .header("content-type", "application/json")
                     .header("chatgpt-account-id", "CLIENT-ACCOUNT-MUST-NOT-LEAK")
                     .header("x-openai-fedramp", "true")
+                    .header("OpenAI-Organization", "org-CLIENT-MUST-NOT-LEAK")
+                    .header("OpenAI-Project", "proj_CLIENT-MUST-NOT-LEAK")
                     .body(Body::from(body))
                     .expect("request builds"),
             )
@@ -298,9 +301,16 @@ async fn an_account_header_the_client_sends_never_reaches_any_provider() {
         let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
 
         let got = received.lock().expect("lock").clone().expect("mock saw it");
-        for name in ["chatgpt-account-id", "x-openai-fedramp"] {
+        for name in [
+            "chatgpt-account-id",
+            "x-openai-fedramp",
+            "openai-organization",
+            "openai-project",
+        ] {
             assert!(
-                !got.headers.iter().any(|(k, _)| k == name),
+                !got.headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(name)),
                 "{name} reached the provider behind {uri}"
             );
         }
