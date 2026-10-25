@@ -208,21 +208,22 @@ silent.
 | | → A | → R | → C |
 |---|---|---|---|
 | **A →** | native | thinking dropped¹, cache breakpoints dropped | thinking dropped¹, cache breakpoints dropped, system flattened to one string |
-| **R →** | encrypted reasoning dropped¹, non-function tools dropped² | native | encrypted reasoning dropped¹, typed items flattened, non-function tools dropped² |
+| **R →** | encrypted reasoning dropped¹, unsupported tools refused² | native | encrypted reasoning dropped¹, typed items flattened, namespace functions mapped² |
 | **C →** | — | — | native |
 
 ¹ The summary text survives; only the provider-private blob is dropped. The
 receiving provider never validates a foreign blob, and the API that minted it
 drops rather than rejects it (`docs/PROTOCOL.md` §6).
 
-² Responses lets a client declare tools that are not functions: a provider
-built-in (`{"type": "web_search"}`, no `name` at all) and a `namespace`
-holding a nested tool list, one per connected MCP server. Neither has an
-equivalent on the other wires. They are left out of `tools` and named in
-`unexpressible_tools`, which `emit` copies into `Dropped::tools`. The
-alternative this replaced was worse than a drop: a built-in became a function
-named `""`, which every OpenAI-compatible server rejects, so one built-in
-anywhere in a Codex tool list made the whole translated request a 400.
+² Responses-to-Chat translation flattens namespace function groups using a
+request-scoped map. Short generated names avoid every declared top-level
+function name; both request history and named tool choices use the same map.
+Streamed and non-streamed answers restore the original `namespace` and `name`
+before Codex sees them. Namespace descriptions, function schemas, `strict`,
+`parallel_tool_calls`, and supported tool choices survive. Duplicate namespace
+identities, undeclared namespaced history, custom tools, provider-executed
+built-ins, and other unrepresentable declarations are refused rather than
+silently removed. Other translated lanes also refuse `Dropped::tools`.
 
 **What is still a hard refusal**, unchanged by any of this: an unrecognised
 content block. A `document` a user asked a question about is indistinguishable
@@ -282,3 +283,12 @@ to Anthropic.
 6. End-to-end conformance for the newly reachable lanes — A→R first, since a
    Claude Code session falling back onto a ChatGPT subscription is the route
    users are most likely to want and this build could not offer.
+
+### Responses stream item lifecycle
+
+Translated Responses text opens a message and content part before its first
+text delta, then closes text, content and the message before a tool item or the
+terminal response. Later text opens a fresh message. The terminal envelope
+contains all completed output items, including executable function calls.
+Final text retained for that envelope is bounded at 4 MiB; overflow produces a
+failed response rather than a truncated successful answer.

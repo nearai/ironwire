@@ -28,6 +28,7 @@
 pub mod anthropic;
 pub mod chat;
 pub mod ir;
+pub mod namespaces;
 pub mod responses;
 pub mod stream;
 pub mod tool_ids;

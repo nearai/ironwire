@@ -696,6 +696,7 @@ async fn dispatch_inner(
                         peek.requested_model.as_deref().unwrap_or("unknown"),
                         peek.stream,
                         confidence.clone(),
+                        &body,
                     )
                 } else {
                     response
@@ -867,6 +868,11 @@ fn translate_request(
         .or(peek.requested_model.as_deref())
         .unwrap_or("default");
 
+    let parsed = if inbound == Protocol::OpenAiResponses && target == Protocol::OpenAiChat {
+        ironwire_translate::namespaces::NamespaceMap::flatten(&parsed)?.0
+    } else {
+        parsed
+    };
     let mut conversation = ironwire_translate::parse_request(inbound, &parsed);
     // OR rather than assignment: a client that asked for log-probabilities
     // itself keeps them whatever the capture setting says. This is the only
@@ -875,7 +881,16 @@ fn translate_request(
     // byte-identity claim (`docs/PROTOCOL.md` §2) is untouched. Which wires can
     // actually express it is the emitters' business, not this function's.
     conversation.params.logprobs |= logprobs;
-    let (translated, dropped) = ironwire_translate::emit_request(target, &conversation, model);
+    let (mut translated, dropped) = ironwire_translate::emit_request(target, &conversation, model);
+    if inbound == Protocol::OpenAiResponses && target == Protocol::OpenAiChat {
+        preserve_responses_tool_controls(&parsed, &mut translated)?;
+    }
+    if !dropped.tools.is_empty() {
+        return Err(format!(
+            "the request contains tools this build cannot translate ({})",
+            dropped.tools.join(", ")
+        ));
+    }
 
     // A block type this build does not model makes the whole cross-wire route
     // ineligible. We cannot tell whether it was load-bearing — a `document` the
@@ -916,6 +931,50 @@ fn translate_request(
     })
 }
 
+/// These fields have exact Chat counterparts but are not part of the pivot.
+/// Keep them on the explicit Responses-to-Chat lane instead of weakening the
+/// client's selected tool or schema contract.
+fn preserve_responses_tool_controls(
+    source: &serde_json::Value,
+    target: &mut serde_json::Value,
+) -> Result<(), String> {
+    if let Some(parallel) = source.get("parallel_tool_calls") {
+        target["parallel_tool_calls"] = parallel.clone();
+    }
+    if let Some(choice) = source.get("tool_choice") {
+        target["tool_choice"] = match choice {
+            serde_json::Value::String(value)
+                if ["auto", "required", "none"].contains(&value.as_str()) =>
+            {
+                choice.clone()
+            }
+            serde_json::Value::Object(_)
+                if choice["type"] == "function" && choice["name"].is_string() =>
+            {
+                serde_json::json!({"type":"function", "function":{"name":choice["name"]}})
+            }
+            _ => return Err("the requested tool_choice cannot translate to Chat".into()),
+        };
+    }
+    if let (Some(source_tools), Some(target_tools)) = (
+        source.get("tools").and_then(serde_json::Value::as_array),
+        target
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut),
+    ) {
+        for tool in target_tools {
+            if let Some(original) = source_tools
+                .iter()
+                .find(|source| source["name"] == tool["function"]["name"])
+                && let Some(strict) = original.get("strict")
+            {
+                tool["function"]["strict"] = strict.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether to ask a translated request for per-token log-probabilities.
 ///
 /// Both switches, not either. `capture.logprobs` says the user wants the
@@ -943,7 +1002,17 @@ fn translate_response(
     requested_model: &str,
     stream: bool,
     confidence: ConfidenceSink,
+    original_request: &Bytes,
 ) -> UpstreamResponse {
+    let namespaces = if inbound == Protocol::OpenAiResponses && target == Protocol::OpenAiChat {
+        serde_json::from_slice(original_request)
+            .ok()
+            .and_then(|body| ironwire_translate::namespaces::NamespaceMap::flatten(&body).ok())
+            .map(|(_, names)| names)
+            .unwrap_or_default()
+    } else {
+        ironwire_translate::namespaces::NamespaceMap::default()
+    };
     let mut headers: Vec<(String, String)> = response
         .headers
         .into_iter()
@@ -967,6 +1036,7 @@ fn translate_response(
             target,
             requested_model.to_string(),
             confidence,
+            namespaces,
         )
         .boxed()
     } else {
@@ -976,6 +1046,7 @@ fn translate_response(
             target,
             requested_model.to_string(),
             confidence,
+            namespaces,
         )
         .boxed()
     };
@@ -994,6 +1065,7 @@ fn translated_body(
     target: Protocol,
     requested_model: String,
     confidence: ConfidenceSink,
+    namespaces: ironwire_translate::namespaces::NamespaceMap,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     futures_util::stream::once(async move {
         let collected: Vec<Bytes> = inner.filter_map(|c| async move { c.ok() }).collect().await;
@@ -1012,8 +1084,9 @@ fn translated_body(
             ));
         }
         let completion = ironwire_translate::parse_completion(target, &parsed);
-        let (translated, _) =
+        let (mut translated, _) =
             ironwire_translate::emit_completion(inbound, &completion, &requested_model);
+        namespaces.restore_response(&mut translated);
         Ok(Bytes::from(
             serde_json::to_vec(&translated).unwrap_or_else(|_| b"{}".to_vec()),
         ))
@@ -1027,14 +1100,14 @@ fn translated_stream(
     target: Protocol,
     requested_model: String,
     confidence: ConfidenceSink,
+    namespaces: ironwire_translate::namespaces::NamespaceMap,
 ) -> impl Stream<Item = Result<Bytes, UpstreamError>> + Send {
     let state = (
         inner,
-        Some(ironwire_translate::Translator::new(
-            target,
-            inbound,
-            requested_model,
-        )),
+        Some(
+            ironwire_translate::Translator::new(target, inbound, requested_model)
+                .with_namespaces(namespaces),
+        ),
         confidence,
     );
     futures_util::stream::unfold(
@@ -1768,6 +1841,7 @@ mod tests {
             Protocol::OpenAiChat,
             "claude-opus-4-6".to_string(),
             confidence.clone(),
+            ironwire_translate::namespaces::NamespaceMap::default(),
         );
         let _: Vec<_> = translated.collect().await;
 
@@ -1796,6 +1870,7 @@ mod tests {
             Protocol::OpenAiChat,
             "claude-opus-4-6".to_string(),
             confidence.clone(),
+            ironwire_translate::namespaces::NamespaceMap::default(),
         );
         let _: Vec<_> = translated.collect().await;
 
@@ -1816,6 +1891,7 @@ mod tests {
             Protocol::OpenAiChat,
             "claude-opus-4-6".to_string(),
             confidence.clone(),
+            ironwire_translate::namespaces::NamespaceMap::default(),
         );
         let _: Vec<_> = translated.collect().await;
 

@@ -1172,7 +1172,13 @@ fn build_registry(config: &Config, credentials: &Credentials<'_>) -> Result<Back
             models_for(config, "nearai", BackendKind::Credits).unwrap_or_default(),
             timeout,
         )
-        .context(RegistryLabel("building the NEAR AI backend"))?,
+        .context(RegistryLabel("building the NEAR AI backend"))?
+        .responses_via_chat(
+            config
+                .backends
+                .iter()
+                .any(|entry| entry.id == "nearai" && entry.responses_via_chat),
+        ),
     ))?;
 
     // Anything the user declared that discovery does not produce — including
@@ -1397,7 +1403,11 @@ fn backend_from_config(
                             .unwrap_or_default(),
                         timeout,
                     )
-                    .map(|backend| backend.refusing_model_aliases(entry.refuse_model_aliases))
+                    .map(|backend| {
+                        backend
+                            .refusing_model_aliases(entry.refuse_model_aliases)
+                            .responses_via_chat(entry.responses_via_chat)
+                    })
                     .context(RegistryLabel("building a configured NEAR AI backend"))
                 })
                 .transpose()?
@@ -1767,6 +1777,7 @@ mod tests {
             config_dir: None,
             models: None,
             refuse_model_aliases: false,
+            responses_via_chat: false,
         }
     }
 
@@ -2563,6 +2574,32 @@ mod refuse_model_aliases_wiring {
             .await;
         let head = seen.lock().expect("lock").clone().expect("upstream saw it");
         head.to_ascii_lowercase()
+    }
+
+    #[test]
+    fn responses_compatibility_is_opt_in_and_reaches_the_backend() {
+        let mut declared = entry("nearai", "nearai");
+        let env = env_with(&[("NEARAI_API_KEY", "synthetic")]);
+        let credentials = Credentials::discovered(&env);
+        for enabled in [false, true] {
+            declared.responses_via_chat = enabled;
+            let backend = backend_from_config(&declared, 30, &credentials)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                backend
+                    .capabilities()
+                    .wires
+                    .speaks(ironwire_core::protocol::Protocol::OpenAiResponses),
+                !enabled
+            );
+            assert!(
+                backend
+                    .capabilities()
+                    .wires
+                    .speaks(ironwire_core::protocol::Protocol::OpenAiChat)
+            );
+        }
     }
 
     #[tokio::test]

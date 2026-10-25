@@ -247,6 +247,17 @@ impl ChatCompletionsBackend {
         self.with_extra_headers(vec![(NO_ALIASING_HEADER.to_string(), "true".to_string())])
     }
 
+    /// Use the Chat Completions compatibility lane for Responses clients.
+    /// The endpoint and credential remain the same; only the advertised wire
+    /// changes, so the normal translation and eligibility gates still apply.
+    #[must_use]
+    pub fn responses_via_chat(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.capabilities.wires = Wires::only(Protocol::OpenAiChat);
+        }
+        self
+    }
+
     /// Attach the credential, if there is one.
     ///
     /// A local server usually takes none, and sending `Authorization: Bearer `

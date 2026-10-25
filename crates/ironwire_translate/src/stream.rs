@@ -518,8 +518,12 @@ struct Emitter {
     text_open: bool,
     /// Anthropic: next content-block index to allocate.
     next_index: usize,
-    /// Responses: next output index.
-    output_index: usize,
+    /// Responses output items retained for the final response envelope.
+    response_output: Vec<Value>,
+    response_text_index: Option<usize>,
+    response_text_bytes: usize,
+    response_failed: bool,
+    namespaces: crate::namespaces::NamespaceMap,
 }
 
 impl Emitter {
@@ -531,7 +535,11 @@ impl Emitter {
             started: false,
             text_open: false,
             next_index: 0,
-            output_index: 0,
+            response_output: Vec::new(),
+            response_text_index: None,
+            response_text_bytes: 0,
+            response_failed: false,
+            namespaces: crate::namespaces::NamespaceMap::default(),
         }
     }
 
@@ -740,7 +748,32 @@ impl Emitter {
 
     // -- Responses ---------------------------------------------------------
 
+    fn finish_responses_text(&mut self, out: &mut Vec<u8>) {
+        if let Some(index) = self.response_text_index.take() {
+            let item = &mut self.response_output[index];
+            item["status"] = json!("completed");
+            write_event(
+                out,
+                "response.output_text.done",
+                &json!({"type":"response.output_text.done", "output_index":index, "item_id":item["id"], "content_index":0, "text":item["content"][0]["text"]}),
+            );
+            write_event(
+                out,
+                "response.content_part.done",
+                &json!({"type":"response.content_part.done", "output_index":index, "item_id":item["id"], "content_index":0, "part":item["content"][0]}),
+            );
+            write_event(
+                out,
+                "response.output_item.done",
+                &json!({"type":"response.output_item.done", "output_index":index, "item":item}),
+            );
+        }
+    }
+
     fn write_responses(&mut self, delta: &Delta, out: &mut Vec<u8>) {
+        if self.response_failed {
+            return;
+        }
         match delta {
             Delta::Start { id, .. } => {
                 if self.started {
@@ -767,15 +800,52 @@ impl Emitter {
                     }),
                 );
             }
-            Delta::Text(text) => write_event(
-                out,
-                "response.output_text.delta",
-                &json!({
-                    "type": "response.output_text.delta",
-                    "output_index": self.output_index,
-                    "delta": text,
-                }),
-            ),
+            Delta::Text(text) => {
+                // Retaining final output must not turn an unbounded provider
+                // stream into unbounded memory. Fail visibly instead of
+                // handing the client a truncated successful answer.
+                if self.response_text_bytes + text.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    self.response_failed = true;
+                    write_event(
+                        out,
+                        "response.failed",
+                        &json!({"type":"response.failed", "response":{"id":self.id,"status":"failed","error":{"code":"translation_output_limit","message":"Translated output exceeded the bounded response buffer"}}}),
+                    );
+                    return;
+                }
+                self.response_text_bytes += text.len();
+                let index = match self.response_text_index {
+                    Some(index) => index,
+                    None => {
+                        let index = self.response_output.len();
+                        let item = json!({"id":format!("msg_{}_{}", self.id, index), "type":"message", "role":"assistant", "status":"in_progress", "content":[]});
+                        write_event(
+                            out,
+                            "response.output_item.added",
+                            &json!({"type":"response.output_item.added", "output_index":index, "item":item}),
+                        );
+                        write_event(
+                            out,
+                            "response.content_part.added",
+                            &json!({"type":"response.content_part.added", "output_index":index, "item_id":item["id"], "content_index":0, "part":{"type":"output_text", "text":"", "annotations":[]}}),
+                        );
+                        self.response_output.push(item);
+                        self.response_output[index]["content"] =
+                            json!([{"type":"output_text", "text":"", "annotations":[]}]);
+                        self.response_text_index = Some(index);
+                        index
+                    }
+                };
+                let item = &mut self.response_output[index];
+                if let Value::String(full) = &mut item["content"][0]["text"] {
+                    full.push_str(text);
+                }
+                write_event(
+                    out,
+                    "response.output_text.delta",
+                    &json!({"type":"response.output_text.delta", "output_index":index, "item_id":item["id"], "content_index":0, "delta":text}),
+                );
+            }
             Delta::ReasoningText(_) => {}
             Delta::ToolCall {
                 id,
@@ -783,19 +853,23 @@ impl Emitter {
                 arguments,
                 ..
             } => {
-                self.output_index += 1;
-                let item = json!({
+                self.finish_responses_text(out);
+                let index = self.response_output.len();
+                let mut item = json!({
+                    "id": format!("fc_{}_{}", self.id, index),
+                    "status": "completed",
                     "type": "function_call",
                     "call_id": tool_ids::encode(id, Protocol::OpenAiResponses),
                     "name": name,
                     "arguments": arguments,
                 });
+                self.namespaces.restore_item(&mut item);
                 write_event(
                     out,
                     "response.output_item.added",
                     &json!({
                         "type": "response.output_item.added",
-                        "output_index": self.output_index,
+                        "output_index": index,
                         "item": item,
                     }),
                 );
@@ -804,12 +878,14 @@ impl Emitter {
                     "response.output_item.done",
                     &json!({
                         "type": "response.output_item.done",
-                        "output_index": self.output_index,
+                        "output_index": index,
                         "item": item,
                     }),
                 );
+                self.response_output.push(item);
             }
             Delta::Stop { reason, usage } => {
+                self.finish_responses_text(out);
                 let (status, incomplete) = responses::emit_stop_reason(reason);
                 let name = if incomplete.is_some() {
                     "response.incomplete"
@@ -821,6 +897,7 @@ impl Emitter {
                 response.insert("object".into(), json!("response"));
                 response.insert("model".into(), json!(self.model));
                 response.insert("status".into(), status);
+                response.insert("output".into(), json!(self.response_output));
                 if let Some(incomplete) = incomplete {
                     response.insert("incomplete_details".into(), incomplete);
                 }
@@ -879,6 +956,13 @@ impl Translator {
             resyncing: false,
             closed: false,
         }
+    }
+
+    /// Restore Responses namespace identities from this request after translation.
+    #[must_use]
+    pub fn with_namespaces(mut self, namespaces: crate::namespaces::NamespaceMap) -> Self {
+        self.emitter.namespaces = namespaces;
+        self
     }
 
     /// `ln p(chosen token)` for each token the model emitted, in order.
@@ -1516,5 +1600,63 @@ data: {"id":"c","choices":[{"index":0,"delta":{"content":"after"}}]}
             tool_ids::decode("toolu_xw_call_1", Protocol::AnthropicMessages),
             ToolCallId::from("call_1")
         );
+    }
+}
+
+#[cfg(test)]
+mod responses_lifecycle_tests {
+    use super::*;
+    use crate::ir::ToolCallId;
+
+    #[test]
+    fn text_tool_text_finishes_each_item_before_starting_the_next() {
+        let mut emitter = Emitter::new(Protocol::OpenAiResponses, "model".into());
+        let mut output = Vec::new();
+        for delta in [
+            Delta::Start {
+                id: "r".into(),
+                model: "model".into(),
+            },
+            Delta::Text("before".into()),
+            Delta::ToolCall {
+                index: 0,
+                id: ToolCallId::native(Protocol::OpenAiChat, "call"),
+                name: "echo".into(),
+                arguments: "{}".into(),
+            },
+            Delta::Text("after".into()),
+            Delta::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        ] {
+            emitter.write(&delta, &mut output);
+        }
+        let text = String::from_utf8(output).unwrap();
+        let mut active = None;
+        let mut completed = Vec::new();
+        for event in text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        {
+            match event["type"].as_str() {
+                Some("response.output_item.added") => {
+                    assert!(active.is_none(), "{text}");
+                    active = Some(event["item"]["id"].clone());
+                }
+                Some("response.output_item.done") => {
+                    assert_eq!(active.take(), Some(event["item"]["id"].clone()));
+                    completed.push(event["item"].clone());
+                }
+                Some("response.completed") => {
+                    assert_eq!(event["response"]["output"], json!(completed))
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(completed.len(), 3);
+        assert_eq!(completed[0]["content"][0]["text"], "before");
+        assert_eq!(completed[2]["content"][0]["text"], "after");
     }
 }
