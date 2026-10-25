@@ -818,6 +818,7 @@ impl Policy {
             .as_ref()
             .or(self.pin.as_ref())
             .and_then(|(backend, model)| model.as_ref().map(|_| backend.clone()));
+        let forced = route_override.is_some() || self.pin.is_some();
         let mut decision =
             self.route(key.clone(), inbound, peek, candidates, now, route_override)?;
         if forced_model.as_ref() != Some(&decision.backend)
@@ -829,6 +830,24 @@ impl Policy {
             // fallback this one did not take.
             affinity.model = decision.model.clone();
             affinity.rung = decision.rung;
+        }
+        // Forced routes need affinity too: the next tool-result turn must be
+        // distinguishable from switching into a foreign backend mid-loop.
+        if forced {
+            self.affinities.insert(
+                key,
+                Affinity {
+                    backend: decision.backend.clone(),
+                    model: decision.model.clone(),
+                    rung: decision.rung,
+                    since: now,
+                    last_seen: now,
+                    pressure_since: None,
+                    recovery_since: None,
+                    client_login: peek.client_login.clone(),
+                },
+            );
+            self.sweep(now);
         }
         // Pins and overrides passed the same origin gate before reaching here.
         self.note_reasoning_account(reasoning_key, peek, inbound, &decision, candidates, now);
@@ -937,7 +956,19 @@ impl Policy {
             // request.
             let cross = !candidate.caps.wires.speaks(inbound);
             let origin = self.origin_of(&key, peek, candidates, now);
-            let requirements = requirements_for(candidate, peek, &origin);
+            let mut requirements = requirements_for(candidate, peek, &origin);
+            if cross
+                && self.affinities.get(&key).is_some_and(|affinity| {
+                    affinity.backend == candidate.id
+                        && affinity.rung == Rung::CrossFamily
+                        && affinity.client_login == peek.client_login
+                })
+            {
+                // Continuing an established translated tool loop is not a
+                // family switch. A new pin, another backend or another login
+                // still passes the original mid-loop gate unchanged.
+                requirements.mid_tool_loop = false;
+            }
             eligible(
                 &requirements,
                 &candidate.caps,
@@ -4739,6 +4770,78 @@ mod tests {
         assert_eq!(d.rung, Rung::CrossFamily);
         assert!(d.translated);
         assert!(d.rung.is_user_visible());
+    }
+
+    #[test]
+    fn a_pin_can_continue_but_cannot_start_or_move_a_translated_tool_loop() {
+        let first = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+        let second = candidate("other", BackendKind::Credits, Protocol::OpenAiChat);
+        let candidates = [first, second];
+        let mut policy = Policy::new();
+        policy.set_pin(Some(BackendId::from("nearai")), None);
+        let ordinary = peek("qwen3-coder");
+        let mut mid_loop = ordinary.clone();
+        mid_loop.requirements.mid_tool_loop = true;
+        assert!(
+            policy
+                .decide(
+                    key(),
+                    Protocol::OpenAiResponses,
+                    &mid_loop,
+                    &candidates,
+                    t(0)
+                )
+                .is_err()
+        );
+        assert!(
+            policy
+                .decide(
+                    key(),
+                    Protocol::OpenAiResponses,
+                    &ordinary,
+                    &candidates,
+                    t(1)
+                )
+                .unwrap()
+                .translated
+        );
+        assert!(
+            policy
+                .decide(
+                    key(),
+                    Protocol::OpenAiResponses,
+                    &mid_loop,
+                    &candidates,
+                    t(2)
+                )
+                .unwrap()
+                .translated
+        );
+        policy.set_pin(Some(BackendId::from("other")), None);
+        assert!(
+            policy
+                .decide(
+                    key(),
+                    Protocol::OpenAiResponses,
+                    &mid_loop,
+                    &candidates,
+                    t(3)
+                )
+                .is_err()
+        );
+        policy.set_pin(Some(BackendId::from("nearai")), None);
+        mid_loop.client_login = Some(BackendId::from("different-login"));
+        assert!(
+            policy
+                .decide(
+                    key(),
+                    Protocol::OpenAiResponses,
+                    &mid_loop,
+                    &candidates,
+                    t(4)
+                )
+                .is_err()
+        );
     }
 
     #[test]

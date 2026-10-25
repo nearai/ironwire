@@ -639,6 +639,12 @@ pub struct BackendConfig {
     /// is also refused.
     #[serde(default)]
     pub refuse_model_aliases: bool,
+    /// Send Responses requests through Chat Completions translation instead
+    /// of the native Responses endpoint. NEAR AI only, off by default.
+    /// Some hosted models complete Responses tool turns without returning the
+    /// tool call that their Chat Completions endpoint produces.
+    #[serde(default)]
+    pub responses_via_chat: bool,
 }
 
 /// A configured model: a slug, and optionally the tier it should count as.
@@ -1038,6 +1044,13 @@ impl Config {
                 ));
             };
 
+            if backend.responses_via_chat && kind != BackendImpl::NearAi {
+                return Err(invalid(
+                    &backend.id,
+                    "`responses_via_chat` is supported only for `kind = \"nearai\"`.".to_string(),
+                ));
+            }
+
             // The id travels into ledger rows, event payloads and
             // `X-IronWire-Route`, so it is not free-form text.
             if !backend
@@ -1406,6 +1419,29 @@ mod tests {
             Err(error) => error.to_string(),
             Ok(_) => panic!("accepted a config that cannot describe a backend:\n{toml}"),
         }
+    }
+
+    #[test]
+    fn responses_via_chat_is_explicit_and_nearai_only() {
+        let config: Config =
+            toml::from_str("[[backends]]\nid=\"nearai\"\nkind=\"nearai\"\n").unwrap();
+        assert!(!config.backends[0].responses_via_chat);
+        let enabled: Config = toml::from_str(
+            "[[backends]]\nid=\"nearai\"\nkind=\"nearai\"\nresponses_via_chat=true\n",
+        )
+        .unwrap();
+        enabled
+            .validate(Path::new("config.toml"), lexical_dir_identity)
+            .unwrap();
+        let other: Config = toml::from_str(
+            "[[backends]]\nid=\"openai-key\"\nkind=\"openai-api\"\nresponses_via_chat=true\n",
+        )
+        .unwrap();
+        assert!(
+            other
+                .validate(Path::new("config.toml"), lexical_dir_identity)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2175,6 +2211,7 @@ mod tests {
                     api_key_env: None,
                     config_dir: None,
                     refuse_model_aliases: false,
+                    responses_via_chat: false,
                     models: None,
                 },
                 BackendConfig {
@@ -2185,6 +2222,7 @@ mod tests {
                     api_key_env: None,
                     config_dir: Some("~/.claude-work".into()),
                     refuse_model_aliases: false,
+                    responses_via_chat: false,
                     models: None,
                 },
             ],
@@ -2254,6 +2292,7 @@ mod bulk_config_tests {
                     api_key_env: None,
                     config_dir: Some(format!("/fixtures/login-{index}")),
                     refuse_model_aliases: false,
+                    responses_via_chat: false,
                     models: None,
                 })
                 .collect(),

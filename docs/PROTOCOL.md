@@ -864,3 +864,18 @@ release.
 The admission capability also reports `body_capture_ready`: true only when the
 separate capture flags are enabled and both local ledger and body storage opened.
 It reports readiness without enabling capture or exposing stored content.
+
+
+### NEAR AI Responses compatibility mode
+
+A NEAR AI backend can opt into `responses_via_chat = true`. It then advertises
+Chat Completions only, so Responses clients use the existing translated lane
+for the entire session, including tool-result continuation. The default remains
+native Responses. This is for hosted models whose native Responses stream ends
+with an empty output list instead of the function call returned by their Chat
+Completions endpoint. It does not change the destination, credential, model
+selection, capture consent, or the native lane of other backends.
+
+The translated request preserves function definitions, tool selection, parallel
+call settings, and replayed calls/results. Unsupported built-in tools must be
+disabled by the client or the request is refused; they are not silently removed.
