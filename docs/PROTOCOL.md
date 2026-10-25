@@ -159,7 +159,13 @@ For a native-lane request, IronWire performs exactly these mutations:
    fields before body capture. Existing caller fields win, including false.
    No unrelated bytes are reserialized. Ambiguous JSON is not augmented.
    Responses and other protocols are not augmented by this initial adapter.
-10. **Nothing else.** The body is otherwise the bytes the client sent.
+10. **NEAR AI Responses replay**: assistant message content blocks with type
+   `output_text` are sent as `input_text`, which NEAR AI accepts when replaying
+   previous assistant output. Roles, text, order, unknown fields and all other
+   bytes are preserved. This applies only to the NEAR AI credits backend and
+   Responses requests, before capture; other providers and response bytes are
+   untouched. No conversation items are dropped.
+11. **Nothing else.** The body is otherwise the bytes the client sent.
 
 `GET /_ironwire/admission-binding` requires the control bearer and returns
 capability/limits only, never registered session or challenge values.

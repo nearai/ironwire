@@ -25,6 +25,7 @@ pub mod policy;
 pub mod protocol;
 pub mod quota;
 pub mod quota_store;
+pub mod responses_replay;
 
 pub use capability::{Capabilities, Ineligible, ReasoningNeed, RequestRequirements};
 pub use config::{Config, PathsConfig, ResilienceConfig, ServerConfig, UpdateConfig};
