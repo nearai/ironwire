@@ -581,6 +581,13 @@ async fn dispatch_inner(
             .and_then(|candidate| candidate.account_scope.clone());
 
         let upstream_protocol = if decision.translated { target } else { inbound };
+        if upstream_protocol == Protocol::OpenAiResponses
+            && backend.kind() == ironwire_core::protocol::BackendKind::Credits
+            && let Some(body) =
+                ironwire_core::responses_replay::normalize_assistant_text(&request.body)
+        {
+            request.body = Bytes::from(body);
+        }
         let token_target = state
             .config
             .capture

@@ -1068,3 +1068,70 @@ async fn token_capture_uses_response_format_and_stops_augmenting_a_full_spool() 
         }
     }
 }
+
+#[tokio::test]
+async fn nearai_accepts_replayed_assistant_text_without_changing_the_conversation() {
+    assert_responses_replay(true).await;
+}
+
+#[tokio::test]
+async fn other_responses_providers_keep_assistant_output_text() {
+    assert_responses_replay(false).await;
+}
+
+async fn assert_responses_replay(nearai: bool) {
+    use ironwire_core::protocol::{BackendId, BackendKind};
+    use ironwire_upstream::openai_chat::{ChatCompletionsBackend, nearai_capabilities};
+    let (base, received) = spawn_mock_content("{}", "application/json").await;
+    let backend = if nearai {
+        ChatCompletionsBackend::nearai(Some(SecretString::from("test-only")), Some(base), vec![], 5)
+            .unwrap()
+    } else {
+        ChatCompletionsBackend::new(
+            BackendId::from("other"),
+            "fixture",
+            BackendKind::ApiKey,
+            Some(SecretString::from("test-only")),
+            base,
+            vec![],
+            5,
+        )
+        .unwrap()
+        .with_capabilities(nearai_capabilities())
+    };
+    let mut registry = BackendRegistry::new();
+    registry.push(Arc::new(backend));
+    let state = AppState::new(
+        registry,
+        Config::default(),
+        ConsentLedger::default(),
+        "test-token".into(),
+    );
+    let body = serde_json::json!({"model":"fixture", "input":[
+        {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+        {"type":"message","role":"assistant","id":null,"status":"completed","future":true,
+         "content":[{"type":"output_text","text":"hello back","annotations":[],"future":42}]},
+        {"role":"user","content":"continue"}]});
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/openai/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
+    let got = received.lock().unwrap().clone().unwrap();
+    let mut expected = body;
+    if nearai {
+        expected["input"][1]["content"][0]["type"] = "input_text".into();
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&got.body).unwrap(),
+        expected
+    );
+}
