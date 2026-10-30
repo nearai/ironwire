@@ -289,7 +289,15 @@ async fn the_answer_comes_back_as_a_stream_claude_code_can_read() {
         })
         .expect("a tool_use block");
     assert_eq!(call["content_block"]["name"], "Bash");
-    assert_eq!(call["content_block"]["input"]["command"], "cargo test");
+    // Claude Code builds the input from `input_json_delta` fragments only.
+    assert_eq!(call["content_block"]["input"], serde_json::json!({}));
+    let assembled: String = frames
+        .iter()
+        .filter(|(name, _)| name == "content_block_delta")
+        .filter_map(|(_, value)| value.pointer("/delta/partial_json").and_then(Value::as_str))
+        .collect();
+    let input: Value = serde_json::from_str(&assembled).expect("streamed input parses");
+    assert_eq!(input["command"], "cargo test");
     let id = call["content_block"]["id"].as_str().expect("an id");
     assert!(id.starts_with("toolu_"), "{id} is not valid for Anthropic");
 

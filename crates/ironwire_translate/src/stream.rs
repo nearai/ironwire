@@ -613,11 +613,21 @@ impl Emitter {
                 self.close_anthropic_text(out);
                 let index = self.next_index;
                 self.next_index = index + 1;
+                // The real API opens a streamed `tool_use` block with an empty
+                // `input` and sends the arguments as `input_json_delta`
+                // fragments. Claude Code relies on exactly that: it resets
+                // `input` to "" at `content_block_start` and builds it only
+                // from the deltas, so arguments placed in the start event are
+                // discarded and every call reaches the tool empty.
+                let input = serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
                 let block = json!({
                     "type": "tool_use",
                     "id": tool_ids::encode(id, Protocol::AnthropicMessages),
                     "name": name,
-                    "input": serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({})),
+                    "input": {},
                 });
                 write_event(
                     out,
@@ -626,6 +636,15 @@ impl Emitter {
                         "type": "content_block_start",
                         "index": index,
                         "content_block": block,
+                    }),
+                );
+                write_event(
+                    out,
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
                     }),
                 );
                 write_event(
@@ -1447,6 +1466,64 @@ mod tests {
             &chat_stream(),
         );
         assert_eq!(out.matches("event: message_stop").count(), 1, "{out}");
+    }
+
+    /// Claude Code ignores the `input` of a streamed `tool_use` start event: it
+    /// resets it to "" and builds the input only from `input_json_delta`
+    /// fragments, parsing the result at `content_block_stop`. Read the stream
+    /// the same way, so a call whose arguments ride on the start event alone
+    /// shows up here as the empty input the agent actually received.
+    #[test]
+    fn a_tool_call_reaches_an_anthropic_client_through_input_json_delta() {
+        for source in EVERY {
+            let out = run(source, Protocol::AnthropicMessages, &source_stream(source));
+            let mut inputs: std::collections::BTreeMap<i64, String> = Default::default();
+            let mut finished = Vec::new();
+            for line in out.lines().filter(|line| line.starts_with("data: ")) {
+                let Ok(value) = serde_json::from_str::<Value>(&line[6..]) else {
+                    continue;
+                };
+                let index = value.get("index").and_then(Value::as_i64).unwrap_or(-1);
+                match value.get("type").and_then(Value::as_str) {
+                    Some("content_block_start")
+                        if value.pointer("/content_block/type").and_then(Value::as_str)
+                            == Some("tool_use") =>
+                    {
+                        assert_eq!(
+                            value.pointer("/content_block/input"),
+                            Some(&json!({})),
+                            "{source}: a streamed tool_use starts with an empty input"
+                        );
+                        inputs.insert(index, String::new());
+                    }
+                    Some("content_block_delta") => {
+                        if let (Some(buffer), Some(fragment)) = (
+                            inputs.get_mut(&index),
+                            value.pointer("/delta/partial_json").and_then(Value::as_str),
+                        ) {
+                            buffer.push_str(fragment);
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        if let Some(buffer) = inputs.remove(&index) {
+                            let parsed: Value = serde_json::from_str(if buffer.is_empty() {
+                                "{}"
+                            } else {
+                                &buffer
+                            })
+                            .expect("the assembled input parses");
+                            finished.push(parsed);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                finished,
+                vec![json!({"cmd": "ls"})],
+                "{source}: the tool call lost its arguments: {out}"
+            );
+        }
     }
 
     /// Anthropic closes a content block before opening the next, and a client
