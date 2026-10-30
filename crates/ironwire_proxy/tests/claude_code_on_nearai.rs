@@ -279,6 +279,17 @@ fn events(sse: &str) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// The first tool call's input, assembled the way Claude Code assembles it:
+/// from `input_json_delta` fragments, ignoring the start event's `input`.
+fn streamed_input(events: &[(String, Value)]) -> Value {
+    let assembled: String = events
+        .iter()
+        .filter(|(n, _)| n == "content_block_delta")
+        .filter_map(|(_, p)| p.pointer("/delta/partial_json").and_then(Value::as_str))
+        .collect();
+    serde_json::from_str(&assembled).unwrap_or_else(|_| panic!("no streamed input in {events:?}"))
+}
+
 #[tokio::test]
 async fn claude_code_keeps_working_on_near_ai_when_the_subscription_is_exhausted() {
     let (base, received) = spawn_nearai(vec![text_turn("The off-by-one is in sum_to.")]).await;
@@ -355,7 +366,10 @@ async fn a_tool_call_from_near_ai_reaches_claude_code_as_a_valid_tool_use_block(
 
     assert_eq!(block["name"], "Bash");
     // An object, not the JSON *string* Chat Completions streams.
-    assert_eq!(block["input"]["command"], "cargo test --quiet");
+    // Claude Code builds the input from `input_json_delta` fragments only;
+    // what the start event carries is discarded.
+    assert_eq!(block["input"], json!({}));
+    assert_eq!(streamed_input(&events)["command"], "cargo test --quiet");
     // An id valid in the client's namespace — it will replay this forever.
     assert!(
         block["id"].as_str().expect("id").starts_with("toolu_"),
