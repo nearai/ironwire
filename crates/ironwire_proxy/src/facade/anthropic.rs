@@ -42,12 +42,15 @@ pub fn router() -> Router<AppState> {
             post(bound_count_tokens),
         )
         .route("/account/{account}/v1/models", get(bound_models))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            super::MAX_REQUEST_BODY_BYTES,
+        ))
 }
 
 async fn messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<false>,
 ) -> Result<Response, FacadeError> {
     forward(state, headers, body, "/v1/messages", None).await
 }
@@ -58,7 +61,7 @@ async fn messages(
 async fn count_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<false>,
 ) -> Result<Response, FacadeError> {
     forward(state, headers, body, "/v1/messages/count_tokens", None).await
 }
@@ -67,7 +70,7 @@ async fn bound_messages(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<false>,
 ) -> Result<Response, FacadeError> {
     let login = bound(&state, &super::account_segment(account))?;
     forward(state, headers, body, "/v1/messages", Some(login)).await
@@ -77,7 +80,7 @@ async fn bound_count_tokens(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<false>,
 ) -> Result<Response, FacadeError> {
     let login = bound(&state, &super::account_segment(account))?;
     forward(

@@ -110,6 +110,8 @@ pub struct ChatCompletionsBackend {
     /// else's release schedule; a list configured here is a guess that goes
     /// stale silently. Once we have asked, we use the answer.
     discovered: Arc<Mutex<Option<crate::Catalogue>>>,
+    /// Per-model input windows from the same answer as [`Self::discovered`].
+    context_windows: Arc<Mutex<Vec<(String, u32)>>>,
     quota: Arc<Mutex<QuotaSnapshot>>,
 }
 
@@ -213,6 +215,7 @@ impl ChatCompletionsBackend {
             extra_headers: Vec::new(),
             models,
             discovered: Arc::new(Mutex::new(None)),
+            context_windows: Arc::new(Mutex::new(Vec::new())),
             quota: Arc::new(Mutex::new(QuotaSnapshot::default())),
         })
     }
@@ -286,6 +289,70 @@ impl ChatCompletionsBackend {
     }
 }
 
+/// The largest token count read from a `/models` answer. Anything above is
+/// treated as unreadable rather than as a window; the same bound Trace
+/// Commons applies to the same catalogue.
+const MAX_STATED_TOKENS: u64 = 100_000_000;
+
+/// A positive token count no larger than [`MAX_STATED_TOKENS`], or none.
+fn stated_tokens(value: Option<&serde_json::Value>) -> Option<u64> {
+    value?
+        .as_u64()
+        .filter(|n| (1..=MAX_STATED_TOKENS).contains(n))
+}
+
+/// The input window of each model a `/models` answer states one for.
+///
+/// NEAR AI gives `context_length` and sometimes `max_output_length`; an
+/// OpenRouter-shaped answer gives them under `top_provider` as
+/// `context_length` and `max_completion_tokens`. The input window is the
+/// context less the output limit when the limit is below it, so a request
+/// that fits still leaves room for the longest answer; the whole context when
+/// no such limit is stated. A zero, negative, non-numeric or implausibly large
+/// value is ignored, which leaves the model on the backend's default.
+fn parse_context_windows(body: &[u8]) -> Vec<(String, u32)> {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(items) = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut windows: Vec<(String, u32)> = Vec::new();
+    for item in items {
+        let Some(id) = item
+            .get("id")
+            .or_else(|| item.get("slug"))
+            .or_else(|| item.get("model"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(context) = stated_tokens(item.get("context_length"))
+            .or_else(|| stated_tokens(item.pointer("/top_provider/context_length")))
+        else {
+            continue;
+        };
+        let output = stated_tokens(item.get("max_output_length"))
+            .or_else(|| stated_tokens(item.pointer("/top_provider/max_completion_tokens")));
+        let input = match output {
+            Some(output) if output < context => context - output,
+            _ => context,
+        };
+        if windows.iter().any(|(seen, _)| seen == id) {
+            continue;
+        }
+        if let Ok(input) = u32::try_from(input) {
+            windows.push((id.to_string(), input));
+        }
+    }
+    windows
+}
+
 fn host_of(base_url: &str) -> String {
     base_url
         .split("://")
@@ -325,6 +392,13 @@ impl Backend for ChatCompletionsBackend {
         match self.discovered.lock() {
             Ok(guard) => guard.is_some(),
             Err(poisoned) => poisoned.into_inner().is_some(),
+        }
+    }
+
+    fn context_windows(&self) -> Vec<(String, u32)> {
+        match self.context_windows.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -565,11 +639,19 @@ impl Backend for ChatCompletionsBackend {
                 } else {
                     models
                 };
+                // Stored before the catalogue: a window is only read for a
+                // model the catalogue lists, so neither order can mislead.
+                let windows = parse_context_windows(&body);
                 tracing::info!(
                     backend = %self.id,
                     count = models.len(),
+                    windows = windows.len(),
                     "learned the model catalogue from the provider"
                 );
+                match self.context_windows.lock() {
+                    Ok(mut guard) => *guard = windows,
+                    Err(poisoned) => *poisoned.into_inner() = windows,
+                }
                 match self.discovered.lock() {
                     Ok(mut guard) => *guard = Some(models),
                     Err(poisoned) => *poisoned.into_inner() = Some(models),
@@ -700,6 +782,80 @@ mod tests {
     fn trailing_slashes_do_not_double_up_in_the_url() {
         let b = backend("https://api.near.ai/v1/");
         assert_eq!(b.base_url, "https://api.near.ai/v1");
+    }
+
+    /// NEAR AI's catalogue as observed on 2026-10-31, plus the shapes the
+    /// parser must refuse to read as a window.
+    const NEAR_MODELS: &str = r#"{"data": [
+        {"id": "z-ai/glm-5.3", "context_length": 1048576},
+        {"id": "z-ai/glm-5.3-flash", "context_length": 1048576, "max_output_length": 131072},
+        {"id": "z-ai/glm-5", "context_length": 128000},
+        {"id": "b/provider", "top_provider": {"context_length": 262144, "max_completion_tokens": 65536}},
+        {"id": "c/none"},
+        {"id": "d/zero", "context_length": 0},
+        {"id": "e/huge", "context_length": 1099511627776, "max_output_length": -1},
+        {"id": "f/string", "context_length": "1048576"},
+        {"id": "g/negative", "context_length": -5},
+        {"id": "h/output-over", "context_length": 32000, "max_output_length": 64000},
+        {"id": "i/bad-top", "context_length": 0, "top_provider": {"context_length": 200000}}
+    ]}"#;
+
+    #[test]
+    fn context_windows_follow_the_provider_with_trace_commons_bounds() {
+        assert_eq!(
+            parse_context_windows(NEAR_MODELS.as_bytes()),
+            vec![
+                ("z-ai/glm-5.3".to_string(), 1_048_576),
+                // The output limit is subtracted when it is below the window.
+                ("z-ai/glm-5.3-flash".to_string(), 1_048_576 - 131_072),
+                ("z-ai/glm-5".to_string(), 128_000),
+                ("b/provider".to_string(), 262_144 - 65_536),
+                // An output limit at or above the window leaves it whole.
+                ("h/output-over".to_string(), 32_000),
+                // An unreadable top-level value falls back to `top_provider`.
+                ("i/bad-top".to_string(), 200_000),
+            ]
+        );
+        assert!(parse_context_windows(b"not json").is_empty());
+        assert!(parse_context_windows(b"{\"data\": 5}").is_empty());
+    }
+
+    /// The probe reads the windows from the `/models` answer it already
+    /// fetches for the catalogue; nothing new is requested.
+    #[tokio::test]
+    async fn a_probe_learns_each_models_window() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.expect("read");
+                if n == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            assert!(request.starts_with(b"GET /v1/models "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{NEAR_MODELS}",
+                NEAR_MODELS.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let b = backend(&format!("http://{addr}/v1"));
+        assert!(b.context_windows().is_empty(), "nothing is known before");
+        b.probe().await.expect("probe succeeds");
+        assert!(b.catalogue_from_provider());
+        let windows = b.context_windows();
+        assert!(windows.contains(&("z-ai/glm-5.3".to_string(), 1_048_576)));
+        assert!(windows.contains(&("z-ai/glm-5.3-flash".to_string(), 917_504)));
+        assert!(!windows.iter().any(|(id, _)| id == "c/none"));
     }
 
     #[test]

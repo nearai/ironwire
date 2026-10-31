@@ -42,12 +42,15 @@ pub fn router() -> Router<AppState> {
             post(bound_chat_completions),
         )
         .route("/account/{account}/v1/models", get(bound_models))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            super::MAX_REQUEST_BODY_BYTES,
+        ))
 }
 
 async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<true>,
 ) -> Result<Response, FacadeError> {
     forward(
         state,
@@ -63,7 +66,7 @@ async fn responses(
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<true>,
 ) -> Result<Response, FacadeError> {
     forward(
         state,
@@ -80,7 +83,7 @@ async fn bound_responses(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<true>,
 ) -> Result<Response, FacadeError> {
     let login = bound(&state, &super::account_segment(account))?;
     forward(
@@ -98,7 +101,7 @@ async fn bound_chat_completions(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
-    body: Bytes,
+    super::FacadeBody(body): super::FacadeBody<true>,
 ) -> Result<Response, FacadeError> {
     let login = bound(&state, &super::account_segment(account))?;
     forward(
