@@ -197,6 +197,21 @@ pub struct Exchange {
     /// apart from it everywhere it is counted.
     #[serde(default, deserialize_with = "proof::lenient")]
     pub proof: Option<ProofStatus>,
+    /// Why IronWire answered this request itself, as a fixed code, when it
+    /// never reached a backend's response for a reason routing did not decide.
+    ///
+    /// One of `panic`, `body_rejected`, `invalid_json`, `unknown_login`,
+    /// `client_disconnected` (see `ironwire_proxy::facade::guard`). Never
+    /// error text: the text of a parse error or a panic can quote the request.
+    ///
+    /// `None` on every exchange a backend answered, on a routing refusal (whose
+    /// reason is in [`Self::error`]), and on a row written before the column
+    /// existed.
+    ///
+    /// A row with a code is kept for diagnosis but is not a call: the
+    /// aggregates ([`Ledger::summary`], [`Ledger::proof_summary`]) leave it out.
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 impl Exchange {
@@ -397,9 +412,9 @@ impl Ledger {
                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
                 cost_usd, substitutions, status, error,
                 mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
-                model_alias_resolved, proof, proof_attempts
+                model_alias_resolved, proof, proof_attempts, failure
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
-                       ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,0)",
+                       ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,0,?31)",
             rusqlite::params![
                 exchange.started_at.to_rfc3339(),
                 exchange.ttfb_ms,
@@ -433,6 +448,7 @@ impl Ledger {
                     .and_then(|c| i64::try_from(c.token_count).ok()),
                 exchange.model_alias_resolved,
                 exchange.proof.map(ProofStatus::as_str),
+                exchange.failure,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -608,6 +624,10 @@ impl Ledger {
 
     /// Aggregate the last `window`.
     ///
+    /// Rows with a [`Exchange::failure`] code are not exchanges here: they
+    /// are requests IronWire answered itself, kept for diagnosis and left out
+    /// of every count. A routing refusal (`failure` NULL) is still counted.
+    ///
     /// # Errors
     ///
     /// [`LedgerError::Sqlite`] on a read failure.
@@ -627,7 +647,7 @@ impl Ledger {
                     COALESCE(SUM(CASE WHEN COALESCE(cache_write_tokens, 0) > 0
                                        AND COALESCE(cache_read_tokens, 0) = 0
                                       THEN 1 ELSE 0 END), 0)
-             FROM exchanges WHERE started_at >= ?1",
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL",
             [&cutoff],
             |row| {
                 Ok(Summary {
@@ -654,7 +674,7 @@ impl Ledger {
             "SELECT backend, COUNT(*), COALESCE(SUM(cost_usd), 0.0),
                     COALESCE(SUM(cache_read_tokens), 0),
                     COALESCE(SUM(cache_write_tokens), 0)
-             FROM exchanges WHERE started_at >= ?1
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL
              GROUP BY backend ORDER BY COUNT(*) DESC",
         )?;
         let rows = statement
@@ -799,6 +819,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`LedgerError::Sqlite`] on a read failure.
+    ///
+    /// Rows with a [`Exchange::failure`] code are not calls and are left out
+    /// of every group, as in [`Ledger::summary`].
     pub fn proof_summary(&self, since: DateTime<Utc>) -> Result<ProofSummary> {
         let conn = self.lock();
         let mut statement = conn.prepare(
@@ -806,7 +829,7 @@ impl Ledger {
                     COUNT(*),
                     SUM(CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END),
                     COALESCE(SUM(cost_usd), 0.0)
-             FROM exchanges WHERE started_at >= ?1
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL
              GROUP BY 1, 2, 3",
         )?;
         let rows = statement
@@ -889,6 +912,7 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("model_alias_resolved", "TEXT"),
     ("proof", "TEXT"),
     ("proof_attempts", "INTEGER"),
+    ("failure", "TEXT"),
 ];
 
 /// Add any column in [`ADDED_COLUMNS`] the open ledger does not have.
@@ -922,7 +946,7 @@ const COLUMNS: &str = "SELECT id, started_at, ttfb_ms, total_ms, facade, path, c
             input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
             cost_usd, substitutions, status, error,
             mean_confidence, confidence_variability, confidence_bucket, confidence_tokens,
-            model_alias_resolved, proof";
+            model_alias_resolved, proof, failure";
 
 /// Rebuild the confidence aggregate from its four columns.
 ///
@@ -991,6 +1015,7 @@ fn read_exchange(row: &rusqlite::Row<'_>) -> rusqlite::Result<Exchange> {
             .get::<_, Option<String>>(30)?
             .as_deref()
             .and_then(ProofStatus::parse),
+        failure: row.get(31)?,
     })
 }
 
@@ -1041,6 +1066,7 @@ mod tests {
             error: None,
             confidence: None,
             proof: None,
+            failure: None,
         }
     }
 
@@ -1786,6 +1812,100 @@ mod tests {
         assert_eq!(read[0].attempts, 2);
     }
 
+    /// A request IronWire answered without a backend's response carries a
+    /// fixed code naming why, and nothing else: no error text, which can quote
+    /// the request.
+    #[test]
+    fn a_failure_code_survives_the_round_trip() {
+        let ledger = Ledger::in_memory().expect("opens");
+        let mut failed = exchange("none", 0);
+        failed.status = 499;
+        failed.failure = Some("client_disconnected".into());
+        ledger.record(&failed).expect("records");
+        let ok = exchange("claude-sub", 1);
+        ledger.record(&ok).expect("records");
+        let read = ledger.recent(2).expect("reads");
+        assert_eq!(
+            read[0].failure, None,
+            "a served exchange has no failure code"
+        );
+        assert_eq!(read[1].failure.as_deref(), Some("client_disconnected"));
+        assert_eq!(
+            read[1].status, 499,
+            "the new column did not shift into status"
+        );
+        assert_eq!(read[1].error, None);
+    }
+
+    /// An existing install opens, gains the column, still reads its old rows
+    /// (with no code) and records new ones with it.
+    #[test]
+    fn a_ledger_from_before_the_failure_column_upgrades_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("sqlite");
+            conn.execute_batch(
+                "CREATE TABLE exchanges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL, ttfb_ms INTEGER, total_ms INTEGER,
+                    facade TEXT NOT NULL, path TEXT NOT NULL, conversation TEXT NOT NULL,
+                    client_session_id TEXT,
+                    backend TEXT NOT NULL, requested_model TEXT, served_model TEXT,
+                    model_alias_resolved TEXT,
+                    rung TEXT NOT NULL, attempts INTEGER NOT NULL,
+                    input_tokens INTEGER, cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER, output_tokens INTEGER,
+                    cost_usd REAL, substitutions INTEGER, status INTEGER NOT NULL, error TEXT,
+                    mean_confidence REAL, confidence_variability REAL,
+                    confidence_bucket TEXT, confidence_tokens INTEGER,
+                    upstream_id TEXT, request_sha256 TEXT, response_sha256 TEXT,
+                    body_ref TEXT, proof TEXT, proof_attempts INTEGER
+                );
+                INSERT INTO exchanges
+                    (started_at, facade, path, conversation, backend, rung, attempts,
+                     status, error)
+                 VALUES
+                    ('2026-10-30T12:00:00+00:00', 'anthropic', '/v1/messages', 'c-1',
+                     'none', 'none', 0, 503, 'no route');",
+            )
+            .expect("a ledger from before the failure column");
+        }
+
+        let ledger = Ledger::open(&path).expect("the new reader opens an old file");
+        let old = ledger.recent(1).expect("reads").remove(0);
+        assert_eq!(old.status, 503, "the old row read back intact");
+        assert_eq!(
+            old.failure, None,
+            "a row from before the column has no code"
+        );
+
+        let mut failed = exchange("none", 0);
+        failed.status = 500;
+        failed.failure = Some("panic".into());
+        ledger
+            .record(&failed)
+            .expect("records through the upgraded file");
+        let rows = ledger.since(at(-1)).expect("reads");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|row| row.failure.as_deref() == Some("panic"))
+        );
+
+        // An older IronWire's reader names its columns, so the new one is
+        // simply not selected and the file stays readable to it.
+        let conn = rusqlite::Connection::open(&path).expect("sqlite");
+        let statuses: Vec<i64> = conn
+            .prepare("SELECT status FROM exchanges ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        assert_eq!(statuses, vec![503, 500]);
+    }
+
     #[test]
     fn cost_comes_from_the_shared_price_table_and_is_none_without_usage() {
         // A subscription turn still gets a price: "what this would have cost on
@@ -1968,6 +2088,90 @@ mod tests {
         assert_eq!(near.model.as_deref(), Some("Qwen/Qwen3.6-35B-A3B-FP8"));
         assert_eq!(near.route, Route::Routed);
         assert_eq!(near.work_kind, None);
+    }
+
+    /// Every code the proxy writes (`ironwire_proxy::facade::guard`).
+    const FAILURE_CODES: [&str; 6] = [
+        "panic",
+        "body_rejected",
+        "invalid_json",
+        "unknown_login",
+        "client_disconnected",
+        "unrecorded",
+    ];
+
+    /// One served exchange plus one row for every failure code.
+    fn served_and_failed(ledger: &Ledger) {
+        let mut served = nearai(0);
+        served.proof = Some(ProofStatus::Pending);
+        ledger.record(&served).expect("records");
+        for (i, code) in FAILURE_CODES.into_iter().enumerate() {
+            let mut failed = exchange("none", 1 + i64::try_from(i).expect("small"));
+            failed.status = 500;
+            failed.rung = "none".into();
+            failed.attempts = 0;
+            failed.input_tokens = None;
+            failed.cache_read_tokens = None;
+            failed.cache_write_tokens = None;
+            failed.output_tokens = None;
+            failed.cost_usd = None;
+            failed.failure = Some(code.into());
+            ledger.record(&failed).expect("records");
+        }
+    }
+
+    /// A request IronWire answered itself is kept for diagnosis, not shown as
+    /// a call: the grouped summary sees the one served exchange and nothing
+    /// else, in calls, priced calls, cost and every proof bucket.
+    #[test]
+    fn failure_rows_are_not_calls_in_the_proof_summary() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+        assert_eq!(ledger.recent(100).expect("reads").len(), 7, "all kept");
+
+        let summary = ledger.proof_summary(at(-10)).expect("summarises");
+        let calls = summary.routed.calls + summary.outside.calls + summary.unknown.calls;
+        assert_eq!(calls, 1, "{summary:#?}");
+        assert_eq!(summary.routed.calls, 1);
+        assert_eq!(summary.routed.proof.pending, 1);
+        assert_eq!(
+            summary.unknown,
+            proof::RouteTotal::default(),
+            "{summary:#?}"
+        );
+        assert_eq!(summary.outside, proof::RouteTotal::default());
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].backend, "nearai");
+    }
+
+    #[test]
+    fn failure_rows_are_not_exchanges_in_the_status_summary() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+
+        let summary = ledger.summary(at(-10)).expect("summarises");
+        assert_eq!(summary.exchanges, 1, "{summary:#?}");
+        assert_eq!(summary.without_usage, 0);
+        assert_eq!(summary.by_backend, vec![("nearai".to_string(), 1)]);
+        assert_eq!(summary.cost_by_backend.len(), 1);
+        assert_eq!(summary.cache_by_backend.len(), 1);
+    }
+
+    /// A routing refusal is a separate question and is counted as before.
+    #[test]
+    fn a_refusal_row_is_still_counted() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+        let mut refused = exchange("none", 9);
+        refused.status = 503;
+        refused.error = Some("no route".into());
+        refused.cost_usd = None;
+        ledger.record(&refused).expect("records");
+
+        assert_eq!(ledger.summary(at(-10)).expect("summarises").exchanges, 2);
+        let proof = ledger.proof_summary(at(-10)).expect("summarises");
+        assert_eq!(proof.unknown.calls, 1);
+        assert_eq!(proof.unknown.proof.unrecorded, 1);
     }
 
     /// Opening an older file adds the two columns; its rows read as absent.

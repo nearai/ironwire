@@ -195,6 +195,7 @@ fn row(backend: &str, upstream_id: &str, proof: ProofStatus) -> Exchange {
         error: None,
         confidence: None,
         proof: Some(proof),
+        failure: None,
     }
 }
 
