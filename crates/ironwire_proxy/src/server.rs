@@ -9,6 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use axum::Router;
 
 use crate::facade;
+use crate::facade::guard::{Envelope, catch_panics};
 use crate::state::AppState;
 
 /// Failure starting the daemon.
@@ -34,8 +35,14 @@ pub enum ServeError {
 /// Build the full application router.
 pub fn app(state: AppState) -> Router {
     Router::new()
-        .nest("/anthropic", facade::anthropic::router())
-        .nest("/openai", facade::openai::router())
+        .nest(
+            "/anthropic",
+            catch_panics(facade::anthropic::router(), Envelope::Anthropic),
+        )
+        .nest(
+            "/openai",
+            catch_panics(facade::openai::router(), Envelope::OpenAi),
+        )
         .nest("/_ironwire", crate::control::router())
         .with_state(state)
 }

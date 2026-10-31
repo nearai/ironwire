@@ -2,6 +2,7 @@
 
 pub mod anthropic;
 pub mod error;
+pub(crate) mod guard;
 pub mod openai;
 
 pub use error::FacadeError;
