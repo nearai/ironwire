@@ -240,7 +240,8 @@ pub struct Refusal {
     pub facade: &'static str,
     /// Path as the client asked for it.
     pub path: String,
-    /// Conversation key.
+    /// Conversation key, or [`Refusal::NO_CONVERSATION`] for a request that
+    /// failed before its body was read.
     pub conversation: String,
     /// The agent's own session id, where it sent one.
     pub client_session_id: Option<String>,
@@ -248,6 +249,13 @@ pub struct Refusal {
     pub requested_model: Option<String>,
     /// Status IronWire is about to return.
     pub status: u16,
+}
+
+impl Refusal {
+    /// The conversation recorded when none was derived. The column is
+    /// `NOT NULL`, and `none` is what `backend` and `rung` already say for a
+    /// request that reached no backend.
+    pub const NO_CONVERSATION: &'static str = "none";
 }
 
 impl Refusal {
@@ -260,7 +268,32 @@ impl Refusal {
             }
             _ => None,
         };
-        let exchange = Exchange {
+        let exchange = self.exchange(backend, Some(error.to_string()), None);
+        if let Err(error) = ledger.record(&exchange) {
+            tracing::debug!(%error, "could not write the refusal to the trace ledger");
+        }
+    }
+
+    /// Write the row for a request IronWire answered before routing it, under
+    /// the fixed code `failure`.
+    ///
+    /// No error text goes with it: what failed here was the request itself or
+    /// IronWire, and the text of either failure (a JSON parse error, a panic
+    /// message) can quote the request. Never propagates, like [`Self::write`].
+    pub fn write_failure(self, ledger: &Ledger, failure: &'static str) {
+        let exchange = self.exchange(None, None, Some(failure));
+        if let Err(error) = ledger.record(&exchange) {
+            tracing::debug!(%error, failure, "could not write a failed request to the trace ledger");
+        }
+    }
+
+    fn exchange(
+        self,
+        backend: Option<String>,
+        error: Option<String>,
+        failure: Option<&'static str>,
+    ) -> Exchange {
+        Exchange {
             id: None,
             started_at: self.started_at,
             ttfb_ms: None,
@@ -287,16 +320,14 @@ impl Refusal {
             cost_usd: None,
             substitutions: None,
             status: i64::from(self.status),
-            error: Some(error.to_string()),
+            error,
             confidence: None,
             // No backend answered, so there is no answer to prove -- and no
             // backend kind in hand to say which side of the routed/outside line
             // it would have fallen on. Absent, not `outside`: the rollup keeps
             // these with the rows it cannot place rather than guessing.
             proof: None,
-        };
-        if let Err(error) = ledger.record(&exchange) {
-            tracing::debug!(%error, "could not write the refusal to the trace ledger");
+            failure: failure.map(str::to_string),
         }
     }
 }
@@ -1718,6 +1749,7 @@ impl LedgerContext {
             } else {
                 ironwire_ledger::ProofStatus::Outside
             }),
+            failure: None,
         };
         // Metered spend only, and recorded even when the exchange failed:
         // tokens burned by a request that 500'd were still billed.

@@ -332,6 +332,7 @@ pub(crate) mod test_support {
             error: None,
             confidence: None,
             proof: None,
+            failure: None,
         }
     }
 
