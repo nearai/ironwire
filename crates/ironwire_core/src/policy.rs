@@ -7,6 +7,7 @@
 //! (`docs/CRITIQUE.md` §1). So a route change is a state transition taken under
 //! sustained pressure, not a fresh choice made 200 times an hour.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -149,6 +150,13 @@ pub struct Candidate {
     /// model — and substituting our newest known name for the client's is how
     /// `claude-opus-5` became `claude-opus-4-6` and failed.
     pub catalogue_from_provider: bool,
+    /// Input windows, in tokens, the provider stated for individual models.
+    ///
+    /// Sizes the context check for a request whose model this backend lists
+    /// (see [`Self::catalogue_from_provider`]); any other request is sized by
+    /// [`Capabilities::context_tokens`], the backend's default. Empty for a
+    /// backend whose provider states none.
+    pub context_windows: Vec<(String, u32)>,
 }
 
 /// The router's answer.
@@ -969,9 +977,15 @@ impl Policy {
                 // still passes the original mid-loop gate unchanged.
                 requirements.mid_tool_loop = false;
             }
+            // The pinned model is the one that will be served; without one,
+            // the client's, as `keep_listed_model` will keep it.
+            let sized = sized_for(
+                candidate,
+                model.as_deref().or(peek.requested_model.as_deref()),
+            );
             eligible(
                 &requirements,
-                &candidate.caps,
+                &sized,
                 cross,
                 Some((
                     candidate.id.as_str(),
@@ -1718,9 +1732,10 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
     // decided by the emitter, on the body, in `pipeline::translate_request`.
     let cross = !candidate.caps.wires.speaks(inbound);
     let requirements = requirements_for(candidate, peek, accounts.origin);
+    let sized = sized_for(candidate, peek.requested_model.as_deref());
     eligible(
         &requirements,
-        &candidate.caps,
+        &sized,
         cross,
         Some((
             candidate.id.as_str(),
@@ -1732,6 +1747,33 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
         )),
     )
     .map_err(Unusable::Ineligible)
+}
+
+/// `candidate`'s capabilities, with the context window of `model` when the
+/// provider listed that model and stated a window for it.
+///
+/// Only a provider-listed model, for the reason [`keep_listed_model`] gives:
+/// that is the case in which the named model is the one served. Anything else
+/// is sized by the backend's default, which is what every request was sized by
+/// before providers' windows were read.
+fn sized_for<'a>(candidate: &'a Candidate, model: Option<&str>) -> Cow<'a, Capabilities> {
+    let window = model
+        .filter(|_| candidate.catalogue_from_provider)
+        .filter(|model| candidate.models.iter().any(|(listed, _)| listed == model))
+        .and_then(|model| {
+            candidate
+                .context_windows
+                .iter()
+                .find(|(listed, _)| listed == model)
+        })
+        .map(|(_, window)| *window);
+    match window {
+        Some(window) if window != candidate.caps.context_tokens => Cow::Owned(Capabilities {
+            context_tokens: window,
+            ..candidate.caps.clone()
+        }),
+        _ => Cow::Borrowed(&candidate.caps),
+    }
 }
 
 /// Serve the model the client named when the chosen backend's provider lists
@@ -1962,6 +2004,7 @@ mod tests {
             ],
             catalogue_from_provider: true,
             trusted: true,
+            context_windows: Vec::new(),
         }
     }
 
@@ -5212,6 +5255,139 @@ mod tests {
         near
     }
 
+    /// NEAR AI as it answers `/v1/models` today: GLM 5.3 with a 1M-token
+    /// window, a model with a 32K one, one that states none, and the 128K
+    /// default the backend falls back to.
+    fn near_with_windows() -> Candidate {
+        let mut near = candidate("nearai", BackendKind::Credits, Protocol::OpenAiChat);
+        near.caps.context_tokens = 128_000;
+        near.models = ["z-ai/glm-5.3", "small/model-32k", "qwen/qwen3.7-max"]
+            .into_iter()
+            .map(|m| (m.to_string(), ModelTier::Frontier))
+            .collect();
+        near.context_windows = vec![
+            ("z-ai/glm-5.3".to_string(), 1_048_576),
+            ("small/model-32k".to_string(), 32_000),
+        ];
+        near
+    }
+
+    fn sized(model: &str, tokens: u32) -> RequestPeek {
+        let mut peek = peek(model);
+        peek.requirements.min_context_tokens = tokens;
+        peek
+    }
+
+    fn refused_for_context(result: Result<RouteDecision, NoRoute>) -> bool {
+        matches!(
+            result,
+            Err(NoRoute::NoneUsable { refusals })
+                if refusals.iter().any(|(_, why)| {
+                    *why == Refusal::Ineligible(Ineligible::ContextTooSmall)
+                })
+        )
+    }
+
+    /// The 1.1 MB opencode turn that NEAR AI refused with `ContextTooSmall`
+    /// although GLM 5.3 states a 1,048,576-token window.
+    #[test]
+    fn a_provider_stated_window_admits_a_request_past_the_default() {
+        let decision = Policy::new()
+            .decide(
+                key(),
+                Protocol::OpenAiChat,
+                &sized("z-ai/glm-5.3", 300_000),
+                &[near_with_windows()],
+                t(0),
+            )
+            .expect("a 300K-token request fits a 1M-token window");
+        assert_eq!(decision.backend.as_str(), "nearai");
+    }
+
+    /// A model the provider gives no window for keeps the backend default.
+    #[test]
+    fn a_model_without_a_stated_window_keeps_the_default() {
+        let result = Policy::new().decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("qwen/qwen3.7-max", 300_000),
+            &[near_with_windows()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+        Policy::new()
+            .decide(
+                key(),
+                Protocol::OpenAiChat,
+                &sized("qwen/qwen3.7-max", 100_000),
+                &[near_with_windows()],
+                t(0),
+            )
+            .expect("100K tokens still fit the 128K default");
+    }
+
+    /// A window smaller than the default is the provider's word too.
+    #[test]
+    fn a_provider_stated_smaller_window_refuses_what_does_not_fit() {
+        let result = Policy::new().decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("small/model-32k", 100_000),
+            &[near_with_windows()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
+    /// A window is only believed for a model the provider itself listed: a
+    /// compiled-in catalogue is a guess, and so is any size attached to it.
+    #[test]
+    fn a_compiled_in_catalogue_keeps_the_default_window() {
+        let mut near = near_with_windows();
+        near.catalogue_from_provider = false;
+        let result = Policy::new().decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("z-ai/glm-5.3", 300_000),
+            &[near],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
+    /// A pin naming a model is sized by that model, whatever the client sent.
+    #[test]
+    fn a_pinned_model_is_sized_by_its_own_window() {
+        let mut policy = Policy::new();
+        policy.set_pin(
+            Some(BackendId::from("nearai")),
+            Some("z-ai/glm-5.3".to_string()),
+        );
+        policy
+            .decide(
+                key(),
+                Protocol::OpenAiChat,
+                &sized("qwen/qwen3.7-max", 300_000),
+                &[near_with_windows()],
+                t(0),
+            )
+            .expect("the pinned model's 1M window applies");
+
+        let mut policy = Policy::new();
+        policy.set_pin(
+            Some(BackendId::from("nearai")),
+            Some("small/model-32k".to_string()),
+        );
+        let result = policy.decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("z-ai/glm-5.3", 100_000),
+            &[near_with_windows()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
     /// The model a client names is a hint only when the backend cannot say
     /// whether it serves it. A pin on the backend alone used to re-pick by
     /// tier, so a tool's own model picker chose nothing: every request went to
@@ -5607,6 +5783,7 @@ mod compaction_tests {
             // for a catalogue the provider gave us, not one we guessed.
             catalogue_from_provider: true,
             trusted: true,
+            context_windows: Vec::new(),
         }
     }
 

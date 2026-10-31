@@ -312,6 +312,16 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Input windows, in tokens, the provider stated for individual models.
+    ///
+    /// The window less the model's output limit, where the provider states
+    /// one below it. Routing sizes a request for a listed model by its entry
+    /// here and anything else by [`Capabilities::context_tokens`]. Default
+    /// empty: a backend whose provider states no windows keeps its default.
+    fn context_windows(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
+
     /// The client identity this backend will only serve, if it has one
     /// (`docs/TRANSLATION.md` aside, this is `docs/TRUST.md` §3).
     ///

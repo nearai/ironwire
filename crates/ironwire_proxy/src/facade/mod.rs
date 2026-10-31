@@ -6,6 +6,54 @@ pub mod openai;
 
 pub use error::FacadeError;
 
+/// The largest request body either façade accepts, in bytes: 32 MiB.
+///
+/// The ledger's own ceiling on one captured body
+/// ([`ironwire_ledger::token_spool::MAX_BODY_BYTES`]), so a request the proxy
+/// accepts is never one the ledger must turn away for size. Against the
+/// routing gate's estimate of four bytes per token, the largest window
+/// IronWire routes to today (1,048,576 tokens) is about 4 MiB of text; the
+/// rest is room for JSON escaping, tool schemas and inline images, which cost
+/// bytes without costing as many tokens. axum's 2 MB default refused such a
+/// turn before routing ever saw it.
+pub const MAX_REQUEST_BODY_BYTES: usize = ironwire_ledger::token_spool::MAX_BODY_BYTES;
+
+/// A façade request body, refused in the façade's own error envelope.
+///
+/// `OPENAI` picks the envelope. axum's own rejection is a plain-text body in
+/// neither provider's error shape, so a client cannot read why it was refused.
+pub(crate) struct FacadeBody<const OPENAI: bool>(pub(crate) Bytes);
+
+impl<const OPENAI: bool, S: Send + Sync> FromRequest<S> for FacadeBody<OPENAI> {
+    type Rejection = FacadeError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Bytes::from_request(request, state)
+            .await
+            .map(Self)
+            .map_err(|rejection| {
+                let status = rejection.status();
+                let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    format!(
+                        "the request body is larger than IronWire accepts ({} MiB)",
+                        MAX_REQUEST_BODY_BYTES / (1024 * 1024)
+                    )
+                } else {
+                    rejection.body_text()
+                };
+                let error = FacadeError::new(status, "invalid_request_error", message);
+                if OPENAI {
+                    error.on_openai_facade(false)
+                } else {
+                    error
+                }
+            })
+    }
+}
+
+use axum::body::Bytes;
+use axum::extract::{FromRequest, Request};
+use axum::http::StatusCode;
 use ironwire_core::policy::ConversationKey;
 use ironwire_core::protocol::BackendId;
 use ironwire_creds::{SubscriptionLogin, SubscriptionProduct};
