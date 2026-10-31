@@ -175,9 +175,7 @@ fn find_pii(text: &str) -> Vec<Finding> {
     while let Some(offset) = text[index..].find('@') {
         let at = index + offset;
         index = at + 1;
-        let start = text[..at]
-            .rfind(|c: char| !is_email_local(c))
-            .map_or(0, |boundary| boundary + 1);
+        let start = start_after_last(&text[..at], |c| !is_email_local(c));
         let after = &text[at + 1..];
         let host_len = after
             .find(|c: char| !is_email_host(c))
@@ -234,9 +232,7 @@ fn find_pii(text: &str) -> Vec<Finding> {
     let mut cursor = 0;
     while let Some(offset) = text[cursor..].find(':') {
         let colon = cursor + offset;
-        let start = text[..colon]
-            .rfind(|c: char| !is_ipv6_char(c))
-            .map_or(0, |boundary| boundary + 1);
+        let start = start_after_last(&text[..colon], |c| !is_ipv6_char(c));
         let after = &text[start..];
         let len = after
             .find(|c: char| !is_ipv6_char(c))
@@ -281,6 +277,19 @@ fn find_pii(text: &str) -> Vec<Finding> {
     }
 
     findings
+}
+
+/// The byte offset just past the last character of `text` that matches
+/// `stop`, or 0 when none does.
+///
+/// Past the whole character, not one byte past where it starts: the character
+/// that ends an address is often multi-byte (`→`, `é`, `…`, any CJK text), and
+/// `+ 1` from its start lands inside it, where slicing `text` panics.
+fn start_after_last(text: &str, stop: impl Fn(char) -> bool) -> usize {
+    text.char_indices()
+        .rev()
+        .find(|&(_, c)| stop(c))
+        .map_or(0, |(at, c)| at + c.len_utf8())
 }
 
 fn is_email_local(c: char) -> bool {
@@ -519,6 +528,49 @@ mod tests {
             named_values: Vec::new(),
             pii: false,
         })
+    }
+
+    fn pii_only() -> Detector {
+        Detector::new(&Tiers {
+            secrets: false,
+            named_values: Vec::new(),
+            pii: true,
+        })
+    }
+
+    /// A multi-byte character right before a colon or an email local part
+    /// used to put the scan start inside that character, and the slice
+    /// panicked. Every later request of the conversation carried the same
+    /// text, so the session failed on every turn.
+    #[test]
+    fn a_multibyte_character_before_a_colon_or_an_address_does_not_panic() {
+        let detector = pii_only();
+        for text in [
+            "→: done",
+            "café: ok",
+            "status ✓: passed",
+            "日本語:テスト",
+            "…::",
+            "→alice@corp.io",
+            "名前@corp.io",
+        ] {
+            let _ = detector.find(text);
+        }
+    }
+
+    #[test]
+    fn an_address_right_after_a_multibyte_character_is_still_found_whole() {
+        let detector = pii_only();
+
+        let text = "→2a01:4f8:c0c:1::1 is the host";
+        let findings = detector.find(text);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(&text[findings[0].range.clone()], "2a01:4f8:c0c:1::1");
+
+        let text = "→alice@corp.io wrote";
+        let findings = detector.find(text);
+        assert_eq!(findings.len(), 1, "got {findings:?}");
+        assert_eq!(&text[findings[0].range.clone()], "alice@corp.io");
     }
 
     #[test]
