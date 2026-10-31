@@ -201,6 +201,13 @@ async fn a_cancelled_request_still_records_what_it_consumed() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
+    // The tee's row is the request's only row: the façade guard must not
+    // also record the abandoned request as a disconnect.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let rows = ledger.recent(10).expect("reads");
+    assert_eq!(rows.len(), 1, "one request, one row: {rows:#?}");
+    assert_eq!(rows[0].failure, None);
+
     assert_eq!(recorded.backend, "anthropic-key");
     assert_eq!(
         recorded.input_tokens,

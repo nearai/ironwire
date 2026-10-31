@@ -15,7 +15,7 @@ use super::client_session_id;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,6 +26,7 @@ use ironwire_creds::SubscriptionProduct;
 use ironwire_upstream::headers::{forward_request_header, forward_response_header};
 
 use crate::facade::error::FacadeError;
+use crate::facade::guard::{self, RowClaim};
 use crate::pipeline::{self, dialect_for};
 use crate::resilience;
 use crate::state::AppState;
@@ -47,9 +48,12 @@ pub fn router() -> Router<AppState> {
 async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
+    claim: Option<Extension<RowClaim>>,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
+    let claim = RowClaim::from_extension(claim);
     forward(
+        claim,
         state,
         headers,
         body,
@@ -63,9 +67,12 @@ async fn responses(
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
+    claim: Option<Extension<RowClaim>>,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
+    let claim = RowClaim::from_extension(claim);
     forward(
+        claim,
         state,
         headers,
         body,
@@ -80,10 +87,14 @@ async fn bound_responses(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
+    claim: Option<Extension<RowClaim>>,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    let login = bound(&state, &super::account_segment(account))?;
+    let claim = RowClaim::from_extension(claim);
+    let login = bound(&state, &super::account_segment(account))
+        .inspect_err(|_| claim.failed(guard::UNKNOWN_LOGIN))?;
     forward(
+        claim,
         state,
         headers,
         body,
@@ -98,10 +109,14 @@ async fn bound_chat_completions(
     State(state): State<AppState>,
     account: Result<Path<String>, PathRejection>,
     headers: HeaderMap,
+    claim: Option<Extension<RowClaim>>,
     body: Bytes,
 ) -> Result<Response, FacadeError> {
-    let login = bound(&state, &super::account_segment(account))?;
+    let claim = RowClaim::from_extension(claim);
+    let login = bound(&state, &super::account_segment(account))
+        .inspect_err(|_| claim.failed(guard::UNKNOWN_LOGIN))?;
     forward(
+        claim,
         state,
         headers,
         body,
@@ -228,6 +243,7 @@ async fn openai_shaped_models(state: AppState, client_login: Option<BackendId>) 
 }
 
 async fn forward(
+    claim: RowClaim,
     state: AppState,
     headers: HeaderMap,
     body: Bytes,
@@ -239,8 +255,10 @@ async fn forward(
     let started = std::time::Instant::now();
     // Parsed once, for the peek only. The bytes we forward are the bytes we
     // received unless policy changes the model (`docs/PROTOCOL.md` §2).
-    let parsed: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| FacadeError::invalid_request(format!("body is not valid JSON: {e}")))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        claim.failed(guard::INVALID_JSON);
+        FacadeError::invalid_request(format!("body is not valid JSON: {e}"))
+    })?;
     let markers = state.identity_markers();
     let mut peek = RequestPeek::inspect_with(protocol, &parsed, body.len(), &markers);
     // The body-side marker is only half the signal, and it is the half that
@@ -278,6 +296,11 @@ async fn forward(
     );
     let peek = peek;
     let conversation = key.0;
+    claim.describe(
+        conversation.to_string(),
+        peek.client_session.clone(),
+        peek.requested_model.clone(),
+    );
 
     // The privacy filter is the one documented exception to byte-identical
     // forwarding (`docs/PROTOCOL.md` §2), and it is opt-in. With it off,
@@ -337,6 +360,7 @@ async fn forward(
             }
             .write(ledger, &e);
         }
+        claim.arranged();
         rendered
     })?;
 
@@ -404,6 +428,9 @@ async fn forward(
             }
         },
     );
+    // The tee writes this request's row when the body ends or is dropped,
+    // including when it is dropped unread.
+    claim.arranged();
 
     // Put the real values back before anything reaches the client. This runs
     // inside the resilience guard's input, so a reconnect gets its own

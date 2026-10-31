@@ -37,11 +37,19 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .nest(
             "/anthropic",
-            catch_panics(facade::anthropic::router(), Envelope::Anthropic),
+            catch_panics(
+                facade::anthropic::router(),
+                Envelope::Anthropic,
+                state.ledger.clone(),
+            ),
         )
         .nest(
             "/openai",
-            catch_panics(facade::openai::router(), Envelope::OpenAi),
+            catch_panics(
+                facade::openai::router(),
+                Envelope::OpenAi,
+                state.ledger.clone(),
+            ),
         )
         .nest("/_ironwire", crate::control::router())
         .with_state(state)

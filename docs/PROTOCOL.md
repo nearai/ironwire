@@ -53,7 +53,8 @@ one of the user's logins (`DESIGN.md` §5):
   no other way (below). Anything else is a 404 in the façade's own envelope —
   Anthropic `not_found_error`, OpenAI `invalid_request_error` — naming the
   logins that do exist, their URLs, and the command that adds one. Nothing is
-  sent and no ledger row is written. It is never served as the plain façade
+  sent, and the ledger row records only the 404 and the code `unknown_login`
+  (§3). It is never served as the plain façade
   instead: that would put one account's request on another account's token. An
   `{id}` that is not a plain identifier is described in the message rather than
   echoed back to a terminal. That includes an empty one, and one that is not
@@ -232,6 +233,30 @@ Usage and quota come off the wire, never from a model of our own (DESIGN §4).
 
 An exchange whose usage could not be observed is recorded with
 `usage: unknown`, not with an estimate.
+
+### Every exchange leaves one row, including the failed ones
+
+Every `POST` to a façade route leaves exactly one ledger row. A request that
+reached a backend is recorded when its response ends or is dropped (§4); a
+routing refusal is recorded with its reason in `error`. A request IronWire
+answered itself, before routing it, is recorded by the façade guard
+(`crates/ironwire_proxy/src/facade/guard.rs`) with backend, rung and
+conversation `none`, no tokens, no proof, no `error`, and a fixed code in
+`failure`:
+
+| `failure` | status | when |
+|---|---|---|
+| `panic` | 500 | the handler panicked |
+| `body_rejected` | 413 / 400 | the body was refused before the handler ran (over the size limit, or unreadable) |
+| `invalid_json` | 400 | the body is not JSON |
+| `unknown_login` | 404 | a login-bound URL names no login (§1) |
+| `client_disconnected` | 499 | the client went away before the response began; no client saw this status |
+| `unrecorded` | as answered | a handler answered without arranging a row; none does today |
+
+No request content, error text or panic message is ever written to these rows:
+the text of a parse error or a panic can quote the request. A model listing,
+and the router's own 404 or 405 for a path or method no route takes, are not
+exchanges and leave no row.
 
 ### Model substitution
 

@@ -763,6 +763,7 @@ mod log_tests {
             error: None,
             confidence: None,
             proof: None,
+            failure: None,
         }
     }
 
