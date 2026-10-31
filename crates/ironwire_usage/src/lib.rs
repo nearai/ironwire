@@ -500,6 +500,26 @@ mod tests {
         assert_eq!(report.sessions[0].backend, "claude-sub");
     }
 
+    /// A request IronWire answered itself carries no usage and is not a call:
+    /// it must not open a usage window of its own.
+    #[test]
+    fn a_failed_request_opens_no_session() {
+        let now = at("2026-08-09T14:00:00Z");
+        let mut rows = ledger(&[("claude-sub", "2026-08-09T13:00:00Z", 90_000, 1.0)]);
+        let mut failed = exchange("none", at("2026-08-09T13:10:00Z"));
+        failed.failure = Some("client_disconnected".into());
+        rows.push(failed.clone());
+        let mut same_backend = failed;
+        same_backend.backend = "claude-sub".into();
+        same_backend.failure = Some("panic".into());
+        rows.push(same_backend);
+
+        let report = report(&rows, now, &Options::default());
+        assert_eq!(report.sessions.len(), 1, "{:#?}", report.sessions);
+        assert_eq!(report.sessions[0].backend, "claude-sub");
+        assert_eq!(report.sessions[0].exchanges, 1);
+    }
+
     #[test]
     fn a_closed_window_is_history_and_not_shown_as_open() {
         let report = report(

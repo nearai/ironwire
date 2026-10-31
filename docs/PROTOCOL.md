@@ -253,6 +253,11 @@ conversation `none`, no tokens, no proof, no `error`, and a fixed code in
 | `client_disconnected` | 499 | the client went away before the response began; no client saw this status |
 | `unrecorded` | as answered | a handler answered without arranging a row; none does today |
 
+These rows are kept for diagnosis and appear in `ironwire log`'s row listing,
+but they are not calls: the summaries (`ironwire log` totals, `ironwire status`,
+the usage windows, and the control API's grouped summary) leave every row with
+a `failure` code out. Routing refusals have no code and are still counted.
+
 No request content, error text or panic message is ever written to these rows:
 the text of a parse error or a panic can quote the request. A model listing,
 and the router's own 404 or 405 for a path or method no route takes, are not
