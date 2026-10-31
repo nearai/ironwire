@@ -18,6 +18,7 @@ use axum::http::{Request, StatusCode};
 use ironwire_core::config::Config;
 use ironwire_creds::ConsentLedger;
 use ironwire_ledger::{Exchange, Ledger};
+use ironwire_proxy::facade::MAX_REQUEST_BODY_BYTES;
 use ironwire_proxy::server::app;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_upstream::anthropic::AnthropicBackend;
@@ -79,30 +80,79 @@ fn only_row(ledger: &Ledger) -> Exchange {
     row
 }
 
+/// The four inference routes, one per façade lane.
+const PATHS: [&str; 4] = [
+    "/anthropic/v1/messages",
+    "/anthropic/v1/messages/count_tokens",
+    "/openai/v1/chat/completions",
+    "/openai/v1/responses",
+];
+
 #[tokio::test]
 async fn a_body_over_the_limit_is_recorded_as_rejected() {
-    let ledger = Ledger::in_memory().expect("ledger opens");
-    // Over axum's default 2 MB limit on the `Bytes` extractor.
+    // Over the façades' own limit, refused by `FacadeBody` before the handler
+    // runs, in the façade's JSON envelope.
     let mut body =
         format!(r#"{{"model":"claude-opus-4-6","messages":[{{"role":"user","content":"{SECRET}"#);
-    body.push_str(&"x".repeat(3 * 1024 * 1024));
+    body.push_str(&"x".repeat(MAX_REQUEST_BODY_BYTES));
     body.push_str(r#""}]}"#);
+    let body = bytes::Bytes::from(body);
 
-    let response = app(state_for(NOWHERE, ledger.clone()))
-        .oneshot(post("/anthropic/v1/messages", body))
-        .await
-        .expect("served");
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    for path in PATHS {
+        let ledger = Ledger::in_memory().expect("ledger opens");
+        let response = app(state_for(NOWHERE, ledger.clone()))
+            .oneshot(post(path, body.clone()))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        let answer = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let error: serde_json::Value = serde_json::from_slice(&answer)
+            .unwrap_or_else(|_| panic!("{path}: not JSON: {}", String::from_utf8_lossy(&answer)));
+        assert_eq!(error["error"]["type"], "invalid_request_error", "{path}");
 
-    let row = only_row(&ledger);
-    assert_eq!(row.status, 413);
-    assert_eq!(row.failure.as_deref(), Some("body_rejected"));
-    assert_eq!(row.facade, "anthropic");
-    assert_eq!(row.path, "/v1/messages");
-    assert_eq!(
-        row.requested_model, None,
-        "the body was never read, so no model is known"
-    );
+        let row = only_row(&ledger);
+        assert_eq!(row.status, 413, "{path}");
+        assert_eq!(row.failure.as_deref(), Some("body_rejected"), "{path}");
+        let (facade, beneath) = path[1..].split_once('/').expect("a façade path");
+        assert_eq!(row.facade, facade);
+        assert_eq!(row.path, format!("/{beneath}"));
+        assert_eq!(
+            row.requested_model, None,
+            "the body was never read, so no model is known"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_body_that_cannot_be_read_is_recorded_as_rejected() {
+    for path in PATHS {
+        let ledger = Ledger::in_memory().expect("ledger opens");
+        let broken = Body::from_stream(futures_util::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{\"model\":")),
+            Err(std::io::Error::other("the client's stream broke")),
+        ]));
+        let response = app(state_for(NOWHERE, ledger.clone()))
+            .oneshot(post(path, broken))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+
+        let row = only_row(&ledger);
+        assert_eq!(row.status, 400, "{path}");
+        assert_eq!(
+            row.failure.as_deref(),
+            Some("body_rejected"),
+            "{path}: not the `unrecorded` backstop"
+        );
+        assert!(
+            !serde_json::to_string(&row)
+                .expect("serializes")
+                .contains("broke"),
+            "{path}: the read error's text reached the row"
+        );
+    }
 }
 
 #[tokio::test]
