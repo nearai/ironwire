@@ -207,6 +207,9 @@ pub struct Exchange {
     /// `None` on every exchange a backend answered, on a routing refusal (whose
     /// reason is in [`Self::error`]), and on a row written before the column
     /// existed.
+    ///
+    /// A row with a code is kept for diagnosis but is not a call: the
+    /// aggregates ([`Ledger::summary`], [`Ledger::proof_summary`]) leave it out.
     #[serde(default)]
     pub failure: Option<String>,
 }
@@ -621,6 +624,10 @@ impl Ledger {
 
     /// Aggregate the last `window`.
     ///
+    /// Rows with a [`Exchange::failure`] code are not exchanges here: they
+    /// are requests IronWire answered itself, kept for diagnosis and left out
+    /// of every count. A routing refusal (`failure` NULL) is still counted.
+    ///
     /// # Errors
     ///
     /// [`LedgerError::Sqlite`] on a read failure.
@@ -640,7 +647,7 @@ impl Ledger {
                     COALESCE(SUM(CASE WHEN COALESCE(cache_write_tokens, 0) > 0
                                        AND COALESCE(cache_read_tokens, 0) = 0
                                       THEN 1 ELSE 0 END), 0)
-             FROM exchanges WHERE started_at >= ?1",
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL",
             [&cutoff],
             |row| {
                 Ok(Summary {
@@ -667,7 +674,7 @@ impl Ledger {
             "SELECT backend, COUNT(*), COALESCE(SUM(cost_usd), 0.0),
                     COALESCE(SUM(cache_read_tokens), 0),
                     COALESCE(SUM(cache_write_tokens), 0)
-             FROM exchanges WHERE started_at >= ?1
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL
              GROUP BY backend ORDER BY COUNT(*) DESC",
         )?;
         let rows = statement
@@ -812,6 +819,9 @@ impl Ledger {
     /// # Errors
     ///
     /// [`LedgerError::Sqlite`] on a read failure.
+    ///
+    /// Rows with a [`Exchange::failure`] code are not calls and are left out
+    /// of every group, as in [`Ledger::summary`].
     pub fn proof_summary(&self, since: DateTime<Utc>) -> Result<ProofSummary> {
         let conn = self.lock();
         let mut statement = conn.prepare(
@@ -819,7 +829,7 @@ impl Ledger {
                     COUNT(*),
                     SUM(CASE WHEN cost_usd IS NULL THEN 0 ELSE 1 END),
                     COALESCE(SUM(cost_usd), 0.0)
-             FROM exchanges WHERE started_at >= ?1
+             FROM exchanges WHERE started_at >= ?1 AND failure IS NULL
              GROUP BY 1, 2, 3",
         )?;
         let rows = statement
@@ -2078,6 +2088,90 @@ mod tests {
         assert_eq!(near.model.as_deref(), Some("Qwen/Qwen3.6-35B-A3B-FP8"));
         assert_eq!(near.route, Route::Routed);
         assert_eq!(near.work_kind, None);
+    }
+
+    /// Every code the proxy writes (`ironwire_proxy::facade::guard`).
+    const FAILURE_CODES: [&str; 6] = [
+        "panic",
+        "body_rejected",
+        "invalid_json",
+        "unknown_login",
+        "client_disconnected",
+        "unrecorded",
+    ];
+
+    /// One served exchange plus one row for every failure code.
+    fn served_and_failed(ledger: &Ledger) {
+        let mut served = nearai(0);
+        served.proof = Some(ProofStatus::Pending);
+        ledger.record(&served).expect("records");
+        for (i, code) in FAILURE_CODES.into_iter().enumerate() {
+            let mut failed = exchange("none", 1 + i64::try_from(i).expect("small"));
+            failed.status = 500;
+            failed.rung = "none".into();
+            failed.attempts = 0;
+            failed.input_tokens = None;
+            failed.cache_read_tokens = None;
+            failed.cache_write_tokens = None;
+            failed.output_tokens = None;
+            failed.cost_usd = None;
+            failed.failure = Some(code.into());
+            ledger.record(&failed).expect("records");
+        }
+    }
+
+    /// A request IronWire answered itself is kept for diagnosis, not shown as
+    /// a call: the grouped summary sees the one served exchange and nothing
+    /// else, in calls, priced calls, cost and every proof bucket.
+    #[test]
+    fn failure_rows_are_not_calls_in_the_proof_summary() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+        assert_eq!(ledger.recent(100).expect("reads").len(), 7, "all kept");
+
+        let summary = ledger.proof_summary(at(-10)).expect("summarises");
+        let calls = summary.routed.calls + summary.outside.calls + summary.unknown.calls;
+        assert_eq!(calls, 1, "{summary:#?}");
+        assert_eq!(summary.routed.calls, 1);
+        assert_eq!(summary.routed.proof.pending, 1);
+        assert_eq!(
+            summary.unknown,
+            proof::RouteTotal::default(),
+            "{summary:#?}"
+        );
+        assert_eq!(summary.outside, proof::RouteTotal::default());
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].backend, "nearai");
+    }
+
+    #[test]
+    fn failure_rows_are_not_exchanges_in_the_status_summary() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+
+        let summary = ledger.summary(at(-10)).expect("summarises");
+        assert_eq!(summary.exchanges, 1, "{summary:#?}");
+        assert_eq!(summary.without_usage, 0);
+        assert_eq!(summary.by_backend, vec![("nearai".to_string(), 1)]);
+        assert_eq!(summary.cost_by_backend.len(), 1);
+        assert_eq!(summary.cache_by_backend.len(), 1);
+    }
+
+    /// A routing refusal is a separate question and is counted as before.
+    #[test]
+    fn a_refusal_row_is_still_counted() {
+        let ledger = Ledger::in_memory().expect("opens");
+        served_and_failed(&ledger);
+        let mut refused = exchange("none", 9);
+        refused.status = 503;
+        refused.error = Some("no route".into());
+        refused.cost_usd = None;
+        ledger.record(&refused).expect("records");
+
+        assert_eq!(ledger.summary(at(-10)).expect("summarises").exchanges, 2);
+        let proof = ledger.proof_summary(at(-10)).expect("summarises");
+        assert_eq!(proof.unknown.calls, 1);
+        assert_eq!(proof.unknown.proof.unrecorded, 1);
     }
 
     /// Opening an older file adds the two columns; its rows read as absent.

@@ -140,7 +140,9 @@ pub fn build(exchanges: &[Exchange], session: Duration, now: DateTime<Utc>) -> V
     // pools, and one burn rate across both would describe neither.
     let mut by_backend: std::collections::BTreeMap<&str, Vec<&Exchange>> =
         std::collections::BTreeMap::new();
-    for exchange in exchanges {
+    // A request IronWire answered itself (a `failure` code) used nothing and
+    // is not a call, so it opens and extends no window.
+    for exchange in exchanges.iter().filter(|e| e.failure.is_none()) {
         by_backend
             .entry(exchange.backend.as_str())
             .or_default()
