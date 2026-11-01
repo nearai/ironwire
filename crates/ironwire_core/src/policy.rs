@@ -150,7 +150,8 @@ pub struct Candidate {
     /// model — and substituting our newest known name for the client's is how
     /// `claude-opus-5` became `claude-opus-4-6` and failed.
     pub catalogue_from_provider: bool,
-    /// Input windows, in tokens, the provider stated for individual models.
+    /// Context windows, in tokens, the provider stated for individual models:
+    /// prompt and answer together, as the provider states them.
     ///
     /// Sizes the context check for a request whose model this backend lists
     /// (see [`Self::catalogue_from_provider`]); any other request is sized by
@@ -977,12 +978,8 @@ impl Policy {
                 // still passes the original mid-loop gate unchanged.
                 requirements.mid_tool_loop = false;
             }
-            // The pinned model is the one that will be served; without one,
-            // the client's, as `keep_listed_model` will keep it.
-            let sized = sized_for(
-                candidate,
-                model.as_deref().or(peek.requested_model.as_deref()),
-            );
+            let served = served_model(candidate, model.as_deref(), peek, tier);
+            let sized = sized_for(candidate, served.as_deref());
             eligible(
                 &requirements,
                 &sized,
@@ -1696,6 +1693,7 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
     let Turn {
         inbound,
         peek,
+        tier,
         now,
         accounts,
         ..
@@ -1732,7 +1730,8 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
     // decided by the emitter, on the body, in `pipeline::translate_request`.
     let cross = !candidate.caps.wires.speaks(inbound);
     let requirements = requirements_for(candidate, peek, accounts.origin);
-    let sized = sized_for(candidate, peek.requested_model.as_deref());
+    let served = served_model(candidate, None, peek, tier);
+    let sized = sized_for(candidate, served.as_deref());
     eligible(
         &requirements,
         &sized,
@@ -1752,10 +1751,10 @@ fn usable(candidate: &Candidate, turn: Turn<'_>) -> Result<(), Unusable> {
 /// `candidate`'s capabilities, with the context window of `model` when the
 /// provider listed that model and stated a window for it.
 ///
-/// Only a provider-listed model, for the reason [`keep_listed_model`] gives:
-/// that is the case in which the named model is the one served. Anything else
-/// is sized by the backend's default, which is what every request was sized by
-/// before providers' windows were read.
+/// `model` is the one [`served_model`] says will be served. Its window is
+/// believed only when the provider listed it; anything else is sized by the
+/// backend's default, which is what every request was sized by before
+/// providers' windows were read.
 fn sized_for<'a>(candidate: &'a Candidate, model: Option<&str>) -> Cow<'a, Capabilities> {
     let window = model
         .filter(|_| candidate.catalogue_from_provider)
@@ -1768,11 +1767,34 @@ fn sized_for<'a>(candidate: &'a Candidate, model: Option<&str>) -> Cow<'a, Capab
         })
         .map(|(_, window)| *window);
     match window {
-        Some(window) if window != candidate.caps.context_tokens => Cow::Owned(Capabilities {
+        Some(window) => Cow::Owned(Capabilities {
             context_tokens: window,
+            context_from_provider: true,
             ..candidate.caps.clone()
         }),
-        _ => Cow::Borrowed(&candidate.caps),
+        None => Cow::Borrowed(&candidate.caps),
+    }
+}
+
+/// The model `candidate` will serve this request: a pinned model; else the
+/// client's, when the provider lists it, as [`keep_listed_model`] keeps it;
+/// else the tier pick. Sizing any other model checks a window nobody uses.
+fn served_model<'a>(
+    candidate: &Candidate,
+    pinned: Option<&'a str>,
+    peek: &'a RequestPeek,
+    tier: ModelTier,
+) -> Option<Cow<'a, str>> {
+    if let Some(pinned) = pinned {
+        return Some(Cow::Borrowed(pinned));
+    }
+    let listed = peek.requested_model.as_deref().filter(|requested| {
+        candidate.catalogue_from_provider
+            && candidate.models.iter().any(|(model, _)| model == requested)
+    });
+    match listed {
+        Some(requested) => Some(Cow::Borrowed(requested)),
+        None => pick_model(candidate, tier).map(Cow::Owned),
     }
 }
 
@@ -1981,6 +2003,7 @@ mod tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -5339,6 +5362,86 @@ mod tests {
         assert!(refused_for_context(result));
     }
 
+    /// A ~4 MB opencode turn whose prompt alone fits GLM 5.3's window, but
+    /// not with the 128K-token answer it asks for. NEAR AI refuses that
+    /// upstream (prompt plus `max_tokens` over `context_length`), where a
+    /// refusal here would have let routing try another backend.
+    #[test]
+    fn a_prompt_that_leaves_no_room_for_the_requested_answer_is_refused() {
+        let body = serde_json::json!({
+            "model": "z-ai/glm-5.3",
+            "max_tokens": 128_000,
+            "messages": [{"role": "user", "content": "..."}],
+        });
+        let peek = RequestPeek::inspect(Protocol::OpenAiChat, &body, 4_000_000);
+        let result = Policy::new().decide(
+            key(),
+            Protocol::OpenAiChat,
+            &peek,
+            &[near_with_windows()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
+    /// The reserve is the request's own answer, not the model's longest one:
+    /// asking for 16 tokens leaves the rest of an 8K window to the prompt.
+    #[test]
+    fn a_small_answer_leaves_the_rest_of_the_window_to_the_prompt() {
+        let mut near = near_with_windows();
+        near.context_windows = vec![("z-ai/glm-5.3".to_string(), 8_192)];
+        let body = serde_json::json!({
+            "model": "z-ai/glm-5.3",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "..."}],
+        });
+        let peek = RequestPeek::inspect(Protocol::OpenAiChat, &body, 20_000);
+        Policy::new()
+            .decide(key(), Protocol::OpenAiChat, &peek, &[near], t(0))
+            .expect("5,000 prompt tokens and a 16-token answer fit 8,192");
+    }
+
+    /// NEAR AI's catalogue with the 32K model first, so the tier pick for a
+    /// model it does not list lands on the small window.
+    fn near_with_small_model_first() -> Candidate {
+        let mut near = near_with_windows();
+        near.models = ["small/model-32k", "z-ai/glm-5.3"]
+            .into_iter()
+            .map(|m| (m.to_string(), ModelTier::Frontier))
+            .collect();
+        near
+    }
+
+    /// A requested model the provider does not list is not the one served:
+    /// the tier pick is, and it is that model's window the request must fit.
+    #[test]
+    fn an_unlisted_model_is_sized_by_the_model_actually_served() {
+        let result = Policy::new().decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("vendor/unlisted-frontier", 100_000),
+            &[near_with_small_model_first()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
+    /// The same with a pin on the backend alone: the pin keeps only a model
+    /// the provider lists, so it too serves the tier pick.
+    #[test]
+    fn a_backend_pin_sizes_an_unlisted_model_by_the_model_actually_served() {
+        let mut policy = Policy::new();
+        policy.set_pin(Some(BackendId::from("nearai")), None);
+        let result = policy.decide(
+            key(),
+            Protocol::OpenAiChat,
+            &sized("vendor/unlisted-frontier", 100_000),
+            &[near_with_small_model_first()],
+            t(0),
+        );
+        assert!(refused_for_context(result));
+    }
+
     /// A window is only believed for a model the provider itself listed: a
     /// compiled-in catalogue is a guess, and so is any size attached to it.
     #[test]
@@ -5755,6 +5858,7 @@ mod compaction_tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 

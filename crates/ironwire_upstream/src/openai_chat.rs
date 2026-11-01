@@ -61,6 +61,7 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
         structured_output: false,
         context_tokens,
         unsupported_responses_tools: Vec::new(),
+        context_from_provider: false,
     }
 }
 
@@ -81,6 +82,7 @@ pub fn nearai_capabilities() -> Capabilities {
         // `code_interpreter`, `computer`, `mcp``. Every other type Codex
         // sends is on that list, so only this one is stripped.
         unsupported_responses_tools: vec!["namespace".to_string()],
+        context_from_provider: false,
         ..chat_capabilities(128_000)
     }
 }
@@ -295,21 +297,29 @@ impl ChatCompletionsBackend {
 const MAX_STATED_TOKENS: u64 = 100_000_000;
 
 /// A positive token count no larger than [`MAX_STATED_TOKENS`], or none.
+///
+/// A whole number written as a float (`262144.0`) is the same count: some
+/// OpenRouter-shaped catalogues write it that way, and dropping it left the
+/// model on the backend default.
 fn stated_tokens(value: Option<&serde_json::Value>) -> Option<u64> {
-    value?
-        .as_u64()
-        .filter(|n| (1..=MAX_STATED_TOKENS).contains(n))
+    let value = value?;
+    if let Some(n) = value.as_u64() {
+        return Some(n).filter(|n| (1..=MAX_STATED_TOKENS).contains(n));
+    }
+    let n = value.as_f64()?;
+    // In range and whole, so the cast is exact.
+    (n.is_finite() && n.fract() == 0.0 && (1.0..=MAX_STATED_TOKENS as f64).contains(&n))
+        .then_some(n as u64)
 }
 
-/// The input window of each model a `/models` answer states one for.
+/// The context window of each model a `/models` answer states one for.
 ///
-/// NEAR AI gives `context_length` and sometimes `max_output_length`; an
-/// OpenRouter-shaped answer gives them under `top_provider` as
-/// `context_length` and `max_completion_tokens`. The input window is the
-/// context less the output limit when the limit is below it, so a request
-/// that fits still leaves room for the longest answer; the whole context when
-/// no such limit is stated. A zero, negative, non-numeric or implausibly large
-/// value is ignored, which leaves the model on the backend's default.
+/// NEAR AI gives `context_length`; an OpenRouter-shaped answer gives it under
+/// `top_provider`. Recorded as stated: the prompt and the answer share it, and
+/// it is the request's own output allowance, not the model's largest, that
+/// routing reserves beside the prompt (`ironwire_core::capability::eligible`).
+/// A zero, negative, non-numeric, fractional or implausibly large value is
+/// ignored, which leaves the model on the backend's default.
 fn parse_context_windows(body: &[u8]) -> Vec<(String, u32)> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return Vec::new();
@@ -337,17 +347,11 @@ fn parse_context_windows(body: &[u8]) -> Vec<(String, u32)> {
         else {
             continue;
         };
-        let output = stated_tokens(item.get("max_output_length"))
-            .or_else(|| stated_tokens(item.pointer("/top_provider/max_completion_tokens")));
-        let input = match output {
-            Some(output) if output < context => context - output,
-            _ => context,
-        };
         if windows.iter().any(|(seen, _)| seen == id) {
             continue;
         }
-        if let Ok(input) = u32::try_from(input) {
-            windows.push((id.to_string(), input));
+        if let Ok(context) = u32::try_from(context) {
+            windows.push((id.to_string(), context));
         }
     }
     windows
@@ -806,11 +810,10 @@ mod tests {
             parse_context_windows(NEAR_MODELS.as_bytes()),
             vec![
                 ("z-ai/glm-5.3".to_string(), 1_048_576),
-                // The output limit is subtracted when it is below the window.
-                ("z-ai/glm-5.3-flash".to_string(), 1_048_576 - 131_072),
+                // A stated output limit leaves the window as stated.
+                ("z-ai/glm-5.3-flash".to_string(), 1_048_576),
                 ("z-ai/glm-5".to_string(), 128_000),
-                ("b/provider".to_string(), 262_144 - 65_536),
-                // An output limit at or above the window leaves it whole.
+                ("b/provider".to_string(), 262_144),
                 ("h/output-over".to_string(), 32_000),
                 // An unreadable top-level value falls back to `top_provider`.
                 ("i/bad-top".to_string(), 200_000),
@@ -818,6 +821,44 @@ mod tests {
         );
         assert!(parse_context_windows(b"not json").is_empty());
         assert!(parse_context_windows(b"{\"data\": 5}").is_empty());
+    }
+
+    /// A model-wide output limit is not this request's answer. Recording the
+    /// context less it refused a 5,000-token prompt asking for 16 tokens of a
+    /// model with an 8,192-token context and a 4,096-token output limit.
+    #[test]
+    fn a_stated_output_limit_does_not_shrink_the_window() {
+        let body = br#"{"data": [
+            {"id": "a/flat", "context_length": 8192, "max_output_length": 4096},
+            {"id": "b/provider", "top_provider": {"context_length": 8192, "max_completion_tokens": 4096}}
+        ]}"#;
+        assert_eq!(
+            parse_context_windows(body),
+            vec![
+                ("a/flat".to_string(), 8_192),
+                ("b/provider".to_string(), 8_192),
+            ]
+        );
+    }
+
+    /// OpenRouter-shaped catalogues sometimes write a count as a float. A
+    /// whole one is the same count; a fraction is not a token count at all.
+    #[test]
+    fn a_whole_number_written_as_a_float_is_a_window() {
+        let body = br#"{"data": [
+            {"id": "a/float", "context_length": 262144.0},
+            {"id": "b/top-float", "top_provider": {"context_length": 131072.0}},
+            {"id": "c/fraction", "context_length": 262144.5},
+            {"id": "d/float-huge", "context_length": 1e300},
+            {"id": "e/float-zero", "context_length": 0.0}
+        ]}"#;
+        assert_eq!(
+            parse_context_windows(body),
+            vec![
+                ("a/float".to_string(), 262_144),
+                ("b/top-float".to_string(), 131_072),
+            ]
+        );
     }
 
     /// The probe reads the windows from the `/models` answer it already
@@ -854,7 +895,7 @@ mod tests {
         assert!(b.catalogue_from_provider());
         let windows = b.context_windows();
         assert!(windows.contains(&("z-ai/glm-5.3".to_string(), 1_048_576)));
-        assert!(windows.contains(&("z-ai/glm-5.3-flash".to_string(), 917_504)));
+        assert!(windows.contains(&("z-ai/glm-5.3-flash".to_string(), 1_048_576)));
         assert!(!windows.iter().any(|(id, _)| id == "c/none"));
     }
 

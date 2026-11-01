@@ -234,6 +234,7 @@ impl RequestPeek {
             cached_prefix_tokens: 0,
             structured_output: false,
             min_context_tokens: estimate_tokens(raw_len),
+            output_tokens: output_tokens(body, &["max_tokens"]),
             mid_tool_loop: anthropic_mid_tool_loop(messages),
             encrypted_reasoning: false,
         };
@@ -348,6 +349,13 @@ impl RequestPeek {
                 .is_some_and(|t| t == "json_schema")
                 || body.pointer("/text/format/type").and_then(Value::as_str) == Some("json_schema"),
             min_context_tokens: estimate_tokens(raw_len),
+            // Responses names it `max_output_tokens`; Chat Completions
+            // deprecated `max_tokens` for `max_completion_tokens`, and a
+            // client sending both means the newer one.
+            output_tokens: output_tokens(
+                body,
+                &["max_output_tokens", "max_completion_tokens", "max_tokens"],
+            ),
             mid_tool_loop: openai_mid_tool_loop(items),
             encrypted_reasoning: false,
         };
@@ -558,6 +566,16 @@ fn estimate_tokens(bytes: usize) -> u32 {
     u32::try_from(bytes / BYTES_PER_TOKEN_ESTIMATE).unwrap_or(u32::MAX)
 }
 
+/// The first of `fields` the body sets to a positive whole number, saturating
+/// at `u32::MAX`: an allowance that large fits no window, which is the answer
+/// it should get. Anything else counts as not named.
+fn output_tokens(body: &Value, fields: &[&str]) -> Option<u32> {
+    fields
+        .iter()
+        .find_map(|field| body.get(*field).and_then(Value::as_u64).filter(|n| *n > 0))
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
 /// Cheap size hint without re-serialising: string lengths dominate a request
 /// body, so summing them tracks the real size closely enough for the decisions
 /// that consume it.
@@ -604,6 +622,47 @@ mod tests {
     fn peek_anthropic(body: serde_json::Value) -> RequestPeek {
         let raw = body.to_string();
         RequestPeek::inspect(Protocol::AnthropicMessages, &body, raw.len())
+    }
+
+    #[test]
+    fn each_wire_names_the_answer_size_in_its_own_field() {
+        let anthropic = peek_anthropic(json!({"max_tokens": 32_000, "messages": []}));
+        assert_eq!(anthropic.requirements.output_tokens, Some(32_000));
+
+        let inspect = |body: serde_json::Value| {
+            RequestPeek::inspect(Protocol::OpenAiChat, &body, 0)
+                .requirements
+                .output_tokens
+        };
+        assert_eq!(inspect(json!({"max_output_tokens": 4_096})), Some(4_096));
+        assert_eq!(inspect(json!({"max_tokens": 512})), Some(512));
+        assert_eq!(
+            inspect(json!({"max_tokens": 512, "max_completion_tokens": 2_048})),
+            Some(2_048),
+            "the newer Chat field wins over the deprecated one"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_answer_size_counts_as_none_named() {
+        let inspect = |body: serde_json::Value| {
+            RequestPeek::inspect(Protocol::OpenAiChat, &body, 0)
+                .requirements
+                .output_tokens
+        };
+        assert_eq!(inspect(json!({"messages": []})), None);
+        assert_eq!(inspect(json!({"max_tokens": 0})), None);
+        assert_eq!(inspect(json!({"max_tokens": -1})), None);
+        assert_eq!(inspect(json!({"max_tokens": "512"})), None);
+        assert_eq!(
+            inspect(json!({"max_completion_tokens": 0, "max_tokens": 512})),
+            Some(512)
+        );
+        assert_eq!(
+            inspect(json!({"max_tokens": 10_000_000_000_u64})),
+            Some(u32::MAX),
+            "an allowance past u32 still fits no window"
+        );
     }
 
     #[test]
