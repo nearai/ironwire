@@ -7,6 +7,7 @@
 pub mod control;
 pub mod events;
 pub mod facade;
+pub mod panic_hook;
 pub mod pipeline;
 pub mod privacy;
 pub mod proof;

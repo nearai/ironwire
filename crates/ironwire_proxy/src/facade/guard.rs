@@ -162,6 +162,7 @@ pub(crate) fn catch_panics<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
+    crate::panic_hook::chain_for_guarded_handlers();
     router.layer(axum::middleware::from_fn(
         move |request: Request, next: Next| guard(envelope, ledger.clone(), request, next),
     ))
@@ -309,7 +310,12 @@ async fn guard(
     // Before this guard, the connection task caught the same unwind and the
     // daemon carried on serving other requests; this changes only what the
     // client is told, not whether the daemon continues.
-    match AssertUnwindSafe(next.run(request)).catch_unwind().await {
+    // `Guarded` keeps the panic's message out of the log: the hook runs
+    // before this catch, and std's default one prints the message.
+    match AssertUnwindSafe(crate::panic_hook::Guarded::new(next.run(request)))
+        .catch_unwind()
+        .await
+    {
         Ok(response) => {
             if let Some(pending) = pending {
                 pending.settle(response.status(), false);
@@ -318,7 +324,8 @@ async fn guard(
         }
         Err(_payload) => {
             // The payload is dropped unread: its text can quote the request.
-            // The panic hook has already reported the location.
+            // The hook has already reported the location, and only that
+            // (`crate::panic_hook`).
             tracing::error!("a façade handler panicked; answered with a 500");
             if let Some(pending) = pending {
                 pending.settle(StatusCode::INTERNAL_SERVER_ERROR, true);
@@ -336,7 +343,9 @@ mod tests {
     use tower::ServiceExt;
 
     /// The text a handler panics with: it stands for request content, which
-    /// must not reach the client or the log.
+    /// must not reach the client or the log. These tests hold the client to
+    /// that; the log is the panic hook's, and `crate::panic_hook`'s tests
+    /// hold it there in a child process, since a hook is process-wide.
     const SECRET: &str = "prompt text that must not leak";
 
     async fn boom() -> StatusCode {

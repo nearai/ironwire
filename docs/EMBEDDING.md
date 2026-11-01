@@ -290,6 +290,17 @@ containable only with **panic unwinding**; `panic = "abort"` terminates the
 process and cannot provide this guarantee. The IronWire CLI's release profile
 currently uses abort, so a downstream host must choose its own panic policy.
 
+A panic's message can quote request content (a slicing panic prints the
+string it was slicing), and the panic hook prints it before anything can catch
+the unwind. The proxy reports a panic in a façade handler by location only,
+and leaves every other panic to the hook the process already had: it takes the
+host's hook over for handler panics alone, and neither replaces it nor calls
+it twice. The rest of the process's panics are the host's to keep out of its
+log. A host with no hook of its own can install IronWire's
+(`ironwire_proxy::panic_hook::install_location_only`), which the CLI installs
+first thing. A host that installs its hook after starting the proxy replaces
+the handler-panic one too, and then reports those panics itself.
+
 `shutdown(self)` is graceful: in-flight model streams finish, while the control
 event stream closes itself. There is no internal timeout that silently cuts a
 model response. Dropping the handle, or canceling an in-progress shutdown
