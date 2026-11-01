@@ -247,10 +247,10 @@ conversation `none`, no tokens, no proof, no `error`, and a fixed code in
 | `failure` | status | when |
 |---|---|---|
 | `panic` | 500 | the handler panicked |
-| `body_rejected` | 413 / 400 | the body was refused before the handler ran (over the size limit, or unreadable) |
+| `body_rejected` | 413 | the body was refused before the handler ran, over the size limit |
 | `invalid_json` | 400 | the body is not JSON |
 | `unknown_login` | 404 | a login-bound URL names no login (§1) |
-| `client_disconnected` | 499 | the client went away before the response began; no client saw this status |
+| `client_disconnected` | 499 | the client went away before the response began, including mid-upload (the body read failed); no client saw this status |
 | `unrecorded` | as answered | a handler answered without arranging a row; none does today |
 
 These rows are kept for diagnosis and appear in `ironwire log`'s row listing,

@@ -187,6 +187,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything can panic. std's hook prints the panic's message, which
+    // can quote a prompt, to stderr: the daemon's log. The release profile
+    // aborts on panic, so no catch further in ever gets the chance to drop it.
+    ironwire_proxy::panic_hook::install_location_only();
     // Parsed before the subscriber exists, because `--color` decides whether
     // the logs are coloured too. `tracing_subscriber` paints unconditionally
     // otherwise, and its stderr is in the same pipe as everything else the
