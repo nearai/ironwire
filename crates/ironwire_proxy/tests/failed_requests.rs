@@ -126,7 +126,7 @@ async fn a_body_over_the_limit_is_recorded_as_rejected() {
 }
 
 #[tokio::test]
-async fn a_body_that_cannot_be_read_is_recorded_as_rejected() {
+async fn a_client_that_hangs_up_mid_body_is_recorded_as_disconnected() {
     for path in PATHS {
         let ledger = Ledger::in_memory().expect("ledger opens");
         let broken = Body::from_stream(futures_util::stream::iter([
@@ -140,11 +140,14 @@ async fn a_body_that_cannot_be_read_is_recorded_as_rejected() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
 
         let row = only_row(&ledger);
-        assert_eq!(row.status, 400, "{path}");
+        assert_eq!(
+            row.status, 499,
+            "{path}: no client saw the 400 the extractor answered"
+        );
         assert_eq!(
             row.failure.as_deref(),
-            Some("body_rejected"),
-            "{path}: not the `unrecorded` backstop"
+            Some("client_disconnected"),
+            "{path}: not `body_rejected` or the `unrecorded` backstop"
         );
         assert!(
             !serde_json::to_string(&row)

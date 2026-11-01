@@ -29,11 +29,23 @@ impl<const OPENAI: bool, S: Send + Sync> FromRequest<S> for FacadeBody<OPENAI> {
     type Rejection = FacadeError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let claim = request.extensions().get::<guard::RowClaim>().cloned();
         Bytes::from_request(request, state)
             .await
             .map(Self)
             .map_err(|rejection| {
                 let status = rejection.status();
+                if status != StatusCode::PAYLOAD_TOO_LARGE {
+                    // Anything but the length limit is the body stream
+                    // failing under the read, and on a loopback listener
+                    // that is the client hanging up mid-upload. The 400
+                    // answered below goes to a socket hyper is about to
+                    // drop, so recording it would claim a refusal no client
+                    // saw.
+                    if let Some(claim) = claim {
+                        claim.disconnected();
+                    }
+                }
                 let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
                     format!(
                         "the request body is larger than IronWire accepts ({} MiB)",
