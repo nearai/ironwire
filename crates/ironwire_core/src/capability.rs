@@ -67,8 +67,19 @@ pub struct RequestRequirements {
     pub cached_prefix_tokens: u32,
     /// A strict JSON schema response format is requested.
     pub structured_output: bool,
-    /// Minimum usable context window, in tokens.
+    /// The prompt's size in tokens, estimated from the body's bytes. Not the
+    /// whole requirement: [`eligible`] adds a margin for the estimate and the
+    /// answer's room ([`Self::output_tokens`]).
     pub min_context_tokens: u32,
+    /// The longest answer the client asked for: Anthropic's `max_tokens`,
+    /// Chat Completions' `max_completion_tokens` or `max_tokens`, Responses'
+    /// `max_output_tokens`. `None` when the body names none.
+    ///
+    /// Read from the client's body, because it is the request's own
+    /// allowance that shares the window with the prompt, not the model's
+    /// largest.
+    #[serde(default)]
+    pub output_tokens: Option<u32>,
     /// The conversation is **mid tool loop**: the client is replaying tool
     /// results and expects the model to continue an exchange already in flight.
     ///
@@ -143,6 +154,14 @@ pub struct Capabilities {
     /// something: this list is evidence, not caution.
     #[serde(default)]
     pub unsupported_responses_tools: Vec<String>,
+    /// Whether [`Self::context_tokens`] is the window the provider stated for
+    /// the model being served, rather than the backend's compiled-in default.
+    ///
+    /// Only a stated window is checked with room for the answer and a margin
+    /// for the estimate (see [`eligible`]). Set when sizing a request, never
+    /// configured, so it is not serialized.
+    #[serde(skip)]
+    pub context_from_provider: bool,
 }
 
 impl Capabilities {
@@ -161,6 +180,7 @@ impl Capabilities {
             structured_output: false,
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 }
@@ -220,6 +240,49 @@ pub enum Ineligible {
 /// fallback has hysteresis (`docs/CRITIQUE.md` §1).
 pub const CACHE_SACRIFICE_THRESHOLD_TOKENS: u32 = 4_000;
 
+/// The answer's room when the client names no output limit, in tokens, on a
+/// provider-stated window.
+///
+/// Routing headroom, not a claim about any provider: with no limit named, a
+/// provider may answer up to the rest of the window, so any finite figure is a
+/// floor. 8,192 is what the translated lane already writes as `max_tokens`
+/// when it must send one and the client named none, so a route admitted here
+/// is not refused for the number IronWire itself put on the wire.
+pub const DEFAULT_OUTPUT_TOKENS: u32 = 8_192;
+
+/// The prompt estimate is raised by `1 / ESTIMATE_MARGIN_DIVISOR` of itself.
+///
+/// The estimate is body bytes / 4, and code-heavy prompts run under 4 bytes
+/// per token, so it comes out low exactly on the large coding turns that
+/// approach a window. One eighth (12.5%) covers about 3.55 bytes per token.
+const ESTIMATE_MARGIN_DIVISOR: u64 = 8;
+
+/// Tokens a request needs from `caps`' window.
+///
+/// On a window the provider stated for the model, the prompt estimate with
+/// its margin plus room for the answer the request asked for: the provider
+/// refuses a prompt plus `max_tokens` over its stated context, and that
+/// window is the provider's exact edge. Any stated window at or above the
+/// backend's default refuses nothing the default admitted.
+///
+/// On the backend's compiled-in default, the bare estimate, as before
+/// providers' windows were read. The estimate also counts base64 images and
+/// JSON at four bytes a token, so it can run high, and a refusal here is
+/// worse than the provider's own: when every backend refuses, the client gets
+/// a 503, which Claude Code retries, not the provider's "prompt is too long",
+/// on which it compacts. A reserve there would refuse a single-backend
+/// session turns the provider would have served, with nowhere else to go.
+///
+/// In `u64`, so no sum wraps.
+fn context_needed(req: &RequestRequirements, caps: &Capabilities) -> u64 {
+    let prompt = u64::from(req.min_context_tokens);
+    if !caps.context_from_provider {
+        return prompt;
+    }
+    let answer = u64::from(req.output_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS));
+    prompt + prompt / ESTIMATE_MARGIN_DIVISOR + answer
+}
+
 /// Decide whether `caps` can serve `req` without breaking it.
 ///
 /// `cross_family` is true when taking this route means translating between API
@@ -268,7 +331,7 @@ pub fn eligible(
     if req.structured_output && !caps.structured_output {
         return Err(Ineligible::StructuredOutputUnsupported);
     }
-    if req.min_context_tokens > caps.context_tokens {
+    if context_needed(req, caps) > u64::from(caps.context_tokens) {
         return Err(Ineligible::ContextTooSmall);
     }
     // Economic rather than semantic, but it belongs in the same gate: a route
@@ -298,6 +361,7 @@ mod tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -316,6 +380,7 @@ mod tests {
             cached_prefix_tokens: 120_000,
             structured_output: false,
             min_context_tokens: 40_000,
+            output_tokens: Some(32_000),
             mid_tool_loop: false,
             encrypted_reasoning: false,
         }
@@ -332,6 +397,7 @@ mod tests {
             structured_output: false,
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -544,6 +610,135 @@ mod tests {
         };
         assert_eq!(
             eligible(&req, &full_caps(), false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+    }
+
+    #[test]
+    fn the_requested_answer_must_fit_beside_the_prompt() {
+        let caps = Capabilities {
+            context_tokens: 1_048_576,
+            context_from_provider: true,
+            ..full_caps()
+        };
+        let req = RequestRequirements {
+            min_context_tokens: 900_000,
+            output_tokens: Some(128_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+        let req = RequestRequirements {
+            output_tokens: Some(16),
+            ..req
+        };
+        assert_eq!(eligible(&req, &caps, false, None), Ok(()));
+    }
+
+    #[test]
+    fn a_request_naming_no_answer_size_still_reserves_room_for_one() {
+        let caps = Capabilities {
+            context_tokens: 32_000,
+            context_from_provider: true,
+            ..full_caps()
+        };
+        // Fits on its own, with the margin; not with the default answer.
+        let req = RequestRequirements {
+            min_context_tokens: 24_000,
+            output_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+        let req = RequestRequirements {
+            min_context_tokens: 20_000,
+            ..req
+        };
+        assert_eq!(eligible(&req, &caps, false, None), Ok(()));
+    }
+
+    #[test]
+    fn an_estimate_short_of_the_window_by_less_than_its_margin_is_refused() {
+        let caps = Capabilities {
+            context_tokens: 100_000,
+            context_from_provider: true,
+            ..full_caps()
+        };
+        let req = RequestRequirements {
+            min_context_tokens: 90_000,
+            output_tokens: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+    }
+
+    /// Where the reserve and margin put the edge on a provider-stated 200K
+    /// window for a turn asking for 32,000 tokens: about
+    /// (200,000 - 32,000) * 8/9.
+    #[test]
+    fn a_stated_200k_window_with_a_32k_answer_admits_a_149k_token_estimate() {
+        let caps = Capabilities {
+            context_tokens: 200_000,
+            context_from_provider: true,
+            ..full_caps()
+        };
+        let at = |min_context_tokens| RequestRequirements {
+            min_context_tokens,
+            output_tokens: Some(32_000),
+            ..Default::default()
+        };
+        assert_eq!(eligible(&at(149_334), &caps, false, None), Ok(()));
+        assert_eq!(
+            eligible(&at(149_335), &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+    }
+
+    /// The backend's compiled-in window is checked against the bare estimate,
+    /// as before providers' windows were read: a refusal there sends a 503 the
+    /// client retries, where the provider's own answer would make it compact.
+    #[test]
+    fn a_default_window_still_admits_what_it_admitted_before_stated_windows() {
+        let caps = Capabilities {
+            context_tokens: 200_000,
+            ..full_caps()
+        };
+        let req = RequestRequirements {
+            min_context_tokens: 190_000,
+            output_tokens: Some(32_000),
+            ..Default::default()
+        };
+        assert_eq!(eligible(&req, &caps, false, None), Ok(()));
+        let req = RequestRequirements {
+            min_context_tokens: 200_001,
+            ..req
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+    }
+
+    #[test]
+    fn the_largest_requirements_do_not_wrap_into_a_fit() {
+        let req = RequestRequirements {
+            min_context_tokens: u32::MAX,
+            output_tokens: Some(u32::MAX),
+            ..Default::default()
+        };
+        let caps = Capabilities {
+            context_from_provider: true,
+            ..full_caps()
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
             Err(Ineligible::ContextTooSmall)
         );
     }

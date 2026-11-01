@@ -118,7 +118,9 @@ struct RequestRequirements {
     prompt_cache: bool,
     cached_prefix_tokens: u32,
     structured_output: bool,
-    min_context_tokens: u32,
+    min_context_tokens: u32,      // prompt estimate (body bytes / 4)
+    output_tokens: Option<u32>,   // the client's own max_tokens; on a provider-stated
+                                  // window, eligible() reserves it and adds a margin
     mid_tool_loop: bool,          // the cross-family gate
     encrypted_reasoning: bool,    // the cross-account gate (§3)
 }

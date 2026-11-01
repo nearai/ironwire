@@ -666,6 +666,16 @@ mod tests {
         assert_eq!(out["messages"][0]["content"][0]["text"], "done");
     }
 
+    /// Routing reserves this much answer for a request naming none, so a
+    /// route it admits is not refused for the number this lane writes.
+    #[test]
+    fn the_default_answer_size_is_the_one_routing_reserves() {
+        assert_eq!(
+            DEFAULT_MAX_TOKENS,
+            u64::from(ironwire_core::capability::DEFAULT_OUTPUT_TOKENS)
+        );
+    }
+
     #[test]
     fn a_conversation_with_no_max_tokens_still_produces_a_valid_request() {
         // Anthropic requires the field; both OpenAI wires treat it as optional.
