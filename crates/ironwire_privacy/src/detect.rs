@@ -292,8 +292,44 @@ fn start_after_last(text: &str, stop: impl Fn(char) -> bool) -> usize {
         .map_or(0, |(at, c)| at + c.len_utf8())
 }
 
+/// A character of an address's local part.
+///
+/// RFC 6531 allows any non-ASCII character there, and a local part cut short
+/// leaves the rest of the address in the clear. So every non-ASCII character
+/// counts except the ones that end a word: whitespace, controls, and the
+/// punctuation and symbol blocks. A list of what to stop at, not of what to
+/// keep: `char::is_alphanumeric` alone misses combining marks (a decomposed
+/// `é`, a Devanagari virama, Thai tone marks), and a missed character splits
+/// the address. Over-reach only extends a redaction into text written with
+/// no space before an address.
 fn is_email_local(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
+    }
+    !c.is_whitespace() && !c.is_control() && !is_punctuation_or_symbol_block(c)
+}
+
+/// Whether `c` is in a Unicode block of punctuation or symbols: the Latin-1
+/// ones, general punctuation through dingbats and arrows, CJK and full-width
+/// punctuation, and emoji.
+fn is_punctuation_or_symbol_block(c: char) -> bool {
+    matches!(
+        c,
+        '\u{80}'..='\u{bf}'
+            | '\u{d7}'
+            | '\u{f7}'
+            | '\u{2000}'..='\u{2bff}'
+            | '\u{2e00}'..='\u{2e7f}'
+            | '\u{3000}'..='\u{303f}'
+            | '\u{fe10}'..='\u{fe1f}'
+            | '\u{fe30}'..='\u{fe6f}'
+            | '\u{ff00}'..='\u{ff0f}'
+            | '\u{ff1a}'..='\u{ff20}'
+            | '\u{ff3b}'..='\u{ff40}'
+            | '\u{ff5b}'..='\u{ff65}'
+            | '\u{fff0}'..='\u{ffff}'
+            | '\u{1f000}'..='\u{1faff}'
+    )
 }
 
 fn is_email_host(c: char) -> bool {
@@ -571,6 +607,51 @@ mod tests {
         let findings = detector.find(text);
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert_eq!(&text[findings[0].range.clone()], "alice@corp.io");
+    }
+
+    /// RFC 6531 addresses have non-ASCII local parts. A scan that stopped at
+    /// the first non-ASCII character skipped `josé@corp.io` entirely (the
+    /// local part came out empty) and redacted `müller.hans@corp.de` from
+    /// `ller.hans`, leaving `mü` in the clear.
+    #[test]
+    fn an_address_with_a_non_ascii_local_part_is_found_whole() {
+        let detector = pii_only();
+        for address in [
+            "josé@corp.io",
+            "müller.hans@corp.de",
+            "名前@corp.io",
+            "иван.петров@corp.ru",
+            "δοκιμή@corp.gr",
+            "हिन्दी@corp.in",
+            "ผู้ใช้@corp.th",
+            "משתמש@corp.co.il",
+            "jose\u{301}@corp.io",
+        ] {
+            let text = format!("write to {address} today");
+            let findings = detector.find(&text);
+            assert_eq!(findings.len(), 1, "{address}: got {findings:?}");
+            assert_eq!(&text[findings[0].range.clone()], address);
+        }
+    }
+
+    /// Punctuation and symbols still end the local part, in any script, so
+    /// widening it does not swallow the text around an address.
+    #[test]
+    fn a_non_ascii_local_part_stops_at_punctuation_and_symbols() {
+        let detector = pii_only();
+        for (text, address) in [
+            ("→josé@corp.io", "josé@corp.io"),
+            ("\u{201c}josé@corp.io\u{201d}", "josé@corp.io"),
+            ("«müller@corp.de»", "müller@corp.de"),
+            ("邮箱：张伟@corp.cn", "张伟@corp.cn"),
+            ("「名前@corp.io」", "名前@corp.io"),
+            ("✓ josé@corp.io", "josé@corp.io"),
+            ("\u{a0}josé@corp.io", "josé@corp.io"),
+        ] {
+            let findings = detector.find(text);
+            assert_eq!(findings.len(), 1, "{text}: got {findings:?}");
+            assert_eq!(&text[findings[0].range.clone()], address, "{text}");
+        }
     }
 
     #[test]
