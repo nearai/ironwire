@@ -21,12 +21,13 @@
 //! with a status and one of the fixed codes below and nothing else:
 //!
 //! - [`PANIC`]: the handler panicked (status 500).
-//! - [`BODY_REJECTED`]: the body was refused before the handler ran, over the
-//!   size limit or unreadable (the status axum answered with, 413 or 400).
+//! - [`BODY_REJECTED`]: the body was refused before the handler ran for being
+//!   over the size limit (413).
 //! - [`INVALID_JSON`] and [`UNKNOWN_LOGIN`]: the handler refused the request
 //!   before routing it (400, 404).
 //! - [`CLIENT_DISCONNECTED`]: the client went away before the response began,
-//!   so the handler's future was dropped (status 499, which no client saw).
+//!   either mid-upload (the body read failed) or after the request was in, so
+//!   the handler's future was dropped (status 499, which no client saw).
 //! - [`UNRECORDED`]: a handler answered without arranging a row. No handler
 //!   does this today; the code keeps such a bug visible instead of silent.
 //!
@@ -51,7 +52,7 @@ use crate::pipeline::Refusal;
 
 /// The handler panicked.
 pub(crate) const PANIC: &str = "panic";
-/// The body was refused before the handler ran.
+/// The body was refused before the handler ran, over the size limit.
 pub(crate) const BODY_REJECTED: &str = "body_rejected";
 /// The body was read but is not JSON.
 pub(crate) const INVALID_JSON: &str = "invalid_json";
@@ -109,6 +110,13 @@ impl RowClaim {
     /// The handler refused the request under `failure` without writing a row.
     pub(crate) fn failed(&self, failure: &'static str) {
         self.lock().failure = Some(failure);
+    }
+
+    /// The client went away while the request was still being read. Its status
+    /// is [`CLOSED_BY_CLIENT`] whatever the extractor answered, since nothing
+    /// that was answered reached anyone.
+    pub(crate) fn disconnected(&self) {
+        self.lock().failure = Some(CLIENT_DISCONNECTED);
     }
 
     /// What the handler has learned about the request, kept for the row the
@@ -227,14 +235,19 @@ impl PendingRow {
                 return;
             } else if status.is_client_error() {
                 // The body extractor is the one fallible extractor that
-                // answers before a façade handler runs (413 over the limit,
-                // 400 for a body that could not be read).
+                // answers before a façade handler runs, and a read failure
+                // there is claimed as a disconnect, so what is left is 413.
                 BODY_REJECTED
             } else {
                 UNRECORDED
             }
         };
-        self.write(status.as_u16(), failure);
+        let status = if failure == CLIENT_DISCONNECTED {
+            CLOSED_BY_CLIENT
+        } else {
+            status.as_u16()
+        };
+        self.write(status, failure);
     }
 
     fn write(&self, status: u16, failure: &'static str) {
