@@ -50,6 +50,7 @@ pub fn anthropic_capabilities() -> Capabilities {
         context_tokens: 200_000,
         // This backend never sees a Responses body.
         unsupported_responses_tools: Vec::new(),
+        context_from_provider: false,
     }
 }
 

@@ -1767,11 +1767,12 @@ fn sized_for<'a>(candidate: &'a Candidate, model: Option<&str>) -> Cow<'a, Capab
         })
         .map(|(_, window)| *window);
     match window {
-        Some(window) if window != candidate.caps.context_tokens => Cow::Owned(Capabilities {
+        Some(window) => Cow::Owned(Capabilities {
             context_tokens: window,
+            context_from_provider: true,
             ..candidate.caps.clone()
         }),
-        _ => Cow::Borrowed(&candidate.caps),
+        None => Cow::Borrowed(&candidate.caps),
     }
 }
 
@@ -2002,6 +2003,7 @@ mod tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -5856,6 +5858,7 @@ mod compaction_tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 

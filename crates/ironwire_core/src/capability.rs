@@ -154,6 +154,14 @@ pub struct Capabilities {
     /// something: this list is evidence, not caution.
     #[serde(default)]
     pub unsupported_responses_tools: Vec<String>,
+    /// Whether [`Self::context_tokens`] is the window the provider stated for
+    /// the model being served, rather than the backend's compiled-in default.
+    ///
+    /// Only a stated window is checked with room for the answer and a margin
+    /// for the estimate (see [`eligible`]). Set when sizing a request, never
+    /// configured, so it is not serialized.
+    #[serde(skip)]
+    pub context_from_provider: bool,
 }
 
 impl Capabilities {
@@ -172,6 +180,7 @@ impl Capabilities {
             structured_output: false,
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 }
@@ -231,7 +240,8 @@ pub enum Ineligible {
 /// fallback has hysteresis (`docs/CRITIQUE.md` §1).
 pub const CACHE_SACRIFICE_THRESHOLD_TOKENS: u32 = 4_000;
 
-/// The answer's room when the client names no output limit, in tokens.
+/// The answer's room when the client names no output limit, in tokens, on a
+/// provider-stated window.
 ///
 /// Routing headroom, not a claim about any provider: with no limit named, a
 /// provider may answer up to the rest of the window, so any finite figure is a
@@ -245,15 +255,30 @@ pub const DEFAULT_OUTPUT_TOKENS: u32 = 8_192;
 /// The estimate is body bytes / 4, and code-heavy prompts run under 4 bytes
 /// per token, so it comes out low exactly on the large coding turns that
 /// approach a window. One eighth (12.5%) covers about 3.55 bytes per token.
-/// It is kept that small on purpose: Claude Code compacts close to its
-/// window with its own `max_tokens` already reserved, and a larger margin
-/// would refuse those turns on the backend that would have served them.
 const ESTIMATE_MARGIN_DIVISOR: u64 = 8;
 
-/// Tokens a request needs from a window: the prompt estimate with its margin,
-/// plus room for the answer it asked for. In `u64`, so no sum wraps.
-fn context_needed(req: &RequestRequirements) -> u64 {
+/// Tokens a request needs from `caps`' window.
+///
+/// On a window the provider stated for the model, the prompt estimate with
+/// its margin plus room for the answer the request asked for: the provider
+/// refuses a prompt plus `max_tokens` over its stated context, and that
+/// window is the provider's exact edge. Any stated window at or above the
+/// backend's default refuses nothing the default admitted.
+///
+/// On the backend's compiled-in default, the bare estimate, as before
+/// providers' windows were read. The estimate also counts base64 images and
+/// JSON at four bytes a token, so it can run high, and a refusal here is
+/// worse than the provider's own: when every backend refuses, the client gets
+/// a 503, which Claude Code retries, not the provider's "prompt is too long",
+/// on which it compacts. A reserve there would refuse a single-backend
+/// session turns the provider would have served, with nowhere else to go.
+///
+/// In `u64`, so no sum wraps.
+fn context_needed(req: &RequestRequirements, caps: &Capabilities) -> u64 {
     let prompt = u64::from(req.min_context_tokens);
+    if !caps.context_from_provider {
+        return prompt;
+    }
     let answer = u64::from(req.output_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS));
     prompt + prompt / ESTIMATE_MARGIN_DIVISOR + answer
 }
@@ -306,7 +331,7 @@ pub fn eligible(
     if req.structured_output && !caps.structured_output {
         return Err(Ineligible::StructuredOutputUnsupported);
     }
-    if context_needed(req) > u64::from(caps.context_tokens) {
+    if context_needed(req, caps) > u64::from(caps.context_tokens) {
         return Err(Ineligible::ContextTooSmall);
     }
     // Economic rather than semantic, but it belongs in the same gate: a route
@@ -336,6 +361,7 @@ mod tests {
             structured_output: true,
             context_tokens: 200_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -371,6 +397,7 @@ mod tests {
             structured_output: false,
             context_tokens: 128_000,
             unsupported_responses_tools: Vec::new(),
+            context_from_provider: false,
         }
     }
 
@@ -591,6 +618,7 @@ mod tests {
     fn the_requested_answer_must_fit_beside_the_prompt() {
         let caps = Capabilities {
             context_tokens: 1_048_576,
+            context_from_provider: true,
             ..full_caps()
         };
         let req = RequestRequirements {
@@ -613,6 +641,7 @@ mod tests {
     fn a_request_naming_no_answer_size_still_reserves_room_for_one() {
         let caps = Capabilities {
             context_tokens: 32_000,
+            context_from_provider: true,
             ..full_caps()
         };
         // Fits on its own, with the margin; not with the default answer.
@@ -636,6 +665,7 @@ mod tests {
     fn an_estimate_short_of_the_window_by_less_than_its_margin_is_refused() {
         let caps = Capabilities {
             context_tokens: 100_000,
+            context_from_provider: true,
             ..full_caps()
         };
         let req = RequestRequirements {
@@ -649,12 +679,14 @@ mod tests {
         );
     }
 
-    /// Where the reserve and margin put the edge on a 200K window for a
-    /// Claude Code turn asking for 32,000 tokens: about (200,000 - 32,000) * 8/9.
+    /// Where the reserve and margin put the edge on a provider-stated 200K
+    /// window for a turn asking for 32,000 tokens: about
+    /// (200,000 - 32,000) * 8/9.
     #[test]
-    fn a_200k_window_with_a_32k_answer_admits_a_149k_token_estimate() {
+    fn a_stated_200k_window_with_a_32k_answer_admits_a_149k_token_estimate() {
         let caps = Capabilities {
             context_tokens: 200_000,
+            context_from_provider: true,
             ..full_caps()
         };
         let at = |min_context_tokens| RequestRequirements {
@@ -669,6 +701,31 @@ mod tests {
         );
     }
 
+    /// The backend's compiled-in window is checked against the bare estimate,
+    /// as before providers' windows were read: a refusal there sends a 503 the
+    /// client retries, where the provider's own answer would make it compact.
+    #[test]
+    fn a_default_window_still_admits_what_it_admitted_before_stated_windows() {
+        let caps = Capabilities {
+            context_tokens: 200_000,
+            ..full_caps()
+        };
+        let req = RequestRequirements {
+            min_context_tokens: 190_000,
+            output_tokens: Some(32_000),
+            ..Default::default()
+        };
+        assert_eq!(eligible(&req, &caps, false, None), Ok(()));
+        let req = RequestRequirements {
+            min_context_tokens: 200_001,
+            ..req
+        };
+        assert_eq!(
+            eligible(&req, &caps, false, None),
+            Err(Ineligible::ContextTooSmall)
+        );
+    }
+
     #[test]
     fn the_largest_requirements_do_not_wrap_into_a_fit() {
         let req = RequestRequirements {
@@ -676,8 +733,12 @@ mod tests {
             output_tokens: Some(u32::MAX),
             ..Default::default()
         };
+        let caps = Capabilities {
+            context_from_provider: true,
+            ..full_caps()
+        };
         assert_eq!(
-            eligible(&req, &full_caps(), false, None),
+            eligible(&req, &caps, false, None),
             Err(Ineligible::ContextTooSmall)
         );
     }

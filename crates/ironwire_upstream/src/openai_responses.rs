@@ -65,6 +65,7 @@ pub fn responses_capabilities() -> Capabilities {
         // Codex talks to this endpoint natively every day; it accepts the
         // whole tool vocabulary Codex emits.
         unsupported_responses_tools: Vec::new(),
+        context_from_provider: false,
     }
 }
 
