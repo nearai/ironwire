@@ -61,7 +61,6 @@ pub fn chat_capabilities(context_tokens: u32) -> Capabilities {
         structured_output: false,
         context_tokens,
         unsupported_responses_tools: Vec::new(),
-        context_from_provider: false,
     }
 }
 
@@ -82,7 +81,6 @@ pub fn nearai_capabilities() -> Capabilities {
         // `code_interpreter`, `computer`, `mcp``. Every other type Codex
         // sends is on that list, so only this one is stripped.
         unsupported_responses_tools: vec!["namespace".to_string()],
-        context_from_provider: false,
         ..chat_capabilities(128_000)
     }
 }
