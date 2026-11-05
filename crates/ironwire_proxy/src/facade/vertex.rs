@@ -36,7 +36,10 @@ pub(crate) async fn authorize(
             .path()
             .strip_prefix("/projects/")
             .and_then(|path| path.split_once('/').map(|(project, _)| project));
-        if !gateway.accepts(project) {
+        // Accepted keep-alive connections can race graceful shutdown's
+        // per-connection notification. Revoke future bound requests at the
+        // shared stop flag while already-authorized responses keep draining.
+        if state.shutdown.begun() || !gateway.accepts(project) {
             if let Some(claim) = request.extensions().get::<RowClaim>() {
                 claim.failed(guard::INVALID_VERTEX_CAPABILITY);
             }

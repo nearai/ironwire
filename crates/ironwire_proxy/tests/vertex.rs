@@ -731,3 +731,93 @@ async fn bound_translated_responses_report_provider_model_while_retaining_client
         }
     }
 }
+
+#[tokio::test]
+async fn stopping_a_bound_gateway_revokes_new_requests_on_idle_and_live_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (state, seen) = setup().await;
+    let state = state.with_vertex_gateway(gateway(None));
+    let listener = ironwire_proxy::server::bind(0).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_state = state.clone();
+    // Keep the listener alive while announcing the stop flag. This makes a
+    // new handler's refusal observable independently of OS socket closure or
+    // the scheduling of graceful shutdown on already-accepted connections.
+    let server =
+        tokio::spawn(async move { axum::serve(listener, app(server_state)).await.unwrap() });
+    let path = format!(
+        "/vertex/projects/{CAPABILITY}/locations/region/publishers/anthropic/models/claude:rawPredict"
+    );
+    let url = format!("http://{address}{path}");
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .body(r#"{"messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let before = seen.lock().unwrap().len();
+    assert_eq!(before, 1);
+    let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = r#"{"messages":[]}"#;
+    idle.write_all(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n", body.len()).as_bytes()).await.unwrap();
+    state.shutdown.begin();
+    // The pooled client can reuse its live connection; the incomplete idle
+    // request becomes a complete request only after capability revocation.
+    let response = client.post(&url).body(body).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["error"]["message"],
+        "Invalid Vertex capability."
+    );
+    idle.write_all(format!("\r\n{body}").as_bytes())
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        idle.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with(b"HTTP/1.1 403"));
+    let response = reqwest::Client::new()
+        .post(&url)
+        .body("not JSON")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let health = reqwest::get(format!("http://{address}/_ironwire/health"))
+        .await
+        .unwrap();
+    assert_eq!(
+        health.status(),
+        StatusCode::OK,
+        "the listener still served health, so refusal came from the capability gate"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        before,
+        "revoked requests must never reach inference"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn generic_vertex_requests_keep_existing_behavior_during_shutdown() {
+    let (state, seen) = setup().await;
+    state.shutdown.begin();
+    let response = app(state)
+        .oneshot(request("claude:rawPredict", r#"{"messages":[]}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}

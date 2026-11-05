@@ -37,20 +37,21 @@ async fn a_closed_tokio_listener_refuses_connections_while_an_accepted_stream_li
     let mut client = client.unwrap();
     let (mut accepted, _) = accepted.unwrap();
     drop(listener);
+    // Windows may take longer than this bound to report connection refusal.
+    // Elapsed means no handshake completed, not that a listener accepted it.
     let late = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tokio::net::TcpStream::connect(address),
     )
-    .await
-    .unwrap();
-    if let Ok(stream) = &late {
+    .await;
+    if let Ok(Ok(stream)) = &late {
         eprintln!(
             "Tokio listener: late connect succeeded; peer_known={}",
             stream.peer_addr().is_ok()
         );
     }
     assert!(
-        late.is_err(),
+        !matches!(late, Ok(Ok(_))),
         "the Tokio listener still completed a new handshake"
     );
     client.write_all(b"draining").await.unwrap();

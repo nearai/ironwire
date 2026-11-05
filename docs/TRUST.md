@@ -835,4 +835,6 @@ model. `tests/vertex.rs` pins these restrictions alongside generic behavior.
 rotation over a real loopback socket. A host revokes new connections by awaiting `stop_accepting`; the barrier is
 acknowledged only after destruction of the OS listener. Accepted streams drain
 under the retained owner until full `shutdown` finishes. Replacing a binding
-requires a new secret.
+requires a new secret. The bound capability also refuses new requests as soon
+as the shared shutdown flag is set, covering idle/persistent connections accepted
+before the listener closes; previously authorized responses still drain.

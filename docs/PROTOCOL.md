@@ -89,7 +89,11 @@ provider's explicit completion/initial-stream model, including a substitution.
 The selected configured model is only the fallback when that value is absent.
 Generic translated responses continue reporting the client alias.
 
-The binding is immutable and memory-only. A host must await the old listener's
+The binding is immutable and memory-only. Once shutdown begins, the capability
+is revoked for new requests, including requests arriving on an already accepted
+idle or persistent connection. They receive the same fixed 403. Responses whose
+requests were already authorized continue draining unchanged. A host must await
+the old listener's
 `stop_accepting` closure barrier before reporting disconnect or starting a
 replacement with a freshly generated capability. In-flight inference drains
 under the retained owner until full shutdown completes. This library
