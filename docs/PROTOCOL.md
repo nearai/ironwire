@@ -86,8 +86,9 @@ retry returns an error instead of selecting another backend or model. The ledger
 retains the original requested ID and separately observes the served model.
 
 The binding is immutable and memory-only. A host must await the old listener's
-shutdown before reporting disconnect or starting a replacement with a freshly
-generated capability. In-flight inference drains during shutdown. This library
+`stop_accepting` closure barrier before reporting disconnect or starting a
+replacement with a freshly generated capability. In-flight inference drains
+under the retained owner until full shutdown completes. This library
 contract alone does not establish Claude Desktop compatibility; hosts must
 validate the installed Desktop client and own its setup/lifecycle integration.
 

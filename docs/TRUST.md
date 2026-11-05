@@ -832,5 +832,7 @@ eligibility gates. Failure never selects another backend or sibling model.
 The original requested model remains distinct from the provider-observed served
 model. `tests/vertex.rs` pins these restrictions alongside generic behavior.
 `tests/embed.rs` proves option propagation and shutdown/restart capability
-rotation over a real loopback socket. A host revokes by awaiting shutdown;
-requests already forwarded drain, and replacing a binding requires a new secret.
+rotation over a real loopback socket. A host revokes new connections by awaiting `stop_accepting`; the barrier is
+acknowledged only after destruction of the OS listener. Accepted streams drain
+under the retained owner until full `shutdown` finishes. Replacing a binding
+requires a new secret.

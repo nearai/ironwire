@@ -541,3 +541,13 @@ back to another destination. Counting remains a terminal 400 after capability
 authentication. See `docs/PROTOCOL.md` for the wire contract and `docs/TRUST.md`
 for the bearer-secret boundary. Hosts own Desktop configuration, process state,
 connection persistence and installed-client validation.
+
+`EmbeddedProxy::stop_accepting(&mut self).await` requests graceful shutdown and
+waits for an explicit listener destruction acknowledgement. The OS listener is
+closed before this barrier returns, while already accepted inference streams
+can continue indefinitely. It is cancellation-safe and repeatable. A host that
+must report disconnect promptly can await this barrier, then move the owner
+into a retained background `proxy.shutdown()` task. Full drain still owns the
+home lock, discovery pointer and maintenance tasks until it completes; replacing
+a connection before drain finishes therefore needs a distinct owned home.
+The ordinary `shutdown().await` behavior remains a complete graceful drain.

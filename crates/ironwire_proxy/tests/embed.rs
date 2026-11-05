@@ -1332,3 +1332,81 @@ async fn a_host_bound_vertex_listener_rotates_capabilities_only_after_shutdown()
     );
     second.shutdown().await;
 }
+
+#[tokio::test]
+async fn stopping_acceptance_closes_the_listener_without_waiting_for_inflight_inference() {
+    use ironwire_proxy::embed::{
+        EmbedOptions, HostSecret, StartupProbes, UpdateChecks, VertexGateway, start_with_options,
+    };
+    use std::sync::Arc;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let upstream_release = release.clone();
+    let upstream = axum::Router::new().fallback(move || {
+        let release = upstream_release.clone();
+        async move {
+            let body = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"held\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"held-model\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"));
+                yield Ok(axum::body::Bytes::from_static(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"started\"}}\n\n"));
+                release.notified().await;
+                yield Ok(axum::body::Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+            };
+            ([ ("content-type", "text/event-stream") ], axum::body::Body::from_stream(body))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), format!("[[backends]]\nid='nearai'\nkind='nearai'\nenabled=false\n[[backends]]\nid='anthropic-key'\nkind='anthropic-api'\nbase_url='{base}'\napi_key_env='FIXTURE_KEY'\n")).unwrap();
+    let project = "nearai-0123456789abcdef0123456789abcdef";
+    let mut proxy = start_with_options(
+        home.path(),
+        Some(0),
+        EmbedOptions::default()
+            .with_credentials(|name| {
+                (name == "FIXTURE_KEY").then(|| HostSecret::from("fixture-key"))
+            })
+            .with_startup_probes(StartupProbes::Off)
+            .with_update_checks(UpdateChecks::Off)
+            .with_vertex_gateway(
+                VertexGateway::new(
+                    project.into(),
+                    "anthropic-key".into(),
+                    "held-model".into(),
+                    None,
+                )
+                .unwrap(),
+            ),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    let port = proxy.port();
+    let mut response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/vertex/projects/{project}/locations/region/publishers/anthropic/models/claude:streamRawPredict"))
+        .body(r#"{"messages":[],"stream":true}"#).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.chunk().await.unwrap().is_some());
+    tokio::time::timeout(std::time::Duration::from_secs(3), proxy.stop_accepting())
+        .await
+        .expect("stopping acceptance must not wait for a held inference stream");
+    assert!(
+        !proxy.is_finished(),
+        "in-flight stream and drain owner must remain alive"
+    );
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+    );
+    // The barrier is repeatable, and its completion does not consume the owner.
+    proxy.stop_accepting().await;
+    let drained = tokio::spawn(proxy.shutdown());
+    assert!(!drained.is_finished());
+    release.notify_one();
+    while response.chunk().await.unwrap().is_some() {}
+    tokio::time::timeout(std::time::Duration::from_secs(3), drained)
+        .await
+        .unwrap()
+        .unwrap();
+    upstream_task.abort();
+}

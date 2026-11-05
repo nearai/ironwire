@@ -582,6 +582,7 @@ pub struct EmbeddedProxy {
     port: u16,
     report: StartupReport,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    accepting_stopped: Option<tokio::sync::oneshot::Receiver<()>>,
     task: Option<tokio::task::JoinHandle<Result<(), ExitError>>>,
     exit: Option<Result<(), ExitError>>,
 }
@@ -620,6 +621,25 @@ impl EmbeddedProxy {
         self.exit = Some(exit);
         exit
     }
+    /// Request graceful shutdown and wait until the OS listener is closed.
+    ///
+    /// Accepted inference streams continue draining. This retains ownership of
+    /// the supervisor, home lock and housekeeping; call `shutdown` or `wait`
+    /// later to observe their completion. A host may move that drain to a
+    /// background task after this barrier, so disconnect need not wait for an
+    /// indefinitely held inference stream. No new connections can be accepted
+    /// when this returns. Repeated calls return immediately after closure.
+    ///
+    /// Cancellation-safe: canceling the wait still requests shutdown, and a
+    /// later call waits on the same listener-closure acknowledgement.
+    pub async fn stop_accepting(&mut self) {
+        self.request_shutdown();
+        if let Some(stopped) = self.accepting_stopped.as_mut() {
+            let _ = stopped.await;
+            self.accepting_stopped = None;
+        }
+    }
+
     /// Drain in-flight requests, stop housekeeping, flush quota, and release
     /// the listener, discovery pointer, and home lock. No timeout truncates a
     /// model stream; the host owns any policy for abandoning its own process.
@@ -896,7 +916,9 @@ pub async fn start_with_options(
     background.0.push(quota.spawn(state.clone()));
     let (tx, rx) = tokio::sync::oneshot::channel();
     let server_state = state.clone();
-    let server = tokio::spawn(crate::server::serve_on(
+    let (listener_stopped, accepting_stopped) = tokio::sync::oneshot::channel();
+    let listener = crate::server::ClosingListener::new(listener, Some(listener_stopped));
+    let server = tokio::spawn(crate::server::serve_listener(
         listener,
         server_state,
         async move {
@@ -920,6 +942,7 @@ pub async fn start_with_options(
         port,
         report,
         shutdown: Some(tx),
+        accepting_stopped: Some(accepting_stopped),
         task: Some(task),
         exit: None,
     })
@@ -2471,6 +2494,7 @@ mod lifecycle_tests {
             port: 1,
             report: StartupReport::default(),
             shutdown: None,
+            accepting_stopped: None,
             task: Some(task),
             exit: None,
         };
@@ -2490,6 +2514,7 @@ mod lifecycle_tests {
             port: 1,
             report: StartupReport::default(),
             shutdown: Some(tx),
+            accepting_stopped: None,
             task: Some(task),
             exit: None,
         };
