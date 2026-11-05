@@ -1339,10 +1339,13 @@ async fn stopping_acceptance_closes_the_listener_without_waiting_for_inflight_in
         EmbedOptions, HostSecret, StartupProbes, UpdateChecks, VertexGateway, start_with_options,
     };
     use std::sync::Arc;
+    let inference_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = inference_calls.clone();
     let release = Arc::new(tokio::sync::Notify::new());
     let upstream_release = release.clone();
     let upstream = axum::Router::new().fallback(move || {
         let release = upstream_release.clone();
+        received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move {
             let body = async_stream::stream! {
                 yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"held\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"held-model\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"));
@@ -1393,10 +1396,37 @@ async fn stopping_acceptance_closes_the_listener_without_waiting_for_inflight_in
         !proxy.is_finished(),
         "in-flight stream and drain owner must remain alive"
     );
+    let late_connection = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    let before_late = inference_calls.load(std::sync::atomic::Ordering::SeqCst);
+    let late_inference = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/vertex/projects/{project}/locations/region/publishers/anthropic/models/claude:rawPredict"))
+        .timeout(std::time::Duration::from_millis(500))
+        .body(r#"{"messages":[],"stream":false}"#).send().await;
+    if let Ok(stream) = &late_connection {
+        eprintln!(
+            "embedded listener: late connect succeeded; peer_known={}; late_http_status={:?}; new_upstream_calls={}",
+            stream.peer_addr().is_ok(),
+            late_inference
+                .as_ref()
+                .map(|response| response.status().as_u16())
+                .ok(),
+            inference_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_sub(before_late)
+        );
+    }
+    assert_eq!(
+        inference_calls.load(std::sync::atomic::Ordering::SeqCst),
+        before_late,
+        "shutdown admitted another inference request"
+    );
     assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err()
+        late_inference.is_err(),
+        "shutdown served another HTTP request"
+    );
+    assert!(
+        late_connection.is_err(),
+        "shutdown still completed a new handshake"
     );
     // The barrier is repeatable, and its completion does not consume the owner.
     proxy.stop_accepting().await;
