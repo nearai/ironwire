@@ -84,6 +84,10 @@ aliases and failures cannot widen that destination: ordinary capability, privacy
 identity, consent and model context checks still run; a refusal or exhausted
 retry returns an error instead of selecting another backend or model. The ledger
 retains the original requested ID and separately observes the served model.
+For translated bound responses, the client-visible model and ledger use the
+provider's explicit completion/initial-stream model, including a substitution.
+The selected configured model is only the fallback when that value is absent.
+Generic translated responses continue reporting the client alias.
 
 The binding is immutable and memory-only. A host must await the old listener's
 `stop_accepting` closure barrier before reporting disconnect or starting a

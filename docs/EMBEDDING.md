@@ -537,7 +537,9 @@ A bound listener has no Anthropic/OpenAI facade to bypass the restriction.
 It ignores control pins, refuses inbound route overrides, maps IDs containing
 `haiku` case-insensitively to the optional background model, and sends every
 other ID to the main model. Eligibility still applies and failures never fall
-back to another destination. Counting remains a terminal 400 after capability
+back to another destination. Translated responses report the provider's explicit
+model when supplied (including substitutions), otherwise the forced configured
+model; the ledger keeps the Desktop alias separately as `requested_model`. Counting remains a terminal 400 after capability
 authentication. See `docs/PROTOCOL.md` for the wire contract and `docs/TRUST.md`
 for the bearer-secret boundary. Hosts own Desktop configuration, process state,
 connection persistence and installed-client validation.

@@ -617,3 +617,117 @@ async fn bound_background_models_keep_their_provider_stated_context_limit() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(inference.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn bound_translated_responses_report_provider_model_while_retaining_client_alias() {
+    for streaming in [false, true] {
+        for provider_model in ["configured-qwen", "canonical-qwen-provider"] {
+            for bound in [false, true] {
+                let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+                let received = seen.clone();
+                let upstream = axum::Router::new().fallback(move |body: Bytes| {
+                    let received = received.clone();
+                    async move {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let stream = body["stream"] == true;
+                        received.lock().unwrap().push(body);
+                        if stream {
+                            let event = serde_json::json!({"id":"translated-id", "model":provider_model, "choices":[{"index":0,"delta":{"role":"assistant","content":"READY"},"finish_reason":null}]});
+                            ([ ("content-type", "text/event-stream") ], format!("data: {event}\n\ndata: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":1}}}}\n\ndata: [DONE]\n\n"))
+                        } else {
+                            ([ ("content-type", "application/json") ], serde_json::json!({"id":"translated-id","model":provider_model,"choices":[{"index":0,"message":{"role":"assistant","content":"READY"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}).to_string())
+                        }
+                    }
+                });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let task =
+                    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+                let mut registry = BackendRegistry::new();
+                registry.push(Arc::new(
+                    ChatCompletionsBackend::new(
+                        BackendId::from("qwen"),
+                        "Qwen",
+                        BackendKind::ApiKey,
+                        Some(SecretString::from("host-key")),
+                        base,
+                        vec![("configured-qwen".into(), ModelTier::Frontier)],
+                        5,
+                    )
+                    .unwrap(),
+                ));
+                let state = AppState::new(
+                    registry,
+                    Config::default(),
+                    ConsentLedger::default(),
+                    "control".into(),
+                )
+                .with_ledger(Some(ironwire_ledger::Ledger::in_memory().unwrap()));
+                state.policy.lock().unwrap().set_pin(
+                    Some(BackendId::from("qwen")),
+                    Some("configured-qwen".into()),
+                );
+                let state = if bound {
+                    state.with_vertex_gateway(
+                        VertexGateway::new(
+                            CAPABILITY.into(),
+                            "qwen".into(),
+                            "configured-qwen".into(),
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                } else {
+                    state
+                };
+                let action = if streaming {
+                    "streamRawPredict"
+                } else {
+                    "rawPredict"
+                };
+                let request = Request::builder().method("POST").uri(format!("/vertex/projects/{CAPABILITY}/locations/region/publishers/anthropic/models/claude-sonnet-current:{action}"))
+                    .body(Body::from(r#"{"max_tokens":17,"messages":[{"role":"user","content":"hi"}]}"#)).unwrap();
+                let response = app(state.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let expected = if bound {
+                    provider_model
+                } else {
+                    "claude-sonnet-current"
+                };
+                if streaming {
+                    let frames: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|line| serde_json::from_str(line).ok())
+                        .collect();
+                    let start = frames
+                        .iter()
+                        .find(|frame| frame["type"] == "message_start")
+                        .unwrap();
+                    assert_eq!(start["message"]["model"], expected, "bound={bound}");
+                } else {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["model"],
+                        expected,
+                        "bound={bound}"
+                    );
+                }
+                let rows = state.ledger.as_ref().unwrap().recent(1).unwrap();
+                assert_eq!(
+                    rows[0].requested_model.as_deref(),
+                    Some("claude-sonnet-current")
+                );
+                assert_eq!(rows[0].served_model.as_deref(), Some(expected));
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1);
+                assert_eq!(seen[0]["model"], "configured-qwen");
+                assert_eq!(seen[0]["max_tokens"], 17);
+                task.abort();
+            }
+        }
+    }
+}
