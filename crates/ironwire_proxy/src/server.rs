@@ -51,6 +51,14 @@ pub fn app(state: AppState) -> Router {
                 state.ledger.clone(),
             ),
         )
+        .nest(
+            "/vertex",
+            catch_panics(
+                facade::vertex::router(),
+                Envelope::Vertex,
+                state.ledger.clone(),
+            ),
+        )
         .nest("/_ironwire", crate::control::router())
         .with_state(state)
 }

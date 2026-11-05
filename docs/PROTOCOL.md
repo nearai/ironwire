@@ -31,6 +31,45 @@ and any `anthropic-*` we do not recognize.
 | `POST /v1/chat/completions` | Chat Completions | Aider, Cline, most third parties |
 | `GET /v1/models` | — | pickers |
 
+### Vertex envelope — `http://127.0.0.1:8463/vertex`
+
+This is a separate normalization contract, before the existing Anthropic
+Messages pipeline. It does not expand the native-lane mutation set in §2:
+requests to `/anthropic/v1/messages` retain that contract unchanged.
+
+| Route beneath `/vertex` | Normalized request |
+|---|---|
+| `POST /projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict` | `/v1/messages`, `model` from the path, `stream: false` |
+| `POST /projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict` | `/v1/messages`, `model` from the path, `stream: true` |
+| `POST /projects/{project}/locations/{region}/publishers/anthropic/models/count-tokens:rawPredict` | terminal HTTP 400 `invalid_request_error`: token counting is unsupported; no upstream call and no invented count |
+
+The path has exactly that shape, with nonempty ASCII identifiers (letters,
+digits, `-`, `_`, `.`; model identifiers may also contain `@`). Percent-encoded
+segments, extra segments, queries and other actions are refused. The body must
+be a JSON object with unique top-level keys. A body `model` or `stream` must
+match the path; wrong types and conflicting values are refused.
+`anthropic_version` may be absent or `"vertex-2023-10-16"` and is consumed,
+never forwarded as a Messages field. All other body fields survive
+normalization, subject to the existing routing, translation and privacy rules.
+The same 32 MiB inbound body limit and Anthropic error envelope apply.
+
+The path's model remains the **requested** model in routing and the ledger.
+The existing daemon pin and policy determine which backend and model serve it;
+there is no separate Vertex mapping or hardcoded provider/model. Inbound
+`x-ironwire-route` is refused, so a Vertex request cannot override the pin.
+Project and region are discarded, never used as upstream URL, route, ledger
+path or error text. Pre-handler failures also record only `/v1/messages` (or
+`/v1/messages/count_tokens` for the counting route). Google `x-goog-*` headers
+are consumed alongside the ordinary credential stripping; the selected backend
+uses only its own credential. No client identity is added or rewritten.
+
+Normalized requests use the existing Messages handler directly: streaming,
+cancellation, retries, usage, receipts and local capture share that pipeline,
+without an additional HTTP hop. Native Anthropic responses remain verbatim;
+a cross-wire backend uses the ordinary translation contract. This is a generic
+facade foundation, not verified Claude Desktop compatibility or an installation,
+per-session model-selection, backend-restriction or lifecycle integration.
+
 ### Login-bound URLs — `…/anthropic/account/{id}`, `…/openai/account/{id}`
 
 Every route above also exists under an account prefix, for a client bound to
@@ -248,7 +287,9 @@ conversation `none`, no tokens, no proof, no `error`, and a fixed code in
 |---|---|---|
 | `panic` | 500 | the handler panicked |
 | `body_rejected` | 413 | the body was refused before the handler ran, over the size limit |
-| `invalid_json` | 400 | the body is not JSON |
+| `invalid_json` | 400 | the native-facade body is not JSON |
+| `invalid_vertex_request` | 400 | the Vertex path, JSON object, envelope fields or route header are invalid (§1) |
+| `unsupported_token_count` | 400 | the Vertex counting route has no authoritative count (§1) |
 | `unknown_login` | 404 | a login-bound URL names no login (§1) |
 | `client_disconnected` | 499 | the client went away before the response began, including mid-upload (the body read failed); no client saw this status |
 | `unrecorded` | as answered | a handler answered without arranging a row; none does today |
