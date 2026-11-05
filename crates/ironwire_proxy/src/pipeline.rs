@@ -426,6 +426,15 @@ async fn dispatch_inner(
         )
     });
 
+    // This is a trusted, immutable host restriction, not a client header or a
+    // mutable control pin. Forced routes retain the ordinary eligibility gate
+    // and cannot descend to another backend or sibling model on failure.
+    let route_override = state
+        .vertex_gateway
+        .as_ref()
+        .map(|gateway| gateway.route(peek.requested_model.as_deref()))
+        .or(route_override);
+
     let cross_account_fallback = state
         .policy
         .lock()

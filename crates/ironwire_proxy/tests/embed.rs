@@ -1240,3 +1240,95 @@ async fn a_host_still_starts_on_config_shapes_main_accepted() {
         .expect("a config main accepted still starts");
     proxy.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_host_bound_vertex_listener_rotates_capabilities_only_after_shutdown() {
+    use ironwire_proxy::embed::{EmbedOptions, VertexGateway, start_with_options};
+    let home = home();
+    let old = "nearai-0123456789abcdef0123456789abcdef";
+    let new = "nearai-fedcba9876543210fedcba9876543210";
+    let options = |project: &str| {
+        EmbedOptions::default().with_vertex_gateway(
+            VertexGateway::new(
+                project.into(),
+                "nearai".into(),
+                "configured-model".into(),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    let client = reqwest::Client::new();
+    let first = start_with_options(home.path(), Some(0), options(old), |_, _| {})
+        .await
+        .unwrap();
+    let old_port = first.port();
+    let url = |port, project| {
+        format!(
+            "http://127.0.0.1:{port}/vertex/projects/{project}/locations/region/publishers/anthropic/models/count-tokens:rawPredict"
+        )
+    };
+    assert_eq!(
+        client
+            .post(url(old_port, old))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        client
+            .post(url(old_port, new))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(format!("http://127.0.0.1:{old_port}/anthropic/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    first.shutdown().await;
+    assert!(
+        client
+            .post(url(old_port, old))
+            .body("{}")
+            .send()
+            .await
+            .is_err()
+    );
+    let second = start_with_options(home.path(), Some(0), options(new), |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .post(url(second.port(), old))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        client
+            .post(url(second.port(), new))
+            .body("{}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    second.shutdown().await;
+}

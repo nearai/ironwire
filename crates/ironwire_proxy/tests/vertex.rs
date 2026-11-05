@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, Request, StatusCode, Uri};
 use ironwire_core::config::Config;
-use ironwire_core::protocol::BackendId;
+use ironwire_core::protocol::{BackendId, BackendKind, ModelTier};
 use ironwire_creds::ConsentLedger;
+use ironwire_proxy::embed::{EmbedOptions, VertexGateway};
 use ironwire_proxy::server::app;
 use ironwire_proxy::state::{AppState, BackendRegistry};
 use ironwire_upstream::anthropic::AnthropicBackend;
+use ironwire_upstream::openai_chat::ChatCompletionsBackend;
 use secrecy::SecretString;
 use tower::ServiceExt;
 
@@ -25,6 +27,10 @@ const SSE: &str = concat!(
 type Seen = Arc<Mutex<Vec<(Uri, HeaderMap, Bytes)>>>;
 
 async fn setup() -> (AppState, Seen) {
+    setup_with_status(StatusCode::OK).await
+}
+
+async fn setup_with_status(status: StatusCode) -> (AppState, Seen) {
     let seen: Seen = Arc::default();
     let received = seen.clone();
     let upstream =
@@ -33,17 +39,29 @@ async fn setup() -> (AppState, Seen) {
             async move {
                 let streaming =
                     serde_json::from_slice::<serde_json::Value>(&body).unwrap()["stream"] == true;
+                let model = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["model"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
                 received.lock().unwrap().push((uri, headers, body));
                 (
-                    [(
-                        "content-type",
-                        if streaming {
-                            "text/event-stream"
-                        } else {
-                            "application/json"
-                        },
-                    )],
-                    if streaming { SSE } else { JSON },
+                    status,
+                    [
+                        ("retry-after", "60"),
+                        (
+                            "content-type",
+                            if streaming {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        ),
+                    ],
+                    if streaming {
+                        SSE.to_owned()
+                    } else {
+                        JSON.replace("served-model", &model)
+                    },
                 )
             }
         });
@@ -54,7 +72,19 @@ async fn setup() -> (AppState, Seen) {
     });
     let mut registry = BackendRegistry::new();
     registry.push(Arc::new(
-        AnthropicBackend::api_key(SecretString::from("host-key"), Some(base), 5).unwrap(),
+        AnthropicBackend::api_key(SecretString::from("host-key"), Some(base.clone()), 5).unwrap(),
+    ));
+    registry.push(Arc::new(
+        ChatCompletionsBackend::new(
+            BackendId::from("spare"),
+            "Spare",
+            BackendKind::ApiKey,
+            Some(SecretString::from("spare-key")),
+            base,
+            vec![("escape-model".into(), ModelTier::Frontier)],
+            5,
+        )
+        .unwrap(),
     ));
     let state = AppState::new(
         registry,
@@ -267,4 +297,323 @@ async fn oversized_vertex_uploads_keep_anthropic_errors_and_canonical_ledger_pat
     let rows = state.ledger.as_ref().unwrap().recent(1).unwrap();
     assert_eq!(rows[0].path, "/v1/messages");
     assert_eq!(rows[0].failure.as_deref(), Some("body_rejected"));
+}
+
+const CAPABILITY: &str = "nearai-0123456789abcdef0123456789abcdef";
+
+fn gateway(background: Option<&str>) -> VertexGateway {
+    VertexGateway::new(
+        CAPABILITY.into(),
+        "anthropic-key".into(),
+        "served-model".into(),
+        background.map(str::to_owned),
+    )
+    .unwrap()
+}
+
+fn bound_request(project: &str, model: &str, body: &str) -> Request<Body> {
+    Request::builder().method("POST")
+        .uri(format!("/vertex/projects/{project}/locations/private-region/publishers/anthropic/models/{model}:rawPredict"))
+        .header("content-type", "application/json").body(Body::from(body.to_owned())).unwrap()
+}
+
+#[test]
+fn bound_gateway_validation_and_debug_never_echo_the_capability() {
+    let options = EmbedOptions::default().with_vertex_gateway(gateway(None));
+    assert!(!format!("{options:?}").contains(CAPABILITY));
+    assert!(!format!("{:?}", gateway(None)).contains(CAPABILITY));
+    for (project, backend, model, background, label) in [
+        (
+            "private-secret",
+            "anthropic-key",
+            "model",
+            None,
+            "invalid_vertex_project",
+        ),
+        (CAPABILITY, "", "model", None, "invalid_vertex_backend"),
+        (
+            CAPABILITY,
+            "anthropic-key",
+            "",
+            None,
+            "invalid_vertex_model",
+        ),
+        (
+            CAPABILITY,
+            "anthropic-key",
+            "model",
+            Some(""),
+            "invalid_vertex_background_model",
+        ),
+    ] {
+        assert_eq!(
+            VertexGateway::new(
+                project.into(),
+                backend.into(),
+                model.into(),
+                background.map(str::to_owned)
+            )
+            .unwrap_err(),
+            label
+        );
+    }
+}
+
+#[tokio::test]
+async fn bound_gateway_authenticates_before_parsing_or_answering_counts() {
+    let (state, seen) = setup().await;
+    let state = state.with_vertex_gateway(gateway(None));
+    for project in [
+        "wrong",
+        "",
+        "nearai-0123456789abcdef0123456789abcdeF",
+        "nearai-0123456789abcdef0123456789abcdef%2F",
+    ] {
+        for model in ["claude", "count-tokens"] {
+            let response = app(state.clone())
+                .oneshot(bound_request(project, model, "not JSON"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let error = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&error).unwrap()["error"]["message"],
+                "Invalid Vertex capability."
+            );
+        }
+    }
+    let response = app(state.clone())
+        .oneshot(bound_request(
+            "wrong",
+            "claude",
+            &"x".repeat(ironwire_proxy::facade::MAX_REQUEST_BODY_BYTES + 1),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app(state)
+        .oneshot(bound_request(CAPABILITY, "count-tokens", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bound_gateway_hides_other_inference_facades_and_preserves_control_auth() {
+    let (state, seen) = setup().await;
+    let state = state.with_vertex_gateway(gateway(None));
+    for path in [
+        "/anthropic/v1/messages",
+        "/anthropic/account/anthropic-key/v1/messages",
+        "/openai/v1/chat/completions",
+        "/openai/v1/responses",
+        "/anthropic/v1/models",
+        "/openai/v1/models",
+    ] {
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    for (path, expected) in [
+        ("/_ironwire/health", StatusCode::OK),
+        ("/_ironwire/status", StatusCode::UNAUTHORIZED),
+    ] {
+        let response = app(state.clone())
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/_ironwire/status")
+                .header("authorization", "Bearer control-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&status).contains(CAPABILITY));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bound_gateway_maps_main_and_haiku_without_losing_requested_model() {
+    for background in [None, Some("served-fast")] {
+        let (state, seen) = setup().await;
+        let state = state.with_vertex_gateway(gateway(background));
+        // Even authenticated mutable control pins cannot widen the host binding.
+        state
+            .policy
+            .lock()
+            .unwrap()
+            .set_pin(Some(BackendId::from("spare")), Some("escape-model".into()));
+        for requested in ["claude-opus", "claude-HaIkU@20261001"] {
+            let response = app(state.clone())
+                .oneshot(bound_request(
+                    CAPABILITY,
+                    requested,
+                    r#"{"max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let served = if requested.contains("HaIkU") {
+                background.unwrap_or("served-model")
+            } else {
+                "served-model"
+            };
+            let rows = state.ledger.as_ref().unwrap().recent(1).unwrap();
+            assert_eq!(rows[0].requested_model.as_deref(), Some(requested));
+            assert_eq!(rows[0].served_model.as_deref(), Some(served));
+            let seen = seen.lock().unwrap();
+            let last = seen.last().unwrap();
+            assert_eq!(last.0.path(), "/v1/messages");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&last.2).unwrap()["model"],
+                served
+            );
+            let wire = format!("{last:?}");
+            assert!(!wire.contains(CAPABILITY));
+            assert!(!wire.contains("private-region"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_gateway_never_falls_back_to_a_second_backend_or_model() {
+    let (state, seen) = setup_with_status(StatusCode::TOO_MANY_REQUESTS).await;
+    let state = state.with_vertex_gateway(gateway(Some("served-fast")));
+    let response = app(state.clone())
+        .oneshot(bound_request(
+            CAPABILITY,
+            "claude-opus",
+            r#"{"messages":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let _ = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0.path(), "/v1/messages");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&seen[0].2).unwrap()["model"],
+        "served-model"
+    );
+}
+
+#[tokio::test]
+async fn bound_gateway_refuses_route_headers_and_keeps_model_eligibility() {
+    let (state, seen) = setup().await;
+    let state = state.with_vertex_gateway(gateway(None));
+    let mut override_request = bound_request(CAPABILITY, "claude", r#"{"messages":[]}"#);
+    override_request
+        .headers_mut()
+        .insert("x-ironwire-route", "spare:escape-model".parse().unwrap());
+    assert_eq!(
+        app(state.clone())
+            .oneshot(override_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // A configured text-only Chat model must still refuse image input, even
+    // when the bound route forces its backend and model.
+    let state = state.with_vertex_gateway(
+        VertexGateway::new(
+            CAPABILITY.into(),
+            "spare".into(),
+            "escape-model".into(),
+            None,
+        )
+        .unwrap(),
+    );
+    let response = app(state).oneshot(bound_request(CAPABILITY, "claude", r#"{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}]}"#)).await.unwrap();
+    assert!(!response.status().is_success());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bound_background_models_keep_their_provider_stated_context_limit() {
+    use ironwire_upstream::backend::Backend;
+    let inference = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = inference.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"data": [
+                    {"id": "wide-model", "context_length": 200000},
+                    {"id": "small-model", "context_length": 1024}
+                ]}))
+            }),
+        )
+        .fallback(move || {
+            received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { StatusCode::INTERNAL_SERVER_ERROR }
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+    let backend = ChatCompletionsBackend::new(
+        BackendId::from("sized"),
+        "Sized",
+        BackendKind::ApiKey,
+        Some(SecretString::from("host-key")),
+        base,
+        vec![],
+        5,
+    )
+    .unwrap();
+    backend.probe().await.unwrap();
+    let mut registry = BackendRegistry::new();
+    registry.push(Arc::new(backend));
+    let state = AppState::new(
+        registry,
+        Config::default(),
+        ConsentLedger::default(),
+        "control".into(),
+    )
+    .with_vertex_gateway(
+        VertexGateway::new(
+            CAPABILITY.into(),
+            "sized".into(),
+            "wide-model".into(),
+            Some("small-model".into()),
+        )
+        .unwrap(),
+    );
+    let response = app(state)
+        .oneshot(bound_request(
+            CAPABILITY,
+            "claude-haiku",
+            r#"{"max_tokens":4096,"messages":[]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(inference.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

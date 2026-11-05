@@ -813,3 +813,24 @@ On Windows, owned state and the detailed spool receive protected current-user
 ACLs. Foreign-owned paths and reparse ancestors are refused. Fresh payloads
 inherit the verified spool ACL; status and control never depend on a broadly
 readable custom home. The Windows spool CI leg checks raw-file ACLs.
+
+
+## Host-bound Vertex inference
+
+An embedding host can create a dedicated `VertexGateway` listener with one
+opaque project capability, one backend, and a main/background model pair. Only
+`/vertex` inference exists on that listener. The exact raw capability is checked
+before body parsing, body-limit errors and token-count responses; a missing or
+incorrect value receives a fixed 403. This capability is a bearer secret:
+loopback does not isolate users or processes, and anyone who obtains it can use
+the bound inference destination. It is never part of a provider request,
+recorded path, status/control response or `Debug` output.
+
+Bindings are immutable and do not inherit mutable control pins. Client route
+headers are refused, and the trusted forced route still passes the normal
+eligibility gates. Failure never selects another backend or sibling model.
+The original requested model remains distinct from the provider-observed served
+model. `tests/vertex.rs` pins these restrictions alongside generic behavior.
+`tests/embed.rs` proves option propagation and shutdown/restart capability
+rotation over a real loopback socket. A host revokes by awaiting shutdown;
+requests already forwarded drain, and replacing a binding requires a new secret.

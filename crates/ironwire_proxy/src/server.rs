@@ -34,27 +34,34 @@ pub enum ServeError {
 
 /// Build the full application router.
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .nest(
-            "/anthropic",
-            catch_panics(
-                facade::anthropic::router(),
-                Envelope::Anthropic,
-                state.ledger.clone(),
-            ),
-        )
-        .nest(
-            "/openai",
-            catch_panics(
-                facade::openai::router(),
-                Envelope::OpenAi,
-                state.ledger.clone(),
-            ),
-        )
+    let mut router = Router::new();
+    if state.vertex_gateway.is_none() {
+        router = router
+            .nest(
+                "/anthropic",
+                catch_panics(
+                    facade::anthropic::router(),
+                    Envelope::Anthropic,
+                    state.ledger.clone(),
+                ),
+            )
+            .nest(
+                "/openai",
+                catch_panics(
+                    facade::openai::router(),
+                    Envelope::OpenAi,
+                    state.ledger.clone(),
+                ),
+            );
+    }
+    router
         .nest(
             "/vertex",
             catch_panics(
-                facade::vertex::router(),
+                facade::vertex::router().layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    facade::vertex::authorize,
+                )),
                 Envelope::Vertex,
                 state.ledger.clone(),
             ),

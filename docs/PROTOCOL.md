@@ -54,9 +54,9 @@ normalization, subject to the existing routing, translation and privacy rules.
 The same 32 MiB inbound body limit and Anthropic error envelope apply.
 
 The path's model remains the **requested** model in routing and the ledger.
-The existing daemon pin and policy determine which backend and model serve it;
-there is no separate Vertex mapping or hardcoded provider/model. Inbound
-`x-ironwire-route` is refused, so a Vertex request cannot override the pin.
+For a generic daemon, the existing pin and policy determine which backend and
+model serve it. An embedding host can instead supply an immutable
+`VertexGateway` binding (§ below). Inbound `x-ironwire-route` is always refused.
 Project and region are discarded, never used as upstream URL, route, ledger
 path or error text. Pre-handler failures also record only `/v1/messages` (or
 `/v1/messages/count_tokens` for the counting route). Google `x-goog-*` headers
@@ -66,9 +66,30 @@ uses only its own credential. No client identity is added or rewritten.
 Normalized requests use the existing Messages handler directly: streaming,
 cancellation, retries, usage, receipts and local capture share that pipeline,
 without an additional HTTP hop. Native Anthropic responses remain verbatim;
-a cross-wire backend uses the ordinary translation contract. This is a generic
-facade foundation, not verified Claude Desktop compatibility or an installation,
-per-session model-selection, backend-restriction or lifecycle integration.
+a cross-wire backend uses the ordinary translation contract.
+
+A host-bound listener exposes only `/vertex` inference; `/anthropic` and
+`/openai` are absent, including model listings and account-bound routes. Before
+reading a body or answering token counting, the raw project segment must match
+the binding's opaque bearer capability exactly. Missing or incorrect values
+return fixed HTTP 403 `permission_error` / `Invalid Vertex capability.`; the
+capability is never returned by status/control or rendered by `Debug`. Encoded
+forms and case changes are not aliases. Health remains public and other control
+endpoints retain their independent control bearer.
+
+A bound request always targets the configured backend and main model. A requested
+ID containing `haiku` (ASCII case-insensitive) selects the configured background
+model, or the main model when none is configured. Mutable pins, client model
+aliases and failures cannot widen that destination: ordinary capability, privacy,
+identity, consent and model context checks still run; a refusal or exhausted
+retry returns an error instead of selecting another backend or model. The ledger
+retains the original requested ID and separately observes the served model.
+
+The binding is immutable and memory-only. A host must await the old listener's
+shutdown before reporting disconnect or starting a replacement with a freshly
+generated capability. In-flight inference drains during shutdown. This library
+contract alone does not establish Claude Desktop compatibility; hosts must
+validate the installed Desktop client and own its setup/lifecycle integration.
 
 ### Login-bound URLs — `…/anthropic/account/{id}`, `…/openai/account/{id}`
 
@@ -289,6 +310,7 @@ conversation `none`, no tokens, no proof, no `error`, and a fixed code in
 | `body_rejected` | 413 | the body was refused before the handler ran, over the size limit |
 | `invalid_json` | 400 | the native-facade body is not JSON |
 | `invalid_vertex_request` | 400 | the Vertex path, JSON object, envelope fields or route header are invalid (§1) |
+| `invalid_vertex_capability` | 403 | a host-bound Vertex request lacks its exact private capability (§1) |
 | `unsupported_token_count` | 400 | the Vertex counting route has no authoritative count (§1) |
 | `unknown_login` | 404 | a login-bound URL names no login (§1) |
 | `client_disconnected` | 499 | the client went away before the response began, including mid-upload (the body read failed); no client saw this status |

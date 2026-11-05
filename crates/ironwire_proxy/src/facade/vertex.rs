@@ -2,7 +2,9 @@
 
 use axum::Router;
 use axum::extract::{Extension, State};
-use axum::http::{HeaderMap, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::post;
 use serde::de::{MapAccess, Visitor};
@@ -19,6 +21,34 @@ pub(crate) fn router() -> Router<AppState> {
         .layer(axum::extract::DefaultBodyLimit::max(
             super::MAX_REQUEST_BODY_BYTES,
         ))
+}
+
+/// Authenticate the opaque raw path segment before reading the body, parsing
+/// an envelope or answering a count request. Percent-encoding is not an alias.
+pub(crate) async fn authorize(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if let Some(gateway) = &state.vertex_gateway {
+        let project = request
+            .uri()
+            .path()
+            .strip_prefix("/projects/")
+            .and_then(|path| path.split_once('/').map(|(project, _)| project));
+        if !gateway.accepts(project) {
+            if let Some(claim) = request.extensions().get::<RowClaim>() {
+                claim.failed(guard::INVALID_VERTEX_CAPABILITY);
+            }
+            return FacadeError::new(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Invalid Vertex capability.",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 /// Even an upload rejected before the handler must not persist cloud routing

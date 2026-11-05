@@ -58,6 +58,8 @@ pub(crate) const BODY_REJECTED: &str = "body_rejected";
 pub(crate) const INVALID_JSON: &str = "invalid_json";
 /// A malformed Vertex path, body or route override.
 pub(crate) const INVALID_VERTEX_REQUEST: &str = "invalid_vertex_request";
+/// A bound Vertex request did not carry its private capability.
+pub(crate) const INVALID_VERTEX_CAPABILITY: &str = "invalid_vertex_capability";
 /// No authoritative count is available for this facade.
 pub(crate) const UNSUPPORTED_TOKEN_COUNT: &str = "unsupported_token_count";
 /// A login-bound URL names no login of the façade's product.
