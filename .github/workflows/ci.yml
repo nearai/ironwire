@@ -52,6 +52,24 @@ jobs:
           }
 
 
+  windows-embedded-lifecycle:
+    runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Listener transport baseline with accepted connections
+        run: cargo test -p ironwire_proxy --test listener_lifecycle -- --nocapture
+      - name: Embedded listener barrier with accepted inference stream
+        if: always()
+        run: cargo test -p ironwire_proxy --test embed stopping_acceptance_closes_the_listener_without_waiting_for_inflight_inference -- --nocapture
+      - name: Bound shutdown revokes idle and persistent connections
+        if: always()
+        run: cargo test -p ironwire_proxy --test vertex stopping_a_bound_gateway_revokes_new_requests_on_idle_and_live_connections
+
+
   test:
     strategy:
       fail-fast: false
