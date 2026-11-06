@@ -1070,7 +1070,7 @@ async fn token_capture_uses_response_format_and_stops_augmenting_a_full_spool() 
 }
 
 #[tokio::test]
-async fn nearai_accepts_replayed_assistant_text_without_changing_the_conversation() {
+async fn nearai_keeps_replayed_assistant_output_text() {
     assert_responses_replay(true).await;
 }
 
@@ -1126,12 +1126,9 @@ async fn assert_responses_replay(nearai: bool) {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = axum::body::to_bytes(response.into_body(), 1 << 20).await;
     let got = received.lock().unwrap().clone().unwrap();
-    let mut expected = body;
-    if nearai {
-        expected["input"][1]["content"][0]["type"] = "input_text".into();
-    }
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&got.body).unwrap(),
-        expected
+        got.body,
+        body.to_string(),
+        "native replay must preserve bytes"
     );
 }

@@ -132,18 +132,12 @@ For a native-lane request, IronWire performs exactly these mutations:
    conflicting or ambiguous metadata refuses before sending. Other sessions are
    byte-identical; a bound session routed to another backend/protocol or past
    expiry is refused, never silently sent without its binding.
-7. **Responses `tools` entries the backend rejects**: removed, and only the
-   `type`s that backend is *known* to reject
-   (`Capabilities::unsupported_responses_tools`, empty for almost everything).
-   This is the one place a body edit is made on the client's behalf rather than
-   the user's, and it is narrow on purpose. NEAR AI deserialises `tools`
-   strictly and answers a `namespace` entry -- which Codex emits once per
-   connected MCP server -- with `unknown variant `namespace`` and refuses the
-   whole turn; forwarding it faithfully means the request cannot be served at
-   all. Nothing is filtered to a lowest common set: `web_search` is on NEAR AI's
-   own accepted list and goes through untouched, because dropping a tool the
-   provider would have taken is a capability the user silently loses. The
-   removal is logged with what went and how much.
+7. **Responses `tools` entries a custom backend rejects**: a driver may name
+   explicitly unsupported tool types in `Capabilities::unsupported_responses_tools`.
+   Only those types are removed, with a diagnostic stating which capabilities
+   were lost. Built-in backends currently leave this list empty. In particular,
+   NEAR AI's stateless Responses endpoint accepts client-managed namespaces,
+   so their declarations, named choices and replayed results pass through.
 8. **Provider opt-ins**: a backend may carry request headers of its own,
    declared once where that backend is built rather than in the shared request
    path. There is exactly one today, and it is **off unless an operator turns
@@ -160,13 +154,11 @@ For a native-lane request, IronWire performs exactly these mutations:
    fields before body capture. Existing caller fields win, including false.
    No unrelated bytes are reserialized. Ambiguous JSON is not augmented.
    Responses and other protocols are not augmented by this initial adapter.
-10. **NEAR AI Responses replay**: assistant message content blocks with type
-   `output_text` are sent as `input_text`, which NEAR AI accepts when replaying
-   previous assistant output. Roles, text, order, unknown fields and all other
-   bytes are preserved. This applies only to the NEAR AI credits backend and
-   Responses requests, before capture; other providers and response bytes are
-   untouched. No conversation items are dropped.
-11. **Nothing else.** The body is otherwise the bytes the client sent.
+10. **Nothing else.** The body is otherwise the bytes the client sent.
+
+Replayed Responses assistant `output_text` content is preserved, including for
+NEAR AI. Its native OpenAI Responses transport requires that output shape;
+rewriting it as `input_text` makes an otherwise valid continuation fail.
 
 `GET /_ironwire/admission-binding` requires the control bearer and returns
 capability/limits only, never registered session or challenge values.

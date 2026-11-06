@@ -612,13 +612,6 @@ async fn dispatch_inner(
             .and_then(|candidate| candidate.account_scope.clone());
 
         let upstream_protocol = if decision.translated { target } else { inbound };
-        if upstream_protocol == Protocol::OpenAiResponses
-            && backend.kind() == ironwire_core::protocol::BackendKind::Credits
-            && let Some(body) =
-                ironwire_core::responses_replay::normalize_assistant_text(&request.body)
-        {
-            request.body = Bytes::from(body);
-        }
         let token_target = state
             .config
             .capture
@@ -1199,31 +1192,9 @@ pub fn apply_model(body: &Bytes, model: Option<&str>) -> Bytes {
     serde_json::to_vec(&value).map_or_else(|_| body.clone(), Bytes::from)
 }
 
-/// Remove Responses `tools` entries this backend is known to reject.
-///
-/// The native lane forwards a body untouched, which is its whole point and is
-/// right for every field a provider merely does not recognise. A tool `type`
-/// is not one of those: NEAR AI deserialises `tools` strictly and answers a
-/// `namespace` entry with
-///
-/// ```text
-/// tools[8].type: unknown variant `namespace`, expected one of `function`,
-/// `web_search`, `web_context_search`, `file_search`, `code_interpreter`,
-/// `computer`, `mcp`
-/// ```
-///
-/// — refusing the entire turn. Codex emits one `namespace` per connected MCP
-/// server, so before this, any Codex user with a single MCP server configured
-/// could not reach NEAR AI at all.
-///
-/// Only types the backend is *known* to reject are removed
-/// ([`Capabilities::unsupported_responses_tools`]). Everything else, built-ins
-/// included, goes through: `web_search` is on NEAR AI's own accepted list, and
-/// stripping a tool the provider would have taken is a capability the user
-/// silently loses.
-///
-/// The removal is logged with what went and how much, because the model not
-/// having the user's MCP tools is a thing they need to be able to find out.
+/// Remove only Responses tool types a custom backend explicitly rejects.
+/// Built-in backends currently leave this list empty. Any removal is logged
+/// because losing a client-managed tool changes what the model can do.
 #[must_use]
 pub fn strip_unsupported_tools(
     body: &Bytes,

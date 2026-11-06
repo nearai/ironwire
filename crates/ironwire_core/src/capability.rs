@@ -139,19 +139,11 @@ pub struct Capabilities {
     pub structured_output: bool,
     /// Context window in tokens.
     pub context_tokens: u32,
-    /// Responses `tools` entry `type`s this backend rejects outright.
+    /// Responses `tools` entry `type`s a custom backend rejects outright.
     ///
-    /// Responses lets a client declare tool entries that are not functions,
-    /// and providers do not agree on which of them exist. OpenAI accepts
-    /// everything Codex sends; NEAR AI answers a `namespace` entry with a
-    /// deserialisation error naming the variants it knows, and refuses the
-    /// whole request over it — so a Codex turn with any MCP server connected
-    /// could not reach NEAR AI at all.
-    ///
-    /// Named per backend rather than filtered to some lowest common set,
-    /// because dropping a tool the provider would have accepted is a real
-    /// capability loss. Empty for every backend not *known* to reject
-    /// something: this list is evidence, not caution.
+    /// Built-in backends leave this empty. A driver may declare an
+    /// unsupported type from provider evidence; the proxy logs any removal
+    /// because dropping a tool the provider accepts is a capability loss.
     #[serde(default)]
     pub unsupported_responses_tools: Vec<String>,
     /// Whether [`Self::context_tokens`] is the window the provider stated for
