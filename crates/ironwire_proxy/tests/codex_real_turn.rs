@@ -38,13 +38,6 @@ use tower::ServiceExt;
 
 const FIXTURE: &str = include_str!("fixtures/codex_responses_request.json");
 
-/// NEAR AI's real answer to this fixture, quoted from a live run. The whole
-/// turn is refused over one tool entry.
-const REAL_NEARAI_REFUSAL: &str = "Failed to deserialize the JSON body into the target type: \
-     tools[8].type: unknown variant `namespace`, expected one of `function`, `web_search`, \
-     `web_context_search`, `file_search`, `code_interpreter`, `computer`, `mcp` \
-     at line 1 column 72749";
-
 /// A provider refusal in the shape an OpenAI-compatible server sends one.
 const REFUSAL: &str = r#"{"error":{"message":"tools[22]: 'name' is a required property","type":"invalid_request_error","param":"tools"}}"#;
 
@@ -291,16 +284,10 @@ async fn spawn_accepting_nearai() -> (String, Arc<Mutex<Option<Received>>>) {
     (format!("http://{addr}/v1"), received)
 }
 
-/// The tool entry NEAR AI refuses does not reach NEAR AI.
-///
-/// This is the native lane: the body is forwarded as the client wrote it, and
-/// that is correct for every field a provider merely does not recognise. A
-/// tool `type` is not one of those — NEAR AI deserialises `tools` strictly and
-/// throws the whole turn away over one entry. Codex sends one `namespace` per
-/// connected MCP server, so this was every Codex user with any MCP server
-/// configured.
+/// NEAR AI's stateless Responses endpoint accepts Codex's client-managed
+/// namespace groups, so the declarations must reach it unchanged.
 #[tokio::test]
-async fn a_tool_type_near_ai_rejects_never_reaches_it() {
+async fn nearai_preserves_the_codex_namespace_tools_it_now_accepts() {
     let (base, received) = spawn_accepting_nearai().await;
     let ledger = Ledger::in_memory().expect("ledger opens");
 
@@ -328,8 +315,8 @@ async fn a_tool_type_near_ai_rejects_never_reaches_it() {
         .map(|t| t["type"].as_str().unwrap_or_default())
         .collect();
     assert!(
-        !kinds.contains(&"namespace"),
-        "the entry that produced `{REAL_NEARAI_REFUSAL}` was forwarded anyway"
+        kinds.contains(&"namespace"),
+        "client-managed tools were removed"
     );
 
     // Not over-filtered. `web_search` is on NEAR AI's own accepted list, and
@@ -349,8 +336,48 @@ async fn a_tool_type_near_ai_rejects_never_reaches_it() {
     assert!(sent.get("client_metadata").is_some(), "body was reshaped");
     assert_eq!(sent["include"][0], "reasoning.encrypted_content");
     let original: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture");
+    assert_eq!(sent["tools"], original["tools"]);
     assert_eq!(sent["instructions"], original["instructions"]);
     assert_eq!(sent["client_metadata"], original["client_metadata"]);
+}
+
+/// A native request keeps namespace identity in declarations, named tool
+/// selection and replayed calls/results instead of silently losing MCP tools.
+#[tokio::test]
+async fn nearai_keeps_namespaced_tool_choice_and_result_replay() {
+    let (base, received) = spawn_accepting_nearai().await;
+    let router = app(state_for(&base, Ledger::in_memory().unwrap()));
+    let tool = serde_json::json!({"type":"namespace","name":"probe","description":"Synthetic local tools",
+        "tools":[{"type":"function","name":"echo","description":"Echo a marker",
+            "parameters":{"type":"object","properties":{"marker":{"type":"string"}},"required":["marker"]}}]});
+    let user = serde_json::json!({"role":"user","content":"Echo synthetic-marker"});
+    let call = serde_json::json!({"type":"function_call","namespace":"probe","name":"echo",
+        "call_id":"call_probe","arguments":"{\"marker\":\"synthetic-marker\"}"});
+    let result = serde_json::json!({"type":"function_call_output","call_id":"call_probe","output":"synthetic-marker"});
+    for input in [
+        serde_json::json!([user]),
+        serde_json::json!([user, call, result]),
+    ] {
+        let body = serde_json::json!({"model":"Qwen/Qwen3.6-35B-A3B-FP8","stream":true,"store":false,
+            "tools":[tool],"tool_choice":{"type":"function","namespace":"probe","name":"echo"},"input":input}).to_string();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/openai/v1/responses")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(received.lock().unwrap().as_ref().unwrap().body, body);
+    }
 }
 
 /// Only what the backend is known to reject, and only on this wire.
