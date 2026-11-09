@@ -15,7 +15,7 @@ ironwire_core.workspace = true
 ironclaw_common.workspace = true
 
 chrono.workspace = true
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

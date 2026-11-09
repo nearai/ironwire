@@ -541,6 +541,8 @@ impl Ledger {
     ///
     /// [`LedgerError::Sqlite`] on a read failure.
     pub fn recent(&self, limit: usize) -> Result<Vec<Exchange>> {
+        let limit = i64::try_from(limit)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let conn = self.lock();
         let mut statement = conn.prepare(&format!(
             "{COLUMNS} FROM exchanges ORDER BY id DESC LIMIT ?1"
@@ -1030,6 +1032,29 @@ fn parse_time(text: &str) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unrepresentable_recent_limit_is_refused_instead_of_wrapping() {
+        let ledger = Ledger::in_memory().expect("opens");
+        assert!(ledger.recent(0).expect("zero limit").is_empty());
+        if usize::BITS > 63 {
+            assert!(matches!(
+                ledger.recent(usize::MAX),
+                Err(LedgerError::Sqlite(
+                    rusqlite::Error::ToSqlConversionFailure(_)
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn bundled_sqlite_includes_the_wal_page_cache_memory_fix() {
+        assert!(
+            rusqlite::version_number() >= 3_054_000,
+            "bundled SQLite {} predates the RUSTSEC-2026-0459 WAL page-cache memory fix",
+            rusqlite::version()
+        );
+    }
+
     use super::*;
 
     fn at(offset: i64) -> DateTime<Utc> {
